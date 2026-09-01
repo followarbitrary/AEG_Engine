@@ -1,0 +1,49 @@
+# 基于 Google 编码规范的基础配置
+BasedOnStyle: Google
+
+# 基础排版
+Language: Cpp
+Standard: c++20
+IndentWidth: 4
+ColumnLimit: 120
+UseTab: Never
+
+# 大括号与换行风格
+BreakBeforeBraces: Attach
+AllowShortBlocksOnASingleLine: Empty
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+
+# 指针与引用对齐（紧贴类型，如 int* p）
+PointerAlignment: Left
+
+# 包含头文件排序规则 (Include Categories)
+SortIncludes: CaseSensitive
+IncludeBlocks: Regroup
+IncludeCategories:
+  - Regex:           '^<.*\.h>'
+    Priority:        1
+  - Regex:           '^<.*'
+    Priority:        2
+  - Regex:           '.*'
+    Priority:        3
+
+# 空间与对齐
+SpacesInParentheses: false
+SpacesInSquareBrackets: false
+SpaceBeforeAssignmentOperators: true
+SpaceBeforeParens: ControlStatements
+SpaceInEmptyParentheses: false
+AlignConsecutiveAssignments: false
+AlignConsecutiveDeclarations: false
+AlignEscapedNewlines: Left
+
+# 构造函数与类
+ConstructorInitializerIndentWidth: 4
+PackConstructorInitializers: NextLine
+AccessModifierOffset: -4
+
+# 命名空间处理
+NamespaceIndentation: None
+FixNamespaceComments: true

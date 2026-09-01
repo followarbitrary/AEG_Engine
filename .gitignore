@@ -1,0 +1,48 @@
+# Build directories
+/cmake-build-*/
+/build/
+/out/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile
+compile_commands.json
+install_manifest.txt
+Testing/
+
+# IDE and editor files
+/.idea/
+/.vs/
+/.vscode/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Compiled binaries and intermediate files
+*.a
+*.dll
+*.dylib
+*.exe
+*.exp
+*.ilk
+*.lib
+*.obj
+*.o
+*.pdb
+*.so
+*.gch
+*.pch
+
+# Logs and runtime output
+*.log
+/logs/
+
+# OS and tool caches
+.DS_Store
+Thumbs.db
+__pycache__/
+*.pyc
