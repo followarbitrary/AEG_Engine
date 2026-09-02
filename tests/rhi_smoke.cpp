@@ -7,26 +7,30 @@
 #include <string_view>
 
 namespace {
-    bool check(const aeg::rhi::Result &result, std::string_view operation) {
+    using aeg::foundation::ResultCode;
+
+    bool check(const aeg::foundation::Result &result, std::string_view operation) {
         if (result) {
             return true;
         }
         AEG_LOG_ERROR(aeg::logging::Category::kTest, "{} failed [{}]: {}", operation,
-                      aeg::rhi::result_code_name(result.code), result.message);
+                      aeg::foundation::result_code_name(result.code), result.message);
         return false;
     }
 
     template<typename T>
-    bool check(const aeg::rhi::ResultValue<T> &result, std::string_view operation) {
+    bool check(const aeg::foundation::ResultValue<T> &result, std::string_view operation) {
         return check(result.result, operation);
     }
 
-    bool expect_code(const aeg::rhi::Result &result, aeg::rhi::ResultCode expected, std::string_view operation) {
+    bool expect_code(const aeg::foundation::Result &result, aeg::foundation::ResultCode expected,
+                     std::string_view operation) {
         if (result.code == expected) {
             return true;
         }
         AEG_LOG_ERROR(aeg::logging::Category::kTest, "{} returned [{}] instead of [{}]: {}", operation,
-                      aeg::rhi::result_code_name(result.code), aeg::rhi::result_code_name(expected), result.message);
+                      aeg::foundation::result_code_name(result.code),
+                      aeg::foundation::result_code_name(expected), result.message);
         return false;
     }
 

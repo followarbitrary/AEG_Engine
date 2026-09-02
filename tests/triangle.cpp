@@ -47,8 +47,8 @@ namespace {
     using aeg::rhi::QueueClass;
     using aeg::rhi::RenderingDesc;
     using aeg::rhi::ResourceUsage;
-    using aeg::rhi::Result;
-    using aeg::rhi::ResultCode;
+    using aeg::foundation::Result;
+    using aeg::foundation::ResultCode;
     using aeg::rhi::ScissorRect;
     using aeg::rhi::ShaderStage;
     using aeg::rhi::ShaderStageDesc;
@@ -74,12 +74,12 @@ namespace {
             return true;
         }
         AEG_LOG_ERROR(aeg::logging::Category::kTest, "{} failed [{}]: {}", operation,
-                      aeg::rhi::result_code_name(result.code), result.message);
+                      aeg::foundation::result_code_name(result.code), result.message);
         return false;
     }
 
     template<typename T>
-    bool check_result(const aeg::rhi::ResultValue<T> &result, std::string_view operation) {
+    bool check_result(const aeg::foundation::ResultValue<T> &result, std::string_view operation) {
         return check_result(result.result, operation);
     }
 

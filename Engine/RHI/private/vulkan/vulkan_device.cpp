@@ -29,6 +29,10 @@
 #include <vector>
 
 namespace aeg::rhi {
+    using foundation::Result;
+    using foundation::ResultCode;
+    using foundation::ResultValue;
+
     namespace {
         constexpr uint32_t kInvalidIndex = std::numeric_limits<uint32_t>::max();
 

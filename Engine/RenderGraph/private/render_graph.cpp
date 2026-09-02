@@ -329,10 +329,10 @@ namespace aeg::render_graph {
             return true;
         }
 
-        [[nodiscard]] rhi::Result normalize_texture_range(const rhi::TextureDesc& desc,
+        [[nodiscard]] foundation::Result normalize_texture_range(const rhi::TextureDesc& desc,
                                                            rhi::SubresourceRange& range) {
             if (range.aspects == static_cast<rhi::AspectMask>(0)) {
-                return rhi::Result::failure(rhi::ResultCode::kInvalidArgument,
+                return foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                              "Render graph texture aspects must not be empty");
             }
             if (range.aspects == rhi::Aspect::kColor && is_depth_format(desc.format)) {
@@ -340,7 +340,7 @@ namespace aeg::render_graph {
             }
             const rhi::AspectMask valid_aspects = default_aspect(desc.format);
             if ((static_cast<uint32_t>(range.aspects) & ~static_cast<uint32_t>(valid_aspects)) != 0) {
-                return rhi::Result::failure(rhi::ResultCode::kInvalidArgument,
+                return foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                              "Render graph texture range contains an invalid aspect");
             }
             const uint32_t mip_count = range.mip_count == rhi::kRemaining ? desc.mip_levels - range.base_mip
@@ -351,22 +351,22 @@ namespace aeg::render_graph {
             if (range.base_mip >= desc.mip_levels || mip_count == 0 || mip_count > desc.mip_levels - range.base_mip ||
                 range.base_layer >= desc.array_layers || layer_count == 0 ||
                 layer_count > desc.array_layers - range.base_layer) {
-                return rhi::Result::failure(rhi::ResultCode::kInvalidArgument,
+                return foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                              "Render graph texture subresource range is out of bounds");
             }
             range.mip_count = mip_count;
             range.layer_count = layer_count;
-            return rhi::Result::success();
+            return foundation::Result::success();
         }
 
-        [[nodiscard]] rhi::Result copy_buffer_desc(const rhi::BufferDesc& source, OwnedBufferDesc& destination) {
+        [[nodiscard]] foundation::Result copy_buffer_desc(const rhi::BufferDesc& source, OwnedBufferDesc& destination) {
             destination.desc = source;
             destination.desc.name = {};
             destination.name.assign(source.name.value.begin(), source.name.value.end());
-            return rhi::Result::success();
+            return foundation::Result::success();
         }
 
-        [[nodiscard]] rhi::Result copy_texture_desc(const rhi::TextureDesc& source, OwnedTextureDesc& destination) {
+        [[nodiscard]] foundation::Result copy_texture_desc(const rhi::TextureDesc& source, OwnedTextureDesc& destination) {
             try {
                 destination.desc = source;
                 destination.desc.compatible_view_formats = {};
@@ -375,10 +375,10 @@ namespace aeg::render_graph {
                                                        source.compatible_view_formats.end());
                 destination.name.assign(source.name.value.begin(), source.name.value.end());
             } catch (const std::bad_alloc&) {
-                return rhi::Result::failure(rhi::ResultCode::kOutOfMemory,
+                return foundation::Result::failure(foundation::ResultCode::kOutOfMemory,
                                              "Render graph texture description allocation failed");
             }
-            return rhi::Result::success();
+            return foundation::Result::success();
         }
 
         [[nodiscard]] rhi::ResourceState make_state(rhi::ResourceUsage usage, rhi::QueueClass queue,
@@ -480,35 +480,35 @@ namespace aeg::render_graph {
             return record.generation == handle.generation ? &record : nullptr;
         }
 
-        [[nodiscard]] rhi::Result add_use(uint32_t pass_index, ResourceUse use);
-        [[nodiscard]] rhi::Result add_color_attachment(uint32_t pass_index, ColorAttachment attachment);
-        [[nodiscard]] rhi::Result add_depth_stencil_attachment(uint32_t pass_index,
+        [[nodiscard]] foundation::Result add_use(uint32_t pass_index, ResourceUse use);
+        [[nodiscard]] foundation::Result add_color_attachment(uint32_t pass_index, ColorAttachment attachment);
+        [[nodiscard]] foundation::Result add_depth_stencil_attachment(uint32_t pass_index,
                                                                DepthStencilAttachment attachment);
-        [[nodiscard]] rhi::Result compile_graph(RenderGraphCompileInfo& info);
-        [[nodiscard]] rhi::Result ensure_transient_pool(uint32_t frame_count);
-        [[nodiscard]] rhi::Result ensure_transient_buffer(uint32_t frame_slot, uint32_t slot_index);
-        [[nodiscard]] rhi::Result ensure_transient_texture(uint32_t frame_slot, uint32_t slot_index);
-        [[nodiscard]] rhi::Result ensure_persistent_buffer(BufferRecord& record);
-        [[nodiscard]] rhi::Result ensure_persistent_texture(TextureRecord& record);
-        [[nodiscard]] rhi::Result release_physical_buffer(PhysicalBuffer& physical);
-        [[nodiscard]] rhi::Result release_physical_texture(PhysicalTexture& physical);
-        [[nodiscard]] rhi::Result release_all();
-        [[nodiscard]] rhi::ResultValue<rhi::BufferHandle> resolve_buffer(RenderGraphBuffer handle,
+        [[nodiscard]] foundation::Result compile_graph(RenderGraphCompileInfo& info);
+        [[nodiscard]] foundation::Result ensure_transient_pool(uint32_t frame_count);
+        [[nodiscard]] foundation::Result ensure_transient_buffer(uint32_t frame_slot, uint32_t slot_index);
+        [[nodiscard]] foundation::Result ensure_transient_texture(uint32_t frame_slot, uint32_t slot_index);
+        [[nodiscard]] foundation::Result ensure_persistent_buffer(BufferRecord& record);
+        [[nodiscard]] foundation::Result ensure_persistent_texture(TextureRecord& record);
+        [[nodiscard]] foundation::Result release_physical_buffer(PhysicalBuffer& physical);
+        [[nodiscard]] foundation::Result release_physical_texture(PhysicalTexture& physical);
+        [[nodiscard]] foundation::Result release_all();
+        [[nodiscard]] foundation::ResultValue<rhi::BufferHandle> resolve_buffer(RenderGraphBuffer handle,
                                                                           uint32_t frame_slot) const;
-        [[nodiscard]] rhi::ResultValue<rhi::TextureHandle> resolve_texture(RenderGraphTexture handle,
+        [[nodiscard]] foundation::ResultValue<rhi::TextureHandle> resolve_texture(RenderGraphTexture handle,
                                                                            uint32_t frame_slot) const;
-        [[nodiscard]] rhi::ResultValue<rhi::BufferViewHandle> resolve_buffer_view(
+        [[nodiscard]] foundation::ResultValue<rhi::BufferViewHandle> resolve_buffer_view(
                 RenderGraphBuffer handle, uint32_t frame_slot, rhi::BufferViewKind kind, uint64_t offset,
                 uint64_t size, rhi::Format format, uint32_t structure_stride);
-        [[nodiscard]] rhi::ResultValue<rhi::TextureViewHandle> resolve_texture_view(
+        [[nodiscard]] foundation::ResultValue<rhi::TextureViewHandle> resolve_texture_view(
                 RenderGraphTexture handle, uint32_t frame_slot, rhi::TextureViewKind kind,
                 rhi::SubresourceRange subresources, rhi::Format format, rhi::TextureViewDimension dimension);
-        [[nodiscard]] rhi::Result record_barriers(rhi::CommandListHandle command_list,
+        [[nodiscard]] foundation::Result record_barriers(rhi::CommandListHandle command_list,
                                                    uint32_t frame_slot, uint32_t topological_index,
                                                    const ResourceUse& use,
                                                    std::vector<RuntimeBufferState>& buffer_states,
                                                    std::vector<RuntimeTextureState>& texture_states);
-        [[nodiscard]] rhi::Result update_runtime_state(const ResourceUse& use, uint32_t frame_slot,
+        [[nodiscard]] foundation::Result update_runtime_state(const ResourceUse& use, uint32_t frame_slot,
                                                         std::vector<RuntimeBufferState>& buffer_states,
                                                         std::vector<RuntimeTextureState>& texture_states);
         void commit_runtime_states(const std::vector<RuntimeBufferState>& buffer_states,
@@ -519,11 +519,11 @@ namespace aeg::render_graph {
         [[nodiscard]] PhysicalTexture* physical_texture(TextureRecord& record, uint32_t frame_slot) noexcept;
         [[nodiscard]] const PhysicalTexture* physical_texture(const TextureRecord& record,
                                                                uint32_t frame_slot) const noexcept;
-        [[nodiscard]] rhi::Result initialize_runtime_states(uint32_t frame_slot,
+        [[nodiscard]] foundation::Result initialize_runtime_states(uint32_t frame_slot,
                                                              std::vector<RuntimeBufferState>& buffer_states,
                                                              std::vector<RuntimeTextureState>& texture_states);
-        [[nodiscard]] rhi::Result validate_pass_attachments(const PassRecord& pass) const;
-        [[nodiscard]] rhi::Result validate_use(const ResourceUse& use, const PassRecord& pass) const;
+        [[nodiscard]] foundation::Result validate_pass_attachments(const PassRecord& pass) const;
+        [[nodiscard]] foundation::Result validate_use(const ResourceUse& use, const PassRecord& pass) const;
     };
 
     RenderGraph::RenderGraph(rhi::Device& device)
@@ -593,29 +593,29 @@ namespace aeg::render_graph {
         compile_info_ = {};
     }
 
-    rhi::ResultValue<RenderGraphBuffer> RenderGraph::create_buffer(const rhi::BufferDesc& desc,
+    foundation::ResultValue<RenderGraphBuffer> RenderGraph::create_buffer(const rhi::BufferDesc& desc,
                                                                     ResourceLifetime lifetime) {
         if (impl_ == nullptr) {
-            return {rhi::Result::failure(rhi::ResultCode::kInvalidState,
+            return {foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                          "Render graph implementation is not initialized"), {}};
         }
         if (lifetime == ResourceLifetime::kImported) {
-            return {rhi::Result::failure(rhi::ResultCode::kInvalidArgument,
+            return {foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                          "Imported buffers must be created with import_buffer"), {}};
         }
         if (desc.size == 0 || desc.capabilities == rhi::BufferCapability::kNone) {
-            return {rhi::Result::failure(rhi::ResultCode::kInvalidArgument,
+            return {foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                          "Render graph buffer size and capabilities must be non-zero"), {}};
         }
         if (lifetime == ResourceLifetime::kTransient && rhi::has_flag(desc.flags, rhi::ResourceFlags::kExternal)) {
-            return {rhi::Result::failure(rhi::ResultCode::kInvalidArgument,
+            return {foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                          "Transient buffers cannot be external resources"), {}};
         }
 
         BufferRecord record{};
         record.generation = impl_->allocate_generation();
         record.lifetime = lifetime;
-        const rhi::Result copy_result = copy_buffer_desc(desc, record.desc);
+        const foundation::Result copy_result = copy_buffer_desc(desc, record.desc);
         if (!copy_result) {
             return {copy_result, {}};
         }
@@ -629,38 +629,38 @@ namespace aeg::render_graph {
             const uint32_t index = static_cast<uint32_t>(impl_->buffers.size());
             impl_->buffers.push_back(std::move(record));
             impl_->mark_dirty();
-            return {rhi::Result::success(), RenderGraphBuffer{index, impl_->buffers.back().generation}};
+            return {foundation::Result::success(), RenderGraphBuffer{index, impl_->buffers.back().generation}};
         } catch (const std::bad_alloc&) {
-            return {rhi::Result::failure(rhi::ResultCode::kOutOfMemory,
+            return {foundation::Result::failure(foundation::ResultCode::kOutOfMemory,
                                          "Render graph buffer resource allocation failed"), {}};
         }
     }
 
-    rhi::ResultValue<RenderGraphTexture> RenderGraph::create_texture(const rhi::TextureDesc& desc,
+    foundation::ResultValue<RenderGraphTexture> RenderGraph::create_texture(const rhi::TextureDesc& desc,
                                                                       ResourceLifetime lifetime) {
         if (impl_ == nullptr) {
-            return {rhi::Result::failure(rhi::ResultCode::kInvalidState,
+            return {foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                          "Render graph implementation is not initialized"), {}};
         }
         if (lifetime == ResourceLifetime::kImported) {
-            return {rhi::Result::failure(rhi::ResultCode::kInvalidArgument,
+            return {foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                          "Imported textures must be created with import_texture"), {}};
         }
         if (desc.format == rhi::Format::kUnknown || desc.extent.width == 0 || desc.extent.height == 0 ||
             desc.extent.depth == 0 || desc.mip_levels == 0 || desc.array_layers == 0 ||
             desc.capabilities == rhi::TextureCapability::kNone) {
-            return {rhi::Result::failure(rhi::ResultCode::kInvalidArgument,
+            return {foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                          "Render graph texture description is incomplete"), {}};
         }
         if (lifetime == ResourceLifetime::kTransient && rhi::has_flag(desc.flags, rhi::ResourceFlags::kExternal)) {
-            return {rhi::Result::failure(rhi::ResultCode::kInvalidArgument,
+            return {foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                          "Transient textures cannot be external resources"), {}};
         }
 
         TextureRecord record{};
         record.generation = impl_->allocate_generation();
         record.lifetime = lifetime;
-        const rhi::Result copy_result = copy_texture_desc(desc, record.desc);
+        const foundation::Result copy_result = copy_texture_desc(desc, record.desc);
         if (!copy_result) {
             return {copy_result, {}};
         }
@@ -674,18 +674,18 @@ namespace aeg::render_graph {
             const uint32_t index = static_cast<uint32_t>(impl_->textures.size());
             impl_->textures.push_back(std::move(record));
             impl_->mark_dirty();
-            return {rhi::Result::success(), RenderGraphTexture{index, impl_->textures.back().generation}};
+            return {foundation::Result::success(), RenderGraphTexture{index, impl_->textures.back().generation}};
         } catch (const std::bad_alloc&) {
-            return {rhi::Result::failure(rhi::ResultCode::kOutOfMemory,
+            return {foundation::Result::failure(foundation::ResultCode::kOutOfMemory,
                                          "Render graph texture resource allocation failed"), {}};
         }
     }
 
-    rhi::ResultValue<RenderGraphBuffer> RenderGraph::import_buffer(rhi::BufferHandle buffer,
+    foundation::ResultValue<RenderGraphBuffer> RenderGraph::import_buffer(rhi::BufferHandle buffer,
                                                                     const rhi::BufferDesc& desc,
                                                                     const rhi::ResourceState& initial_state) {
         if (!buffer.is_valid()) {
-            return {rhi::Result::failure(rhi::ResultCode::kInvalidArgument,
+            return {foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                          "Cannot import an invalid buffer handle"), {}};
         }
         auto resource_result = create_buffer(desc, ResourceLifetime::kPersistent);
@@ -707,12 +707,12 @@ namespace aeg::render_graph {
         return resource_result;
     }
 
-    rhi::ResultValue<RenderGraphTexture> RenderGraph::import_texture(rhi::TextureHandle texture,
+    foundation::ResultValue<RenderGraphTexture> RenderGraph::import_texture(rhi::TextureHandle texture,
                                                                        rhi::TextureViewHandle default_view,
                                                                        const rhi::TextureDesc& desc,
                                                                        const rhi::ResourceState& initial_state) {
         if (!texture.is_valid()) {
-            return {rhi::Result::failure(rhi::ResultCode::kInvalidArgument,
+            return {foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                          "Cannot import an invalid texture handle"), {}};
         }
         auto resource_result = create_texture(desc, ResourceLifetime::kPersistent);
@@ -736,22 +736,22 @@ namespace aeg::render_graph {
                                            record->imported_state);
         } catch (const std::bad_alloc&) {
             impl_->textures.pop_back();
-            return {rhi::Result::failure(rhi::ResultCode::kOutOfMemory,
+            return {foundation::Result::failure(foundation::ResultCode::kOutOfMemory,
                                          "Render graph imported texture state allocation failed"), {}};
         }
         impl_->mark_dirty();
         return resource_result;
     }
 
-    rhi::Result RenderGraph::update_imported_buffer(RenderGraphBuffer resource, rhi::BufferHandle buffer,
+    foundation::Result RenderGraph::update_imported_buffer(RenderGraphBuffer resource, rhi::BufferHandle buffer,
                                                     const rhi::ResourceState& initial_state) {
         BufferRecord* record = impl_->get_buffer(resource);
         if (record == nullptr || record->lifetime != ResourceLifetime::kImported) {
-            return rhi::Result::failure(rhi::ResultCode::kNotFound,
+            return foundation::Result::failure(foundation::ResultCode::kNotFound,
                                          "Invalid imported buffer resource");
         }
         if (!buffer.is_valid()) {
-            return rhi::Result::failure(rhi::ResultCode::kInvalidArgument,
+            return foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                         "Imported buffer handle must be valid");
         }
         for (const BufferViewCacheEntry& view: record->physical.views) {
@@ -765,19 +765,19 @@ namespace aeg::render_graph {
         record->physical.owns_handle = false;
         record->physical.state = initial_state;
         record->last_completion = {};
-        return rhi::Result::success();
+        return foundation::Result::success();
     }
 
-    rhi::Result RenderGraph::update_imported_texture(RenderGraphTexture resource, rhi::TextureHandle texture,
+    foundation::Result RenderGraph::update_imported_texture(RenderGraphTexture resource, rhi::TextureHandle texture,
                                                      rhi::TextureViewHandle default_view,
                                                      const rhi::ResourceState& initial_state) {
         TextureRecord* record = impl_->get_texture(resource);
         if (record == nullptr || record->lifetime != ResourceLifetime::kImported) {
-            return rhi::Result::failure(rhi::ResultCode::kNotFound,
+            return foundation::Result::failure(foundation::ResultCode::kNotFound,
                                         "Invalid imported texture resource");
         }
         if (!texture.is_valid()) {
-            return rhi::Result::failure(rhi::ResultCode::kInvalidArgument,
+            return foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                         "Imported texture handle must be valid");
         }
         std::vector<rhi::ResourceState> new_states;
@@ -786,7 +786,7 @@ namespace aeg::render_graph {
                                       record->desc.desc.array_layers,
                               initial_state);
         } catch (const std::bad_alloc&) {
-            return rhi::Result::failure(rhi::ResultCode::kOutOfMemory,
+            return foundation::Result::failure(foundation::ResultCode::kOutOfMemory,
                                         "Render graph imported texture state allocation failed");
         }
         for (TextureViewCacheEntry& view: record->physical.views) {
@@ -802,51 +802,51 @@ namespace aeg::render_graph {
         record->physical.states.swap(new_states);
         record->imported_state = initial_state;
         record->last_completion = {};
-        return rhi::Result::success();
+        return foundation::Result::success();
     }
 
-    rhi::ResultValue<RenderGraphTexture> RenderGraph::import_swapchain_image(
+    foundation::ResultValue<RenderGraphTexture> RenderGraph::import_swapchain_image(
             const rhi::FrameAcquireResult& acquired, const rhi::TextureDesc& desc,
             const rhi::ResourceState& initial_state) {
         if (!acquired.frame.is_valid() || !acquired.image.texture.is_valid() || !acquired.image.view.is_valid()) {
-            return {rhi::Result::failure(rhi::ResultCode::kInvalidArgument,
+            return {foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                          "Swapchain image import requires a valid acquired frame"), {}};
         }
         return import_texture(acquired.image.texture, acquired.image.view, desc, initial_state);
     }
 
-    rhi::Result RenderGraph::export_buffer(RenderGraphBuffer resource) {
+    foundation::Result RenderGraph::export_buffer(RenderGraphBuffer resource) {
         BufferRecord* record = impl_->get_buffer(resource);
         if (record == nullptr) {
-            return rhi::Result::failure(rhi::ResultCode::kNotFound,
+            return foundation::Result::failure(foundation::ResultCode::kNotFound,
                                         "Invalid render graph buffer export handle");
         }
         record->exported = true;
         impl_->mark_dirty();
-        return rhi::Result::success();
+        return foundation::Result::success();
     }
 
-    rhi::Result RenderGraph::export_texture(RenderGraphTexture resource) {
+    foundation::Result RenderGraph::export_texture(RenderGraphTexture resource) {
         TextureRecord* record = impl_->get_texture(resource);
         if (record == nullptr) {
-            return rhi::Result::failure(rhi::ResultCode::kNotFound,
+            return foundation::Result::failure(foundation::ResultCode::kNotFound,
                                         "Invalid render graph texture export handle");
         }
         record->exported = true;
         impl_->mark_dirty();
-        return rhi::Result::success();
+        return foundation::Result::success();
     }
 
-    rhi::ResultValue<RenderGraphPass> RenderGraph::add_pass(std::string_view name, rhi::QueueClass queue,
+    foundation::ResultValue<RenderGraphPass> RenderGraph::add_pass(std::string_view name, rhi::QueueClass queue,
                                                             PassSetupCallback setup,
                                                             PassExecuteCallback execute) {
         if (impl_ == nullptr) {
-            return {rhi::Result::failure(rhi::ResultCode::kInvalidState,
+            return {foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                          "Render graph implementation is not initialized"), {}};
         }
         queue = normalize_queue(queue);
         if (queue == rhi::QueueClass::kPresent) {
-            return {rhi::Result::failure(rhi::ResultCode::kInvalidArgument,
+            return {foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                          "Render graph passes cannot use the present queue"), {}};
         }
 
@@ -863,49 +863,49 @@ namespace aeg::render_graph {
             PassRecord& stored_pass = impl_->passes.back();
             if (stored_pass.setup) {
                 PassBuilder builder(*this, index);
-                const rhi::Result setup_result = stored_pass.setup(builder);
+                const foundation::Result setup_result = stored_pass.setup(builder);
                 if (!setup_result) {
                     impl_->passes.pop_back();
                     return {setup_result, {}};
                 }
             }
             impl_->mark_dirty();
-            return {rhi::Result::success(), RenderGraphPass{index, stored_pass.generation}};
+            return {foundation::Result::success(), RenderGraphPass{index, stored_pass.generation}};
         } catch (const std::bad_alloc&) {
             if (!impl_->passes.empty() && impl_->passes.back().generation == generation) {
                 impl_->passes.pop_back();
             }
-            return {rhi::Result::failure(rhi::ResultCode::kOutOfMemory,
+            return {foundation::Result::failure(foundation::ResultCode::kOutOfMemory,
                                          "Render graph pass allocation failed"), {}};
         } catch (...) {
             if (!impl_->passes.empty() && impl_->passes.back().generation == generation) {
                 impl_->passes.pop_back();
             }
-            return {rhi::Result::failure(rhi::ResultCode::kBackendError,
+            return {foundation::Result::failure(foundation::ResultCode::kBackendError,
                                          "Render graph pass setup threw an exception"), {}};
         }
     }
 
-    rhi::Result RenderGraph::compile() {
+    foundation::Result RenderGraph::compile() {
         if (impl_ == nullptr) {
-            return rhi::Result::failure(rhi::ResultCode::kInvalidState,
+            return foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                         "Render graph implementation is not initialized");
         }
         return impl_->compile_graph(compile_info_);
     }
 
-    rhi::Result PassBuilder::read(RenderGraphBuffer buffer, rhi::ResourceUsage usage,
+    foundation::Result PassBuilder::read(RenderGraphBuffer buffer, rhi::ResourceUsage usage,
                                   rhi::PipelineStageMask pipeline_stages,
                                   rhi::ShaderStageMask shader_stages,
                                   RenderGraphBufferRange range) {
         if (pass_index_ >= graph_.impl_->passes.size()) {
-            return rhi::Result::failure(rhi::ResultCode::kInvalidState,
+            return foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                         "Pass builder is no longer attached to a pass");
         }
         const PassRecord* pass = graph_.impl_->get_pass(RenderGraphPass{pass_index_,
                                                                           graph_.impl_->passes[pass_index_].generation});
         if (pass == nullptr) {
-            return rhi::Result::failure(rhi::ResultCode::kInvalidState,
+            return foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                         "Pass builder is no longer attached to a pass");
         }
         ResourceUse use{};
@@ -919,18 +919,18 @@ namespace aeg::render_graph {
         return graph_.impl_->add_use(pass_index_, std::move(use));
     }
 
-    rhi::Result PassBuilder::write(RenderGraphBuffer buffer, rhi::ResourceUsage usage,
+    foundation::Result PassBuilder::write(RenderGraphBuffer buffer, rhi::ResourceUsage usage,
                                    rhi::PipelineStageMask pipeline_stages,
                                    rhi::ShaderStageMask shader_stages,
                                    RenderGraphBufferRange range, bool discard_contents) {
         if (pass_index_ >= graph_.impl_->passes.size()) {
-            return rhi::Result::failure(rhi::ResultCode::kInvalidState,
+            return foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                         "Pass builder is no longer attached to a pass");
         }
         const PassRecord* pass = graph_.impl_->get_pass(RenderGraphPass{pass_index_,
                                                                           graph_.impl_->passes[pass_index_].generation});
         if (pass == nullptr) {
-            return rhi::Result::failure(rhi::ResultCode::kInvalidState,
+            return foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                         "Pass builder is no longer attached to a pass");
         }
         ResourceUse use{};
@@ -945,18 +945,18 @@ namespace aeg::render_graph {
         return graph_.impl_->add_use(pass_index_, std::move(use));
     }
 
-    rhi::Result PassBuilder::read_write(RenderGraphBuffer buffer, rhi::ResourceUsage usage,
+    foundation::Result PassBuilder::read_write(RenderGraphBuffer buffer, rhi::ResourceUsage usage,
                                         rhi::PipelineStageMask pipeline_stages,
                                         rhi::ShaderStageMask shader_stages,
                                         RenderGraphBufferRange range) {
         if (pass_index_ >= graph_.impl_->passes.size()) {
-            return rhi::Result::failure(rhi::ResultCode::kInvalidState,
+            return foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                         "Pass builder is no longer attached to a pass");
         }
         const PassRecord* pass = graph_.impl_->get_pass(RenderGraphPass{pass_index_,
                                                                           graph_.impl_->passes[pass_index_].generation});
         if (pass == nullptr) {
-            return rhi::Result::failure(rhi::ResultCode::kInvalidState,
+            return foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                         "Pass builder is no longer attached to a pass");
         }
         ResourceUse use{};
@@ -970,26 +970,26 @@ namespace aeg::render_graph {
         return graph_.impl_->add_use(pass_index_, std::move(use));
     }
 
-    rhi::Result PassBuilder::read(RenderGraphTexture texture, rhi::ResourceUsage usage,
+    foundation::Result PassBuilder::read(RenderGraphTexture texture, rhi::ResourceUsage usage,
                                   rhi::PipelineStageMask pipeline_stages,
                                   rhi::ShaderStageMask shader_stages,
                                   rhi::SubresourceRange subresources) {
         if (pass_index_ >= graph_.impl_->passes.size()) {
-            return rhi::Result::failure(rhi::ResultCode::kInvalidState,
+            return foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                         "Pass builder is no longer attached to a pass");
         }
         const PassRecord* pass = graph_.impl_->get_pass(RenderGraphPass{pass_index_,
                                                                           graph_.impl_->passes[pass_index_].generation});
         if (pass == nullptr) {
-            return rhi::Result::failure(rhi::ResultCode::kInvalidState,
+            return foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                         "Pass builder is no longer attached to a pass");
         }
         const TextureRecord* record = graph_.impl_->get_texture(texture);
         if (record == nullptr) {
-            return rhi::Result::failure(rhi::ResultCode::kNotFound,
+            return foundation::Result::failure(foundation::ResultCode::kNotFound,
                                         "Pass references an invalid render graph texture");
         }
-        const rhi::Result range_result = normalize_texture_range(record->desc.desc, subresources);
+        const foundation::Result range_result = normalize_texture_range(record->desc.desc, subresources);
         if (!range_result) {
             return range_result;
         }
@@ -1004,26 +1004,26 @@ namespace aeg::render_graph {
         return graph_.impl_->add_use(pass_index_, std::move(use));
     }
 
-    rhi::Result PassBuilder::write(RenderGraphTexture texture, rhi::ResourceUsage usage,
+    foundation::Result PassBuilder::write(RenderGraphTexture texture, rhi::ResourceUsage usage,
                                    rhi::PipelineStageMask pipeline_stages,
                                    rhi::ShaderStageMask shader_stages,
                                    rhi::SubresourceRange subresources, bool discard_contents) {
         if (pass_index_ >= graph_.impl_->passes.size()) {
-            return rhi::Result::failure(rhi::ResultCode::kInvalidState,
+            return foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                         "Pass builder is no longer attached to a pass");
         }
         const PassRecord* pass = graph_.impl_->get_pass(RenderGraphPass{pass_index_,
                                                                           graph_.impl_->passes[pass_index_].generation});
         if (pass == nullptr) {
-            return rhi::Result::failure(rhi::ResultCode::kInvalidState,
+            return foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                         "Pass builder is no longer attached to a pass");
         }
         const TextureRecord* record = graph_.impl_->get_texture(texture);
         if (record == nullptr) {
-            return rhi::Result::failure(rhi::ResultCode::kNotFound,
+            return foundation::Result::failure(foundation::ResultCode::kNotFound,
                                         "Pass references an invalid render graph texture");
         }
-        const rhi::Result range_result = normalize_texture_range(record->desc.desc, subresources);
+        const foundation::Result range_result = normalize_texture_range(record->desc.desc, subresources);
         if (!range_result) {
             return range_result;
         }
@@ -1039,26 +1039,26 @@ namespace aeg::render_graph {
         return graph_.impl_->add_use(pass_index_, std::move(use));
     }
 
-    rhi::Result PassBuilder::read_write(RenderGraphTexture texture, rhi::ResourceUsage usage,
+    foundation::Result PassBuilder::read_write(RenderGraphTexture texture, rhi::ResourceUsage usage,
                                         rhi::PipelineStageMask pipeline_stages,
                                         rhi::ShaderStageMask shader_stages,
                                         rhi::SubresourceRange subresources) {
         if (pass_index_ >= graph_.impl_->passes.size()) {
-            return rhi::Result::failure(rhi::ResultCode::kInvalidState,
+            return foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                         "Pass builder is no longer attached to a pass");
         }
         const PassRecord* pass = graph_.impl_->get_pass(RenderGraphPass{pass_index_,
                                                                           graph_.impl_->passes[pass_index_].generation});
         if (pass == nullptr) {
-            return rhi::Result::failure(rhi::ResultCode::kInvalidState,
+            return foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                         "Pass builder is no longer attached to a pass");
         }
         const TextureRecord* record = graph_.impl_->get_texture(texture);
         if (record == nullptr) {
-            return rhi::Result::failure(rhi::ResultCode::kNotFound,
+            return foundation::Result::failure(foundation::ResultCode::kNotFound,
                                         "Pass references an invalid render graph texture");
         }
-        const rhi::Result range_result = normalize_texture_range(record->desc.desc, subresources);
+        const foundation::Result range_result = normalize_texture_range(record->desc.desc, subresources);
         if (!range_result) {
             return range_result;
         }
@@ -1073,20 +1073,20 @@ namespace aeg::render_graph {
         return graph_.impl_->add_use(pass_index_, std::move(use));
     }
 
-    rhi::Result PassBuilder::use_color_attachment(RenderGraphTexture texture, rhi::LoadOp load_op,
+    foundation::Result PassBuilder::use_color_attachment(RenderGraphTexture texture, rhi::LoadOp load_op,
                                                   rhi::StoreOp store_op, rhi::ClearColorValue clear_color,
                                                   rhi::ResourceUsage final_usage,
                                                   rhi::SubresourceRange subresources) {
         if (pass_index_ >= graph_.impl_->passes.size()) {
-            return rhi::Result::failure(rhi::ResultCode::kInvalidState,
+            return foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                         "Pass builder is no longer attached to a pass");
         }
         const TextureRecord* record = graph_.impl_->get_texture(texture);
         if (record == nullptr) {
-            return rhi::Result::failure(rhi::ResultCode::kNotFound,
+            return foundation::Result::failure(foundation::ResultCode::kNotFound,
                                         "Color attachment references an invalid render graph texture");
         }
-        const rhi::Result range_result = normalize_texture_range(record->desc.desc, subresources);
+        const foundation::Result range_result = normalize_texture_range(record->desc.desc, subresources);
         if (!range_result) {
             return range_result;
         }
@@ -1094,20 +1094,20 @@ namespace aeg::render_graph {
                 pass_index_, ColorAttachment{texture, load_op, store_op, clear_color, final_usage, subresources});
     }
 
-    rhi::Result PassBuilder::use_depth_stencil_attachment(RenderGraphTexture texture, rhi::LoadOp depth_load_op,
+    foundation::Result PassBuilder::use_depth_stencil_attachment(RenderGraphTexture texture, rhi::LoadOp depth_load_op,
                                                           rhi::StoreOp depth_store_op, float clear_depth,
                                                           uint32_t clear_stencil, rhi::ResourceUsage final_usage,
                                                           rhi::SubresourceRange subresources) {
         if (pass_index_ >= graph_.impl_->passes.size()) {
-            return rhi::Result::failure(rhi::ResultCode::kInvalidState,
+            return foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                         "Pass builder is no longer attached to a pass");
         }
         const TextureRecord* record = graph_.impl_->get_texture(texture);
         if (record == nullptr) {
-            return rhi::Result::failure(rhi::ResultCode::kNotFound,
+            return foundation::Result::failure(foundation::ResultCode::kNotFound,
                                         "Depth attachment references an invalid render graph texture");
         }
-        const rhi::Result range_result = normalize_texture_range(record->desc.desc, subresources);
+        const foundation::Result range_result = normalize_texture_range(record->desc.desc, subresources);
         if (!range_result) {
             return range_result;
         }
@@ -1122,16 +1122,16 @@ namespace aeg::render_graph {
         }
     }
 
-    rhi::Result RenderGraph::Impl::add_use(uint32_t pass_index, ResourceUse use) {
+    foundation::Result RenderGraph::Impl::add_use(uint32_t pass_index, ResourceUse use) {
         if (pass_index >= passes.size()) {
-            return rhi::Result::failure(rhi::ResultCode::kInvalidState,
+            return foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                         "Render graph pass index is invalid");
         }
         PassRecord& pass = passes[pass_index];
         if (use.kind == ResourceKind::kBuffer) {
             if (use.resource_index >= buffers.size() ||
                 buffers[use.resource_index].generation != use.resource_generation) {
-                return rhi::Result::failure(rhi::ResultCode::kNotFound,
+                return foundation::Result::failure(foundation::ResultCode::kNotFound,
                                             "Render graph pass references an invalid buffer");
             }
             const BufferRecord& record = buffers[use.resource_index];
@@ -1139,17 +1139,17 @@ namespace aeg::render_graph {
             if (!checked_range_end(use.buffer_range.offset, use.buffer_range.size, end) ||
                 use.buffer_range.offset > record.desc.desc.size ||
                 (end != std::numeric_limits<uint64_t>::max() && end > record.desc.desc.size)) {
-                return rhi::Result::failure(rhi::ResultCode::kInvalidArgument,
+                return foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                             "Render graph buffer range is out of bounds");
             }
         } else {
             if (use.resource_index >= textures.size() ||
                 textures[use.resource_index].generation != use.resource_generation) {
-                return rhi::Result::failure(rhi::ResultCode::kNotFound,
+                return foundation::Result::failure(foundation::ResultCode::kNotFound,
                                             "Render graph pass references an invalid texture");
             }
             rhi::SubresourceRange normalized = use.subresources;
-            const rhi::Result range_result = normalize_texture_range(
+            const foundation::Result range_result = normalize_texture_range(
                     textures[use.resource_index].desc.desc, normalized);
             if (!range_result) {
                 return range_result;
@@ -1161,7 +1161,7 @@ namespace aeg::render_graph {
             use.before_state.pipeline_stages == rhi::PipelineStage::kNone ||
             use.after_state.usage == rhi::ResourceUsage::kUndefined ||
             use.after_state.pipeline_stages == rhi::PipelineStage::kNone) {
-            return rhi::Result::failure(rhi::ResultCode::kInvalidArgument,
+            return foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                         "Render graph resource usage must specify a valid state");
         }
         use.before_state = normalize_state(use.before_state, pass.queue);
@@ -1169,42 +1169,42 @@ namespace aeg::render_graph {
         try {
             pass.uses.push_back(std::move(use));
         } catch (const std::bad_alloc&) {
-            return rhi::Result::failure(rhi::ResultCode::kOutOfMemory,
+            return foundation::Result::failure(foundation::ResultCode::kOutOfMemory,
                                         "Render graph resource-use allocation failed");
         }
-        return rhi::Result::success();
+        return foundation::Result::success();
     }
 
-    rhi::Result RenderGraph::Impl::add_color_attachment(uint32_t pass_index, ColorAttachment attachment) {
+    foundation::Result RenderGraph::Impl::add_color_attachment(uint32_t pass_index, ColorAttachment attachment) {
         if (pass_index >= passes.size()) {
-            return rhi::Result::failure(rhi::ResultCode::kInvalidState,
+            return foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                         "Render graph pass index is invalid");
         }
         PassRecord& pass = passes[pass_index];
         if (pass.queue != rhi::QueueClass::kGraphics) {
-            return rhi::Result::failure(rhi::ResultCode::kInvalidArgument,
+            return foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                         "Color attachments require a graphics pass");
         }
         const TextureRecord* texture = get_texture(attachment.texture);
         if (texture == nullptr) {
-            return rhi::Result::failure(rhi::ResultCode::kNotFound,
+            return foundation::Result::failure(foundation::ResultCode::kNotFound,
                                         "Color attachment references an invalid texture");
         }
-        const rhi::Result range_result = normalize_texture_range(texture->desc.desc, attachment.subresources);
+        const foundation::Result range_result = normalize_texture_range(texture->desc.desc, attachment.subresources);
         if (!range_result) {
             return range_result;
         }
         if (is_depth_format(texture->desc.desc.format)) {
-            return rhi::Result::failure(rhi::ResultCode::kInvalidArgument,
+            return foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                         "A depth texture cannot be used as a color attachment");
         }
         if (attachment.subresources.mip_count != 1 || attachment.subresources.layer_count != 1 ||
             attachment.subresources.aspects != rhi::Aspect::kColor) {
-            return rhi::Result::failure(rhi::ResultCode::kInvalidArgument,
+            return foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                         "Color attachments must select one color subresource");
         }
         if (attachment.final_usage == rhi::ResourceUsage::kUndefined) {
-            return rhi::Result::failure(rhi::ResultCode::kInvalidArgument,
+            return foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                         "Color attachment final usage must be specified");
         }
 
@@ -1224,52 +1224,52 @@ namespace aeg::render_graph {
         try {
             pass.color_attachments.push_back(std::move(attachment));
         } catch (const std::bad_alloc&) {
-            return rhi::Result::failure(rhi::ResultCode::kOutOfMemory,
+            return foundation::Result::failure(foundation::ResultCode::kOutOfMemory,
                                         "Render graph color attachment allocation failed");
         }
-        const rhi::Result use_result = add_use(pass_index, std::move(use));
+        const foundation::Result use_result = add_use(pass_index, std::move(use));
         if (!use_result) {
             pass.color_attachments.resize(previous_count);
         }
         return use_result;
     }
 
-    rhi::Result RenderGraph::Impl::add_depth_stencil_attachment(uint32_t pass_index,
+    foundation::Result RenderGraph::Impl::add_depth_stencil_attachment(uint32_t pass_index,
                                                                 DepthStencilAttachment attachment) {
         if (pass_index >= passes.size()) {
-            return rhi::Result::failure(rhi::ResultCode::kInvalidState,
+            return foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                         "Render graph pass index is invalid");
         }
         PassRecord& pass = passes[pass_index];
         if (pass.queue != rhi::QueueClass::kGraphics) {
-            return rhi::Result::failure(rhi::ResultCode::kInvalidArgument,
+            return foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                         "Depth attachments require a graphics pass");
         }
         if (pass.depth_stencil.has_value()) {
-            return rhi::Result::failure(rhi::ResultCode::kInvalidArgument,
+            return foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                         "A pass cannot have multiple depth attachments");
         }
         const TextureRecord* texture = get_texture(attachment.texture);
         if (texture == nullptr) {
-            return rhi::Result::failure(rhi::ResultCode::kNotFound,
+            return foundation::Result::failure(foundation::ResultCode::kNotFound,
                                         "Depth attachment references an invalid texture");
         }
-        const rhi::Result range_result = normalize_texture_range(texture->desc.desc, attachment.subresources);
+        const foundation::Result range_result = normalize_texture_range(texture->desc.desc, attachment.subresources);
         if (!range_result) {
             return range_result;
         }
         if (!is_depth_format(texture->desc.desc.format)) {
-            return rhi::Result::failure(rhi::ResultCode::kInvalidArgument,
+            return foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                         "A color texture cannot be used as a depth attachment");
         }
         const rhi::AspectMask expected_aspects = default_aspect(texture->desc.desc.format);
         if (attachment.subresources.mip_count != 1 || attachment.subresources.layer_count != 1 ||
             attachment.subresources.aspects != expected_aspects) {
-            return rhi::Result::failure(rhi::ResultCode::kInvalidArgument,
+            return foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                         "Depth attachments must select one depth subresource");
         }
         if (attachment.final_usage == rhi::ResourceUsage::kUndefined) {
-            return rhi::Result::failure(rhi::ResultCode::kInvalidArgument,
+            return foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                         "Depth attachment final usage must be specified");
         }
 
@@ -1289,32 +1289,32 @@ namespace aeg::render_graph {
         try {
             pass.depth_stencil = std::move(attachment);
         } catch (const std::bad_alloc&) {
-            return rhi::Result::failure(rhi::ResultCode::kOutOfMemory,
+            return foundation::Result::failure(foundation::ResultCode::kOutOfMemory,
                                         "Render graph depth attachment allocation failed");
         }
-        const rhi::Result use_result = add_use(pass_index, std::move(use));
+        const foundation::Result use_result = add_use(pass_index, std::move(use));
         if (!use_result) {
             pass.depth_stencil.reset();
         }
         return use_result;
     }
 
-    rhi::Result RenderGraph::Impl::validate_use(const ResourceUse& use, const PassRecord& pass) const {
+    foundation::Result RenderGraph::Impl::validate_use(const ResourceUse& use, const PassRecord& pass) const {
         if (use.before_state.usage == rhi::ResourceUsage::kUndefined ||
             use.after_state.usage == rhi::ResourceUsage::kUndefined ||
             use.before_state.pipeline_stages == rhi::PipelineStage::kNone ||
             use.after_state.pipeline_stages == rhi::PipelineStage::kNone) {
-            return rhi::Result::failure(rhi::ResultCode::kInvalidArgument,
+            return foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                         "Render graph pass contains an undefined resource state");
         }
         if (use.before_state.queue != pass.queue || use.after_state.queue != pass.queue) {
-            return rhi::Result::failure(rhi::ResultCode::kInvalidArgument,
+            return foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                         "Render graph resource state queue does not match its pass queue");
         }
         if (use.kind == ResourceKind::kBuffer) {
             if (use.resource_index >= buffers.size() ||
                 buffers[use.resource_index].generation != use.resource_generation) {
-                return rhi::Result::failure(rhi::ResultCode::kNotFound,
+                return foundation::Result::failure(foundation::ResultCode::kNotFound,
                                             "Render graph pass contains an invalid buffer use");
             }
             const BufferRecord& buffer = buffers[use.resource_index];
@@ -1322,32 +1322,32 @@ namespace aeg::render_graph {
             if (!checked_range_end(use.buffer_range.offset, use.buffer_range.size, end) ||
                 use.buffer_range.offset > buffer.desc.desc.size ||
                 (end != std::numeric_limits<uint64_t>::max() && end > buffer.desc.desc.size)) {
-                return rhi::Result::failure(rhi::ResultCode::kInvalidArgument,
+                return foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                             "Render graph buffer use range is out of bounds");
             }
         } else {
             if (use.resource_index >= textures.size() ||
                 textures[use.resource_index].generation != use.resource_generation) {
-                return rhi::Result::failure(rhi::ResultCode::kNotFound,
+                return foundation::Result::failure(foundation::ResultCode::kNotFound,
                                             "Render graph pass contains an invalid texture use");
             }
             rhi::SubresourceRange range = use.subresources;
-            const rhi::Result range_result = normalize_texture_range(textures[use.resource_index].desc.desc, range);
+            const foundation::Result range_result = normalize_texture_range(textures[use.resource_index].desc.desc, range);
             if (!range_result) {
                 return range_result;
             }
         }
-        return rhi::Result::success();
+        return foundation::Result::success();
     }
 
-    rhi::Result RenderGraph::Impl::validate_pass_attachments(const PassRecord& pass) const {
+    foundation::Result RenderGraph::Impl::validate_pass_attachments(const PassRecord& pass) const {
         if ((!pass.color_attachments.empty() || pass.depth_stencil.has_value()) &&
             pass.queue != rhi::QueueClass::kGraphics) {
-            return rhi::Result::failure(rhi::ResultCode::kInvalidArgument,
+            return foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                         "Render graph attachments require a graphics pass");
         }
         if ((!pass.color_attachments.empty() || pass.depth_stencil.has_value()) && !pass.execute) {
-            return rhi::Result::failure(rhi::ResultCode::kInvalidArgument,
+            return foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                         "Attachment passes require an execute callback");
         }
 
@@ -1355,24 +1355,24 @@ namespace aeg::render_graph {
             const ColorAttachment& attachment = pass.color_attachments[index];
             const TextureRecord* texture = get_texture(attachment.texture);
             if (texture == nullptr) {
-                return rhi::Result::failure(rhi::ResultCode::kNotFound,
+                return foundation::Result::failure(foundation::ResultCode::kNotFound,
                                             "Render graph color attachment texture is invalid");
             }
             if (is_depth_format(texture->desc.desc.format) ||
                 !rhi::has_flag(texture->desc.desc.capabilities, rhi::TextureCapability::kColorAttachment)) {
-                return rhi::Result::failure(rhi::ResultCode::kInvalidArgument,
+                return foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                             "Render graph color attachment texture is not color-renderable");
             }
             if (attachment.subresources.aspects != rhi::Aspect::kColor ||
                 attachment.subresources.mip_count != 1 || attachment.subresources.layer_count != 1) {
-                return rhi::Result::failure(rhi::ResultCode::kInvalidArgument,
+                return foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                             "Render graph color attachment must select one subresource");
             }
             for (size_t previous = 0; previous < index; ++previous) {
                 if (pass.color_attachments[previous].texture == attachment.texture &&
                     ranges_overlap(pass.color_attachments[previous].subresources, attachment.subresources,
                                    texture->desc.desc)) {
-                    return rhi::Result::failure(rhi::ResultCode::kInvalidArgument,
+                    return foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                                 "Render graph pass contains duplicate color attachments");
                 }
             }
@@ -1382,24 +1382,24 @@ namespace aeg::render_graph {
             const DepthStencilAttachment& attachment = pass.depth_stencil.value();
             const TextureRecord* texture = get_texture(attachment.texture);
             if (texture == nullptr) {
-                return rhi::Result::failure(rhi::ResultCode::kNotFound,
+                return foundation::Result::failure(foundation::ResultCode::kNotFound,
                                             "Render graph depth attachment texture is invalid");
             }
             if (!is_depth_format(texture->desc.desc.format) ||
                 !rhi::has_flag(texture->desc.desc.capabilities, rhi::TextureCapability::kDepthStencil)) {
-                return rhi::Result::failure(rhi::ResultCode::kInvalidArgument,
+                return foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                             "Render graph depth attachment texture is not depth-renderable");
             }
             if (attachment.subresources.mip_count != 1 || attachment.subresources.layer_count != 1 ||
                 attachment.subresources.aspects != default_aspect(texture->desc.desc.format)) {
-                return rhi::Result::failure(rhi::ResultCode::kInvalidArgument,
+                return foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                             "Render graph depth attachment must select one subresource");
             }
         }
-        return rhi::Result::success();
+        return foundation::Result::success();
     }
 
-    rhi::Result RenderGraph::Impl::compile_graph(RenderGraphCompileInfo& info) {
+    foundation::Result RenderGraph::Impl::compile_graph(RenderGraphCompileInfo& info) {
         if (compiled && compiled_revision == revision) {
             info = RenderGraphCompileInfo{
                 static_cast<uint32_t>(buffers.size() + textures.size()),
@@ -1410,7 +1410,7 @@ namespace aeg::render_graph {
                 static_cast<uint32_t>(transient_texture_slots.size()),
                 info.barrier_count
             };
-            return rhi::Result::success();
+            return foundation::Result::success();
         }
 
         try {
@@ -1436,12 +1436,12 @@ namespace aeg::render_graph {
             }
 
             for (const PassRecord& pass: passes) {
-                const rhi::Result attachment_result = validate_pass_attachments(pass);
+                const foundation::Result attachment_result = validate_pass_attachments(pass);
                 if (!attachment_result) {
                     return attachment_result;
                 }
                 for (const ResourceUse& use: pass.uses) {
-                    const rhi::Result use_result = validate_use(use, pass);
+                    const foundation::Result use_result = validate_use(use, pass);
                     if (!use_result) {
                         return use_result;
                     }
@@ -1460,8 +1460,8 @@ namespace aeg::render_graph {
                                                                        textures[use.resource_index].desc.desc);
                         if (overlap && (!state_matches(previous.before_state, use.before_state) ||
                                         !state_matches(previous.after_state, use.after_state))) {
-                            return rhi::Result::failure(
-                                    rhi::ResultCode::kInvalidArgument,
+                            return foundation::Result::failure(
+                                    foundation::ResultCode::kInvalidArgument,
                                     "A render graph pass contains overlapping resource uses with different states");
                         }
                     }
@@ -1589,7 +1589,7 @@ namespace aeg::render_graph {
                 }
             }
             if (topological_order.size() != live_count) {
-                return rhi::Result::failure(rhi::ResultCode::kInvalidState,
+                return foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                             "Render graph contains a dependency cycle");
             }
 
@@ -1665,7 +1665,7 @@ namespace aeg::render_graph {
                 }
                 if (first_resource_use == nullptr || first_resource_use->access != ResourceAccess::kWrite ||
                     !first_resource_use->discard_on_first_use) {
-                    return rhi::Result::failure(rhi::ResultCode::kInvalidArgument,
+                    return foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                                 "A transient resource must be first written with discarded contents");
                 }
 
@@ -1769,7 +1769,7 @@ namespace aeg::render_graph {
                 frame_output_batches += batch.submits_frame ? 1u : 0u;
             }
             if (frame_output_batches > 1) {
-                return rhi::Result::failure(rhi::ResultCode::kInvalidArgument,
+                return foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                             "A render graph can have only one present output batch");
             }
 
@@ -1790,29 +1790,29 @@ namespace aeg::render_graph {
             };
             compiled_revision = revision;
             compiled = true;
-            return rhi::Result::success();
+            return foundation::Result::success();
         } catch (const std::bad_alloc&) {
             compiled = false;
-            return rhi::Result::failure(rhi::ResultCode::kOutOfMemory,
+            return foundation::Result::failure(foundation::ResultCode::kOutOfMemory,
                                         "Render graph compilation allocation failed");
         }
     }
 
-    rhi::Result RenderGraph::Impl::release_physical_buffer(PhysicalBuffer& physical) {
-        rhi::Result first_error = rhi::Result::success();
+    foundation::Result RenderGraph::Impl::release_physical_buffer(PhysicalBuffer& physical) {
+        foundation::Result first_error = foundation::Result::success();
         for (const BufferViewCacheEntry& view: physical.views) {
             if (!view.handle.is_valid()) {
                 continue;
             }
-            const rhi::Result result = device.destroy_buffer_view(view.handle);
-            if (!result && result.code != rhi::ResultCode::kNotFound && first_error) {
+            const foundation::Result result = device.destroy_buffer_view(view.handle);
+            if (!result && result.code != foundation::ResultCode::kNotFound && first_error) {
                 first_error = result;
             }
         }
         physical.views.clear();
         if (physical.owns_handle && physical.handle.is_valid()) {
-            const rhi::Result result = device.destroy_buffer(physical.handle);
-            if (!result && result.code != rhi::ResultCode::kNotFound && first_error) {
+            const foundation::Result result = device.destroy_buffer(physical.handle);
+            if (!result && result.code != foundation::ResultCode::kNotFound && first_error) {
                 first_error = result;
             }
         }
@@ -1820,21 +1820,21 @@ namespace aeg::render_graph {
         return first_error;
     }
 
-    rhi::Result RenderGraph::Impl::release_physical_texture(PhysicalTexture& physical) {
-        rhi::Result first_error = rhi::Result::success();
+    foundation::Result RenderGraph::Impl::release_physical_texture(PhysicalTexture& physical) {
+        foundation::Result first_error = foundation::Result::success();
         for (const TextureViewCacheEntry& view: physical.views) {
             if (!view.owns_handle || !view.handle.is_valid()) {
                 continue;
             }
-            const rhi::Result result = device.destroy_texture_view(view.handle);
-            if (!result && result.code != rhi::ResultCode::kNotFound && first_error) {
+            const foundation::Result result = device.destroy_texture_view(view.handle);
+            if (!result && result.code != foundation::ResultCode::kNotFound && first_error) {
                 first_error = result;
             }
         }
         physical.views.clear();
         if (physical.owns_handle && physical.handle.is_valid()) {
-            const rhi::Result result = device.destroy_texture(physical.handle);
-            if (!result && result.code != rhi::ResultCode::kNotFound && first_error) {
+            const foundation::Result result = device.destroy_texture(physical.handle);
+            if (!result && result.code != foundation::ResultCode::kNotFound && first_error) {
                 first_error = result;
             }
         }
@@ -1842,9 +1842,9 @@ namespace aeg::render_graph {
         return first_error;
     }
 
-    rhi::Result RenderGraph::Impl::ensure_transient_pool(uint32_t frame_count) {
+    foundation::Result RenderGraph::Impl::ensure_transient_pool(uint32_t frame_count) {
         if (frame_count == 0) {
-            return rhi::Result::failure(rhi::ResultCode::kInvalidArgument,
+            return foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                         "Render graph requires at least one frame slot");
         }
         try {
@@ -1876,23 +1876,23 @@ namespace aeg::render_graph {
                 pool.textures.resize(transient_texture_slots.size());
             }
         } catch (const std::bad_alloc&) {
-            return rhi::Result::failure(rhi::ResultCode::kOutOfMemory,
+            return foundation::Result::failure(foundation::ResultCode::kOutOfMemory,
                                         "Render graph transient pool allocation failed");
         }
-        return rhi::Result::success();
+        return foundation::Result::success();
     }
 
-    rhi::Result RenderGraph::Impl::ensure_transient_buffer(uint32_t frame_slot, uint32_t slot_index) {
+    foundation::Result RenderGraph::Impl::ensure_transient_buffer(uint32_t frame_slot, uint32_t slot_index) {
         if (frame_slot >= transient_pools.size() || slot_index >= transient_buffer_slots.size()) {
-            return rhi::Result::failure(rhi::ResultCode::kInvalidArgument,
+            return foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                         "Render graph transient buffer slot is out of bounds");
         }
         PhysicalBuffer& physical = transient_pools[frame_slot].buffers[slot_index];
         const TransientBufferSlotPlan& plan = transient_buffer_slots[slot_index];
         if (physical.handle.is_valid() && buffer_desc_equal(physical.desc, plan.desc)) {
-            return rhi::Result::success();
+            return foundation::Result::success();
         }
-        const rhi::Result release_result = release_physical_buffer(physical);
+        const foundation::Result release_result = release_physical_buffer(physical);
         if (!release_result) {
             return release_result;
         }
@@ -1910,23 +1910,23 @@ namespace aeg::render_graph {
         } catch (const std::bad_alloc&) {
             (void) device.destroy_buffer(create_result.value);
             physical = {};
-            return rhi::Result::failure(rhi::ResultCode::kOutOfMemory,
+            return foundation::Result::failure(foundation::ResultCode::kOutOfMemory,
                                         "Render graph transient buffer bookkeeping failed");
         }
-        return rhi::Result::success();
+        return foundation::Result::success();
     }
 
-    rhi::Result RenderGraph::Impl::ensure_transient_texture(uint32_t frame_slot, uint32_t slot_index) {
+    foundation::Result RenderGraph::Impl::ensure_transient_texture(uint32_t frame_slot, uint32_t slot_index) {
         if (frame_slot >= transient_pools.size() || slot_index >= transient_texture_slots.size()) {
-            return rhi::Result::failure(rhi::ResultCode::kInvalidArgument,
+            return foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                         "Render graph transient texture slot is out of bounds");
         }
         PhysicalTexture& physical = transient_pools[frame_slot].textures[slot_index];
         const TransientTextureSlotPlan& plan = transient_texture_slots[slot_index];
         if (physical.handle.is_valid() && texture_desc_equal(physical.desc, plan.desc)) {
-            return rhi::Result::success();
+            return foundation::Result::success();
         }
-        const rhi::Result release_result = release_physical_texture(physical);
+        const foundation::Result release_result = release_physical_texture(physical);
         if (!release_result) {
             return release_result;
         }
@@ -1945,18 +1945,18 @@ namespace aeg::render_graph {
         } catch (const std::bad_alloc&) {
             (void) device.destroy_texture(create_result.value);
             physical = {};
-            return rhi::Result::failure(rhi::ResultCode::kOutOfMemory,
+            return foundation::Result::failure(foundation::ResultCode::kOutOfMemory,
                                         "Render graph transient texture bookkeeping failed");
         }
-        return rhi::Result::success();
+        return foundation::Result::success();
     }
 
-    rhi::Result RenderGraph::Impl::ensure_persistent_buffer(BufferRecord& record) {
+    foundation::Result RenderGraph::Impl::ensure_persistent_buffer(BufferRecord& record) {
         if (record.physical.handle.is_valid()) {
             if (buffer_desc_equal(record.physical.desc, record.desc)) {
-                return rhi::Result::success();
+                return foundation::Result::success();
             }
-            const rhi::Result release_result = release_physical_buffer(record.physical);
+            const foundation::Result release_result = release_physical_buffer(record.physical);
             if (!release_result) {
                 return release_result;
             }
@@ -1975,18 +1975,18 @@ namespace aeg::render_graph {
         } catch (const std::bad_alloc&) {
             (void) device.destroy_buffer(create_result.value);
             record.physical = {};
-            return rhi::Result::failure(rhi::ResultCode::kOutOfMemory,
+            return foundation::Result::failure(foundation::ResultCode::kOutOfMemory,
                                         "Render graph persistent buffer bookkeeping failed");
         }
-        return rhi::Result::success();
+        return foundation::Result::success();
     }
 
-    rhi::Result RenderGraph::Impl::ensure_persistent_texture(TextureRecord& record) {
+    foundation::Result RenderGraph::Impl::ensure_persistent_texture(TextureRecord& record) {
         if (record.physical.handle.is_valid()) {
             if (texture_desc_equal(record.physical.desc, record.desc)) {
-                return rhi::Result::success();
+                return foundation::Result::success();
             }
-            const rhi::Result release_result = release_physical_texture(record.physical);
+            const foundation::Result release_result = release_physical_texture(record.physical);
             if (!release_result) {
                 return release_result;
             }
@@ -2006,23 +2006,23 @@ namespace aeg::render_graph {
         } catch (const std::bad_alloc&) {
             (void) device.destroy_texture(create_result.value);
             record.physical = {};
-            return rhi::Result::failure(rhi::ResultCode::kOutOfMemory,
+            return foundation::Result::failure(foundation::ResultCode::kOutOfMemory,
                                         "Render graph persistent texture bookkeeping failed");
         }
-        return rhi::Result::success();
+        return foundation::Result::success();
     }
 
-    rhi::Result RenderGraph::Impl::release_all() {
-        rhi::Result first_error = rhi::Result::success();
+    foundation::Result RenderGraph::Impl::release_all() {
+        foundation::Result first_error = foundation::Result::success();
         for (TransientPool& pool: transient_pools) {
             for (PhysicalBuffer& buffer: pool.buffers) {
-                const rhi::Result result = release_physical_buffer(buffer);
+                const foundation::Result result = release_physical_buffer(buffer);
                 if (!result && first_error) {
                     first_error = result;
                 }
             }
             for (PhysicalTexture& texture: pool.textures) {
-                const rhi::Result result = release_physical_texture(texture);
+                const foundation::Result result = release_physical_texture(texture);
                 if (!result && first_error) {
                     first_error = result;
                 }
@@ -2030,7 +2030,7 @@ namespace aeg::render_graph {
         }
         for (BufferRecord& record: buffers) {
             if (record.lifetime != ResourceLifetime::kTransient) {
-                const rhi::Result result = release_physical_buffer(record.physical);
+                const foundation::Result result = release_physical_buffer(record.physical);
                 if (!result && first_error) {
                     first_error = result;
                 }
@@ -2038,7 +2038,7 @@ namespace aeg::render_graph {
         }
         for (TextureRecord& record: textures) {
             if (record.lifetime != ResourceLifetime::kTransient) {
-                const rhi::Result result = release_physical_texture(record.physical);
+                const foundation::Result result = release_physical_texture(record.physical);
                 if (!result && first_error) {
                     first_error = result;
                 }
@@ -2093,47 +2093,47 @@ namespace aeg::render_graph {
         return &record.physical;
     }
 
-    rhi::ResultValue<rhi::BufferHandle> RenderGraph::Impl::resolve_buffer(RenderGraphBuffer handle,
+    foundation::ResultValue<rhi::BufferHandle> RenderGraph::Impl::resolve_buffer(RenderGraphBuffer handle,
                                                                             uint32_t frame_slot) const {
         const BufferRecord* record = get_buffer(handle);
         if (record == nullptr) {
-            return {rhi::Result::failure(rhi::ResultCode::kNotFound,
+            return {foundation::Result::failure(foundation::ResultCode::kNotFound,
                                          "Invalid render graph buffer handle"), {}};
         }
         const PhysicalBuffer* physical = physical_buffer(*record, frame_slot);
         if (physical == nullptr || !physical->handle.is_valid()) {
-            return {rhi::Result::failure(rhi::ResultCode::kInvalidState,
+            return {foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                          "Render graph buffer has no physical allocation"), {}};
         }
-        return {rhi::Result::success(), physical->handle};
+        return {foundation::Result::success(), physical->handle};
     }
 
-    rhi::ResultValue<rhi::TextureHandle> RenderGraph::Impl::resolve_texture(RenderGraphTexture handle,
+    foundation::ResultValue<rhi::TextureHandle> RenderGraph::Impl::resolve_texture(RenderGraphTexture handle,
                                                                              uint32_t frame_slot) const {
         const TextureRecord* record = get_texture(handle);
         if (record == nullptr) {
-            return {rhi::Result::failure(rhi::ResultCode::kNotFound,
+            return {foundation::Result::failure(foundation::ResultCode::kNotFound,
                                          "Invalid render graph texture handle"), {}};
         }
         const PhysicalTexture* physical = physical_texture(*record, frame_slot);
         if (physical == nullptr || !physical->handle.is_valid()) {
-            return {rhi::Result::failure(rhi::ResultCode::kInvalidState,
+            return {foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                          "Render graph texture has no physical allocation"), {}};
         }
-        return {rhi::Result::success(), physical->handle};
+        return {foundation::Result::success(), physical->handle};
     }
 
-    rhi::ResultValue<rhi::BufferViewHandle> RenderGraph::Impl::resolve_buffer_view(
+    foundation::ResultValue<rhi::BufferViewHandle> RenderGraph::Impl::resolve_buffer_view(
             RenderGraphBuffer handle, uint32_t frame_slot, rhi::BufferViewKind kind, uint64_t offset, uint64_t size,
             rhi::Format format, uint32_t structure_stride) {
         BufferRecord* record = get_buffer(handle);
         if (record == nullptr) {
-            return {rhi::Result::failure(rhi::ResultCode::kNotFound,
+            return {foundation::Result::failure(foundation::ResultCode::kNotFound,
                                          "Invalid render graph buffer handle"), {}};
         }
         PhysicalBuffer* physical = physical_buffer(*record, frame_slot);
         if (physical == nullptr || !physical->handle.is_valid()) {
-            return {rhi::Result::failure(rhi::ResultCode::kInvalidState,
+            return {foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                          "Render graph buffer has no physical allocation"), {}};
         }
         rhi::BufferViewDesc desc{};
@@ -2145,7 +2145,7 @@ namespace aeg::render_graph {
         desc.structure_stride = structure_stride;
         for (const BufferViewCacheEntry& view: physical->views) {
             if (buffer_view_desc_equal(view.desc, desc)) {
-                return {rhi::Result::success(), view.handle};
+                return {foundation::Result::success(), view.handle};
             }
         }
 
@@ -2157,27 +2157,27 @@ namespace aeg::render_graph {
             physical->views.push_back(BufferViewCacheEntry{desc, create_result.value});
         } catch (const std::bad_alloc&) {
             (void) device.destroy_buffer_view(create_result.value);
-            return {rhi::Result::failure(rhi::ResultCode::kOutOfMemory,
+            return {foundation::Result::failure(foundation::ResultCode::kOutOfMemory,
                                          "Render graph buffer-view cache allocation failed"), {}};
         }
         return create_result;
     }
 
-    rhi::ResultValue<rhi::TextureViewHandle> RenderGraph::Impl::resolve_texture_view(
+    foundation::ResultValue<rhi::TextureViewHandle> RenderGraph::Impl::resolve_texture_view(
             RenderGraphTexture handle, uint32_t frame_slot, rhi::TextureViewKind kind,
             rhi::SubresourceRange subresources, rhi::Format format, rhi::TextureViewDimension dimension) {
         TextureRecord* record = get_texture(handle);
         if (record == nullptr) {
-            return {rhi::Result::failure(rhi::ResultCode::kNotFound,
+            return {foundation::Result::failure(foundation::ResultCode::kNotFound,
                                          "Invalid render graph texture handle"), {}};
         }
-        const rhi::Result range_result = normalize_texture_range(record->desc.desc, subresources);
+        const foundation::Result range_result = normalize_texture_range(record->desc.desc, subresources);
         if (!range_result) {
             return {range_result, {}};
         }
         PhysicalTexture* physical = physical_texture(*record, frame_slot);
         if (physical == nullptr || !physical->handle.is_valid()) {
-            return {rhi::Result::failure(rhi::ResultCode::kInvalidState,
+            return {foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                          "Render graph texture has no physical allocation"), {}};
         }
 
@@ -2190,7 +2190,7 @@ namespace aeg::render_graph {
             kind == rhi::TextureViewKind::kColorAttachment && canonical_color_range &&
             format == rhi::Format::kUnknown && dimension == rhi::TextureViewDimension::kAuto &&
             !is_depth_format(record->desc.desc.format)) {
-            return {rhi::Result::success(), record->imported_default_view};
+            return {foundation::Result::success(), record->imported_default_view};
         }
         if (kind == rhi::TextureViewKind::kDepthStencil && subresources.aspects == rhi::Aspect::kColor) {
             subresources.aspects = default_range_aspect;
@@ -2204,7 +2204,7 @@ namespace aeg::render_graph {
         desc.subresources = subresources;
         for (const TextureViewCacheEntry& view: physical->views) {
             if (view_desc_equal(view.desc, desc)) {
-                return {rhi::Result::success(), view.handle};
+                return {foundation::Result::success(), view.handle};
             }
         }
 
@@ -2216,20 +2216,20 @@ namespace aeg::render_graph {
             physical->views.push_back(TextureViewCacheEntry{desc, create_result.value, true});
         } catch (const std::bad_alloc&) {
             (void) device.destroy_texture_view(create_result.value);
-            return {rhi::Result::failure(rhi::ResultCode::kOutOfMemory,
+            return {foundation::Result::failure(foundation::ResultCode::kOutOfMemory,
                                          "Render graph texture-view cache allocation failed"), {}};
         }
         return create_result;
     }
 
-    rhi::Result RenderGraph::Impl::initialize_runtime_states(
+    foundation::Result RenderGraph::Impl::initialize_runtime_states(
             uint32_t frame_slot, std::vector<RuntimeBufferState>& buffer_states,
             std::vector<RuntimeTextureState>& texture_states) {
         try {
             buffer_states.resize(buffers.size());
             texture_states.resize(textures.size());
         } catch (const std::bad_alloc&) {
-            return rhi::Result::failure(rhi::ResultCode::kOutOfMemory,
+            return foundation::Result::failure(foundation::ResultCode::kOutOfMemory,
                                         "Render graph runtime-state allocation failed");
         }
 
@@ -2238,7 +2238,7 @@ namespace aeg::render_graph {
                 BufferRecord& record = buffers[index];
                 PhysicalBuffer* physical = physical_buffer(record, frame_slot);
                 if (record.has_use && (physical == nullptr || !physical->handle.is_valid())) {
-                    return rhi::Result::failure(rhi::ResultCode::kInvalidState,
+                    return foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                                 "Render graph buffer was not physically allocated");
                 }
                 RuntimeBufferState& runtime = buffer_states[index];
@@ -2263,7 +2263,7 @@ namespace aeg::render_graph {
                 PhysicalTexture* physical = physical_texture(record, frame_slot);
                 if (record.has_use &&
                     (physical == nullptr || !physical->handle.is_valid() || physical->states.empty())) {
-                    return rhi::Result::failure(rhi::ResultCode::kInvalidState,
+                    return foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                                 "Render graph texture was not physically allocated");
                 }
                 RuntimeTextureState& runtime = texture_states[index];
@@ -2284,13 +2284,13 @@ namespace aeg::render_graph {
                 }
             }
         } catch (const std::bad_alloc&) {
-            return rhi::Result::failure(rhi::ResultCode::kOutOfMemory,
+            return foundation::Result::failure(foundation::ResultCode::kOutOfMemory,
                                         "Render graph runtime-state allocation failed");
         }
-        return rhi::Result::success();
+        return foundation::Result::success();
     }
 
-    rhi::Result RenderGraph::Impl::record_barriers(
+    foundation::Result RenderGraph::Impl::record_barriers(
             rhi::CommandListHandle command_list, uint32_t frame_slot, uint32_t topological_index,
             const ResourceUse& use, std::vector<RuntimeBufferState>& buffer_states,
             std::vector<RuntimeTextureState>& texture_states) {
@@ -2302,7 +2302,7 @@ namespace aeg::render_graph {
             if (use.resource_index >= buffer_states.size() ||
                 buffer_states[use.resource_index].physical == nullptr ||
                 buffer_states[use.resource_index].shared == nullptr) {
-                return rhi::Result::failure(rhi::ResultCode::kInvalidState,
+                return foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                             "Render graph buffer runtime state is unavailable");
             }
             PhysicalBuffer* physical = buffer_states[use.resource_index].physical;
@@ -2315,19 +2315,19 @@ namespace aeg::render_graph {
             if (!state_matches(before, stored_after) || discard) {
                 const rhi::BufferBarrier barrier{physical->handle, 0,
                                                  std::numeric_limits<uint64_t>::max(), before, after};
-                const rhi::Result barrier_result = device.barrier(
+                const foundation::Result barrier_result = device.barrier(
                         command_list, rhi::BarrierDesc{std::span<const rhi::BufferBarrier>{&barrier, 1}, {}});
                 if (!barrier_result) {
                     return barrier_result;
                 }
             }
             runtime.state = stored_after;
-            return rhi::Result::success();
+            return foundation::Result::success();
         }
 
         if (use.resource_index >= texture_states.size() || texture_states[use.resource_index].physical == nullptr ||
             texture_states[use.resource_index].shared == nullptr) {
-            return rhi::Result::failure(rhi::ResultCode::kInvalidState,
+            return foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                         "Render graph texture runtime state is unavailable");
         }
         PhysicalTexture* physical = texture_states[use.resource_index].physical;
@@ -2346,11 +2346,11 @@ namespace aeg::render_graph {
                     for (uint32_t layer = range.base_layer; layer < range.base_layer + range.layer_count; ++layer) {
                         const uint32_t state_index = texture_state_index(aspect, desc, mip, layer);
                         if (state_index >= physical->states.size()) {
-                            return rhi::Result::failure(rhi::ResultCode::kInvalidState,
+                            return foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                                         "Render graph texture state index is out of bounds");
                         }
                         if (state_index >= runtime.states.size()) {
-                            return rhi::Result::failure(rhi::ResultCode::kInvalidState,
+                            return foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                                         "Render graph texture shadow state index is out of bounds");
                         }
                         const rhi::ResourceState before = runtime.states[state_index];
@@ -2371,11 +2371,11 @@ namespace aeg::render_graph {
                 }
             }
         } catch (const std::bad_alloc&) {
-            return rhi::Result::failure(rhi::ResultCode::kOutOfMemory,
+            return foundation::Result::failure(foundation::ResultCode::kOutOfMemory,
                                         "Render graph texture barrier allocation failed");
         }
         if (!barriers.empty()) {
-            const rhi::Result barrier_result = device.barrier(
+            const foundation::Result barrier_result = device.barrier(
                     command_list, rhi::BarrierDesc{{}, std::span<const rhi::TextureBarrier>{barriers}});
             if (!barrier_result) {
                     return barrier_result;
@@ -2384,10 +2384,10 @@ namespace aeg::render_graph {
         for (const auto& pending_state: pending_states) {
             runtime.states[pending_state.first] = pending_state.second;
         }
-        return rhi::Result::success();
+        return foundation::Result::success();
     }
 
-    rhi::Result RenderGraph::Impl::update_runtime_state(
+    foundation::Result RenderGraph::Impl::update_runtime_state(
             const ResourceUse& use, uint32_t frame_slot, std::vector<RuntimeBufferState>& buffer_states,
             std::vector<RuntimeTextureState>& texture_states) {
         (void) frame_slot;
@@ -2395,17 +2395,17 @@ namespace aeg::render_graph {
             if (use.resource_index >= buffer_states.size() ||
                 buffer_states[use.resource_index].physical == nullptr ||
                 buffer_states[use.resource_index].shared == nullptr) {
-                return rhi::Result::failure(rhi::ResultCode::kInvalidState,
+                return foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                             "Render graph buffer runtime state is unavailable");
             }
             const rhi::ResourceState state = normalize_state(use.after_state, use.after_state.queue);
             buffer_states[use.resource_index].shared->state = state;
-            return rhi::Result::success();
+            return foundation::Result::success();
         }
 
         if (use.resource_index >= texture_states.size() || texture_states[use.resource_index].physical == nullptr ||
             texture_states[use.resource_index].shared == nullptr) {
-            return rhi::Result::failure(rhi::ResultCode::kInvalidState,
+            return foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                         "Render graph texture runtime state is unavailable");
         }
         PhysicalTexture* physical = texture_states[use.resource_index].physical;
@@ -2422,14 +2422,14 @@ namespace aeg::render_graph {
                      layer < use.subresources.base_layer + use.subresources.layer_count; ++layer) {
                     const uint32_t index = texture_state_index(aspect, physical->desc.desc, mip, layer);
                     if (index >= physical->states.size() || index >= runtime.states.size()) {
-                        return rhi::Result::failure(rhi::ResultCode::kInvalidState,
+                        return foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                                     "Render graph texture state index is out of bounds");
                     }
                     runtime.states[index] = state;
                 }
             }
         }
-        return rhi::Result::success();
+        return foundation::Result::success();
     }
 
     void RenderGraph::Impl::commit_runtime_states(
@@ -2457,38 +2457,38 @@ namespace aeg::render_graph {
           frame_slot_(frame_slot) {
     }
 
-    rhi::ResultValue<rhi::BufferHandle> PassExecutionContext::buffer(RenderGraphBuffer buffer) const {
+    foundation::ResultValue<rhi::BufferHandle> PassExecutionContext::buffer(RenderGraphBuffer buffer) const {
         return graph_.impl_->resolve_buffer(buffer, frame_slot_);
     }
 
-    rhi::ResultValue<rhi::TextureHandle> PassExecutionContext::texture(RenderGraphTexture texture) const {
+    foundation::ResultValue<rhi::TextureHandle> PassExecutionContext::texture(RenderGraphTexture texture) const {
         return graph_.impl_->resolve_texture(texture, frame_slot_);
     }
 
-    rhi::ResultValue<rhi::BufferViewHandle> PassExecutionContext::buffer_view(
+    foundation::ResultValue<rhi::BufferViewHandle> PassExecutionContext::buffer_view(
             RenderGraphBuffer buffer, rhi::BufferViewKind kind, uint64_t offset, uint64_t size,
             rhi::Format format, uint32_t structure_stride) {
         return graph_.impl_->resolve_buffer_view(buffer, frame_slot_, kind, offset, size, format, structure_stride);
     }
 
-    rhi::ResultValue<rhi::TextureViewHandle> PassExecutionContext::texture_view(
+    foundation::ResultValue<rhi::TextureViewHandle> PassExecutionContext::texture_view(
             RenderGraphTexture texture, rhi::TextureViewKind kind, rhi::SubresourceRange subresources,
             rhi::Format format, rhi::TextureViewDimension dimension) {
         return graph_.impl_->resolve_texture_view(texture, frame_slot_, kind, subresources, format, dimension);
     }
 
-    rhi::Result PassExecutionContext::begin_rendering() {
+    foundation::Result PassExecutionContext::begin_rendering() {
         if (rendering_active_) {
-            return rhi::Result::failure(rhi::ResultCode::kInvalidState,
+            return foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                         "Render graph rendering scope is already active");
         }
         const PassRecord* pass_record = graph_.impl_->get_pass(pass_);
         if (pass_record == nullptr || pass_record->queue != rhi::QueueClass::kGraphics) {
-            return rhi::Result::failure(rhi::ResultCode::kInvalidState,
+            return foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                         "Pass execution context is not attached to a graphics pass");
         }
         if (pass_record->color_attachments.empty() && !pass_record->depth_stencil.has_value()) {
-            return rhi::Result::failure(rhi::ResultCode::kInvalidArgument,
+            return foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                         "Pass has no graphics attachments");
         }
 
@@ -2519,7 +2519,7 @@ namespace aeg::render_graph {
                                                         attachment.final_usage};
             }
         } catch (const std::bad_alloc&) {
-            return rhi::Result::failure(rhi::ResultCode::kOutOfMemory,
+            return foundation::Result::failure(foundation::ResultCode::kOutOfMemory,
                                         "Render graph rendering attachment allocation failed");
         }
 
@@ -2529,7 +2529,7 @@ namespace aeg::render_graph {
             rendering_desc.depth_stencil = depth.value();
         }
         rendering_desc.name = rhi::DebugName{pass_record->name};
-        const rhi::Result result = device_.begin_rendering(command_list_, rendering_desc);
+        const foundation::Result result = device_.begin_rendering(command_list_, rendering_desc);
         if (result) {
             rendering_started_ = true;
             rendering_active_ = true;
@@ -2537,19 +2537,19 @@ namespace aeg::render_graph {
         return result;
     }
 
-    rhi::Result PassExecutionContext::end_rendering() {
+    foundation::Result PassExecutionContext::end_rendering() {
         if (!rendering_active_) {
-            return rhi::Result::failure(rhi::ResultCode::kInvalidState,
+            return foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                         "Render graph rendering scope is not active");
         }
-        const rhi::Result result = device_.end_rendering(command_list_);
+        const foundation::Result result = device_.end_rendering(command_list_);
         if (result) {
             rendering_active_ = false;
         }
         return result;
     }
 
-    rhi::Result PassExecutionContext::copy_buffer(RenderGraphBuffer source, RenderGraphBuffer destination,
+    foundation::Result PassExecutionContext::copy_buffer(RenderGraphBuffer source, RenderGraphBuffer destination,
                                                   uint64_t source_offset, uint64_t destination_offset,
                                                   uint64_t size) {
         auto source_result = buffer(source);
@@ -2564,7 +2564,7 @@ namespace aeg::render_graph {
                                                                        source_offset, destination_offset, size});
     }
 
-    rhi::Result PassExecutionContext::copy_buffer_to_texture(
+    foundation::Result PassExecutionContext::copy_buffer_to_texture(
             RenderGraphBuffer source, uint64_t source_offset, uint32_t source_row_length,
             uint32_t source_image_height, RenderGraphTexture destination,
             rhi::TextureSubresourceLayers destination_subresources, rhi::Offset3D destination_offset,
@@ -2583,7 +2583,7 @@ namespace aeg::render_graph {
                                                           destination_subresources, destination_offset, extent});
     }
 
-    rhi::Result PassExecutionContext::copy_texture_to_buffer(
+    foundation::Result PassExecutionContext::copy_texture_to_buffer(
             RenderGraphTexture source, rhi::TextureSubresourceLayers source_subresources,
             rhi::Offset3D source_offset, rhi::Extent3D extent, RenderGraphBuffer destination,
             uint64_t destination_offset, uint32_t destination_row_length, uint32_t destination_image_height) {
@@ -2601,7 +2601,7 @@ namespace aeg::render_graph {
                                                           destination_row_length, destination_image_height});
     }
 
-    rhi::Result PassExecutionContext::copy_texture(
+    foundation::Result PassExecutionContext::copy_texture(
             RenderGraphTexture source, rhi::TextureSubresourceLayers source_subresources,
             rhi::Offset3D source_offset, RenderGraphTexture destination,
             rhi::TextureSubresourceLayers destination_subresources, rhi::Offset3D destination_offset,
@@ -2620,7 +2620,7 @@ namespace aeg::render_graph {
                                                     destination_offset, extent});
     }
 
-    rhi::Result PassExecutionContext::clear_texture(RenderGraphTexture texture, rhi::SubresourceRange subresources,
+    foundation::Result PassExecutionContext::clear_texture(RenderGraphTexture texture, rhi::SubresourceRange subresources,
                                                     rhi::ClearColorValue color, float depth, uint32_t stencil) {
         auto texture_result = this->texture(texture);
         if (!texture_result) {
@@ -2630,54 +2630,54 @@ namespace aeg::render_graph {
                                      rhi::ClearTextureDesc{texture_result.value, subresources, color, depth, stencil});
     }
 
-    rhi::ResultValue<RenderGraphExecutionResult> RenderGraph::execute(
+    foundation::ResultValue<RenderGraphExecutionResult> RenderGraph::execute(
             FrameContext& frame_context, const RenderGraphExecuteDesc& desc) {
         if (impl_ == nullptr) {
-            return {rhi::Result::failure(rhi::ResultCode::kInvalidState,
+            return {foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                          "Render graph implementation is not initialized"), {}};
         }
         if (!frame_context.is_frame_active()) {
-            return {rhi::Result::failure(rhi::ResultCode::kInvalidState,
+            return {foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                          "Render graph execution requires an active FrameContext frame"), {}};
         }
         if (&frame_context.device() != &device_) {
-            return {rhi::Result::failure(rhi::ResultCode::kInvalidArgument,
+            return {foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                          "Render graph and FrameContext must use the same RHI device"), {}};
         }
 
-        const auto fail_execution = [&frame_context](rhi::Result result)
-                -> rhi::ResultValue<RenderGraphExecutionResult> {
+        const auto fail_execution = [&frame_context](foundation::Result result)
+                -> foundation::ResultValue<RenderGraphExecutionResult> {
             (void) frame_context.abort_frame();
             return {std::move(result), {}};
         };
 
-        const rhi::Result compile_result = compile();
+        const foundation::Result compile_result = compile();
         if (!compile_result) {
             return fail_execution(compile_result);
         }
 
         const uint32_t frame_slot = frame_context.frame_slot_index();
-        const rhi::Result pool_result = impl_->ensure_transient_pool(frame_context.frames_in_flight());
+        const foundation::Result pool_result = impl_->ensure_transient_pool(frame_context.frames_in_flight());
         if (!pool_result) {
             return fail_execution(pool_result);
         }
 
         try {
             for (uint32_t slot_index = 0; slot_index < impl_->transient_buffer_slots.size(); ++slot_index) {
-                const rhi::Result result = impl_->ensure_transient_buffer(frame_slot, slot_index);
+                const foundation::Result result = impl_->ensure_transient_buffer(frame_slot, slot_index);
                 if (!result) {
                     return fail_execution(result);
                 }
             }
             for (uint32_t slot_index = 0; slot_index < impl_->transient_texture_slots.size(); ++slot_index) {
-                const rhi::Result result = impl_->ensure_transient_texture(frame_slot, slot_index);
+                const foundation::Result result = impl_->ensure_transient_texture(frame_slot, slot_index);
                 if (!result) {
                     return fail_execution(result);
                 }
             }
             for (BufferRecord& record: impl_->buffers) {
                 if (record.lifetime == ResourceLifetime::kPersistent && record.has_use) {
-                    const rhi::Result result = impl_->ensure_persistent_buffer(record);
+                    const foundation::Result result = impl_->ensure_persistent_buffer(record);
                     if (!result) {
                         return fail_execution(result);
                     }
@@ -2685,15 +2685,15 @@ namespace aeg::render_graph {
             }
             for (TextureRecord& record: impl_->textures) {
                 if (record.lifetime == ResourceLifetime::kPersistent && record.has_use) {
-                    const rhi::Result result = impl_->ensure_persistent_texture(record);
+                    const foundation::Result result = impl_->ensure_persistent_texture(record);
                     if (!result) {
                         return fail_execution(result);
                     }
                 }
                 if (record.lifetime == ResourceLifetime::kImported && record.has_use &&
                     !record.physical.handle.is_valid()) {
-                    return fail_execution(rhi::Result::failure(
-                            rhi::ResultCode::kInvalidState,
+                    return fail_execution(foundation::Result::failure(
+                            foundation::ResultCode::kInvalidState,
                             "Render graph imported texture has no current physical handle"));
                 }
             }
@@ -2706,24 +2706,24 @@ namespace aeg::render_graph {
                 }
                 frame_output_batch = batch_index;
                 if (impl_->batches[batch_index].queue != rhi::QueueClass::kGraphics) {
-                    return fail_execution(rhi::Result::failure(
-                            rhi::ResultCode::kInvalidArgument,
+                    return fail_execution(foundation::Result::failure(
+                            foundation::ResultCode::kInvalidArgument,
                             "Present output must be produced by a graphics batch"));
                 }
             }
             if (desc.present_acquired_frame && acquired == nullptr) {
-                return fail_execution(rhi::Result::failure(
-                        rhi::ResultCode::kInvalidState,
+                return fail_execution(foundation::Result::failure(
+                        foundation::ResultCode::kInvalidState,
                         "Present was requested without an acquired swapchain frame"));
             }
             if (frame_output_batch != kInvalidHandleIndex && acquired == nullptr) {
-                return fail_execution(rhi::Result::failure(
-                        rhi::ResultCode::kInvalidState,
+                return fail_execution(foundation::Result::failure(
+                        foundation::ResultCode::kInvalidState,
                         "Render graph has a present output but no acquired swapchain frame"));
             }
             if (desc.present_acquired_frame && frame_output_batch == kInvalidHandleIndex) {
-                return fail_execution(rhi::Result::failure(
-                        rhi::ResultCode::kInvalidArgument,
+                return fail_execution(foundation::Result::failure(
+                        foundation::ResultCode::kInvalidArgument,
                         "Present was requested but the graph has no kPresent output"));
             }
             if (acquired != nullptr && frame_output_batch != kInvalidHandleIndex) {
@@ -2736,8 +2736,8 @@ namespace aeg::render_graph {
                         }
                         ++present_output_count;
                         if (use.kind != ResourceKind::kTexture) {
-                            return fail_execution(rhi::Result::failure(
-                                    rhi::ResultCode::kInvalidArgument,
+                            return fail_execution(foundation::Result::failure(
+                                    foundation::ResultCode::kInvalidArgument,
                                     "Present output must reference a texture"));
                         }
                         const TextureRecord& record = impl_->textures[use.resource_index];
@@ -2748,8 +2748,8 @@ namespace aeg::render_graph {
                     }
                 }
                 if (present_output_count != 1 || !present_output_matches) {
-                    return fail_execution(rhi::Result::failure(
-                            rhi::ResultCode::kInvalidArgument,
+                    return fail_execution(foundation::Result::failure(
+                            foundation::ResultCode::kInvalidArgument,
                             "Present output must reference exactly the acquired swapchain image"));
                 }
             }
@@ -2761,7 +2761,7 @@ namespace aeg::render_graph {
 
             std::vector<RuntimeBufferState> buffer_states;
             std::vector<RuntimeTextureState> texture_states;
-            const rhi::Result state_result = impl_->initialize_runtime_states(frame_slot, buffer_states,
+            const foundation::Result state_result = impl_->initialize_runtime_states(frame_slot, buffer_states,
                                                                                 texture_states);
             if (!state_result) {
                 return fail_execution(state_result);
@@ -2818,8 +2818,8 @@ namespace aeg::render_graph {
                 for (const uint32_t source_batch_index: batch.wait_batches) {
                     if (source_batch_index >= impl_->batches.size() ||
                         !impl_->batches[source_batch_index].completion.is_valid()) {
-                        return fail_execution(rhi::Result::failure(
-                                rhi::ResultCode::kInvalidState,
+                        return fail_execution(foundation::Result::failure(
+                                foundation::ResultCode::kInvalidState,
                                 "Render graph batch dependency has no submitted completion point"));
                     }
                     append_wait(persistent_waits, impl_->batches[source_batch_index].completion,
@@ -2856,7 +2856,7 @@ namespace aeg::render_graph {
                     PassRecord& pass = impl_->passes[pass_index];
                     const uint32_t topo_index = topological_positions[pass_index];
                     for (const ResourceUse& use: pass.uses) {
-                        const rhi::Result barrier_result = impl_->record_barriers(
+                        const foundation::Result barrier_result = impl_->record_barriers(
                                 command_list, frame_slot, topo_index, use, buffer_states, texture_states);
                         if (!barrier_result) {
                             return fail_execution(barrier_result);
@@ -2867,35 +2867,35 @@ namespace aeg::render_graph {
                                                  command_list, pass_index, frame_slot);
                     try {
                         if (pass.execute) {
-                            const rhi::Result execute_result = pass.execute(context);
+                            const foundation::Result execute_result = pass.execute(context);
                             if (!execute_result) {
                                 return fail_execution(execute_result);
                             }
                         }
                     } catch (const std::bad_alloc&) {
-                        return fail_execution(rhi::Result::failure(
-                                rhi::ResultCode::kOutOfMemory,
+                        return fail_execution(foundation::Result::failure(
+                                foundation::ResultCode::kOutOfMemory,
                                 "Render graph pass execution allocation failed"));
                     } catch (...) {
-                        return fail_execution(rhi::Result::failure(
-                                rhi::ResultCode::kBackendError,
+                        return fail_execution(foundation::Result::failure(
+                                foundation::ResultCode::kBackendError,
                                 "Render graph pass execution threw an exception"));
                     }
 
                     if (!pass.color_attachments.empty() || pass.depth_stencil.has_value()) {
                         if (!context.rendering_started() || context.rendering_active()) {
-                            return fail_execution(rhi::Result::failure(
-                                    rhi::ResultCode::kInvalidState,
+                            return fail_execution(foundation::Result::failure(
+                                    foundation::ResultCode::kInvalidState,
                                     "Attachment pass must begin and end its rendering scope"));
                         }
                     } else if (context.rendering_active()) {
-                        return fail_execution(rhi::Result::failure(
-                                rhi::ResultCode::kInvalidState,
+                        return fail_execution(foundation::Result::failure(
+                                foundation::ResultCode::kInvalidState,
                                 "Pass ended with an active rendering scope"));
                     }
 
                     for (const ResourceUse& use: pass.uses) {
-                        const rhi::Result state_update = impl_->update_runtime_state(
+                        const foundation::Result state_update = impl_->update_runtime_state(
                                 use, frame_slot, buffer_states, texture_states);
                         if (!state_update) {
                             return fail_execution(state_update);
@@ -2903,16 +2903,16 @@ namespace aeg::render_graph {
                     }
                 }
 
-                const rhi::Result end_result = frame_context.end_command_list(command_list);
+                const foundation::Result end_result = frame_context.end_command_list(command_list);
                 if (!end_result) {
                     return fail_execution(end_result);
                 }
                 const std::array<rhi::CommandListHandle, 1> command_lists{command_list};
-                rhi::ResultValue<rhi::SubmitResult> submit_result{};
+                foundation::ResultValue<rhi::SubmitResult> submit_result{};
                 if (batch.submits_frame) {
                     if (acquired == nullptr) {
-                        return fail_execution(rhi::Result::failure(
-                                rhi::ResultCode::kInvalidState,
+                        return fail_execution(foundation::Result::failure(
+                                foundation::ResultCode::kInvalidState,
                                 "Present batch has no acquired frame token"));
                     }
                     submit_result = frame_context.submit_frame(rhi::FrameSubmitDesc{
@@ -2957,10 +2957,10 @@ namespace aeg::render_graph {
                 execution_result.presented = true;
                 execution_result.suboptimal = present_result.value.suboptimal;
             }
-            return {rhi::Result::success(), execution_result};
+            return {foundation::Result::success(), execution_result};
         } catch (const std::bad_alloc&) {
-            return fail_execution(rhi::Result::failure(
-                    rhi::ResultCode::kOutOfMemory,
+            return fail_execution(foundation::Result::failure(
+                    foundation::ResultCode::kOutOfMemory,
                     "Render graph execution allocation failed"));
         }
     }

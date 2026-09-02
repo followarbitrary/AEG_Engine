@@ -7,6 +7,7 @@
 #include <span>
 #include <vector>
 
+#include "result.hpp"
 #include "rhi.hpp"
 
 namespace aeg::render_graph {
@@ -73,37 +74,38 @@ namespace aeg::render_graph {
         [[nodiscard]] uint32_t frames_in_flight() const noexcept { return desc_.frames_in_flight; }
         [[nodiscard]] uint64_t frame_number() const noexcept { return frame_number_; }
 
-        [[nodiscard]] rhi::Result begin_frame();
-        [[nodiscard]] rhi::Result end_frame();
-        [[nodiscard]] rhi::Result abort_frame();
+        [[nodiscard]] foundation::Result begin_frame();
+        [[nodiscard]] foundation::Result end_frame();
+        [[nodiscard]] foundation::Result abort_frame();
 
-        [[nodiscard]] rhi::ResultValue<rhi::FrameAcquireResult> acquire_next_image(rhi::SwapchainHandle swapchain);
+        [[nodiscard]] foundation::ResultValue<rhi::FrameAcquireResult> acquire_next_image(
+            rhi::SwapchainHandle swapchain);
         [[nodiscard]] const rhi::FrameAcquireResult* acquired_frame() const noexcept;
-        [[nodiscard]] rhi::Result cancel_frame();
-        [[nodiscard]] rhi::ResultValue<rhi::PresentResult> present();
+        [[nodiscard]] foundation::Result cancel_frame();
+        [[nodiscard]] foundation::ResultValue<rhi::PresentResult> present();
 
-        [[nodiscard]] rhi::ResultValue<rhi::CommandListHandle> begin_command_list(
+        [[nodiscard]] foundation::ResultValue<rhi::CommandListHandle> begin_command_list(
                 rhi::QueueClass queue, uint32_t batch_index = 0);
-        [[nodiscard]] rhi::Result end_command_list(rhi::CommandListHandle command_list);
+        [[nodiscard]] foundation::Result end_command_list(rhi::CommandListHandle command_list);
 
-        [[nodiscard]] rhi::ResultValue<FrameAllocation> allocate_upload(uint64_t size, uint64_t alignment = 0);
-        [[nodiscard]] rhi::Result write_upload(const FrameAllocation& allocation,
+        [[nodiscard]] foundation::ResultValue<FrameAllocation> allocate_upload(uint64_t size, uint64_t alignment = 0);
+        [[nodiscard]] foundation::Result write_upload(const FrameAllocation& allocation,
                                                std::span<const std::byte> data);
 
-        [[nodiscard]] rhi::ResultValue<FrameAllocation> allocate_readback(uint64_t size, uint64_t alignment = 0);
-        [[nodiscard]] rhi::Result read_readback(const FrameAllocation& allocation, std::span<std::byte> data);
+        [[nodiscard]] foundation::ResultValue<FrameAllocation> allocate_readback(uint64_t size, uint64_t alignment = 0);
+        [[nodiscard]] foundation::Result read_readback(const FrameAllocation& allocation, std::span<std::byte> data);
 
-        [[nodiscard]] rhi::ResultValue<rhi::SubmitResult> submit(const rhi::SubmitDesc& desc);
-        [[nodiscard]] rhi::ResultValue<rhi::SubmitResult> submit_frame(const rhi::FrameSubmitDesc& desc);
+        [[nodiscard]] foundation::ResultValue<rhi::SubmitResult> submit(const rhi::SubmitDesc& desc);
+        [[nodiscard]] foundation::ResultValue<rhi::SubmitResult> submit_frame(const rhi::FrameSubmitDesc& desc);
 
-        [[nodiscard]] rhi::Result defer_destroy_buffer(rhi::BufferHandle buffer);
-        [[nodiscard]] rhi::Result defer_destroy_texture(rhi::TextureHandle texture);
-        [[nodiscard]] rhi::Result defer_destroy_buffer_view(rhi::BufferViewHandle view);
-        [[nodiscard]] rhi::Result defer_destroy_texture_view(rhi::TextureViewHandle view);
-        [[nodiscard]] rhi::Result defer_destroy_sampler(rhi::SamplerHandle sampler);
-        [[nodiscard]] rhi::Result defer_destroy_binding_layout(rhi::BindingLayoutHandle layout);
-        [[nodiscard]] rhi::Result defer_destroy_binding_set(rhi::BindingSetHandle set);
-        [[nodiscard]] rhi::Result defer_destroy_pipeline(rhi::PipelineHandle pipeline);
+        [[nodiscard]] foundation::Result defer_destroy_buffer(rhi::BufferHandle buffer);
+        [[nodiscard]] foundation::Result defer_destroy_texture(rhi::TextureHandle texture);
+        [[nodiscard]] foundation::Result defer_destroy_buffer_view(rhi::BufferViewHandle view);
+        [[nodiscard]] foundation::Result defer_destroy_texture_view(rhi::TextureViewHandle view);
+        [[nodiscard]] foundation::Result defer_destroy_sampler(rhi::SamplerHandle sampler);
+        [[nodiscard]] foundation::Result defer_destroy_binding_layout(rhi::BindingLayoutHandle layout);
+        [[nodiscard]] foundation::Result defer_destroy_binding_set(rhi::BindingSetHandle set);
+        [[nodiscard]] foundation::Result defer_destroy_pipeline(rhi::PipelineHandle pipeline);
 
     private:
         struct CommandRecord {
@@ -140,33 +142,33 @@ namespace aeg::render_graph {
             DeferredResources deferred{};
         };
 
-        [[nodiscard]] rhi::Result validate_desc() const noexcept;
-        [[nodiscard]] rhi::Result prepare_slot(FrameSlot& slot);
-        [[nodiscard]] rhi::Result release_deferred(DeferredResources& resources);
-        [[nodiscard]] rhi::Result reset_command_lists(FrameSlot& slot);
+        [[nodiscard]] foundation::Result validate_desc() const noexcept;
+        [[nodiscard]] foundation::Result prepare_slot(FrameSlot& slot);
+        [[nodiscard]] foundation::Result release_deferred(DeferredResources& resources);
+        [[nodiscard]] foundation::Result reset_command_lists(FrameSlot& slot);
         [[nodiscard]] CommandRecord* find_command(rhi::CommandListHandle command_list) noexcept;
         [[nodiscard]] const CommandRecord* find_command(rhi::CommandListHandle command_list) const noexcept;
-        [[nodiscard]] rhi::Result validate_allocation(const FrameAllocation& allocation) const noexcept;
-        [[nodiscard]] rhi::ResultValue<UploadChunk*> acquire_chunk(std::vector<UploadChunk>& chunks,
+        [[nodiscard]] foundation::Result validate_allocation(const FrameAllocation& allocation) const noexcept;
+        [[nodiscard]] foundation::ResultValue<UploadChunk*> acquire_chunk(std::vector<UploadChunk>& chunks,
                                                                      uint64_t size, uint64_t alignment,
                                                                      bool readback);
         template<typename HandleType>
-        [[nodiscard]] rhi::Result add_deferred_handle(std::vector<HandleType>& handles, HandleType handle);
-        [[nodiscard]] rhi::Result add_deferred_handle(std::vector<rhi::BufferHandle>& handles,
+        [[nodiscard]] foundation::Result add_deferred_handle(std::vector<HandleType>& handles, HandleType handle);
+        [[nodiscard]] foundation::Result add_deferred_handle(std::vector<rhi::BufferHandle>& handles,
                                                       rhi::BufferHandle handle);
-        [[nodiscard]] rhi::Result add_deferred_handle(std::vector<rhi::TextureHandle>& handles,
+        [[nodiscard]] foundation::Result add_deferred_handle(std::vector<rhi::TextureHandle>& handles,
                                                       rhi::TextureHandle handle);
-        [[nodiscard]] rhi::Result add_deferred_handle(std::vector<rhi::BufferViewHandle>& handles,
+        [[nodiscard]] foundation::Result add_deferred_handle(std::vector<rhi::BufferViewHandle>& handles,
                                                       rhi::BufferViewHandle handle);
-        [[nodiscard]] rhi::Result add_deferred_handle(std::vector<rhi::TextureViewHandle>& handles,
+        [[nodiscard]] foundation::Result add_deferred_handle(std::vector<rhi::TextureViewHandle>& handles,
                                                       rhi::TextureViewHandle handle);
-        [[nodiscard]] rhi::Result add_deferred_handle(std::vector<rhi::SamplerHandle>& handles,
+        [[nodiscard]] foundation::Result add_deferred_handle(std::vector<rhi::SamplerHandle>& handles,
                                                       rhi::SamplerHandle handle);
-        [[nodiscard]] rhi::Result add_deferred_handle(std::vector<rhi::BindingLayoutHandle>& handles,
+        [[nodiscard]] foundation::Result add_deferred_handle(std::vector<rhi::BindingLayoutHandle>& handles,
                                                       rhi::BindingLayoutHandle handle);
-        [[nodiscard]] rhi::Result add_deferred_handle(std::vector<rhi::BindingSetHandle>& handles,
+        [[nodiscard]] foundation::Result add_deferred_handle(std::vector<rhi::BindingSetHandle>& handles,
                                                       rhi::BindingSetHandle handle);
-        [[nodiscard]] rhi::Result add_deferred_handle(std::vector<rhi::PipelineHandle>& handles,
+        [[nodiscard]] foundation::Result add_deferred_handle(std::vector<rhi::PipelineHandle>& handles,
                                                       rhi::PipelineHandle handle);
 
         rhi::Device& device_;

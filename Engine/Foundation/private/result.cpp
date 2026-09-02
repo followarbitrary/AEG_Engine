@@ -1,7 +1,7 @@
-#include "../public/rhi.hpp"
+#include "../public/result.hpp"
 
-namespace aeg::rhi {
-    const char *result_code_name(ResultCode code) noexcept {
+namespace aeg::foundation {
+    const char* result_code_name(ResultCode code) noexcept {
         switch (code) {
             case ResultCode::kSuccess:
                 return "Success";
@@ -32,4 +32,4 @@ namespace aeg::rhi {
         }
         return "Unknown";
     }
-} // namespace aeg::rhi
+} // namespace aeg::foundation

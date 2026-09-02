@@ -127,6 +127,29 @@ add_executable(aeg_math_smoke
 )
 target_link_libraries(aeg_math_smoke PRIVATE aeg_math)
 
+add_library(aeg_foundation STATIC
+    Engine/Foundation/private/result.cpp
+)
+target_compile_features(aeg_foundation PUBLIC cxx_std_20)
+target_include_directories(aeg_foundation
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Foundation/public
+)
+
+if (MSVC)
+    target_compile_options(aeg_foundation PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(aeg_foundation PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+add_executable(aeg_result_smoke
+    tests/result_smoke.cpp
+)
+target_link_libraries(aeg_result_smoke PRIVATE aeg_foundation)
+if (WIN32)
+    target_compile_definitions(aeg_result_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
 include(CTest)
 
 set(AEG_VMA_INCLUDE_DIR
@@ -139,7 +162,6 @@ endif()
 
 add_library(aeg_rhi_core STATIC
         Engine/RHI/private/rhi_factory.cpp
-        Engine/RHI/private/rhi_result.cpp
 )
 
 target_compile_features(aeg_rhi_core PUBLIC cxx_std_20)
@@ -153,6 +175,7 @@ target_include_directories(aeg_rhi_core
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RHI/public
 )
+target_link_libraries(aeg_rhi_core PUBLIC aeg_foundation)
 
 add_library(aeg_rhi_vulkan STATIC
         Engine/RHI/private/vulkan/vulkan_device.cpp
@@ -174,7 +197,7 @@ target_include_directories(aeg_rhi_vulkan
     SYSTEM PRIVATE
         ${AEG_VMA_INCLUDE_DIR}
 )
-target_link_libraries(aeg_rhi_vulkan PUBLIC aeg_logging Vulkan::Vulkan)
+target_link_libraries(aeg_rhi_vulkan PUBLIC aeg_foundation aeg_logging Vulkan::Vulkan)
 
 if (MSVC)
     target_compile_options(aeg_rhi_core PRIVATE /W4 /permissive-)
@@ -197,7 +220,7 @@ target_include_directories(aeg_render_graph
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RenderGraph/public
 )
-target_link_libraries(aeg_render_graph PUBLIC aeg_rhi_core)
+target_link_libraries(aeg_render_graph PUBLIC aeg_foundation aeg_rhi_core)
 
 if (MSVC)
     target_compile_options(aeg_render_graph PRIVATE /W4 /permissive-)
@@ -238,12 +261,13 @@ endif()
 
 if (BUILD_TESTING)
     add_test(NAME aeg_math_smoke COMMAND aeg_math_smoke)
+    add_test(NAME aeg_result_smoke COMMAND aeg_result_smoke)
     add_test(NAME aeg_rhi_smoke COMMAND aeg_rhi_smoke)
     add_test(NAME aeg_logging_smoke COMMAND aeg_logging_smoke)
     add_test(NAME aeg_triangle COMMAND aeg_triangle --frames 1)
     if (MINGW)
         get_filename_component(AEG_MINGW_RUNTIME_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
-        set_tests_properties(aeg_math_smoke aeg_rhi_smoke aeg_logging_smoke aeg_triangle PROPERTIES
+        set_tests_properties(aeg_math_smoke aeg_result_smoke aeg_rhi_smoke aeg_logging_smoke aeg_triangle PROPERTIES
             ENVIRONMENT "PATH=${AEG_MINGW_RUNTIME_DIR};$ENV{PATH}"
         )
     endif()

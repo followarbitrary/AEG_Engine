@@ -9,6 +9,7 @@
 #include <span>
 #include <string_view>
 
+#include "result.hpp"
 #include "frame_context.hpp"
 
 namespace aeg::render_graph {
@@ -85,48 +86,48 @@ namespace aeg::render_graph {
     class PassBuilder;
     class PassExecutionContext;
 
-    using PassSetupCallback = std::function<rhi::Result(PassBuilder&)>;
-    using PassExecuteCallback = std::function<rhi::Result(PassExecutionContext&)>;
+    using PassSetupCallback = std::function<foundation::Result(PassBuilder&)>;
+    using PassExecuteCallback = std::function<foundation::Result(PassExecutionContext&)>;
 
     class PassBuilder final {
     public:
-        [[nodiscard]] rhi::Result read(RenderGraphBuffer buffer, rhi::ResourceUsage usage,
+        [[nodiscard]] foundation::Result read(RenderGraphBuffer buffer, rhi::ResourceUsage usage,
                                        rhi::PipelineStageMask pipeline_stages = rhi::PipelineStage::kAllCommands,
                                        rhi::ShaderStageMask shader_stages = rhi::ShaderStage::kAll,
                                        RenderGraphBufferRange range = {});
 
-        [[nodiscard]] rhi::Result write(RenderGraphBuffer buffer, rhi::ResourceUsage usage,
+        [[nodiscard]] foundation::Result write(RenderGraphBuffer buffer, rhi::ResourceUsage usage,
                                         rhi::PipelineStageMask pipeline_stages = rhi::PipelineStage::kAllCommands,
                                         rhi::ShaderStageMask shader_stages = rhi::ShaderStage::kAll,
                                         RenderGraphBufferRange range = {}, bool discard_contents = true);
 
-        [[nodiscard]] rhi::Result read_write(RenderGraphBuffer buffer, rhi::ResourceUsage usage,
+        [[nodiscard]] foundation::Result read_write(RenderGraphBuffer buffer, rhi::ResourceUsage usage,
                                              rhi::PipelineStageMask pipeline_stages = rhi::PipelineStage::kAllCommands,
                                              rhi::ShaderStageMask shader_stages = rhi::ShaderStage::kAll,
                                              RenderGraphBufferRange range = {});
 
-        [[nodiscard]] rhi::Result read(RenderGraphTexture texture, rhi::ResourceUsage usage,
+        [[nodiscard]] foundation::Result read(RenderGraphTexture texture, rhi::ResourceUsage usage,
                                        rhi::PipelineStageMask pipeline_stages = rhi::PipelineStage::kAllCommands,
                                        rhi::ShaderStageMask shader_stages = rhi::ShaderStage::kAll,
                                        rhi::SubresourceRange subresources = {});
 
-        [[nodiscard]] rhi::Result write(RenderGraphTexture texture, rhi::ResourceUsage usage,
+        [[nodiscard]] foundation::Result write(RenderGraphTexture texture, rhi::ResourceUsage usage,
                                         rhi::PipelineStageMask pipeline_stages = rhi::PipelineStage::kAllCommands,
                                         rhi::ShaderStageMask shader_stages = rhi::ShaderStage::kAll,
                                         rhi::SubresourceRange subresources = {}, bool discard_contents = true);
 
-        [[nodiscard]] rhi::Result read_write(RenderGraphTexture texture, rhi::ResourceUsage usage,
+        [[nodiscard]] foundation::Result read_write(RenderGraphTexture texture, rhi::ResourceUsage usage,
                                              rhi::PipelineStageMask pipeline_stages = rhi::PipelineStage::kAllCommands,
                                              rhi::ShaderStageMask shader_stages = rhi::ShaderStage::kAll,
                                              rhi::SubresourceRange subresources = {});
 
-        [[nodiscard]] rhi::Result use_color_attachment(
+        [[nodiscard]] foundation::Result use_color_attachment(
                 RenderGraphTexture texture, rhi::LoadOp load_op, rhi::StoreOp store_op,
                 rhi::ClearColorValue clear_color = {},
                 rhi::ResourceUsage final_usage = rhi::ResourceUsage::kColorAttachmentWrite,
                 rhi::SubresourceRange subresources = {});
 
-        [[nodiscard]] rhi::Result use_depth_stencil_attachment(
+        [[nodiscard]] foundation::Result use_depth_stencil_attachment(
                 RenderGraphTexture texture, rhi::LoadOp depth_load_op, rhi::StoreOp depth_store_op,
                 float clear_depth = 1.0f, uint32_t clear_stencil = 0,
                 rhi::ResourceUsage final_usage = rhi::ResourceUsage::kDepthStencilWrite,
@@ -150,41 +151,42 @@ namespace aeg::render_graph {
         [[nodiscard]] rhi::CommandListHandle command_list() const noexcept { return command_list_; }
         [[nodiscard]] RenderGraphPass pass() const noexcept { return pass_; }
 
-        [[nodiscard]] rhi::ResultValue<rhi::BufferHandle> buffer(RenderGraphBuffer buffer) const;
-        [[nodiscard]] rhi::ResultValue<rhi::TextureHandle> texture(RenderGraphTexture texture) const;
-        [[nodiscard]] rhi::ResultValue<rhi::BufferViewHandle> buffer_view(RenderGraphBuffer buffer,
+        [[nodiscard]] foundation::ResultValue<rhi::BufferHandle> buffer(RenderGraphBuffer buffer) const;
+        [[nodiscard]] foundation::ResultValue<rhi::TextureHandle> texture(RenderGraphTexture texture) const;
+        [[nodiscard]] foundation::ResultValue<rhi::BufferViewHandle> buffer_view(RenderGraphBuffer buffer,
                                                                             rhi::BufferViewKind kind,
                                                                             uint64_t offset = 0,
-                                                                            uint64_t size = std::numeric_limits<uint64_t>::max(),
+                                                                            uint64_t size =
+                                                                                std::numeric_limits<uint64_t>::max(),
                                                                             rhi::Format format = rhi::Format::kUnknown,
                                                                             uint32_t structure_stride = 0);
-        [[nodiscard]] rhi::ResultValue<rhi::TextureViewHandle> texture_view(
+        [[nodiscard]] foundation::ResultValue<rhi::TextureViewHandle> texture_view(
                 RenderGraphTexture texture, rhi::TextureViewKind kind = rhi::TextureViewKind::kSampled,
                 rhi::SubresourceRange subresources = {}, rhi::Format format = rhi::Format::kUnknown,
                 rhi::TextureViewDimension dimension = rhi::TextureViewDimension::kAuto);
 
-        [[nodiscard]] rhi::Result begin_rendering();
-        [[nodiscard]] rhi::Result end_rendering();
+        [[nodiscard]] foundation::Result begin_rendering();
+        [[nodiscard]] foundation::Result end_rendering();
         [[nodiscard]] bool rendering_active() const noexcept { return rendering_active_; }
         [[nodiscard]] bool rendering_started() const noexcept { return rendering_started_; }
 
-        [[nodiscard]] rhi::Result copy_buffer(RenderGraphBuffer source, RenderGraphBuffer destination,
+        [[nodiscard]] foundation::Result copy_buffer(RenderGraphBuffer source, RenderGraphBuffer destination,
                                               uint64_t source_offset, uint64_t destination_offset, uint64_t size);
-        [[nodiscard]] rhi::Result copy_buffer_to_texture(
+        [[nodiscard]] foundation::Result copy_buffer_to_texture(
                 RenderGraphBuffer source, uint64_t source_offset, uint32_t source_row_length,
                 uint32_t source_image_height, RenderGraphTexture destination,
                 rhi::TextureSubresourceLayers destination_subresources, rhi::Offset3D destination_offset,
                 rhi::Extent3D extent);
-        [[nodiscard]] rhi::Result copy_texture_to_buffer(
+        [[nodiscard]] foundation::Result copy_texture_to_buffer(
                 RenderGraphTexture source, rhi::TextureSubresourceLayers source_subresources,
                 rhi::Offset3D source_offset, rhi::Extent3D extent, RenderGraphBuffer destination,
                 uint64_t destination_offset, uint32_t destination_row_length, uint32_t destination_image_height);
-        [[nodiscard]] rhi::Result copy_texture(RenderGraphTexture source,
+        [[nodiscard]] foundation::Result copy_texture(RenderGraphTexture source,
                                                rhi::TextureSubresourceLayers source_subresources,
                                                rhi::Offset3D source_offset, RenderGraphTexture destination,
                                                rhi::TextureSubresourceLayers destination_subresources,
                                                rhi::Offset3D destination_offset, rhi::Extent3D extent);
-        [[nodiscard]] rhi::Result clear_texture(RenderGraphTexture texture,
+        [[nodiscard]] foundation::Result clear_texture(RenderGraphTexture texture,
                                                  rhi::SubresourceRange subresources = {},
                                                  rhi::ClearColorValue color = {}, float depth = 1.0f,
                                                  uint32_t stencil = 0);
@@ -223,38 +225,38 @@ namespace aeg::render_graph {
         // Clears only pass declarations, preserving logical resource handles and persistent allocations.
         void clear_passes() noexcept;
 
-        [[nodiscard]] rhi::ResultValue<RenderGraphBuffer> create_buffer(const rhi::BufferDesc& desc,
+        [[nodiscard]] foundation::ResultValue<RenderGraphBuffer> create_buffer(const rhi::BufferDesc& desc,
                                                                          ResourceLifetime lifetime =
                                                                                  ResourceLifetime::kTransient);
-        [[nodiscard]] rhi::ResultValue<RenderGraphTexture> create_texture(
+        [[nodiscard]] foundation::ResultValue<RenderGraphTexture> create_texture(
                 const rhi::TextureDesc& desc,
                 ResourceLifetime lifetime = ResourceLifetime::kTransient);
 
-        [[nodiscard]] rhi::ResultValue<RenderGraphBuffer> import_buffer(
+        [[nodiscard]] foundation::ResultValue<RenderGraphBuffer> import_buffer(
                 rhi::BufferHandle buffer, const rhi::BufferDesc& desc,
                 const rhi::ResourceState& initial_state = {});
-        [[nodiscard]] rhi::ResultValue<RenderGraphTexture> import_texture(
+        [[nodiscard]] foundation::ResultValue<RenderGraphTexture> import_texture(
                 rhi::TextureHandle texture, rhi::TextureViewHandle default_view, const rhi::TextureDesc& desc,
                 const rhi::ResourceState& initial_state = {});
-        [[nodiscard]] rhi::Result update_imported_buffer(RenderGraphBuffer resource, rhi::BufferHandle buffer,
+        [[nodiscard]] foundation::Result update_imported_buffer(RenderGraphBuffer resource, rhi::BufferHandle buffer,
                                                          const rhi::ResourceState& initial_state = {});
-        [[nodiscard]] rhi::Result update_imported_texture(RenderGraphTexture resource, rhi::TextureHandle texture,
-                                                          rhi::TextureViewHandle default_view,
+        [[nodiscard]] foundation::Result update_imported_texture(
+            RenderGraphTexture resource, rhi::TextureHandle texture, rhi::TextureViewHandle default_view,
                                                           const rhi::ResourceState& initial_state = {});
-        [[nodiscard]] rhi::ResultValue<RenderGraphTexture> import_swapchain_image(
+        [[nodiscard]] foundation::ResultValue<RenderGraphTexture> import_swapchain_image(
                 const rhi::FrameAcquireResult& acquired, const rhi::TextureDesc& desc,
                 const rhi::ResourceState& initial_state = {});
 
-        [[nodiscard]] rhi::Result export_buffer(RenderGraphBuffer resource);
-        [[nodiscard]] rhi::Result export_texture(RenderGraphTexture resource);
+        [[nodiscard]] foundation::Result export_buffer(RenderGraphBuffer resource);
+        [[nodiscard]] foundation::Result export_texture(RenderGraphTexture resource);
 
-        [[nodiscard]] rhi::ResultValue<RenderGraphPass> add_pass(std::string_view name, rhi::QueueClass queue,
+        [[nodiscard]] foundation::ResultValue<RenderGraphPass> add_pass(std::string_view name, rhi::QueueClass queue,
                                                                   PassSetupCallback setup,
                                                                   PassExecuteCallback execute);
 
-        [[nodiscard]] rhi::Result compile();
+        [[nodiscard]] foundation::Result compile();
         [[nodiscard]] const RenderGraphCompileInfo& compile_info() const noexcept { return compile_info_; }
-        [[nodiscard]] rhi::ResultValue<RenderGraphExecutionResult> execute(
+        [[nodiscard]] foundation::ResultValue<RenderGraphExecutionResult> execute(
                 FrameContext& frame_context, const RenderGraphExecuteDesc& desc = {});
 
     private:
