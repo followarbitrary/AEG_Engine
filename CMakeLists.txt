@@ -127,6 +127,8 @@ add_executable(aeg_math_smoke
 )
 target_link_libraries(aeg_math_smoke PRIVATE aeg_math)
 
+include(CTest)
+
 set(AEG_VMA_INCLUDE_DIR
     "${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/VulkanMemoryAllocator/include")
 if (NOT EXISTS "${AEG_VMA_INCLUDE_DIR}/vk_mem_alloc.h")
@@ -137,6 +139,7 @@ endif()
 
 add_library(aeg_rhi_core STATIC
         Engine/RHI/private/rhi_factory.cpp
+        Engine/RHI/private/rhi_result.cpp
 )
 
 target_compile_features(aeg_rhi_core PUBLIC cxx_std_20)
@@ -152,7 +155,6 @@ target_include_directories(aeg_rhi_core
 )
 
 add_library(aeg_rhi_vulkan STATIC
-        Engine/RHI/private/vulkan/vulkan_factory.cpp
         Engine/RHI/private/vulkan/vulkan_device.cpp
         Engine/RHI/private/vulkan/vma_impl.cpp
 )
@@ -172,7 +174,7 @@ target_include_directories(aeg_rhi_vulkan
     SYSTEM PRIVATE
         ${AEG_VMA_INCLUDE_DIR}
 )
-target_link_libraries(aeg_rhi_vulkan PUBLIC aeg_rhi_core aeg_logging Vulkan::Vulkan)
+target_link_libraries(aeg_rhi_vulkan PUBLIC aeg_logging Vulkan::Vulkan)
 
 if (MSVC)
     target_compile_options(aeg_rhi_core PRIVATE /W4 /permissive-)
@@ -182,9 +184,26 @@ else()
     target_compile_options(aeg_rhi_vulkan PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
-# The selected backend provides the generic create_device implementation.
+# The runtime RHI links only production backends.
 add_library(aeg_rhi INTERFACE)
-target_link_libraries(aeg_rhi INTERFACE aeg_rhi_vulkan)
+target_link_libraries(aeg_rhi INTERFACE aeg_rhi_core aeg_rhi_vulkan)
+
+add_library(aeg_render_graph STATIC
+    Engine/RenderGraph/private/frame_context.cpp
+    Engine/RenderGraph/private/render_graph.cpp
+)
+target_compile_features(aeg_render_graph PUBLIC cxx_std_20)
+target_include_directories(aeg_render_graph
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RenderGraph/public
+)
+target_link_libraries(aeg_render_graph PUBLIC aeg_rhi_core)
+
+if (MSVC)
+    target_compile_options(aeg_render_graph PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(aeg_render_graph PRIVATE -Wall -Wextra -Wpedantic)
+endif()
 
 add_executable(aeg_rhi_smoke
     tests/rhi_smoke.cpp
@@ -217,7 +236,6 @@ if (WIN32)
     target_compile_definitions(aeg_triangle PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
-include(CTest)
 if (BUILD_TESTING)
     add_test(NAME aeg_math_smoke COMMAND aeg_math_smoke)
     add_test(NAME aeg_rhi_smoke COMMAND aeg_rhi_smoke)
@@ -225,7 +243,7 @@ if (BUILD_TESTING)
     add_test(NAME aeg_triangle COMMAND aeg_triangle --frames 1)
     if (MINGW)
         get_filename_component(AEG_MINGW_RUNTIME_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
-        set_tests_properties(aeg_rhi_smoke aeg_logging_smoke aeg_triangle PROPERTIES
+        set_tests_properties(aeg_math_smoke aeg_rhi_smoke aeg_logging_smoke aeg_triangle PROPERTIES
             ENVIRONMENT "PATH=${AEG_MINGW_RUNTIME_DIR};$ENV{PATH}"
         )
     endif()

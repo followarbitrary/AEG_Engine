@@ -39,6 +39,7 @@ namespace {
     using aeg::rhi::MemoryClass;
     using aeg::rhi::PipelineDesc;
     using aeg::rhi::PipelineHandle;
+    using aeg::rhi::PipelineStage;
     using aeg::rhi::PipelineType;
     using aeg::rhi::PresentDesc;
     using aeg::rhi::PresentMode;
@@ -358,6 +359,9 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
             buffer_desc.size = sizeof(kTriangleVertices);
             buffer_desc.capabilities = BufferCapability::kVertex;
             buffer_desc.memory = MemoryClass::kUpload;
+            buffer_desc.initial_usage = ResourceUsage::kVertexInput;
+            buffer_desc.initial_stages = PipelineStage::kVertexInput;
+            buffer_desc.initial_queue = QueueClass::kGraphics;
             buffer_desc.name = aeg::rhi::DebugName{"Triangle.VertexBuffer"};
             auto buffer_result = device_->create_buffer(buffer_desc);
             if (!check_result(buffer_result, "create_vertex_buffer")) {

@@ -261,6 +261,217 @@ int main() {
         return 1;
     }
 
+    BufferDesc cross_source_desc{};
+    cross_source_desc.size = 256;
+    cross_source_desc.capabilities = BufferCapability::kTransferSource | BufferCapability::kTransferDestination;
+    cross_source_desc.memory = MemoryClass::kUpload;
+    cross_source_desc.name = DebugName{"Smoke.CrossQueueSource"};
+    auto cross_source_result = device->create_buffer(cross_source_desc);
+    if (!check(cross_source_result, "create_cross_queue_source")) {
+        return 1;
+    }
+    const BufferHandle cross_source = cross_source_result.value;
+
+    BufferDesc cross_destination_desc = cross_source_desc;
+    cross_destination_desc.memory = MemoryClass::kReadback;
+    cross_destination_desc.name = DebugName{"Smoke.CrossQueueDestination"};
+    auto cross_destination_result = device->create_buffer(cross_destination_desc);
+    if (!check(cross_destination_result, "create_cross_queue_destination")) {
+        return 1;
+    }
+    const BufferHandle cross_destination = cross_destination_result.value;
+    const std::array<std::byte, 16> cross_queue_data{
+        std::byte{0x01}, std::byte{0x02}, std::byte{0x03}, std::byte{0x04},
+        std::byte{0x05}, std::byte{0x06}, std::byte{0x07}, std::byte{0x08},
+        std::byte{0x09}, std::byte{0x0a}, std::byte{0x0b}, std::byte{0x0c},
+        std::byte{0x0d}, std::byte{0x0e}, std::byte{0x0f}, std::byte{0x10}
+    };
+    if (!check(device->write_buffer(cross_source, 0, cross_queue_data), "write_cross_queue_source")) {
+        return 1;
+    }
+
+    CommandListDesc cross_copy_desc{};
+    cross_copy_desc.queue = QueueClass::kCopy;
+    cross_copy_desc.name = DebugName{"Smoke.CrossQueueCopyCommand"};
+    auto cross_copy_command_result = device->create_command_list(cross_copy_desc);
+    if (!check(cross_copy_command_result, "create_cross_queue_copy_command")) {
+        return 1;
+    }
+    const CommandListHandle cross_copy_command = cross_copy_command_result.value;
+    if (!check(device->begin_command_list(cross_copy_command), "begin_cross_queue_copy_command") ||
+        !check(device->copy_buffer(cross_copy_command, BufferCopyDesc{cross_source, cross_destination, 0, 0, 16}),
+               "copy_cross_queue_source") ||
+        !check(device->end_command_list(cross_copy_command), "end_cross_queue_copy_command")) {
+        return 1;
+    }
+    const std::array<CommandListHandle, 1> cross_copy_commands{cross_copy_command};
+    auto cross_copy_submit_result = device->submit(
+        SubmitDesc{QueueClass::kCopy, cross_copy_commands, {}});
+    if (!check(cross_copy_submit_result, "submit_cross_queue_copy")) {
+        return 1;
+    }
+
+    CommandListDesc cross_graphics_desc{};
+    cross_graphics_desc.queue = QueueClass::kGraphics;
+    cross_graphics_desc.name = DebugName{"Smoke.CrossQueueGraphicsCommand"};
+    auto cross_graphics_command_result = device->create_command_list(cross_graphics_desc);
+    if (!check(cross_graphics_command_result, "create_cross_queue_graphics_command")) {
+        return 1;
+    }
+    const CommandListHandle cross_graphics_command = cross_graphics_command_result.value;
+    if (!check(device->begin_command_list(cross_graphics_command), "begin_cross_queue_graphics_command") ||
+        !check(device->copy_buffer(cross_graphics_command,
+                                    BufferCopyDesc{cross_source, cross_destination, 0, 0, 16}),
+               "copy_cross_queue_graphics") ||
+        !check(device->end_command_list(cross_graphics_command), "end_cross_queue_graphics_command")) {
+        return 1;
+    }
+    const std::array<CommandListHandle, 1> cross_graphics_commands{cross_graphics_command};
+    const std::array<GpuWait, 1> cross_graphics_waits{
+        GpuWait{cross_copy_submit_result.value.completion, PipelineStage::kCopy}
+    };
+    auto cross_graphics_submit_result = device->submit(
+        SubmitDesc{QueueClass::kGraphics, cross_graphics_commands, cross_graphics_waits});
+    if (!check(cross_graphics_submit_result, "submit_cross_queue_graphics") ||
+        !check(device->wait(cross_graphics_submit_result.value.completion, std::numeric_limits<uint64_t>::max()),
+               "wait_cross_queue_graphics")) {
+        return 1;
+    }
+    std::array<std::byte, 16> cross_queue_readback{};
+    if (!check(device->read_buffer(cross_destination, 0, cross_queue_readback),
+               "read_cross_queue_destination") || cross_queue_readback != cross_queue_data) {
+        AEG_LOG_ERROR(aeg::logging::Category::kTest, "Cross-queue buffer data did not round-trip");
+        return 1;
+    }
+
+    TextureDesc cross_texture_desc{};
+    cross_texture_desc.extent = {4, 4, 1};
+    cross_texture_desc.format = Format::kRgba8Unorm;
+    cross_texture_desc.capabilities =
+            TextureCapability::kTransferSource | TextureCapability::kTransferDestination;
+    cross_texture_desc.initial_queue = QueueClass::kCopy;
+    cross_texture_desc.name = DebugName{"Smoke.CrossQueueTexture"};
+    auto cross_texture_result = device->create_texture(cross_texture_desc);
+    if (!check(cross_texture_result, "create_cross_queue_texture")) {
+        return 1;
+    }
+    const TextureHandle cross_texture = cross_texture_result.value;
+
+    constexpr uint64_t kCrossTextureDataSize = 4 * 4 * 4;
+    BufferDesc cross_texture_upload_desc{};
+    cross_texture_upload_desc.size = kCrossTextureDataSize;
+    cross_texture_upload_desc.capabilities = BufferCapability::kTransferSource;
+    cross_texture_upload_desc.memory = MemoryClass::kUpload;
+    cross_texture_upload_desc.initial_usage = ResourceUsage::kHostWrite;
+    cross_texture_upload_desc.initial_stages = PipelineStage::kHost;
+    cross_texture_upload_desc.initial_queue = QueueClass::kCopy;
+    cross_texture_upload_desc.name = DebugName{"Smoke.CrossQueueTextureUpload"};
+    auto cross_texture_upload_result = device->create_buffer(cross_texture_upload_desc);
+    if (!check(cross_texture_upload_result, "create_cross_queue_texture_upload")) {
+        return 1;
+    }
+    const BufferHandle cross_texture_upload = cross_texture_upload_result.value;
+
+    std::array<std::byte, kCrossTextureDataSize> cross_texture_data{};
+    for (size_t index = 0; index < cross_texture_data.size(); index += 4) {
+        cross_texture_data[index + 0] = std::byte{0xff};
+        cross_texture_data[index + 1] = std::byte{0x00};
+        cross_texture_data[index + 2] = std::byte{0x00};
+        cross_texture_data[index + 3] = std::byte{0xff};
+    }
+    if (!check(device->write_buffer(cross_texture_upload, 0, cross_texture_data),
+               "write_cross_queue_texture_upload")) {
+        return 1;
+    }
+
+    BufferDesc cross_texture_readback_desc{};
+    cross_texture_readback_desc.size = kCrossTextureDataSize;
+    cross_texture_readback_desc.capabilities = BufferCapability::kTransferDestination;
+    cross_texture_readback_desc.memory = MemoryClass::kReadback;
+    cross_texture_readback_desc.initial_queue = QueueClass::kGraphics;
+    cross_texture_readback_desc.name = DebugName{"Smoke.CrossQueueTextureReadback"};
+    auto cross_texture_readback_result = device->create_buffer(cross_texture_readback_desc);
+    if (!check(cross_texture_readback_result, "create_cross_queue_texture_readback")) {
+        return 1;
+    }
+    const BufferHandle cross_texture_readback = cross_texture_readback_result.value;
+
+    CommandListDesc cross_texture_upload_desc_list{};
+    cross_texture_upload_desc_list.queue = QueueClass::kCopy;
+    cross_texture_upload_desc_list.name = DebugName{"Smoke.CrossQueueTextureUploadCommand"};
+    auto cross_texture_upload_command_result = device->create_command_list(cross_texture_upload_desc_list);
+    if (!check(cross_texture_upload_command_result, "create_cross_queue_texture_upload_command")) {
+        return 1;
+    }
+    const CommandListHandle cross_texture_upload_command = cross_texture_upload_command_result.value;
+    const TextureSubresourceLayers cross_texture_layers{Aspect::kColor, 0, 0, 1};
+    if (!check(device->begin_command_list(cross_texture_upload_command),
+               "begin_cross_queue_texture_upload_command") ||
+        !check(device->copy_buffer_to_texture(
+                       cross_texture_upload_command,
+                       BufferTextureCopyDesc{cross_texture_upload, 0, 0, 0, cross_texture,
+                                             cross_texture_layers, Offset3D{0, 0, 0}, Extent3D{4, 4, 1}}),
+               "copy_cross_queue_buffer_to_texture") ||
+        !check(device->end_command_list(cross_texture_upload_command),
+               "end_cross_queue_texture_upload_command")) {
+        return 1;
+    }
+    const std::array<CommandListHandle, 1> cross_texture_upload_commands{cross_texture_upload_command};
+    auto cross_texture_upload_submit_result = device->submit(
+            SubmitDesc{QueueClass::kCopy, cross_texture_upload_commands, {}});
+    if (!check(cross_texture_upload_submit_result, "submit_cross_queue_texture_upload")) {
+        return 1;
+    }
+
+    CommandListDesc cross_texture_read_desc{};
+    cross_texture_read_desc.queue = QueueClass::kGraphics;
+    cross_texture_read_desc.name = DebugName{"Smoke.CrossQueueTextureReadCommand"};
+    auto cross_texture_read_command_result = device->create_command_list(cross_texture_read_desc);
+    if (!check(cross_texture_read_command_result, "create_cross_queue_texture_read_command")) {
+        return 1;
+    }
+    const CommandListHandle cross_texture_read_command = cross_texture_read_command_result.value;
+    if (!check(device->begin_command_list(cross_texture_read_command),
+               "begin_cross_queue_texture_read_command") ||
+        !check(device->copy_texture_to_buffer(
+                       cross_texture_read_command,
+                       TextureBufferCopyDesc{cross_texture, cross_texture_layers, Offset3D{0, 0, 0},
+                                             Extent3D{4, 4, 1}, cross_texture_readback, 0, 0, 0}),
+               "copy_cross_queue_texture_to_buffer") ||
+        !check(device->end_command_list(cross_texture_read_command),
+               "end_cross_queue_texture_read_command")) {
+        return 1;
+    }
+    const std::array<CommandListHandle, 1> cross_texture_read_commands{cross_texture_read_command};
+    const std::array<GpuWait, 1> cross_texture_read_waits{
+        GpuWait{cross_texture_upload_submit_result.value.completion, PipelineStage::kCopy}
+    };
+    auto cross_texture_read_submit_result = device->submit(
+            SubmitDesc{QueueClass::kGraphics, cross_texture_read_commands, cross_texture_read_waits});
+    if (!check(cross_texture_read_submit_result, "submit_cross_queue_texture_read") ||
+        !check(device->wait(cross_texture_read_submit_result.value.completion,
+                             std::numeric_limits<uint64_t>::max()),
+               "wait_cross_queue_texture_read")) {
+        return 1;
+    }
+    std::array<std::byte, kCrossTextureDataSize> cross_texture_readback_data{};
+    if (!check(device->read_buffer(cross_texture_readback, 0, cross_texture_readback_data),
+               "read_cross_queue_texture") || cross_texture_readback_data != cross_texture_data) {
+        AEG_LOG_ERROR(aeg::logging::Category::kTest, "Cross-queue texture data did not round-trip");
+        return 1;
+    }
+    if (!check(device->destroy_command_list(cross_texture_upload_command),
+               "destroy_cross_queue_texture_upload_command") ||
+        !check(device->destroy_command_list(cross_texture_read_command),
+               "destroy_cross_queue_texture_read_command") ||
+        !check(device->destroy_texture(cross_texture), "destroy_cross_queue_texture") ||
+        !check(device->destroy_buffer(cross_texture_upload),
+               "destroy_cross_queue_texture_upload") ||
+        !check(device->destroy_buffer(cross_texture_readback),
+               "destroy_cross_queue_texture_readback")) {
+        return 1;
+    }
+
     if (!check(device->reset_command_list(command_list), "reset_graphics_command_list") ||
         !check(device->begin_command_list(command_list), "rebegin_graphics_command_list") ||
         !check(device->end_command_list(command_list), "reend_graphics_command_list")) {
@@ -280,6 +491,8 @@ int main() {
 
     if (!check(device->destroy_command_list(command_list), "destroy_command_list") ||
         !check(device->destroy_command_list(copy_command_list), "destroy_copy_command_list") ||
+        !check(device->destroy_command_list(cross_copy_command), "destroy_cross_queue_copy_command") ||
+        !check(device->destroy_command_list(cross_graphics_command), "destroy_cross_queue_graphics_command") ||
         !check(device->destroy_pipeline(pipeline), "destroy_pipeline") ||
         !check(device->destroy_binding_set(set), "destroy_binding_set") ||
         !check(device->destroy_binding_layout(layout), "destroy_binding_layout") ||
@@ -287,6 +500,8 @@ int main() {
         !check(device->destroy_texture_view(texture_view), "destroy_texture_view") ||
         !check(device->destroy_buffer_view(buffer_view), "destroy_buffer_view") ||
         !check(device->destroy_texture(texture), "destroy_texture") ||
+        !check(device->destroy_buffer(cross_destination), "destroy_cross_queue_destination") ||
+        !check(device->destroy_buffer(cross_source), "destroy_cross_queue_source") ||
         !check(device->destroy_buffer(buffer), "destroy_buffer") || !check(device->wait_idle(), "wait_idle")) {
         return 1;
     }

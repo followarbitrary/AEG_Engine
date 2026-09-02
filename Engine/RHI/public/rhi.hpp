@@ -40,6 +40,9 @@ namespace aeg::rhi {
         [[nodiscard]] virtual Result write_buffer(BufferHandle buffer, uint64_t offset,
                                                   std::span<const std::byte> data) = 0;
 
+        [[nodiscard]] virtual Result read_buffer(BufferHandle buffer, uint64_t offset,
+                                                 std::span<std::byte> data) = 0;
+
         [[nodiscard]] virtual ResultValue<PipelineHandle> create_pipeline(const PipelineDesc &desc) = 0;
 
         [[nodiscard]] virtual Result destroy_pipeline(PipelineHandle pipeline) = 0;
@@ -78,11 +81,17 @@ namespace aeg::rhi {
 
         [[nodiscard]] virtual Result end_rendering(CommandListHandle command_list) = 0;
 
+        [[nodiscard]] virtual Result barrier(CommandListHandle command_list, const BarrierDesc &desc) = 0;
+
         [[nodiscard]] virtual Result set_viewport(CommandListHandle command_list, const Viewport &viewport) = 0;
 
         [[nodiscard]] virtual Result set_scissor(CommandListHandle command_list, const ScissorRect &scissor) = 0;
 
         [[nodiscard]] virtual Result bind_pipeline(CommandListHandle command_list, PipelineHandle pipeline) = 0;
+
+        [[nodiscard]] virtual Result bind_binding_set(CommandListHandle command_list, uint32_t group,
+                                                      BindingSetHandle set,
+                                                      std::span<const uint32_t> dynamic_offsets = {}) = 0;
 
         [[nodiscard]] virtual Result set_inline_constants(CommandListHandle command_list, uint32_t offset,
                                                           ShaderStageMask shader_stages,
@@ -91,7 +100,34 @@ namespace aeg::rhi {
         [[nodiscard]] virtual Result bind_vertex_buffer(CommandListHandle command_list, uint32_t binding,
                                                         BufferHandle buffer, uint64_t offset = 0) = 0;
 
+        [[nodiscard]] virtual Result bind_index_buffer(CommandListHandle command_list, BufferHandle buffer,
+                                                       uint64_t offset, IndexFormat format) = 0;
+
         [[nodiscard]] virtual Result draw(CommandListHandle command_list, const DrawDesc &desc) = 0;
+
+        [[nodiscard]] virtual Result draw_indexed(CommandListHandle command_list,
+                                                  const DrawIndexedDesc &desc) = 0;
+
+        [[nodiscard]] virtual Result draw_indirect(CommandListHandle command_list,
+                                                   const DrawIndirectDesc &desc) = 0;
+
+        [[nodiscard]] virtual Result dispatch(CommandListHandle command_list, const DispatchDesc &desc) = 0;
+
+        [[nodiscard]] virtual Result dispatch_indirect(CommandListHandle command_list,
+                                                       const DispatchIndirectDesc &desc) = 0;
+
+        [[nodiscard]] virtual Result copy_buffer(CommandListHandle command_list, const BufferCopyDesc &desc) = 0;
+
+        [[nodiscard]] virtual Result copy_buffer_to_texture(CommandListHandle command_list,
+                                                            const BufferTextureCopyDesc &desc) = 0;
+
+        [[nodiscard]] virtual Result copy_texture_to_buffer(CommandListHandle command_list,
+                                                            const TextureBufferCopyDesc &desc) = 0;
+
+        [[nodiscard]] virtual Result copy_texture(CommandListHandle command_list, const TextureCopyDesc &desc) = 0;
+
+        [[nodiscard]] virtual Result clear_texture(CommandListHandle command_list,
+                                                   const ClearTextureDesc &desc) = 0;
 
         [[nodiscard]] virtual Result end_command_list(CommandListHandle command_list) = 0;
 
@@ -105,10 +141,13 @@ namespace aeg::rhi {
 
         [[nodiscard]] virtual bool is_complete(const GpuSyncPoint &point) const = 0;
 
+        [[nodiscard]] virtual Result collect_garbage() = 0;
+
         [[nodiscard]] virtual Result wait_idle() = 0;
     };
 
-    // The active backend module provides the implementation behind this common factory.
+    // The runtime backend module provides the implementation behind this common factory.
+    // Test-only backends expose private factories and are not dispatched here.
     [[nodiscard]] ResultValue<std::unique_ptr<Device> > create_device(const DeviceCreateDesc &desc = {});
 
     [[nodiscard]] const char *result_code_name(ResultCode code) noexcept;

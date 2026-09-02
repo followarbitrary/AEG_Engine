@@ -155,6 +155,9 @@ namespace aeg::rhi {
 
     enum class SurfaceType : uint8_t { kWindow, kHeadless };
 
+    // Selects an implementation without exposing any native graphics API type.
+    enum class BackendType : uint8_t { kVulkan };
+
     struct SurfaceDesc {
         SurfaceType type{SurfaceType::kWindow};
 
@@ -413,6 +416,9 @@ namespace aeg::rhi {
         BufferCapability capabilities{BufferCapability::kNone};
         MemoryClass memory{MemoryClass::kAuto};
         ResourceFlags flags{ResourceFlags::kNone};
+        ResourceUsage initial_usage{ResourceUsage::kUndefined};
+        PipelineStageMask initial_stages{PipelineStage::kAllCommands};
+        QueueClass initial_queue{QueueClass::kAuto};
         DebugName name{};
     };
 
@@ -426,6 +432,9 @@ namespace aeg::rhi {
         TextureCapability capabilities{TextureCapability::kNone};
         MemoryClass memory{MemoryClass::kDeviceLocal};
         ResourceFlags flags{ResourceFlags::kNone};
+        ResourceUsage initial_usage{ResourceUsage::kUndefined};
+        PipelineStageMask initial_stages{PipelineStage::kAllCommands};
+        QueueClass initial_queue{QueueClass::kAuto};
         std::span<const Format> compatible_view_formats{};
         DebugName name{};
     };
@@ -689,6 +698,95 @@ namespace aeg::rhi {
         uint32_t first_instance{0};
     };
 
+    enum class IndexFormat : uint8_t { kUint16, kUint32 };
+
+    struct DrawIndexedDesc {
+        uint32_t index_count{0};
+        uint32_t instance_count{1};
+        uint32_t first_index{0};
+        int32_t vertex_offset{0};
+        uint32_t first_instance{0};
+    };
+
+    struct DispatchDesc {
+        uint32_t group_count_x{0};
+        uint32_t group_count_y{0};
+        uint32_t group_count_z{0};
+    };
+
+    struct DrawIndirectDesc {
+        BufferHandle buffer{};
+        uint64_t offset{0};
+        uint32_t draw_count{1};
+        uint32_t stride{sizeof(uint32_t) * 4};
+    };
+
+    struct DispatchIndirectDesc {
+        BufferHandle buffer{};
+        uint64_t offset{0};
+    };
+
+    struct Offset3D {
+        int32_t x{0};
+        int32_t y{0};
+        int32_t z{0};
+    };
+
+    struct TextureSubresourceLayers {
+        AspectMask aspects{Aspect::kColor};
+        uint32_t mip_level{0};
+        uint32_t base_array_layer{0};
+        uint32_t layer_count{1};
+    };
+
+    struct BufferCopyDesc {
+        BufferHandle source{};
+        BufferHandle destination{};
+        uint64_t source_offset{0};
+        uint64_t destination_offset{0};
+        uint64_t size{0};
+    };
+
+    struct BufferTextureCopyDesc {
+        BufferHandle source{};
+        uint64_t source_offset{0};
+        uint32_t source_row_length{0};
+        uint32_t source_image_height{0};
+        TextureHandle destination{};
+        TextureSubresourceLayers destination_subresources{};
+        Offset3D destination_offset{};
+        Extent3D extent{};
+    };
+
+    struct TextureBufferCopyDesc {
+        TextureHandle source{};
+        TextureSubresourceLayers source_subresources{};
+        Offset3D source_offset{};
+        Extent3D extent{};
+        BufferHandle destination{};
+        uint64_t destination_offset{0};
+        uint32_t destination_row_length{0};
+        uint32_t destination_image_height{0};
+    };
+
+    struct TextureCopyDesc {
+        TextureHandle source{};
+        TextureSubresourceLayers source_subresources{};
+        Offset3D source_offset{};
+        TextureHandle destination{};
+        TextureSubresourceLayers destination_subresources{};
+        Offset3D destination_offset{};
+        Extent3D extent{};
+    };
+
+    struct ClearTextureDesc {
+        TextureHandle texture{};
+        SubresourceRange subresources{};
+        ClearColorValue color{};
+        float depth{1.0f};
+        uint32_t stencil{0};
+    };
+
     struct BindingResource {
         BindingType type{BindingType::kSampledTexture};
         TextureViewHandle texture_view{};
@@ -709,6 +807,29 @@ namespace aeg::rhi {
         ShaderStageMask shader_stages{ShaderStage::kAll};
         QueueClass queue{QueueClass::kAuto};
         bool discard_contents{false};
+        PipelineStageMask pipeline_stages{PipelineStage::kAllCommands};
+
+        friend constexpr bool operator==(const ResourceState &, const ResourceState &) = default;
+    };
+
+    struct BufferBarrier {
+        BufferHandle buffer{};
+        uint64_t offset{0};
+        uint64_t size{std::numeric_limits<uint64_t>::max()};
+        ResourceState before{};
+        ResourceState after{};
+    };
+
+    struct TextureBarrier {
+        TextureHandle texture{};
+        SubresourceRange subresources{};
+        ResourceState before{};
+        ResourceState after{};
+    };
+
+    struct BarrierDesc {
+        std::span<const BufferBarrier> buffers{};
+        std::span<const TextureBarrier> textures{};
     };
 
     struct GpuSyncPoint {
@@ -772,6 +893,7 @@ namespace aeg::rhi {
     };
 
     struct DeviceCreateDesc {
+        BackendType backend{BackendType::kVulkan};
         std::string_view application_name{"AEG Engine"};
         // UINT32_MAX selects automatically using the adapter score. Any other
         // value explicitly selects that enumerated adapter after validation.

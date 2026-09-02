@@ -1,35 +1,13 @@
 #include "../public/rhi.hpp"
 
+#include "vulkan/vulkan_device.hpp"
+
 namespace aeg::rhi {
-    const char *result_code_name(ResultCode code) noexcept {
-        switch (code) {
-            case ResultCode::kSuccess:
-                return "Success";
-            case ResultCode::kInvalidArgument:
-                return "InvalidArgument";
-            case ResultCode::kInvalidState:
-                return "InvalidState";
-            case ResultCode::kUnsupported:
-                return "Unsupported";
-            case ResultCode::kNotFound:
-                return "NotFound";
-            case ResultCode::kOutOfMemory:
-                return "OutOfMemory";
-            case ResultCode::kTimeout:
-                return "Timeout";
-            case ResultCode::kDeviceLost:
-                return "DeviceLost";
-            case ResultCode::kBackendError:
-                return "BackendError";
-            case ResultCode::kNotReady:
-                return "NotReady";
-            case ResultCode::kOutOfDate:
-                return "OutOfDate";
-            case ResultCode::kSurfaceLost:
-                return "SurfaceLost";
-            case ResultCode::kUnknown:
-                return "Unknown";
+    ResultValue<std::unique_ptr<Device> > create_device(const DeviceCreateDesc &desc) {
+        switch (desc.backend) {
+            case BackendType::kVulkan:
+                return create_vulkan_device(desc);
         }
-        return "Unknown";
+        return {Result::failure(ResultCode::kUnsupported, "Requested RHI backend is unavailable"), nullptr};
     }
 } // namespace aeg::rhi
