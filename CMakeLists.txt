@@ -5,6 +5,10 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+if (MSVC)
+    add_compile_options(/Zc:preprocessor)
+endif()
+
 option(AEG_RHI_ENABLE_VALIDATION "Compile RHI validation support" ON)
 option(AEG_RHI_ENABLE_DEBUG "Compile RHI debug support" ${AEG_RHI_ENABLE_VALIDATION})
 option(AEG_RHI_ENABLE_DEBUG_NAMES "Compile RHI object debug-name support" ${AEG_RHI_ENABLE_DEBUG})
@@ -209,7 +213,12 @@ endif()
 
 # The runtime RHI links only production backends.
 add_library(aeg_rhi INTERFACE)
-target_link_libraries(aeg_rhi INTERFACE aeg_rhi_core aeg_rhi_vulkan)
+if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+    target_link_libraries(aeg_rhi INTERFACE
+        "$<LINK_GROUP:RESCAN,aeg_rhi_core,aeg_rhi_vulkan>")
+else()
+    target_link_libraries(aeg_rhi INTERFACE aeg_rhi_core aeg_rhi_vulkan)
+endif()
 
 add_library(aeg_render_graph STATIC
     Engine/RenderGraph/private/frame_context.cpp
@@ -226,6 +235,26 @@ if (MSVC)
     target_compile_options(aeg_render_graph PRIVATE /W4 /permissive-)
 else()
     target_compile_options(aeg_render_graph PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+set(AEG_RESOURCE_PUBLIC_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/Engine/Resource/public")
+
+add_library(aeg_resource STATIC
+    Engine/Resource/private/mesh.cpp
+    Engine/Resource/private/resource_uploader.cpp
+)
+target_compile_features(aeg_resource PUBLIC cxx_std_20)
+target_include_directories(aeg_resource
+    PUBLIC
+        ${AEG_RESOURCE_PUBLIC_DIR}
+)
+target_link_libraries(aeg_resource PUBLIC aeg_foundation aeg_render_graph)
+
+if (MSVC)
+    target_compile_options(aeg_resource PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(aeg_resource PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
 add_executable(aeg_rhi_smoke
@@ -255,7 +284,7 @@ if (WIN32)
         tests/shaders/triangle.vert
         tests/shaders/triangle.frag
     )
-    target_link_libraries(aeg_triangle PRIVATE aeg_rhi aeg_math user32 gdi32)
+    target_link_libraries(aeg_triangle PRIVATE aeg_rhi aeg_math aeg_resource user32 gdi32)
     target_compile_definitions(aeg_triangle PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 

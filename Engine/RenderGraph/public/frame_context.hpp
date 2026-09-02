@@ -46,6 +46,7 @@ namespace aeg::render_graph {
         uint32_t frame_slot{std::numeric_limits<uint32_t>::max()};
         uint64_t frame_number{0};
         uint64_t context_cookie{0};
+        uint64_t buffer_size{0};
 
         [[nodiscard]] bool is_valid() const noexcept {
             return buffer.is_valid() && size != 0 && frame_slot != std::numeric_limits<uint32_t>::max() &&

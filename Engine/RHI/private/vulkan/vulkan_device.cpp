@@ -1119,13 +1119,19 @@ namespace aeg::rhi {
                     result.stages = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
                 }
             }
-            if (state.discard_contents) {
-                result.layout = image ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_UNDEFINED;
-                result.stages = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
-                result.access = 0;
-                result.stages2 = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
-                result.access2 = 0;
+            return result;
+        }
+
+        [[nodiscard]] VulkanResourceState to_vk_discard_source_state(const ResourceState &state,
+                                                                      bool image) {
+            VulkanResourceState result = to_vk_resource_state(state, image);
+            if (image) {
+                result.layout = VK_IMAGE_LAYOUT_UNDEFINED;
             }
+            result.stages = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+            result.access = 0;
+            result.stages2 = VK_PIPELINE_STAGE_2_NONE;
+            result.access2 = 0;
             return result;
         }
 
@@ -1318,6 +1324,7 @@ namespace aeg::rhi {
             uint64_t size{0};
             ResourceState before{};
             ResourceState after{};
+            bool discard_contents{false};
             uint32_t source_family{kInvalidIndex};
             uint32_t destination_family{kInvalidIndex};
             QueueOwnershipPhase phase{QueueOwnershipPhase::kNone};
@@ -1328,6 +1335,7 @@ namespace aeg::rhi {
             VkImageSubresourceRange range{};
             ResourceState before{};
             ResourceState after{};
+            bool discard_contents{false};
             uint32_t source_family{kInvalidIndex};
             uint32_t destination_family{kInvalidIndex};
             QueueOwnershipPhase phase{QueueOwnershipPhase::kNone};
@@ -2815,7 +2823,8 @@ namespace aeg::rhi {
                         return existing->buffer == transfer.buffer && existing->offset == transfer.offset &&
                                existing->size == transfer.size && existing->source_family == transfer.source_family &&
                                existing->destination_family == transfer.destination_family &&
-                               existing->before == transfer.before && existing->after == transfer.after;
+                               existing->before == transfer.before && existing->after == transfer.after &&
+                               existing->discard_contents == transfer.discard_contents;
                     });
             if (!duplicate) {
                 batch.buffers.push_back(&transfer);
@@ -2832,7 +2841,8 @@ namespace aeg::rhi {
                                existing->range.layerCount == transfer.range.layerCount &&
                                existing->source_family == transfer.source_family &&
                                existing->destination_family == transfer.destination_family &&
-                               existing->before == transfer.before && existing->after == transfer.after;
+                               existing->before == transfer.before && existing->after == transfer.after &&
+                               existing->discard_contents == transfer.discard_contents;
                     });
             if (!duplicate) {
                 batch.textures.push_back(&transfer);
@@ -2924,7 +2934,9 @@ namespace aeg::rhi {
                 if (resource == nullptr) {
                     return Result::failure(ResultCode::kNotFound, "Ownership transfer references a destroyed buffer");
                 }
-                const VulkanResourceState source = to_vk_resource_state(transfer->before, false);
+                const VulkanResourceState source = transfer->discard_contents
+                                                           ? to_vk_discard_source_state(transfer->before, false)
+                                                           : to_vk_resource_state(transfer->before, false);
                 VkBufferMemoryBarrier2 barrier{};
                 barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
                 barrier.srcStageMask = source.stages2;
@@ -2956,7 +2968,9 @@ namespace aeg::rhi {
                 if (resource == nullptr) {
                     return Result::failure(ResultCode::kNotFound, "Ownership transfer references a destroyed texture");
                 }
-                const VulkanResourceState source = to_vk_resource_state(transfer->before, true);
+                const VulkanResourceState source = transfer->discard_contents
+                                                           ? to_vk_discard_source_state(transfer->before, true)
+                                                           : to_vk_resource_state(transfer->before, true);
                 const VulkanResourceState destination = to_vk_resource_state(transfer->after, true);
                 VkImageMemoryBarrier2 barrier{};
                 barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
@@ -3562,7 +3576,8 @@ namespace aeg::rhi {
             TextureResource texture_resource{};
             texture_resource.image = vk_images[index];
             texture_resource.desc = texture_desc;
-            texture_resource.state.usage = ResourceUsage::kUndefined;
+            texture_resource.state.usage = ResourceUsage::kPresent;
+            texture_resource.state.shader_stages = ShaderStage::kAll;
             texture_resource.state.queue = QueueClass::kGraphics;
             texture_resource.state.pipeline_stages = PipelineStage::kAllCommands;
             texture_resource.subresource_states.assign(kAspectPlaneCount, texture_resource.state);
@@ -4458,6 +4473,7 @@ namespace aeg::rhi {
             uint64_t size{0};
             ResourceState before{};
             ResourceState after{};
+            bool discard_contents{false};
             bool before_queue_explicit{false};
             bool after_queue_explicit{false};
         };
@@ -4466,6 +4482,7 @@ namespace aeg::rhi {
             VkImageSubresourceRange range{};
             ResourceState before{};
             ResourceState after{};
+            bool discard_contents{false};
             std::vector<uint32_t> state_indices{};
             bool before_queue_explicit{false};
             bool after_queue_explicit{false};
@@ -4531,13 +4548,16 @@ namespace aeg::rhi {
                 return Result::failure(ResultCode::kInvalidState,
                                        "Buffer barrier before-state does not match the tracked state");
             }
-            const ResourceState after = normalize_after_state(barrier.after);
+            ResourceState after = normalize_after_state(barrier.after);
+            const bool discard_contents = after.discard_contents;
+            after.discard_contents = false;
             resolved_buffers.push_back(ResolvedBufferBarrier{
                 barrier.buffer,
                 barrier.offset,
                 barrier.size == std::numeric_limits<uint64_t>::max() ? resource->size - barrier.offset : barrier.size,
                 barrier.before,
                 after,
+                discard_contents,
                 barrier.before.queue != QueueClass::kAuto,
                 barrier.after.queue != QueueClass::kAuto
             });
@@ -4559,7 +4579,9 @@ namespace aeg::rhi {
             const uint32_t layer_count = barrier.subresources.layer_count == kRemaining
                                              ? resource->desc.array_layers - barrier.subresources.base_layer
                                              : barrier.subresources.layer_count;
-            const ResourceState after = normalize_after_state(barrier.after);
+            ResourceState after = normalize_after_state(barrier.after);
+            const bool discard_contents = after.discard_contents;
+            after.discard_contents = false;
             std::array<Aspect, 3> aspects{Aspect::kColor, Aspect::kDepth, Aspect::kStencil};
             for (const Aspect aspect: aspects) {
                 if (!has_flag(barrier.subresources.aspects, aspect)) {
@@ -4597,6 +4619,7 @@ namespace aeg::rhi {
                                                range,
                                                barrier.before,
                                                after,
+                                               discard_contents,
                                                std::move(indices),
                                                barrier.before.queue != QueueClass::kAuto,
                                                barrier.after.queue != QueueClass::kAuto});
@@ -4634,9 +4657,12 @@ namespace aeg::rhi {
         VkPipelineStageFlags legacy_source_stages = 0;
         VkPipelineStageFlags legacy_destination_stages = 0;
         for (const ResolvedBufferBarrier &resolved: resolved_buffers) {
-            const VulkanResourceState source = to_vk_resource_state(resolved.before, false);
+            const VulkanResourceState source = resolved.discard_contents
+                                                       ? to_vk_discard_source_state(resolved.before, false)
+                                                       : to_vk_resource_state(resolved.before, false);
             const VulkanResourceState destination = to_vk_resource_state(resolved.after, false);
-            if (source.access2 == destination.access2 && source.stages2 == destination.stages2 &&
+            if (!resolved.discard_contents && source.access2 == destination.access2 &&
+                source.stages2 == destination.stages2 &&
                 resolved.before.queue == resolved.after.queue) {
                 continue;
             }
@@ -4678,6 +4704,7 @@ namespace aeg::rhi {
                                                  resolved.size,
                                                  resolved.before,
                                                  resolved.after,
+                                                 resolved.discard_contents,
                                                  source_family,
                                                  destination_family,
                                                  QueueOwnershipPhase::kAcquire});
@@ -4685,9 +4712,12 @@ namespace aeg::rhi {
         }
 
         for (const ResolvedTextureBarrier &resolved: resolved_textures) {
-            const VulkanResourceState source = to_vk_resource_state(resolved.before, true);
+            const VulkanResourceState source = resolved.discard_contents
+                                                       ? to_vk_discard_source_state(resolved.before, true)
+                                                       : to_vk_resource_state(resolved.before, true);
             const VulkanResourceState destination = to_vk_resource_state(resolved.after, true);
-            if (source.layout == destination.layout && source.access2 == destination.access2 &&
+            if (!resolved.discard_contents && source.layout == destination.layout &&
+                source.access2 == destination.access2 &&
                 source.stages2 == destination.stages2 && resolved.before.queue == resolved.after.queue) {
                 continue;
             }
@@ -4730,6 +4760,7 @@ namespace aeg::rhi {
                                                   resolved.range,
                                                   resolved.before,
                                                   resolved.after,
+                                                  resolved.discard_contents,
                                                   source_family,
                                                   destination_family,
                                                   QueueOwnershipPhase::kAcquire});
@@ -6933,6 +6964,7 @@ namespace aeg::rhi {
         ResourceState state{};
         state.usage = ResourceUsage::kVertexInput;
         state.queue = command->queue;
+        state.shader_stages = ShaderStage::kVertex;
         state.pipeline_stages = PipelineStage::kVertexInput;
         const Result transition_result = transition_buffer(*command, buffer, offset,
                                                             std::numeric_limits<uint64_t>::max(), state);
@@ -6975,6 +7007,7 @@ namespace aeg::rhi {
         ResourceState state{};
         state.usage = ResourceUsage::kIndexInput;
         state.queue = command->queue;
+        state.shader_stages = ShaderStage::kVertex;
         state.pipeline_stages = PipelineStage::kVertexInput;
         const Result transition_result = transition_buffer(*command, buffer, offset,
                                                             std::numeric_limits<uint64_t>::max(), state);

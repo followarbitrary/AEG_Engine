@@ -14,6 +14,8 @@
 #include <logging.hpp>
 #include <memory>
 #include <math.hpp>
+#include <render_graph.hpp>
+#include <resource_uploader.hpp>
 #include <rhi.hpp>
 #include <span>
 #include <string_view>
@@ -24,15 +26,11 @@ namespace {
     using aeg::rhi::BufferCapability;
     using aeg::rhi::BufferDesc;
     using aeg::rhi::BufferHandle;
-    using aeg::rhi::ColorAttachmentDesc;
-    using aeg::rhi::CommandListDesc;
-    using aeg::rhi::CommandListHandle;
     using aeg::rhi::Device;
     using aeg::rhi::DeviceCreateDesc;
-    using aeg::rhi::DrawDesc;
+    using aeg::rhi::DrawIndexedDesc;
     using aeg::rhi::Format;
     using aeg::rhi::FrameAcquireResult;
-    using aeg::rhi::FrameSubmitDesc;
     using aeg::rhi::GraphicsPipelineState;
     using aeg::rhi::InlineConstantRange;
     using aeg::rhi::LoadOp;
@@ -41,33 +39,35 @@ namespace {
     using aeg::rhi::PipelineHandle;
     using aeg::rhi::PipelineStage;
     using aeg::rhi::PipelineType;
-    using aeg::rhi::PresentDesc;
     using aeg::rhi::PresentMode;
     using aeg::rhi::PrimitiveTopology;
     using aeg::rhi::QueueClass;
-    using aeg::rhi::RenderingDesc;
     using aeg::rhi::ResourceUsage;
     using aeg::foundation::Result;
     using aeg::foundation::ResultCode;
-    using aeg::rhi::ScissorRect;
     using aeg::rhi::ShaderStage;
     using aeg::rhi::ShaderStageDesc;
-    using aeg::rhi::StoreOp;
     using aeg::rhi::SurfaceDesc;
     using aeg::rhi::SurfaceHandle;
     using aeg::rhi::SwapchainDesc;
     using aeg::rhi::SwapchainHandle;
     using aeg::rhi::SwapchainInfo;
-    using aeg::rhi::TextureViewHandle;
     using aeg::rhi::VertexAttributeDesc;
     using aeg::rhi::VertexBindingDesc;
     using aeg::rhi::VertexInputRate;
     using aeg::rhi::Viewport;
     using aeg::math::ClipSpaceConvention;
     using aeg::math::Mat4;
-    using aeg::math::Quat;
     using aeg::math::Transform;
     using aeg::math::Vec3;
+    using aeg::render_graph::FrameContext;
+    using aeg::render_graph::PassExecutionContext;
+    using aeg::render_graph::PassBuilder;
+    using aeg::render_graph::RenderGraph;
+    using aeg::render_graph::RenderGraphBuffer;
+    using aeg::resource::GpuMesh;
+    using aeg::resource::MeshData;
+    using aeg::resource::ResourceUploader;
 
     bool check_result(const Result &result, std::string_view operation) {
         if (result) {
@@ -97,6 +97,8 @@ namespace {
         Vertex{{0.75f, 0.65f}, {0.2f, 1.0f, 0.3f, 1.0f}},
         Vertex{{-0.75f, 0.65f}, {0.2f, 0.4f, 1.0f, 1.0f}},
     };
+
+    constexpr std::array<uint16_t, 3> kTriangleIndices{0, 1, 2};
 
     struct WindowState {
         HWND handle{nullptr};
@@ -191,7 +193,13 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
             }
             surface_ = surface_result.value;
 
-            if (!create_swapchain() || !create_vertex_buffer() || !create_command_list() || !create_pipeline()) {
+            if (!create_swapchain()) {
+                return false;
+            }
+            frame_context_ = std::make_unique<FrameContext>(*device_);
+            render_graph_ = std::make_unique<RenderGraph>(*device_);
+            resource_uploader_ = std::make_unique<ResourceUploader>(*device_);
+            if (!create_mesh() || !create_pipeline()) {
                 return false;
             }
             return true;
@@ -224,20 +232,22 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
                     continue;
                 }
 
-                if (command_list_recorded_) {
-                    if (!check_result(device_->reset_command_list(command_list_), "reset_command_list")) {
-                        return 1;
-                    }
-                    command_list_recorded_ = false;
+                if (!check_result(frame_context_->begin_frame(), "begin_frame")) {
+                    return 1;
                 }
 
-                auto acquire_result = device_->acquire_next_image(swapchain_);
+                auto acquire_result = frame_context_->acquire_next_image(swapchain_);
                 if (!acquire_result) {
+                    const Result abort_result = frame_context_->abort_frame();
                     if (acquire_result.result.code == ResultCode::kOutOfDate) {
                         window_state_.resize_pending = true;
+                        if (!check_result(abort_result, "abort_out_of_date_frame")) {
+                            return 1;
+                        }
                         continue;
                     }
                     check_result(acquire_result, "acquire_next_image");
+                    (void) abort_result;
                     return 1;
                 }
                 const FrameAcquireResult &acquired = acquire_result.value;
@@ -246,38 +256,32 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
                 }
 
                 if (!record_frame(acquired)) {
-                    (void) device_->cancel_frame(acquired.frame);
+                    (void) frame_context_->abort_frame();
                     return 1;
                 }
 
-                const std::array<CommandListHandle, 1> command_lists{command_list_};
-                FrameSubmitDesc submit_desc{};
-                submit_desc.frame = acquired.frame;
-                submit_desc.queue = QueueClass::kGraphics;
-                submit_desc.command_lists = command_lists;
-                auto submit_result = device_->submit_frame(submit_desc);
-                if (!check_result(submit_result, "submit_frame")) {
-                    (void) device_->cancel_frame(acquired.frame);
+                auto execution_result = render_graph_->execute(
+                        *frame_context_, aeg::render_graph::RenderGraphExecuteDesc{true});
+                if (!execution_result) {
+                    if (execution_result.result.code == ResultCode::kOutOfDate ||
+                        execution_result.result.code == ResultCode::kSurfaceLost) {
+                        window_state_.resize_pending = true;
+                        (void) frame_context_->abort_frame();
+                        render_graph_->reset();
+                        continue;
+                    }
+                    check_result(execution_result, "execute_render_graph");
                     return 1;
                 }
-                command_list_recorded_ = true;
-
-                PresentDesc present_desc{};
-                present_desc.frame = acquired.frame;
-                auto present_result = device_->present(present_desc);
-                if (!present_result && present_result.result.code != ResultCode::kOutOfDate) {
-                    check_result(present_result, "present");
-                    return 1;
-                }
-                if (present_result.result.code == ResultCode::kOutOfDate ||
-                    (present_result && present_result.value.suboptimal)) {
+                if (execution_result.value.suboptimal) {
                     window_state_.resize_pending = true;
                 }
-
-                if (!check_result(device_->wait(submit_result.value.completion, std::numeric_limits<uint64_t>::max()),
-                                  "wait_frame")) {
+                if (!check_result(frame_context_->end_frame(), "end_frame")) {
                     return 1;
                 }
+                render_graph_->reset();
+                mesh_vertex_state_ = mesh_vertex_graphics_state_;
+                mesh_index_state_ = mesh_index_graphics_state_;
 
                 rotation_angle_ += 0.02f;
                 ++frame_count;
@@ -322,12 +326,6 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
             if (!check_result(device_->wait_idle(), "wait_idle_before_recreate")) {
                 return false;
             }
-            if (command_list_recorded_) {
-                if (!check_result(device_->reset_command_list(command_list_), "reset_command_list_before_recreate")) {
-                    return false;
-                }
-                command_list_recorded_ = false;
-            }
 
             const Format previous_format = color_format_;
             SwapchainDesc swapchain_desc{};
@@ -344,6 +342,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
             if (!update_swapchain_info()) {
                 return false;
             }
+            render_graph_->reset();
             if (previous_format != color_format_) {
                 if (!check_result(device_->destroy_pipeline(pipeline_), "destroy_pipeline_for_recreate")) {
                     return false;
@@ -354,35 +353,72 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
             return true;
         }
 
-        [[nodiscard]] bool create_vertex_buffer() {
-            BufferDesc buffer_desc{};
-            buffer_desc.size = sizeof(kTriangleVertices);
-            buffer_desc.capabilities = BufferCapability::kVertex;
-            buffer_desc.memory = MemoryClass::kUpload;
-            buffer_desc.initial_usage = ResourceUsage::kVertexInput;
-            buffer_desc.initial_stages = PipelineStage::kVertexInput;
-            buffer_desc.initial_queue = QueueClass::kGraphics;
-            buffer_desc.name = aeg::rhi::DebugName{"Triangle.VertexBuffer"};
-            auto buffer_result = device_->create_buffer(buffer_desc);
-            if (!check_result(buffer_result, "create_vertex_buffer")) {
+        [[nodiscard]] bool create_mesh() {
+            const MeshData mesh_data{
+                std::as_bytes(std::span{kTriangleVertices}),
+                sizeof(Vertex),
+                static_cast<uint32_t>(kTriangleVertices.size()),
+                std::as_bytes(std::span{kTriangleIndices}),
+                aeg::rhi::IndexFormat::kUint16,
+                static_cast<uint32_t>(kTriangleIndices.size())
+            };
+            if (!check_result(frame_context_->begin_frame(), "begin_mesh_upload_frame")) {
                 return false;
             }
-            vertex_buffer_ = buffer_result.value;
 
-            const std::span<const std::byte> vertex_bytes = std::as_bytes(std::span{kTriangleVertices});
-            return check_result(device_->write_buffer(vertex_buffer_, 0, vertex_bytes), "write_vertex_buffer");
-        }
-
-        [[nodiscard]] bool create_command_list() {
-            CommandListDesc command_desc{};
-            command_desc.queue = QueueClass::kGraphics;
-            command_desc.one_time_submit = true;
-            command_desc.name = aeg::rhi::DebugName{"Triangle.CommandList"};
-            auto command_result = device_->create_command_list(command_desc);
-            if (!check_result(command_result, "create_command_list")) {
+            auto upload_result = resource_uploader_->upload_mesh(
+                    *frame_context_, *render_graph_, mesh_data, "Triangle.Mesh");
+            if (!check_result(upload_result, "upload_mesh")) {
+                (void) frame_context_->abort_frame();
                 return false;
             }
-            command_list_ = command_result.value;
+
+            GpuMesh uploaded_mesh = upload_result.value.mesh;
+            auto execution_result = render_graph_->execute(*frame_context_);
+            if (!check_result(execution_result, "execute_mesh_upload")) {
+                (void) device_->wait_idle();
+                (void) resource_uploader_->destroy_mesh(uploaded_mesh);
+                return false;
+            }
+            if (execution_result.value.completion.is_valid() &&
+                !check_result(device_->wait(execution_result.value.completion,
+                                             std::numeric_limits<uint64_t>::max()),
+                              "wait_mesh_upload")) {
+                (void) resource_uploader_->destroy_mesh(uploaded_mesh);
+                (void) frame_context_->abort_frame();
+                return false;
+            }
+            if (!check_result(frame_context_->end_frame(), "end_mesh_upload_frame")) {
+                (void) device_->wait_idle();
+                (void) resource_uploader_->destroy_mesh(uploaded_mesh);
+                return false;
+            }
+
+            mesh_ = uploaded_mesh;
+            mesh_upload_state_ = aeg::rhi::ResourceState{
+                ResourceUsage::kCopyDestination,
+                ShaderStage::kAll,
+                QueueClass::kCopy,
+                false,
+                PipelineStage::kCopy
+            };
+            mesh_vertex_graphics_state_ = aeg::rhi::ResourceState{
+                ResourceUsage::kVertexInput,
+                ShaderStage::kVertex,
+                QueueClass::kGraphics,
+                false,
+                PipelineStage::kVertexInput
+            };
+            mesh_index_graphics_state_ = aeg::rhi::ResourceState{
+                ResourceUsage::kIndexInput,
+                ShaderStage::kVertex,
+                QueueClass::kGraphics,
+                false,
+                PipelineStage::kVertexInput
+            };
+            mesh_vertex_state_ = mesh_upload_state_;
+            mesh_index_state_ = mesh_upload_state_;
+            render_graph_->reset();
             return true;
         }
 
@@ -446,49 +482,144 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
                 60.0f * aeg::math::kPi / 180.0f, aspect_ratio, 0.1f, 100.0f, ClipSpaceConvention{true, false});
             model_view_projection_ = projection * view * model;
 
-            if (!check_result(device_->begin_command_list(command_list_), "begin_command_list")) {
+            render_graph_->reset();
+
+            BufferDesc vertex_desc{};
+            vertex_desc.size = sizeof(kTriangleVertices);
+            vertex_desc.capabilities = BufferCapability::kTransferDestination | BufferCapability::kVertex;
+            vertex_desc.memory = MemoryClass::kDeviceLocal;
+            vertex_desc.name = aeg::rhi::DebugName{"Triangle.VertexBuffer"};
+            auto vertex_resource_result = render_graph_->import_buffer(
+                    mesh_.vertex_buffer, vertex_desc, mesh_vertex_state_);
+            if (!check_result(vertex_resource_result, "import_vertex_buffer")) {
                 return false;
             }
 
-            ColorAttachmentDesc color_attachment{};
-            color_attachment.view = acquired.image.view;
-            color_attachment.load_op = LoadOp::kClear;
-            color_attachment.store_op = StoreOp::kStore;
-            color_attachment.clear_color = {0.025f, 0.035f, 0.06f, 1.0f};
-            color_attachment.final_usage = ResourceUsage::kPresent;
-            const std::array<ColorAttachmentDesc, 1> color_attachments{color_attachment};
-
-            RenderingDesc rendering_desc{};
-            rendering_desc.color_attachments = color_attachments;
-            rendering_desc.name = aeg::rhi::DebugName{"Triangle.Rendering"};
-            if (!check_result(device_->begin_rendering(command_list_, rendering_desc), "begin_rendering")) {
+            BufferDesc index_desc{};
+            index_desc.size = static_cast<uint64_t>(mesh_.index_count) *
+                              (mesh_.index_format == aeg::rhi::IndexFormat::kUint16 ? sizeof(uint16_t)
+                                                                                     : sizeof(uint32_t));
+            index_desc.capabilities = BufferCapability::kTransferDestination | BufferCapability::kIndex;
+            index_desc.memory = MemoryClass::kDeviceLocal;
+            index_desc.name = aeg::rhi::DebugName{"Triangle.IndexBuffer"};
+            auto index_resource_result = render_graph_->import_buffer(
+                    mesh_.index_buffer, index_desc, mesh_index_state_);
+            if (!check_result(index_resource_result, "import_index_buffer")) {
                 return false;
             }
 
-            const Viewport viewport{
-                0.0f,
-                0.0f,
-                static_cast<float>(swapchain_info_.extent.width),
-                static_cast<float>(swapchain_info_.extent.height),
-                0.0f,
-                1.0f
+            aeg::rhi::TextureDesc color_desc{};
+            color_desc.extent = {swapchain_info_.extent.width, swapchain_info_.extent.height, 1};
+            color_desc.format = color_format_;
+            color_desc.capabilities = aeg::rhi::TextureCapability::kColorAttachment;
+            color_desc.memory = MemoryClass::kDeviceLocal;
+            color_desc.initial_usage = ResourceUsage::kPresent;
+            color_desc.initial_stages = PipelineStage::kAllCommands;
+            color_desc.initial_queue = QueueClass::kGraphics;
+            color_desc.name = aeg::rhi::DebugName{"Triangle.SwapchainImage"};
+            const aeg::rhi::ResourceState present_state{
+                ResourceUsage::kPresent,
+                ShaderStage::kAll,
+                QueueClass::kGraphics,
+                false,
+                PipelineStage::kAllCommands
             };
-            const ScissorRect scissor{0, 0, swapchain_info_.extent.width, swapchain_info_.extent.height};
-            if (!check_result(device_->set_viewport(command_list_, viewport), "set_viewport") ||
-                !check_result(device_->set_scissor(command_list_, scissor), "set_scissor") ||
-                !check_result(device_->bind_pipeline(command_list_, pipeline_), "bind_pipeline") ||
-                !check_result(device_->set_inline_constants(command_list_, 0, ShaderStage::kVertex,
-                                                            std::as_bytes(std::span{&model_view_projection_, 1})),
-                              "set_inline_constants") ||
-                !check_result(device_->bind_vertex_buffer(command_list_, 0, vertex_buffer_),
-                              "bind_vertex_buffer") ||
-                !check_result(device_->draw(command_list_, DrawDesc{3, 1, 0, 0}), "draw")) {
+            auto color_resource_result = render_graph_->import_swapchain_image(acquired, color_desc, present_state);
+            if (!check_result(color_resource_result, "import_swapchain_image")) {
                 return false;
             }
-            if (!check_result(device_->end_rendering(command_list_), "end_rendering")) {
+
+            const RenderGraphBuffer vertex_resource = vertex_resource_result.value;
+            const RenderGraphBuffer index_resource = index_resource_result.value;
+            const auto color_resource = color_resource_result.value;
+            auto pass_result = render_graph_->add_pass(
+                    "Triangle.Graphics", QueueClass::kGraphics,
+                    [vertex_resource, index_resource, color_resource](PassBuilder &builder) {
+                        if (const Result result = builder.read(vertex_resource, ResourceUsage::kVertexInput,
+                                                               PipelineStage::kVertexInput, ShaderStage::kVertex,
+                                                               {});
+                            !result) {
+                            return result;
+                        }
+                        if (const Result result = builder.read(index_resource, ResourceUsage::kIndexInput,
+                                                               PipelineStage::kVertexInput, ShaderStage::kVertex,
+                                                               {});
+                            !result) {
+                            return result;
+                        }
+                        if (const Result result = builder.use_color_attachment(
+                                    color_resource, LoadOp::kClear, aeg::rhi::StoreOp::kStore,
+                                    aeg::rhi::ClearColorValue{0.025f, 0.035f, 0.06f, 1.0f},
+                                    ResourceUsage::kPresent);
+                            !result) {
+                            return result;
+                        }
+                        builder.set_side_effects();
+                        return Result::success();
+                    },
+                    [this, vertex_resource, index_resource](PassExecutionContext &context) {
+                        auto vertex_buffer_result = context.buffer(vertex_resource);
+                        if (!vertex_buffer_result) {
+                            return vertex_buffer_result.result;
+                        }
+                        auto index_buffer_result = context.buffer(index_resource);
+                        if (!index_buffer_result) {
+                            return index_buffer_result.result;
+                        }
+                        if (const Result result = context.begin_rendering(); !result) {
+                            return result;
+                        }
+
+                        const Viewport viewport{
+                            0.0f,
+                            0.0f,
+                            static_cast<float>(swapchain_info_.extent.width),
+                            static_cast<float>(swapchain_info_.extent.height),
+                            0.0f,
+                            1.0f
+                        };
+                        const aeg::rhi::ScissorRect scissor{
+                            0, 0, swapchain_info_.extent.width, swapchain_info_.extent.height
+                        };
+                        if (const Result result = context.device().set_viewport(context.command_list(), viewport);
+                            !result) {
+                            return result;
+                        }
+                        if (const Result result = context.device().set_scissor(context.command_list(), scissor);
+                            !result) {
+                            return result;
+                        }
+                        if (const Result result = context.device().bind_pipeline(context.command_list(), pipeline_);
+                            !result) {
+                            return result;
+                        }
+                        if (const Result result = context.device().set_inline_constants(
+                                    context.command_list(), 0, ShaderStage::kVertex,
+                                    std::as_bytes(std::span{&model_view_projection_, 1}));
+                            !result) {
+                            return result;
+                        }
+                        if (const Result result = context.device().bind_vertex_buffer(
+                                    context.command_list(), 0, vertex_buffer_result.value);
+                            !result) {
+                            return result;
+                        }
+                        if (const Result result = context.device().bind_index_buffer(
+                                    context.command_list(), index_buffer_result.value, 0, mesh_.index_format);
+                            !result) {
+                            return result;
+                        }
+                        if (const Result result = context.device().draw_indexed(
+                                    context.command_list(), DrawIndexedDesc{mesh_.index_count, 1, 0, 0, 0});
+                            !result) {
+                            return result;
+                        }
+                        return context.end_rendering();
+                    });
+            if (!check_result(pass_result, "add_triangle_pass")) {
                 return false;
             }
-            return check_result(device_->end_command_list(command_list_), "end_command_list");
+            return true;
         }
 
         void cleanup() {
@@ -496,18 +627,16 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
                 return;
             }
             (void) device_->wait_idle();
-            if (command_list_.is_valid()) {
-                (void) device_->destroy_command_list(command_list_);
-                command_list_ = {};
+            render_graph_.reset();
+            if (resource_uploader_ != nullptr && mesh_.is_valid()) {
+                (void) resource_uploader_->destroy_mesh(mesh_);
             }
             if (pipeline_.is_valid()) {
                 (void) device_->destroy_pipeline(pipeline_);
                 pipeline_ = {};
             }
-            if (vertex_buffer_.is_valid()) {
-                (void) device_->destroy_buffer(vertex_buffer_);
-                vertex_buffer_ = {};
-            }
+            frame_context_.reset();
+            resource_uploader_.reset();
             if (swapchain_.is_valid()) {
                 (void) device_->destroy_swapchain(swapchain_);
                 swapchain_ = {};
@@ -522,16 +651,22 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
         HWND window_{nullptr};
         WindowState &window_state_;
         std::unique_ptr<Device> device_{};
+        std::unique_ptr<FrameContext> frame_context_{};
+        std::unique_ptr<RenderGraph> render_graph_{};
+        std::unique_ptr<ResourceUploader> resource_uploader_{};
         SurfaceHandle surface_{};
         SwapchainHandle swapchain_{};
         SwapchainInfo swapchain_info_{};
-        BufferHandle vertex_buffer_{};
+        GpuMesh mesh_{};
         PipelineHandle pipeline_{};
-        CommandListHandle command_list_{};
         Format color_format_{Format::kUnknown};
+        aeg::rhi::ResourceState mesh_upload_state_{};
+        aeg::rhi::ResourceState mesh_vertex_graphics_state_{};
+        aeg::rhi::ResourceState mesh_index_graphics_state_{};
+        aeg::rhi::ResourceState mesh_vertex_state_{};
+        aeg::rhi::ResourceState mesh_index_state_{};
         Mat4 model_view_projection_{};
         float rotation_angle_{0.0f};
-        bool command_list_recorded_{false};
     };
 
     uint32_t parse_frame_limit(int argc, char **argv) {

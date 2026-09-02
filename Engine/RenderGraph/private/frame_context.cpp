@@ -510,7 +510,8 @@ namespace aeg::render_graph {
         }
         chunk.offset = end;
         return {foundation::Result::success(),
-                FrameAllocation{chunk.buffer, offset, size, current_slot_, frame_number_ - 1, context_cookie_}};
+                FrameAllocation{chunk.buffer, offset, size, current_slot_, frame_number_ - 1, context_cookie_,
+                                chunk.capacity}};
     }
 
     foundation::Result FrameContext::validate_allocation(const FrameAllocation& allocation) const noexcept {
@@ -563,7 +564,8 @@ namespace aeg::render_graph {
         }
         chunk.offset = end;
         return {foundation::Result::success(),
-                FrameAllocation{chunk.buffer, offset, size, current_slot_, frame_number_ - 1, context_cookie_}};
+                FrameAllocation{chunk.buffer, offset, size, current_slot_, frame_number_ - 1, context_cookie_,
+                                chunk.capacity}};
     }
 
     foundation::Result FrameContext::read_readback(const FrameAllocation& allocation, std::span<std::byte> data) {
