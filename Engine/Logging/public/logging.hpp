@@ -20,87 +20,92 @@
 #include <utility>
 
 namespace aeg::logging {
-enum class Level : uint8_t { kTrace, kDebug, kInfo, kNotice, kWarning, kError, kCritical, kOff };
+    enum class Level : uint8_t { kTrace, kDebug, kInfo, kNotice, kWarning, kError, kCritical, kOff };
 
-enum class Category : uint8_t { kCore, kRhi, kRenderGraph, kResource, kApplication, kShader, kAsset, kTest, kCount };
+    enum class Category : uint8_t {
+        kCore, kRhi, kRenderGraph, kResource, kApplication, kShader, kAsset, kTest, kCount
+    };
 
-inline constexpr std::size_t kCategoryCount = static_cast<std::size_t>(Category::kCount);
+    inline constexpr std::size_t kCategoryCount = static_cast<std::size_t>(Category::kCount);
 
 #if defined(NDEBUG)
-inline constexpr Level kDefaultRuntimeLevel = Level::kInfo;
+    inline constexpr Level kDefaultRuntimeLevel = Level::kInfo;
 #else
-inline constexpr Level kDefaultRuntimeLevel = Level::kDebug;
+    inline constexpr Level kDefaultRuntimeLevel = Level::kDebug;
 #endif
 
-struct Config {
-    Level default_level{kDefaultRuntimeLevel};
-    std::array<std::optional<Level>, kCategoryCount> category_levels{};
+    struct Config {
+        Level default_level{kDefaultRuntimeLevel};
+        std::array<std::optional<Level>, kCategoryCount> category_levels{};
 
-    bool console_enabled{true};
-    bool console_colors{true};
+        bool console_enabled{true};
+        bool console_colors{true};
 
-    bool file_enabled{false};
-    std::filesystem::path file_path{"logs/aeg-engine.log"};
-    std::size_t file_rotation_bytes{16u * 1024u * 1024u};
-    uint32_t file_max_backup_files{4};
-    bool rotate_file_on_startup{false};
+        bool file_enabled{false};
+        std::filesystem::path file_path{"logs/aeg-engine.log"};
+        std::size_t file_rotation_bytes{16u * 1024u * 1024u};
+        uint32_t file_max_backup_files{4};
+        bool rotate_file_on_startup{false};
 
-    bool immediate_flush{false};
-    uint32_t immediate_flush_every_n_messages{1};
+        bool immediate_flush{false};
+        uint32_t immediate_flush_every_n_messages{1};
 
-    std::string format_pattern{
-        "%(time) [%(thread_id)] %(logger:<12) %(log_level:<9) "
-        "%(short_source_location:<36) %(message)%(mdc)"};
-    std::string timestamp_pattern{"%Y-%m-%d %H:%M:%S.%Qms"};
-    std::string source_location_path_strip_prefix{};
-    bool use_utc_timestamps{false};
-};
+        std::string format_pattern{
+            "%(time) [%(thread_id)] %(logger:<12) %(log_level:<9) "
+            "%(short_source_location:<36) %(message)%(mdc)"
+        };
+        std::string timestamp_pattern{"%Y-%m-%d %H:%M:%S.%Qms"};
+        std::string source_location_path_strip_prefix{};
+        bool use_utc_timestamps{false};
+    };
 
-struct Status {
-    bool succeeded{true};
-    std::string message{};
+    struct Status {
+        bool succeeded{true};
+        std::string message{};
 
-    [[nodiscard]] explicit operator bool() const noexcept { return succeeded; }
+        [[nodiscard]] explicit operator bool() const noexcept { return succeeded; }
 
-    [[nodiscard]] static Status success() { return {}; }
+        [[nodiscard]] static Status success() { return {}; }
 
-    [[nodiscard]] static Status failure(std::string error_message) { return Status{false, std::move(error_message)}; }
-};
+        [[nodiscard]] static Status failure(std::string error_message) {
+            return Status{false, std::move(error_message)};
+        }
+    };
 
-[[nodiscard]] std::string_view category_name(Category category) noexcept;
+    [[nodiscard]] std::string_view category_name(Category category) noexcept;
 
-[[nodiscard]] Status initialize(const Config& config = {});
+    [[nodiscard]] Status initialize(const Config &config = {});
 
-void shutdown() noexcept;
+    void shutdown() noexcept;
 
-void flush() noexcept;
+    void flush() noexcept;
 
-[[nodiscard]] bool is_initialized() noexcept;
+    [[nodiscard]] bool is_initialized() noexcept;
 
-[[nodiscard]] bool set_category_level(Category category, Level level) noexcept;
+    [[nodiscard]] bool set_category_level(Category category, Level level) noexcept;
 
-[[nodiscard]] Level category_level(Category category) noexcept;
+    [[nodiscard]] Level category_level(Category category) noexcept;
 
-void set_thread_context(std::string_view key, std::string_view value) noexcept;
+    void set_thread_context(std::string_view key, std::string_view value) noexcept;
 
-void erase_thread_context(std::string_view key) noexcept;
+    void erase_thread_context(std::string_view key) noexcept;
 
-void clear_thread_context() noexcept;
+    void clear_thread_context() noexcept;
 
-namespace detail {
-struct QuillFrontendOptions : quill::FrontendOptions {
-    // A bounded blocking queue keeps logging lossless while placing an upper
-    // bound on per-thread memory use during bursts.
-    static constexpr quill::QueueType kQueueType = quill::QueueType::BoundedBlocking;
-    static constexpr std::size_t kInitialQueueCapacity = 256u * 1024u;
-    static constexpr uint32_t kBlockingQueueRetryIntervalNs = 1000u;
-};
+    namespace detail {
+        struct QuillFrontendOptions : quill::FrontendOptions {
+            // A bounded blocking queue keeps logging lossless while placing an upper
+            // bound on per-thread memory use during bursts.
+            static constexpr quill::QueueType kQueueType = quill::QueueType::BoundedBlocking;
+            static constexpr std::size_t kInitialQueueCapacity = 256u * 1024u;
+            static constexpr uint32_t kBlockingQueueRetryIntervalNs = 1000u;
+        };
 
-using QuillLogger = quill::LoggerImpl<QuillFrontendOptions>;
+        using QuillLogger = quill::LoggerImpl<QuillFrontendOptions>;
 
-[[nodiscard]] QuillLogger* logger(Category category) noexcept;
-}  // namespace detail
-}  // namespace aeg::logging
+        [[nodiscard]] QuillLogger *logger(Category category) noexcept;
+    } // namespace detail
+} // namespace aeg::logging
 
 // Keep compile-time filtering in Quill's macro layer. Disabled levels are
 // removed before argument evaluation and therefore have no runtime overhead.

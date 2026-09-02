@@ -12,20 +12,20 @@
 #endif
 
 namespace {
-[[nodiscard]] bool contains(const std::string& text, const char* marker) {
-    return text.find(marker) != std::string::npos;
-}
-}  // namespace
+    [[nodiscard]] bool contains(const std::string &text, const char *marker) {
+        return text.find(marker) != std::string::npos;
+    }
+} // namespace
 
 int main() {
     const auto process_id =
 #if defined(_WIN32)
-        static_cast<unsigned long long>(_getpid());
+            static_cast<unsigned long long>(_getpid());
 #else
-        static_cast<unsigned long long>(getpid());
+    static_cast<unsigned long long>(getpid());
 #endif
     const std::filesystem::path test_directory =
-        std::filesystem::temp_directory_path() / ("aeg-engine-logging-smoke-" + std::to_string(process_id));
+            std::filesystem::temp_directory_path() / ("aeg-engine-logging-smoke-" + std::to_string(process_id));
     const std::filesystem::path log_path = test_directory / "logging.log";
 
     std::error_code error;

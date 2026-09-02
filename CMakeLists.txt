@@ -5,9 +5,12 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-option(AEG_RHI_ENABLE_VALIDATION "Compile Vulkan validation-layer support" ON)
-option(AEG_RHI_ENABLE_DEBUG_UTILS "Compile Vulkan debug-utils support" ${AEG_RHI_ENABLE_VALIDATION})
-option(AEG_RHI_ENABLE_DEBUG_NAMES "Compile Vulkan object debug-name support" ${AEG_RHI_ENABLE_DEBUG_UTILS})
+option(AEG_RHI_ENABLE_VALIDATION "Compile RHI validation support" ON)
+option(AEG_RHI_ENABLE_DEBUG "Compile RHI debug support" ${AEG_RHI_ENABLE_VALIDATION})
+option(AEG_RHI_ENABLE_DEBUG_NAMES "Compile RHI object debug-name support" ${AEG_RHI_ENABLE_DEBUG})
+option(AEG_VULKAN_ENABLE_VALIDATION "Compile Vulkan validation-layer support" ${AEG_RHI_ENABLE_VALIDATION})
+option(AEG_VULKAN_ENABLE_DEBUG_UTILS "Compile Vulkan debug-utils support" ${AEG_RHI_ENABLE_DEBUG})
+option(AEG_VULKAN_ENABLE_DEBUG_NAMES "Compile Vulkan object debug-name support" ${AEG_RHI_ENABLE_DEBUG_NAMES})
 
 set(AEG_LOG_COMPILE_LEVEL "Auto" CACHE STRING
     "Compile-time minimum log level (Auto, Trace, Debug, Info, Notice, Warning, Error, Critical, Off)")
@@ -47,9 +50,14 @@ else()
         "Expected Auto, Trace, Debug, Info, Notice, Warning, Error, Critical, or Off.")
 endif()
 
-if (AEG_RHI_ENABLE_DEBUG_NAMES AND NOT AEG_RHI_ENABLE_DEBUG_UTILS)
+if (AEG_RHI_ENABLE_DEBUG_NAMES AND NOT AEG_RHI_ENABLE_DEBUG)
     message(FATAL_ERROR
-        "AEG_RHI_ENABLE_DEBUG_NAMES requires AEG_RHI_ENABLE_DEBUG_UTILS=ON")
+        "AEG_RHI_ENABLE_DEBUG_NAMES requires AEG_RHI_ENABLE_DEBUG=ON")
+endif()
+
+if (AEG_VULKAN_ENABLE_DEBUG_NAMES AND NOT AEG_VULKAN_ENABLE_DEBUG_UTILS)
+    message(FATAL_ERROR
+        "AEG_VULKAN_ENABLE_DEBUG_NAMES requires AEG_VULKAN_ENABLE_DEBUG_UTILS=ON")
 endif()
 
 find_package(Vulkan REQUIRED)
@@ -105,35 +113,56 @@ if (NOT EXISTS "${AEG_VMA_INCLUDE_DIR}/vk_mem_alloc.h")
         "${AEG_VMA_INCLUDE_DIR}/vk_mem_alloc.h")
 endif()
 
-add_library(aeg_rhi STATIC
+add_library(aeg_rhi_core STATIC
+        Engine/RHI/private/rhi_factory.cpp
+)
+
+target_compile_features(aeg_rhi_core PUBLIC cxx_std_20)
+target_compile_definitions(aeg_rhi_core
+    PUBLIC
+        AEG_RHI_ENABLE_VALIDATION=$<BOOL:${AEG_RHI_ENABLE_VALIDATION}>
+        AEG_RHI_ENABLE_DEBUG=$<BOOL:${AEG_RHI_ENABLE_DEBUG}>
+        AEG_RHI_ENABLE_DEBUG_NAMES=$<BOOL:${AEG_RHI_ENABLE_DEBUG_NAMES}>
+)
+target_include_directories(aeg_rhi_core
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RHI/public
+)
+
+add_library(aeg_rhi_vulkan STATIC
+        Engine/RHI/private/vulkan/vulkan_factory.cpp
         Engine/RHI/private/vulkan/vulkan_device.cpp
         Engine/RHI/private/vulkan/vma_impl.cpp
 )
 
-target_compile_features(aeg_rhi PUBLIC cxx_std_20)
-target_compile_definitions(aeg_rhi
-    PUBLIC
-        AEG_RHI_ENABLE_VALIDATION=$<BOOL:${AEG_RHI_ENABLE_VALIDATION}>
-        AEG_RHI_ENABLE_DEBUG_UTILS=$<BOOL:${AEG_RHI_ENABLE_DEBUG_UTILS}>
-        AEG_RHI_ENABLE_DEBUG_NAMES=$<BOOL:${AEG_RHI_ENABLE_DEBUG_NAMES}>
+target_compile_features(aeg_rhi_vulkan PUBLIC cxx_std_20)
+target_compile_definitions(aeg_rhi_vulkan
     PRIVATE
+        AEG_VULKAN_ENABLE_VALIDATION=$<BOOL:${AEG_VULKAN_ENABLE_VALIDATION}>
+        AEG_VULKAN_ENABLE_DEBUG_UTILS=$<BOOL:${AEG_VULKAN_ENABLE_DEBUG_UTILS}>
+        AEG_VULKAN_ENABLE_DEBUG_NAMES=$<BOOL:${AEG_VULKAN_ENABLE_DEBUG_NAMES}>
         VMA_VULKAN_VERSION=1003000
 )
 if (WIN32)
-    target_compile_definitions(aeg_rhi PRIVATE VK_USE_PLATFORM_WIN32_KHR NOMINMAX)
+    target_compile_definitions(aeg_rhi_vulkan PRIVATE VK_USE_PLATFORM_WIN32_KHR NOMINMAX)
 endif()
-target_include_directories(aeg_rhi
-    PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RHI/public
+target_include_directories(aeg_rhi_vulkan
+    SYSTEM PRIVATE
+        ${AEG_VMA_INCLUDE_DIR}
 )
-target_include_directories(aeg_rhi SYSTEM PRIVATE ${AEG_VMA_INCLUDE_DIR})
-target_link_libraries(aeg_rhi PUBLIC aeg_logging Vulkan::Vulkan)
+target_link_libraries(aeg_rhi_vulkan PUBLIC aeg_rhi_core aeg_logging Vulkan::Vulkan)
 
 if (MSVC)
-    target_compile_options(aeg_rhi PRIVATE /W4 /permissive-)
+    target_compile_options(aeg_rhi_core PRIVATE /W4 /permissive-)
+    target_compile_options(aeg_rhi_vulkan PRIVATE /W4 /permissive-)
 else()
-    target_compile_options(aeg_rhi PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(aeg_rhi_core PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(aeg_rhi_vulkan PRIVATE -Wall -Wextra -Wpedantic)
 endif()
+
+# The selected backend provides the generic create_device implementation.
+add_library(aeg_rhi INTERFACE)
+target_link_libraries(aeg_rhi INTERFACE aeg_rhi_vulkan)
 
 add_executable(aeg_rhi_smoke
     tests/rhi_smoke.cpp
@@ -155,13 +184,25 @@ if (WIN32)
     target_compile_definitions(aeg_logging_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
+if (WIN32)
+    add_executable(aeg_triangle
+        tests/triangle.cpp
+        tests/triangle_shaders.hpp
+        tests/shaders/triangle.vert
+        tests/shaders/triangle.frag
+    )
+    target_link_libraries(aeg_triangle PRIVATE aeg_rhi user32 gdi32)
+    target_compile_definitions(aeg_triangle PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
 include(CTest)
 if (BUILD_TESTING)
     add_test(NAME aeg_rhi_smoke COMMAND aeg_rhi_smoke)
     add_test(NAME aeg_logging_smoke COMMAND aeg_logging_smoke)
+    add_test(NAME aeg_triangle COMMAND aeg_triangle)
     if (MINGW)
         get_filename_component(AEG_MINGW_RUNTIME_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
-        set_tests_properties(aeg_rhi_smoke aeg_logging_smoke PROPERTIES
+        set_tests_properties(aeg_rhi_smoke aeg_logging_smoke aeg_triangle PROPERTIES
             ENVIRONMENT "PATH=${AEG_MINGW_RUNTIME_DIR};$ENV{PATH}"
         )
     endif()

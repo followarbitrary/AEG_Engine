@@ -7,33 +7,55 @@
 #include <string_view>
 
 namespace {
-bool check(const aeg::rhi::Result& result, std::string_view operation) {
-    if (result) {
-        return true;
+    bool check(const aeg::rhi::Result &result, std::string_view operation) {
+        if (result) {
+            return true;
+        }
+        AEG_LOG_ERROR(aeg::logging::Category::kTest, "{} failed [{}]: {}", operation,
+                      aeg::rhi::result_code_name(result.code), result.message);
+        return false;
     }
-    AEG_LOG_ERROR(aeg::logging::Category::kTest, "{} failed [{}]: {}", operation,
-                  aeg::rhi::result_code_name(result.code), result.message);
-    return false;
-}
 
-template <typename T>
-bool check(const aeg::rhi::ResultValue<T>& result, std::string_view operation) {
-    return check(result.result, operation);
-}
-
-bool expect_code(const aeg::rhi::Result& result, aeg::rhi::ResultCode expected, std::string_view operation) {
-    if (result.code == expected) {
-        return true;
+    template<typename T>
+    bool check(const aeg::rhi::ResultValue<T> &result, std::string_view operation) {
+        return check(result.result, operation);
     }
-    AEG_LOG_ERROR(aeg::logging::Category::kTest, "{} returned [{}] instead of [{}]: {}", operation,
-                  aeg::rhi::result_code_name(result.code), aeg::rhi::result_code_name(expected), result.message);
-    return false;
-}
 
-struct LoggingGuard {
-    ~LoggingGuard() { aeg::logging::shutdown(); }
-};
-}  // namespace
+    bool expect_code(const aeg::rhi::Result &result, aeg::rhi::ResultCode expected, std::string_view operation) {
+        if (result.code == expected) {
+            return true;
+        }
+        AEG_LOG_ERROR(aeg::logging::Category::kTest, "{} returned [{}] instead of [{}]: {}", operation,
+                      aeg::rhi::result_code_name(result.code), aeg::rhi::result_code_name(expected), result.message);
+        return false;
+    }
+
+    struct LoggingGuard {
+        ~LoggingGuard() { aeg::logging::shutdown(); }
+    };
+
+    constexpr std::array<uint32_t, 88> kComputeShader{
+        0x07230203u, 0x00010000u, 0x000d000bu, 0x0000000au, 0x00000000u, 0x00020011u, 0x00000001u, 0x0006000bu,
+        0x00000001u,
+        0x4c534c47u, 0x6474732eu, 0x3035342eu, 0x00000000u, 0x0003000eu, 0x00000000u, 0x00000001u, 0x0005000fu,
+        0x00000005u,
+        0x00000004u, 0x6e69616du, 0x00000000u, 0x00060010u, 0x00000004u, 0x00000011u, 0x00000001u, 0x00000001u,
+        0x00000001u,
+        0x00030003u, 0x00000002u, 0x000001c2u, 0x000a0004u, 0x475f4c47u, 0x4c474f4fu, 0x70635f45u, 0x74735f70u,
+        0x5f656c79u,
+        0x656e696cu, 0x7269645fu, 0x69746365u, 0x00006576u, 0x00080004u, 0x475f4c47u, 0x4c474f4fu, 0x6e695f45u,
+        0x64756c63u,
+        0x69645f65u, 0x74636572u, 0x006576u, 0x00040005u, 0x00000004u, 0x6e69616du, 0x00000000u, 0x00040047u,
+        0x00000009u,
+        0x0000000bu, 0x00000019u, 0x00020013u, 0x00000002u, 0x00030021u, 0x00000003u, 0x00000002u, 0x00040015u,
+        0x00000006u,
+        0x00000020u, 0x00000000u, 0x00040017u, 0x00000007u, 0x00000006u, 0x00000003u, 0x0004002bu, 0x00000006u,
+        0x00000008u,
+        0x00000001u, 0x0006002cu, 0x00000007u, 0x00000009u, 0x00000008u, 0x00000008u, 0x00000008u, 0x00050036u,
+        0x00000002u,
+        0x00000004u, 0x00000000u, 0x00000003u, 0x000200f8u, 0x00000005u, 0x000100fdu, 0x00010038u,
+    };
+} // namespace
 
 int main() {
     const aeg::logging::Status logging_status = aeg::logging::initialize();
@@ -47,21 +69,18 @@ int main() {
     DeviceCreateDesc device_desc{};
     device_desc.application_name = "AEG RHI Smoke";
 
-    auto device_result = create_vulkan_device(device_desc);
-    if (!check(device_result, "create_vulkan_device")) {
+    auto device_result = create_device(device_desc);
+    if (!check(device_result, "create_device")) {
         return 1;
     }
     std::unique_ptr<Device> device = std::move(device_result.value);
 
-    AEG_LOG_INFO(aeg::logging::Category::kTest, "GPU: {}", device->capabilities().device_name);
-    const uint32_t api_version = device->capabilities().api_version;
-    AEG_LOG_INFO(aeg::logging::Category::kTest, "Vulkan API: {}.{}.{}", api_version >> 22u,
-                 (api_version >> 12u) & 0x3ffu, api_version & 0xfffu);
+    AEG_LOG_INFO(aeg::logging::Category::kTest, "GPU: {}", device->capabilities().adapter_name);
 
     BufferDesc buffer_desc{};
     buffer_desc.size = 256;
     buffer_desc.capabilities =
-        BufferCapability::kUniform | BufferCapability::kTexel | BufferCapability::kTransferDestination;
+            BufferCapability::kUniform | BufferCapability::kTypedView | BufferCapability::kTransferDestination;
     buffer_desc.memory = MemoryClass::kUpload;
     buffer_desc.name = DebugName{"Smoke.Buffer"};
     auto buffer_result = device->create_buffer(buffer_desc);
@@ -133,7 +152,7 @@ int main() {
     layout_entries[2].type = BindingType::kUniformBuffer;
     layout_entries[2].shader_stages = ShaderStage::kVertex | ShaderStage::kFragment;
     layout_entries[3].location = {0, 3};
-    layout_entries[3].type = BindingType::kUniformTexelBuffer;
+    layout_entries[3].type = BindingType::kReadOnlyTypedBuffer;
     layout_entries[3].shader_stages = ShaderStage::kFragment;
 
     BindingLayoutDesc layout_desc{};
@@ -144,6 +163,23 @@ int main() {
         return 1;
     }
     const BindingLayoutHandle layout = layout_result.value;
+
+    ShaderStageDesc compute_stage{};
+    compute_stage.stage = ShaderStage::kCompute;
+    compute_stage.code = std::as_bytes(std::span{kComputeShader});
+    compute_stage.name = DebugName{"Smoke.ComputeShader"};
+    const std::array<ShaderStageDesc, 1> pipeline_stages{compute_stage};
+    const std::array<BindingLayoutHandle, 1> pipeline_layouts{layout};
+    PipelineDesc pipeline_desc{};
+    pipeline_desc.type = PipelineType::kCompute;
+    pipeline_desc.layout.binding_layouts = pipeline_layouts;
+    pipeline_desc.shader_stages = pipeline_stages;
+    pipeline_desc.name = DebugName{"Smoke.ComputePipeline"};
+    auto pipeline_result = device->create_pipeline(pipeline_desc);
+    if (!check(pipeline_result, "create_compute_pipeline")) {
+        return 1;
+    }
+    const PipelineHandle pipeline = pipeline_result.value;
 
     auto set_result = device->create_binding_set(layout);
     if (!check(set_result, "create_binding_set")) {
@@ -162,7 +198,7 @@ int main() {
     writes[2].resource.type = BindingType::kUniformBuffer;
     writes[2].resource.buffer_range = {buffer, 0, 64};
     writes[3].location = {0, 3};
-    writes[3].resource.type = BindingType::kUniformTexelBuffer;
+    writes[3].resource.type = BindingType::kReadOnlyTypedBuffer;
     writes[3].resource.buffer_view = buffer_view;
     if (!check(device->update_binding_set(set, writes), "update_binding_set")) {
         return 1;
@@ -184,7 +220,11 @@ int main() {
     }
     const CommandListHandle command_list = command_result.value;
     if (!check(device->begin_command_list(command_list), "begin_command_list") ||
+        !check(device->bind_pipeline(command_list, pipeline), "bind_pipeline") ||
         !check(device->end_command_list(command_list), "end_command_list")) {
+        return 1;
+    }
+    if (!expect_code(device->destroy_pipeline(pipeline), ResultCode::kInvalidState, "destroy bound pipeline")) {
         return 1;
     }
 
@@ -240,6 +280,7 @@ int main() {
 
     if (!check(device->destroy_command_list(command_list), "destroy_command_list") ||
         !check(device->destroy_command_list(copy_command_list), "destroy_copy_command_list") ||
+        !check(device->destroy_pipeline(pipeline), "destroy_pipeline") ||
         !check(device->destroy_binding_set(set), "destroy_binding_set") ||
         !check(device->destroy_binding_layout(layout), "destroy_binding_layout") ||
         !check(device->destroy_sampler(sampler), "destroy_sampler") ||
