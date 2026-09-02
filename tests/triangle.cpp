@@ -13,6 +13,7 @@
 #include <limits>
 #include <logging.hpp>
 #include <memory>
+#include <math.hpp>
 #include <rhi.hpp>
 #include <span>
 #include <string_view>
@@ -33,6 +34,7 @@ namespace {
     using aeg::rhi::FrameAcquireResult;
     using aeg::rhi::FrameSubmitDesc;
     using aeg::rhi::GraphicsPipelineState;
+    using aeg::rhi::InlineConstantRange;
     using aeg::rhi::LoadOp;
     using aeg::rhi::MemoryClass;
     using aeg::rhi::PipelineDesc;
@@ -60,6 +62,11 @@ namespace {
     using aeg::rhi::VertexBindingDesc;
     using aeg::rhi::VertexInputRate;
     using aeg::rhi::Viewport;
+    using aeg::math::ClipSpaceConvention;
+    using aeg::math::Mat4;
+    using aeg::math::Quat;
+    using aeg::math::Transform;
+    using aeg::math::Vec3;
 
     bool check_result(const Result &result, std::string_view operation) {
         if (result) {
@@ -85,9 +92,9 @@ namespace {
     };
 
     constexpr std::array<Vertex, 3> kTriangleVertices{
-        Vertex{{0.0f, -0.72f}, {1.0f, 0.2f, 0.2f, 1.0f}},
-        Vertex{{0.72f, 0.64f}, {0.2f, 1.0f, 0.3f, 1.0f}},
-        Vertex{{-0.72f, 0.64f}, {0.2f, 0.4f, 1.0f, 1.0f}},
+        Vertex{{0.0f, -0.75f}, {1.0f, 0.2f, 0.2f, 1.0f}},
+        Vertex{{0.75f, 0.65f}, {0.2f, 1.0f, 0.3f, 1.0f}},
+        Vertex{{-0.75f, 0.65f}, {0.2f, 0.4f, 1.0f, 1.0f}},
     };
 
     struct WindowState {
@@ -271,6 +278,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
                     return 1;
                 }
 
+                rotation_angle_ += 0.02f;
                 ++frame_count;
                 if (frame_limit != 0 && frame_count >= frame_limit) {
                     break;
@@ -401,8 +409,13 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
             graphics_state.cull_mode = aeg::rhi::CullMode::kNone;
             graphics_state.color_formats = color_formats;
 
+            const std::array<InlineConstantRange, 1> inline_constant_ranges{
+                InlineConstantRange{ShaderStage::kVertex, 0, sizeof(Mat4)}
+            };
+
             PipelineDesc pipeline_desc{};
             pipeline_desc.type = PipelineType::kGraphics;
+            pipeline_desc.layout.inline_constant_ranges = inline_constant_ranges;
             pipeline_desc.shader_stages = shader_stages;
             pipeline_desc.graphics = graphics_state;
             pipeline_desc.name = aeg::rhi::DebugName{"Triangle.GraphicsPipeline"};
@@ -415,6 +428,20 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
         }
 
         [[nodiscard]] bool record_frame(const FrameAcquireResult &acquired) {
+            const float aspect_ratio = static_cast<float>(swapchain_info_.extent.width) /
+                                       static_cast<float>(swapchain_info_.extent.height);
+            const Transform object_transform{
+                Vec3{0.0f, 0.0f, 0.0f},
+                aeg::math::quat_from_axis_angle(Vec3{0.0f, 0.0f, 1.0f}, rotation_angle_),
+                Vec3{1.0f, 1.0f, 1.0f}
+            };
+            const Mat4 model = object_transform.to_matrix();
+            const Mat4 view = aeg::math::look_at(Vec3{0.0f, 0.0f, 3.0f}, Vec3{0.0f, 0.0f, 0.0f},
+                                                 Vec3{0.0f, 1.0f, 0.0f});
+            const Mat4 projection = aeg::math::perspective(
+                60.0f * aeg::math::kPi / 180.0f, aspect_ratio, 0.1f, 100.0f, ClipSpaceConvention{true, false});
+            model_view_projection_ = projection * view * model;
+
             if (!check_result(device_->begin_command_list(command_list_), "begin_command_list")) {
                 return false;
             }
@@ -446,7 +473,11 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
             if (!check_result(device_->set_viewport(command_list_, viewport), "set_viewport") ||
                 !check_result(device_->set_scissor(command_list_, scissor), "set_scissor") ||
                 !check_result(device_->bind_pipeline(command_list_, pipeline_), "bind_pipeline") ||
-                !check_result(device_->bind_vertex_buffer(command_list_, 0, vertex_buffer_), "bind_vertex_buffer") ||
+                !check_result(device_->set_inline_constants(command_list_, 0, ShaderStage::kVertex,
+                                                            std::as_bytes(std::span{&model_view_projection_, 1})),
+                              "set_inline_constants") ||
+                !check_result(device_->bind_vertex_buffer(command_list_, 0, vertex_buffer_),
+                              "bind_vertex_buffer") ||
                 !check_result(device_->draw(command_list_, DrawDesc{3, 1, 0, 0}), "draw")) {
                 return false;
             }
@@ -494,6 +525,8 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
         PipelineHandle pipeline_{};
         CommandListHandle command_list_{};
         Format color_format_{Format::kUnknown};
+        Mat4 model_view_projection_{};
+        float rotation_angle_{0.0f};
         bool command_list_recorded_{false};
     };
 

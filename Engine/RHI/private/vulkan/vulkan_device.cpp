@@ -1124,6 +1124,7 @@ namespace aeg::rhi {
             VkPipelineLayout layout{VK_NULL_HANDLE};
             PipelineType type{PipelineType::kGraphics};
             std::vector<BindingLayoutHandle> binding_layouts{};
+            std::vector<InlineConstantRange> inline_constant_ranges{};
         };
 
         struct CommandListResource {
@@ -1162,7 +1163,6 @@ namespace aeg::rhi {
 
         struct FrameSlot {
             VkSemaphore image_available{VK_NULL_HANDLE};
-            VkSemaphore render_finished{VK_NULL_HANDLE};
             VkFence in_flight{VK_NULL_HANDLE};
             uint32_t image_index{kRemaining};
             bool acquired{false};
@@ -1179,6 +1179,7 @@ namespace aeg::rhi {
             VkPresentModeKHR present_mode{VK_PRESENT_MODE_FIFO_KHR};
             VkExtent2D extent{};
             std::vector<SwapchainImage> images{};
+            std::vector<VkSemaphore> render_finished{};
             std::vector<uint32_t> image_in_flight_frame{};
             std::vector<FrameSlot> frames{};
             uint32_t current_frame{0};
@@ -1266,6 +1267,10 @@ namespace aeg::rhi {
             [[nodiscard]] Result set_scissor(CommandListHandle command_list, const ScissorRect &scissor) override;
 
             [[nodiscard]] Result bind_pipeline(CommandListHandle command_list, PipelineHandle pipeline) override;
+
+            [[nodiscard]] Result set_inline_constants(CommandListHandle command_list, uint32_t offset,
+                                                      ShaderStageMask shader_stages,
+                                                      std::span<const std::byte> data) override;
 
             [[nodiscard]] Result bind_vertex_buffer(CommandListHandle command_list, uint32_t binding,
                                                     BufferHandle buffer,
@@ -2169,21 +2174,12 @@ namespace aeg::rhi {
             return make_vulkan_result(result, "vkCreateSemaphore(imageAvailable)");
         }
 
-        result = vkCreateSemaphore(device_, &semaphore_info, nullptr, &frame.render_finished);
-        if (result != VK_SUCCESS) {
-            vkDestroySemaphore(device_, frame.image_available, nullptr);
-            frame.image_available = VK_NULL_HANDLE;
-            return make_vulkan_result(result, "vkCreateSemaphore(renderFinished)");
-        }
-
         VkFenceCreateInfo fence_info{};
         fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
         fence_info.flags = VK_FENCE_CREATE_SIGNALED_BIT;
         result = vkCreateFence(device_, &fence_info, nullptr, &frame.in_flight);
         if (result != VK_SUCCESS) {
-            vkDestroySemaphore(device_, frame.render_finished, nullptr);
             vkDestroySemaphore(device_, frame.image_available, nullptr);
-            frame.render_finished = VK_NULL_HANDLE;
             frame.image_available = VK_NULL_HANDLE;
             return make_vulkan_result(result, "vkCreateFence(frame)");
         }
@@ -2196,15 +2192,11 @@ namespace aeg::rhi {
             if (frame.image_available != VK_NULL_HANDLE) {
                 vkDestroySemaphore(device_, frame.image_available, nullptr);
             }
-            if (frame.render_finished != VK_NULL_HANDLE) {
-                vkDestroySemaphore(device_, frame.render_finished, nullptr);
-            }
             if (frame.in_flight != VK_NULL_HANDLE) {
                 vkDestroyFence(device_, frame.in_flight, nullptr);
             }
         }
         frame.image_available = VK_NULL_HANDLE;
-        frame.render_finished = VK_NULL_HANDLE;
         frame.in_flight = VK_NULL_HANDLE;
         frame.image_index = kRemaining;
         frame.acquired = false;
@@ -2217,6 +2209,16 @@ namespace aeg::rhi {
             destroy_frame_slot_sync(frame);
         }
         resource.frames.clear();
+
+        if (device_ != VK_NULL_HANDLE) {
+            for (VkSemaphore &semaphore: resource.render_finished) {
+                if (semaphore != VK_NULL_HANDLE) {
+                    vkDestroySemaphore(device_, semaphore, nullptr);
+                }
+                semaphore = VK_NULL_HANDLE;
+            }
+        }
+        resource.render_finished.clear();
 
         for (const SwapchainImage &image: resource.images) {
             if (TextureViewResource *view = texture_views_.get(image.view); view != nullptr) {
@@ -2551,6 +2553,18 @@ namespace aeg::rhi {
             return error;
         }
         vk_images.resize(actual_image_count);
+
+        VkSemaphoreCreateInfo semaphore_info{};
+        semaphore_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+        resource.render_finished.resize(vk_images.size(), VK_NULL_HANDLE);
+        for (VkSemaphore &semaphore: resource.render_finished) {
+            result = vkCreateSemaphore(device_, &semaphore_info, nullptr, &semaphore);
+            if (result != VK_SUCCESS) {
+                const Result error = make_vulkan_result(result, "vkCreateSemaphore(renderFinished)");
+                destroy_swapchain_native(resource);
+                return error;
+            }
+        }
 
         const uint32_t frame_count = std::min(desc.frames_in_flight, actual_image_count);
         if (frame_count == 0) {
@@ -3040,13 +3054,22 @@ namespace aeg::rhi {
             wait_values.push_back(wait.point.value);
         }
 
+        if (desc.frame.image_index >= resource->render_finished.size() ||
+            resource->render_finished[desc.frame.image_index] == VK_NULL_HANDLE) {
+            return {
+                Result::failure(ResultCode::kInvalidState, "Swapchain render-finished semaphore is unavailable"), {}
+            };
+        }
+
         const VkResult reset_result = vkResetFences(device_, 1, &frame.in_flight);
         if (reset_result != VK_SUCCESS) {
             return {make_vulkan_result(reset_result, "vkResetFences(submitFrame)"), {}};
         }
 
         const uint64_t signal_value = queue->next_signal_value;
-        const std::array<VkSemaphore, 2> signal_semaphores{frame.render_finished, queue->timeline};
+        const std::array<VkSemaphore, 2> signal_semaphores{
+            resource->render_finished[desc.frame.image_index], queue->timeline
+        };
         const std::array<uint64_t, 2> signal_values{0, signal_value};
 
         VkTimelineSemaphoreSubmitInfo timeline_info{};
@@ -3098,7 +3121,16 @@ namespace aeg::rhi {
             return {Result::failure(ResultCode::kInvalidState, "Swapchain presentation queue is unavailable"), {}};
         }
 
-        const std::array<VkSemaphore, 1> wait_semaphores{frame.render_finished};
+        if (desc.frame.image_index >= resource->render_finished.size() ||
+            resource->render_finished[desc.frame.image_index] == VK_NULL_HANDLE) {
+            return {
+                Result::failure(ResultCode::kInvalidState, "Swapchain render-finished semaphore is unavailable"), {}
+            };
+        }
+
+        const std::array<VkSemaphore, 1> wait_semaphores{
+            resource->render_finished[desc.frame.image_index]
+        };
         const std::array<VkSwapchainKHR, 1> swapchains{resource->swapchain};
         const std::array<uint32_t, 1> image_indices{desc.frame.image_index};
         VkPresentInfoKHR present_info{};
@@ -3831,6 +3863,8 @@ namespace aeg::rhi {
         resource.layout = pipeline_layout;
         resource.type = desc.type;
         resource.binding_layouts = std::move(binding_layouts);
+        resource.inline_constant_ranges.assign(desc.layout.inline_constant_ranges.begin(),
+                                               desc.layout.inline_constant_ranges.end());
 
         if (is_compute) {
             VkComputePipelineCreateInfo pipeline_info{};
@@ -5041,6 +5075,54 @@ namespace aeg::rhi {
                       pipeline) == command_resource->referenced_pipelines.end()) {
             command_resource->referenced_pipelines.push_back(pipeline);
         }
+        return Result::success();
+    }
+
+    Result VulkanDevice::set_inline_constants(CommandListHandle command_list, uint32_t offset,
+                                              ShaderStageMask shader_stages,
+                                              std::span<const std::byte> data) {
+        CommandListResource* command = command_lists_.get(command_list);
+        if (command == nullptr) {
+            return Result::failure(ResultCode::kNotFound, "Invalid command list handle");
+        }
+        if (!command->recording) {
+            return Result::failure(ResultCode::kInvalidState,
+                                   "Inline constants can only be set while recording a command list");
+        }
+        if (!command->bound_pipeline.is_valid()) {
+            return Result::failure(ResultCode::kInvalidState, "Inline constants require a bound pipeline");
+        }
+        if (data.empty() || (offset % 4u) != 0 || (data.size() % 4u) != 0 ||
+            data.size() > std::numeric_limits<uint32_t>::max() ||
+            offset > std::numeric_limits<uint32_t>::max() - data.size()) {
+            return Result::failure(ResultCode::kInvalidArgument,
+                                   "Inline constant offset and size must be non-zero and four-byte aligned");
+        }
+
+        const PipelineResource* pipeline = pipelines_.get(command->bound_pipeline);
+        if (pipeline == nullptr) {
+            return Result::failure(ResultCode::kInvalidState, "Bound pipeline no longer exists");
+        }
+        const VkShaderStageFlags vk_shader_stages = to_vk_shader_stages(shader_stages);
+        if (vk_shader_stages == 0) {
+            return Result::failure(ResultCode::kInvalidArgument, "Inline constants require at least one shader stage");
+        }
+
+        const uint32_t size = static_cast<uint32_t>(data.size());
+        const bool covered = std::any_of(
+            pipeline->inline_constant_ranges.begin(), pipeline->inline_constant_ranges.end(),
+            [offset, size, shader_stages](const InlineConstantRange& range) {
+                if (range.offset > offset || range.size < size || offset - range.offset > range.size - size) {
+                    return false;
+                }
+                return has_flag(range.shader_stages, shader_stages);
+            });
+        if (!covered) {
+            return Result::failure(ResultCode::kInvalidArgument,
+                                   "Inline constant write is not covered by the bound pipeline layout");
+        }
+
+        vkCmdPushConstants(command->command_buffer, pipeline->layout, vk_shader_stages, offset, size, data.data());
         return Result::success();
     }
 

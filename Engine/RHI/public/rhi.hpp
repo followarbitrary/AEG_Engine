@@ -84,6 +84,10 @@ namespace aeg::rhi {
 
         [[nodiscard]] virtual Result bind_pipeline(CommandListHandle command_list, PipelineHandle pipeline) = 0;
 
+        [[nodiscard]] virtual Result set_inline_constants(CommandListHandle command_list, uint32_t offset,
+                                                          ShaderStageMask shader_stages,
+                                                          std::span<const std::byte> data) = 0;
+
         [[nodiscard]] virtual Result bind_vertex_buffer(CommandListHandle command_list, uint32_t binding,
                                                         BufferHandle buffer, uint64_t offset = 0) = 0;
 

@@ -11,6 +11,7 @@ option(AEG_RHI_ENABLE_DEBUG_NAMES "Compile RHI object debug-name support" ${AEG_
 option(AEG_VULKAN_ENABLE_VALIDATION "Compile Vulkan validation-layer support" ${AEG_RHI_ENABLE_VALIDATION})
 option(AEG_VULKAN_ENABLE_DEBUG_UTILS "Compile Vulkan debug-utils support" ${AEG_RHI_ENABLE_DEBUG})
 option(AEG_VULKAN_ENABLE_DEBUG_NAMES "Compile Vulkan object debug-name support" ${AEG_RHI_ENABLE_DEBUG_NAMES})
+option(AEG_MATH_ENABLE_SIMD "Enable the x86 SSE2 math implementation when available" ON)
 
 set(AEG_LOG_COMPILE_LEVEL "Auto" CACHE STRING
     "Compile-time minimum log level (Auto, Trace, Debug, Info, Notice, Warning, Error, Critical, Off)")
@@ -105,6 +106,27 @@ else()
     target_compile_options(aeg_logging PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
+add_library(aeg_math STATIC
+    Engine/Math/private/math.cpp
+)
+target_compile_features(aeg_math PUBLIC cxx_std_20)
+target_compile_definitions(aeg_math PRIVATE AEG_MATH_ENABLE_SIMD=$<BOOL:${AEG_MATH_ENABLE_SIMD}>)
+target_include_directories(aeg_math
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Math/public
+)
+
+if (MSVC)
+    target_compile_options(aeg_math PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(aeg_math PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+add_executable(aeg_math_smoke
+    tests/math_smoke.cpp
+)
+target_link_libraries(aeg_math_smoke PRIVATE aeg_math)
+
 set(AEG_VMA_INCLUDE_DIR
     "${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/VulkanMemoryAllocator/include")
 if (NOT EXISTS "${AEG_VMA_INCLUDE_DIR}/vk_mem_alloc.h")
@@ -191,15 +213,16 @@ if (WIN32)
         tests/shaders/triangle.vert
         tests/shaders/triangle.frag
     )
-    target_link_libraries(aeg_triangle PRIVATE aeg_rhi user32 gdi32)
+    target_link_libraries(aeg_triangle PRIVATE aeg_rhi aeg_math user32 gdi32)
     target_compile_definitions(aeg_triangle PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
 include(CTest)
 if (BUILD_TESTING)
+    add_test(NAME aeg_math_smoke COMMAND aeg_math_smoke)
     add_test(NAME aeg_rhi_smoke COMMAND aeg_rhi_smoke)
     add_test(NAME aeg_logging_smoke COMMAND aeg_logging_smoke)
-    add_test(NAME aeg_triangle COMMAND aeg_triangle)
+    add_test(NAME aeg_triangle COMMAND aeg_triangle --frames 1)
     if (MINGW)
         get_filename_component(AEG_MINGW_RUNTIME_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
         set_tests_properties(aeg_rhi_smoke aeg_logging_smoke aeg_triangle PROPERTIES
