@@ -19,6 +19,7 @@
 #include <rhi.hpp>
 #include <span>
 #include <string_view>
+#include <texture_uploader.hpp>
 
 #include "triangle_shaders.hpp"
 
@@ -26,9 +27,16 @@ namespace {
     using aeg::rhi::BufferCapability;
     using aeg::rhi::BufferDesc;
     using aeg::rhi::BufferHandle;
+    using aeg::rhi::BindingLayoutDesc;
+    using aeg::rhi::BindingLayoutEntry;
+    using aeg::rhi::BindingLayoutHandle;
+    using aeg::rhi::BindingSetHandle;
+    using aeg::rhi::BindingType;
+    using aeg::rhi::BindingWrite;
     using aeg::rhi::Device;
     using aeg::rhi::DeviceCreateDesc;
     using aeg::rhi::DrawIndexedDesc;
+    using aeg::rhi::Filter;
     using aeg::rhi::Format;
     using aeg::rhi::FrameAcquireResult;
     using aeg::rhi::GraphicsPipelineState;
@@ -43,6 +51,8 @@ namespace {
     using aeg::rhi::PrimitiveTopology;
     using aeg::rhi::QueueClass;
     using aeg::rhi::ResourceUsage;
+    using aeg::rhi::SamplerDesc;
+    using aeg::rhi::SamplerHandle;
     using aeg::foundation::Result;
     using aeg::foundation::ResultCode;
     using aeg::rhi::ShaderStage;
@@ -52,6 +62,8 @@ namespace {
     using aeg::rhi::SwapchainDesc;
     using aeg::rhi::SwapchainHandle;
     using aeg::rhi::SwapchainInfo;
+    using aeg::rhi::TextureCapability;
+    using aeg::rhi::TextureDesc;
     using aeg::rhi::VertexAttributeDesc;
     using aeg::rhi::VertexBindingDesc;
     using aeg::rhi::VertexInputRate;
@@ -65,9 +77,14 @@ namespace {
     using aeg::render_graph::PassBuilder;
     using aeg::render_graph::RenderGraph;
     using aeg::render_graph::RenderGraphBuffer;
+    using aeg::render_graph::RenderGraphTexture;
     using aeg::resource::GpuMesh;
     using aeg::resource::MeshData;
+    using aeg::resource::GpuTexture;
     using aeg::resource::ResourceUploader;
+    using aeg::resource::TextureData;
+    using aeg::resource::TextureSubresourceData;
+    using aeg::resource::TextureUploader;
 
     bool check_result(const Result &result, std::string_view operation) {
         if (result) {
@@ -90,15 +107,23 @@ namespace {
     struct Vertex {
         float position[2];
         float color[4];
+        float uv[2];
     };
 
     constexpr std::array<Vertex, 3> kTriangleVertices{
-        Vertex{{0.0f, -0.75f}, {1.0f, 0.2f, 0.2f, 1.0f}},
-        Vertex{{0.75f, 0.65f}, {0.2f, 1.0f, 0.3f, 1.0f}},
-        Vertex{{-0.75f, 0.65f}, {0.2f, 0.4f, 1.0f, 1.0f}},
+        Vertex{{0.0f, -0.75f}, {1.0f, 1.0f, 1.0f, 1.0f}, {0.5f, 1.0f}},
+        Vertex{{0.75f, 0.65f}, {1.0f, 1.0f, 1.0f, 1.0f}, {1.0f, 0.0f}},
+        Vertex{{-0.75f, 0.65f}, {1.0f, 1.0f, 1.0f, 1.0f}, {0.0f, 0.0f}},
     };
 
     constexpr std::array<uint16_t, 3> kTriangleIndices{0, 1, 2};
+
+    constexpr std::array<std::byte, 16> kTexturePixels{
+        std::byte{0xff}, std::byte{0x24}, std::byte{0x24}, std::byte{0xff},
+        std::byte{0x24}, std::byte{0xd4}, std::byte{0x6b}, std::byte{0xff},
+        std::byte{0x34}, std::byte{0x7d}, std::byte{0xff}, std::byte{0xff},
+        std::byte{0xff}, std::byte{0xd3}, std::byte{0x24}, std::byte{0xff},
+    };
 
     struct WindowState {
         HWND handle{nullptr};
@@ -199,7 +224,8 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
             frame_context_ = std::make_unique<FrameContext>(*device_);
             render_graph_ = std::make_unique<RenderGraph>(*device_);
             resource_uploader_ = std::make_unique<ResourceUploader>(*device_);
-            if (!create_mesh() || !create_pipeline()) {
+            texture_uploader_ = std::make_unique<TextureUploader>(*device_);
+            if (!create_mesh() || !create_texture() || !create_texture_bindings() || !create_pipeline()) {
                 return false;
             }
             return true;
@@ -282,6 +308,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
                 render_graph_->reset();
                 mesh_vertex_state_ = mesh_vertex_graphics_state_;
                 mesh_index_state_ = mesh_index_graphics_state_;
+                texture_state_ = texture_sampled_graphics_state_;
 
                 rotation_angle_ += 0.02f;
                 ++frame_count;
@@ -436,11 +463,13 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
             const std::array<VertexBindingDesc, 1> vertex_bindings{
                 VertexBindingDesc{0, sizeof(Vertex), VertexInputRate::kVertex},
             };
-            const std::array<VertexAttributeDesc, 2> vertex_attributes{
+            const std::array<VertexAttributeDesc, 3> vertex_attributes{
                 VertexAttributeDesc{0, 0, Format::kRg32Float, 0},
                 VertexAttributeDesc{1, 0, Format::kRgba32Float, sizeof(float) * 2},
+                VertexAttributeDesc{2, 0, Format::kRg32Float, sizeof(float) * 6},
             };
             const std::array<Format, 1> color_formats{color_format_};
+            const std::array<aeg::rhi::BindingLayoutHandle, 1> binding_layouts{texture_binding_layout_};
 
             GraphicsPipelineState graphics_state{};
             graphics_state.vertex_bindings = vertex_bindings;
@@ -455,6 +484,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
 
             PipelineDesc pipeline_desc{};
             pipeline_desc.type = PipelineType::kGraphics;
+            pipeline_desc.layout.binding_layouts = binding_layouts;
             pipeline_desc.layout.inline_constant_ranges = inline_constant_ranges;
             pipeline_desc.shader_stages = shader_stages;
             pipeline_desc.graphics = graphics_state;
@@ -465,6 +495,134 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
             }
             pipeline_ = pipeline_result.value;
             return true;
+        }
+
+        [[nodiscard]] bool create_texture() {
+            texture_desc_ = {};
+            texture_desc_.extent = {2, 2, 1};
+            texture_desc_.format = Format::kRgba8Unorm;
+            texture_desc_.mip_levels = 1;
+            texture_desc_.array_layers = 1;
+            texture_desc_.capabilities = TextureCapability::kTransferDestination | TextureCapability::kSampled;
+            texture_desc_.memory = MemoryClass::kDeviceLocal;
+            texture_desc_.initial_usage = ResourceUsage::kUndefined;
+            texture_desc_.initial_stages = PipelineStage::kAllCommands;
+            texture_desc_.initial_queue = QueueClass::kAuto;
+            texture_desc_.name = aeg::rhi::DebugName{"Triangle.Texture"};
+
+            const TextureSubresourceData subresource{std::as_bytes(std::span{kTexturePixels}), 0, 0};
+            const TextureData texture_data{
+                texture_desc_, std::span<const TextureSubresourceData>{&subresource, 1}
+            };
+
+            if (!check_result(frame_context_->begin_frame(), "begin_texture_upload_frame")) {
+                return false;
+            }
+
+            auto upload_result = texture_uploader_->upload_texture(
+                    *frame_context_, *render_graph_, texture_data, "Triangle.Texture");
+            if (!check_result(upload_result, "upload_texture")) {
+                (void) frame_context_->abort_frame();
+                return false;
+            }
+
+            GpuTexture uploaded_texture = upload_result.value.texture;
+            auto execution_result = render_graph_->execute(*frame_context_);
+            if (!check_result(execution_result, "execute_texture_upload")) {
+                (void) frame_context_->abort_frame();
+                (void) device_->wait_idle();
+                (void) texture_uploader_->destroy_texture(uploaded_texture);
+                return false;
+            }
+            if (execution_result.value.completion.is_valid() &&
+                !check_result(device_->wait(execution_result.value.completion,
+                                             std::numeric_limits<uint64_t>::max()),
+                              "wait_texture_upload")) {
+                (void) frame_context_->abort_frame();
+                (void) device_->wait_idle();
+                (void) texture_uploader_->destroy_texture(uploaded_texture);
+                return false;
+            }
+            if (!check_result(frame_context_->end_frame(), "end_texture_upload_frame")) {
+                (void) device_->wait_idle();
+                (void) texture_uploader_->destroy_texture(uploaded_texture);
+                return false;
+            }
+
+            texture_ = uploaded_texture;
+            texture_upload_state_ = aeg::rhi::ResourceState{
+                ResourceUsage::kCopyDestination,
+                ShaderStage::kAll,
+                QueueClass::kCopy,
+                false,
+                PipelineStage::kCopy
+            };
+            texture_sampled_graphics_state_ = aeg::rhi::ResourceState{
+                ResourceUsage::kSampledRead,
+                ShaderStage::kAll,
+                QueueClass::kGraphics,
+                false,
+                PipelineStage::kAllCommands
+            };
+            texture_state_ = texture_upload_state_;
+            render_graph_->reset();
+            return true;
+        }
+
+        [[nodiscard]] bool create_texture_bindings() {
+            if (!texture_.has_sampled_view()) {
+                AEG_LOG_ERROR(aeg::logging::Category::kTest,
+                              "Texture upload did not create a sampled texture view");
+                return false;
+            }
+
+            SamplerDesc sampler_desc{};
+            sampler_desc.min_filter = Filter::kNearest;
+            sampler_desc.mag_filter = Filter::kNearest;
+            sampler_desc.mip_filter = Filter::kNearest;
+            sampler_desc.address_u = aeg::rhi::AddressMode::kClampToEdge;
+            sampler_desc.address_v = aeg::rhi::AddressMode::kClampToEdge;
+            sampler_desc.address_w = aeg::rhi::AddressMode::kClampToEdge;
+            sampler_desc.max_lod = 0.0f;
+            sampler_desc.name = aeg::rhi::DebugName{"Triangle.TextureSampler"};
+            auto sampler_result = device_->create_sampler(sampler_desc);
+            if (!check_result(sampler_result, "create_texture_sampler")) {
+                return false;
+            }
+            sampler_ = sampler_result.value;
+
+            std::array<BindingLayoutEntry, 2> layout_entries{};
+            layout_entries[0].location = {0, 0};
+            layout_entries[0].type = BindingType::kSampledTexture;
+            layout_entries[0].shader_stages = ShaderStage::kFragment;
+            layout_entries[1].location = {0, 1};
+            layout_entries[1].type = BindingType::kSampler;
+            layout_entries[1].shader_stages = ShaderStage::kFragment;
+
+            BindingLayoutDesc layout_desc{};
+            layout_desc.entries = layout_entries;
+            layout_desc.name = aeg::rhi::DebugName{"Triangle.TextureBindingLayout"};
+            auto layout_result = device_->create_binding_layout(layout_desc);
+            if (!check_result(layout_result, "create_texture_binding_layout")) {
+                return false;
+            }
+            texture_binding_layout_ = layout_result.value;
+
+            auto set_result = device_->create_binding_set(texture_binding_layout_);
+            if (!check_result(set_result, "create_texture_binding_set")) {
+                return false;
+            }
+            texture_binding_set_ = set_result.value;
+
+            std::array<BindingWrite, 2> writes{};
+            writes[0].location = {0, 0};
+            writes[0].resource.type = BindingType::kSampledTexture;
+            writes[0].resource.texture_view = texture_.sampled_view;
+            writes[1].location = {0, 1};
+            writes[1].resource.type = BindingType::kSampler;
+            writes[1].resource.sampler = sampler_;
+            return check_result(device_->update_binding_set(texture_binding_set_, writes),
+                                "update_texture_binding_set");
         }
 
         [[nodiscard]] bool record_frame(const FrameAcquireResult &acquired) {
@@ -508,6 +666,12 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
                 return false;
             }
 
+            auto texture_resource_result = render_graph_->import_texture(
+                    texture_.texture, texture_.sampled_view, texture_desc_, texture_state_);
+            if (!check_result(texture_resource_result, "import_texture")) {
+                return false;
+            }
+
             aeg::rhi::TextureDesc color_desc{};
             color_desc.extent = {swapchain_info_.extent.width, swapchain_info_.extent.height, 1};
             color_desc.format = color_format_;
@@ -531,10 +695,11 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
 
             const RenderGraphBuffer vertex_resource = vertex_resource_result.value;
             const RenderGraphBuffer index_resource = index_resource_result.value;
+            const RenderGraphTexture texture_resource = texture_resource_result.value;
             const auto color_resource = color_resource_result.value;
             auto pass_result = render_graph_->add_pass(
                     "Triangle.Graphics", QueueClass::kGraphics,
-                    [vertex_resource, index_resource, color_resource](PassBuilder &builder) {
+                    [vertex_resource, index_resource, texture_resource, color_resource](PassBuilder &builder) {
                         if (const Result result = builder.read(vertex_resource, ResourceUsage::kVertexInput,
                                                                PipelineStage::kVertexInput, ShaderStage::kVertex,
                                                                {});
@@ -544,6 +709,11 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
                         if (const Result result = builder.read(index_resource, ResourceUsage::kIndexInput,
                                                                PipelineStage::kVertexInput, ShaderStage::kVertex,
                                                                {});
+                            !result) {
+                            return result;
+                        }
+                        if (const Result result = builder.read(texture_resource, ResourceUsage::kSampledRead,
+                                                               PipelineStage::kAllCommands, ShaderStage::kAll, {});
                             !result) {
                             return result;
                         }
@@ -566,30 +736,12 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
                         if (!index_buffer_result) {
                             return index_buffer_result.result;
                         }
-                        if (const Result result = context.begin_rendering(); !result) {
-                            return result;
-                        }
-
-                        const Viewport viewport{
-                            0.0f,
-                            0.0f,
-                            static_cast<float>(swapchain_info_.extent.width),
-                            static_cast<float>(swapchain_info_.extent.height),
-                            0.0f,
-                            1.0f
-                        };
-                        const aeg::rhi::ScissorRect scissor{
-                            0, 0, swapchain_info_.extent.width, swapchain_info_.extent.height
-                        };
-                        if (const Result result = context.device().set_viewport(context.command_list(), viewport);
-                            !result) {
-                            return result;
-                        }
-                        if (const Result result = context.device().set_scissor(context.command_list(), scissor);
-                            !result) {
-                            return result;
-                        }
                         if (const Result result = context.device().bind_pipeline(context.command_list(), pipeline_);
+                            !result) {
+                            return result;
+                        }
+                        if (const Result result = context.device().bind_binding_set(
+                                    context.command_list(), 0, texture_binding_set_);
                             !result) {
                             return result;
                         }
@@ -606,6 +758,28 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
                         }
                         if (const Result result = context.device().bind_index_buffer(
                                     context.command_list(), index_buffer_result.value, 0, mesh_.index_format);
+                            !result) {
+                            return result;
+                        }
+                        if (const Result result = context.begin_rendering(); !result) {
+                            return result;
+                        }
+                        const Viewport viewport{
+                            0.0f,
+                            0.0f,
+                            static_cast<float>(swapchain_info_.extent.width),
+                            static_cast<float>(swapchain_info_.extent.height),
+                            0.0f,
+                            1.0f
+                        };
+                        const aeg::rhi::ScissorRect scissor{
+                            0, 0, swapchain_info_.extent.width, swapchain_info_.extent.height
+                        };
+                        if (const Result result = context.device().set_viewport(context.command_list(), viewport);
+                            !result) {
+                            return result;
+                        }
+                        if (const Result result = context.device().set_scissor(context.command_list(), scissor);
                             !result) {
                             return result;
                         }
@@ -628,14 +802,31 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
             }
             (void) device_->wait_idle();
             render_graph_.reset();
-            if (resource_uploader_ != nullptr && mesh_.is_valid()) {
-                (void) resource_uploader_->destroy_mesh(mesh_);
+            frame_context_.reset();
+
+            if (texture_binding_set_.is_valid()) {
+                (void) device_->destroy_binding_set(texture_binding_set_);
+                texture_binding_set_ = {};
             }
             if (pipeline_.is_valid()) {
                 (void) device_->destroy_pipeline(pipeline_);
                 pipeline_ = {};
             }
-            frame_context_.reset();
+            if (texture_binding_layout_.is_valid()) {
+                (void) device_->destroy_binding_layout(texture_binding_layout_);
+                texture_binding_layout_ = {};
+            }
+            if (sampler_.is_valid()) {
+                (void) device_->destroy_sampler(sampler_);
+                sampler_ = {};
+            }
+            if (texture_uploader_ != nullptr && texture_.is_valid()) {
+                (void) texture_uploader_->destroy_texture(texture_);
+            }
+            if (resource_uploader_ != nullptr && mesh_.is_valid()) {
+                (void) resource_uploader_->destroy_mesh(mesh_);
+            }
+            texture_uploader_.reset();
             resource_uploader_.reset();
             if (swapchain_.is_valid()) {
                 (void) device_->destroy_swapchain(swapchain_);
@@ -654,17 +845,26 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
         std::unique_ptr<FrameContext> frame_context_{};
         std::unique_ptr<RenderGraph> render_graph_{};
         std::unique_ptr<ResourceUploader> resource_uploader_{};
+        std::unique_ptr<TextureUploader> texture_uploader_{};
         SurfaceHandle surface_{};
         SwapchainHandle swapchain_{};
         SwapchainInfo swapchain_info_{};
         GpuMesh mesh_{};
+        GpuTexture texture_{};
         PipelineHandle pipeline_{};
+        BindingLayoutHandle texture_binding_layout_{};
+        BindingSetHandle texture_binding_set_{};
+        SamplerHandle sampler_{};
         Format color_format_{Format::kUnknown};
         aeg::rhi::ResourceState mesh_upload_state_{};
         aeg::rhi::ResourceState mesh_vertex_graphics_state_{};
         aeg::rhi::ResourceState mesh_index_graphics_state_{};
         aeg::rhi::ResourceState mesh_vertex_state_{};
         aeg::rhi::ResourceState mesh_index_state_{};
+        TextureDesc texture_desc_{};
+        aeg::rhi::ResourceState texture_upload_state_{};
+        aeg::rhi::ResourceState texture_sampled_graphics_state_{};
+        aeg::rhi::ResourceState texture_state_{};
         Mat4 model_view_projection_{};
         float rotation_angle_{0.0f};
     };

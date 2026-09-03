@@ -528,6 +528,11 @@ namespace aeg::render_graph {
     }
 
     foundation::Result FrameContext::write_upload(const FrameAllocation& allocation, std::span<const std::byte> data) {
+        return write_upload(allocation, 0, data);
+    }
+
+    foundation::Result FrameContext::write_upload(const FrameAllocation& allocation, uint64_t relative_offset,
+                                                  std::span<const std::byte> data) {
         const foundation::Result allocation_result = validate_allocation(allocation);
         if (!allocation_result) {
             return allocation_result;
@@ -536,11 +541,15 @@ namespace aeg::render_graph {
             return foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                         "Upload allocation is not from the active frame");
         }
-        if (data.size() > allocation.size) {
+        if (relative_offset > allocation.size || data.size() > allocation.size - relative_offset) {
             return foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                         "Upload data exceeds the allocation size");
         }
-        return device_.write_buffer(allocation.buffer, allocation.offset, data);
+        if (relative_offset > std::numeric_limits<uint64_t>::max() - allocation.offset) {
+            return foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
+                                        "Upload allocation offset overflows");
+        }
+        return device_.write_buffer(allocation.buffer, allocation.offset + relative_offset, data);
     }
 
     foundation::ResultValue<FrameAllocation> FrameContext::allocate_readback(uint64_t size, uint64_t alignment) {

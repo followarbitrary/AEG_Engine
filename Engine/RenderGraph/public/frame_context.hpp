@@ -92,6 +92,8 @@ namespace aeg::render_graph {
         [[nodiscard]] foundation::ResultValue<FrameAllocation> allocate_upload(uint64_t size, uint64_t alignment = 0);
         [[nodiscard]] foundation::Result write_upload(const FrameAllocation& allocation,
                                                std::span<const std::byte> data);
+        [[nodiscard]] foundation::Result write_upload(const FrameAllocation& allocation, uint64_t relative_offset,
+                                               std::span<const std::byte> data);
 
         [[nodiscard]] foundation::ResultValue<FrameAllocation> allocate_readback(uint64_t size, uint64_t alignment = 0);
         [[nodiscard]] foundation::Result read_readback(const FrameAllocation& allocation, std::span<std::byte> data);

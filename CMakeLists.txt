@@ -68,6 +68,50 @@ endif()
 find_package(Vulkan REQUIRED)
 find_package(Threads REQUIRED)
 
+if (WIN32)
+    set(AEG_DXC_EXECUTABLE "" CACHE FILEPATH
+        "Path to the DirectX Shader Compiler executable")
+
+    if (NOT AEG_DXC_EXECUTABLE)
+        set(AEG_VULKAN_BIN_DIR "")
+        if (Vulkan_GLSLC_EXECUTABLE)
+            get_filename_component(AEG_VULKAN_BIN_DIR
+                "${Vulkan_GLSLC_EXECUTABLE}" DIRECTORY)
+        endif()
+
+        if (AEG_VULKAN_BIN_DIR AND
+            EXISTS "${AEG_VULKAN_BIN_DIR}/dxc.exe")
+            set(AEG_DXC_EXECUTABLE
+                "${AEG_VULKAN_BIN_DIR}/dxc.exe")
+        elseif (EXISTS "$ENV{VULKAN_SDK}/Bin/dxc.exe")
+            set(AEG_DXC_EXECUTABLE
+                "$ENV{VULKAN_SDK}/Bin/dxc.exe")
+        endif()
+
+        if (NOT AEG_DXC_EXECUTABLE)
+            find_program(AEG_DXC_EXECUTABLE
+                NAMES dxc dxc.exe
+                HINTS
+                    "${AEG_VULKAN_BIN_DIR}"
+                    "$ENV{VULKAN_SDK}/Bin"
+                    "$ENV{VULKAN_SDK}/Bin/x64"
+            )
+        endif()
+
+        if (AEG_DXC_EXECUTABLE)
+            set(AEG_DXC_EXECUTABLE "${AEG_DXC_EXECUTABLE}"
+                CACHE FILEPATH "Path to the DirectX Shader Compiler executable" FORCE)
+        endif()
+    endif()
+
+    if (NOT AEG_DXC_EXECUTABLE OR
+        NOT EXISTS "${AEG_DXC_EXECUTABLE}")
+        message(FATAL_ERROR
+            "DXC is required to build the HLSL shaders. "
+            "Set AEG_DXC_EXECUTABLE to dxc.exe.")
+    endif()
+endif()
+
 set(AEG_QUILL_INCLUDE_DIR
     "${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/Quill/include")
 set(AEG_QUILL_SOURCE_FILE
@@ -243,6 +287,8 @@ set(AEG_RESOURCE_PUBLIC_DIR
 add_library(aeg_resource STATIC
     Engine/Resource/private/mesh.cpp
     Engine/Resource/private/resource_uploader.cpp
+    Engine/Resource/private/texture.cpp
+    Engine/Resource/private/texture_uploader.cpp
 )
 target_compile_features(aeg_resource PUBLIC cxx_std_20)
 target_include_directories(aeg_resource
@@ -278,11 +324,91 @@ if (WIN32)
 endif()
 
 if (WIN32)
+    set(AEG_TRIANGLE_SHADER_OUTPUT_DIR
+        "${CMAKE_CURRENT_BINARY_DIR}/generated/shaders")
+    set(AEG_TRIANGLE_SHADER_HEADER
+        "${CMAKE_CURRENT_BINARY_DIR}/generated/triangle_shaders.hpp")
+    set(AEG_SHADER_HEADER_SCRIPT
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/generate_spirv_header.cmake")
+
+    set(AEG_TRIANGLE_VERTEX_HLSL
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/triangle.vert.hlsl")
+    set(AEG_TRIANGLE_FRAGMENT_HLSL
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/triangle.frag.hlsl")
+    set(AEG_TRIANGLE_VERTEX_SPV
+        "${AEG_TRIANGLE_SHADER_OUTPUT_DIR}/triangle.vert.spv")
+    set(AEG_TRIANGLE_FRAGMENT_SPV
+        "${AEG_TRIANGLE_SHADER_OUTPUT_DIR}/triangle.frag.spv")
+
+    add_custom_command(
+        OUTPUT "${AEG_TRIANGLE_VERTEX_SPV}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory
+            "${AEG_TRIANGLE_SHADER_OUTPUT_DIR}"
+        COMMAND "${AEG_DXC_EXECUTABLE}"
+            -spirv
+            -fspv-target-env=vulkan1.3
+            -fvk-use-dx-layout
+            -O3
+            -T vs_6_0
+            -E main
+            -Fo "${AEG_TRIANGLE_VERTEX_SPV}"
+            "${AEG_TRIANGLE_VERTEX_HLSL}"
+        DEPENDS
+            "${AEG_TRIANGLE_VERTEX_HLSL}"
+            "${AEG_DXC_EXECUTABLE}"
+        COMMENT "Compiling HLSL vertex shader"
+        VERBATIM
+    )
+
+    add_custom_command(
+        OUTPUT "${AEG_TRIANGLE_FRAGMENT_SPV}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory
+            "${AEG_TRIANGLE_SHADER_OUTPUT_DIR}"
+        COMMAND "${AEG_DXC_EXECUTABLE}"
+            -spirv
+            -fspv-target-env=vulkan1.3
+            -fvk-use-dx-layout
+            -O3
+            -T ps_6_0
+            -E main
+            -Fo "${AEG_TRIANGLE_FRAGMENT_SPV}"
+            "${AEG_TRIANGLE_FRAGMENT_HLSL}"
+        DEPENDS
+            "${AEG_TRIANGLE_FRAGMENT_HLSL}"
+            "${AEG_DXC_EXECUTABLE}"
+        COMMENT "Compiling HLSL fragment shader"
+        VERBATIM
+    )
+
+    add_custom_command(
+        OUTPUT "${AEG_TRIANGLE_SHADER_HEADER}"
+        COMMAND "${CMAKE_COMMAND}"
+            "-DOUTPUT=${AEG_TRIANGLE_SHADER_HEADER}"
+            "-DVERTEX_SPV=${AEG_TRIANGLE_VERTEX_SPV}"
+            "-DFRAGMENT_SPV=${AEG_TRIANGLE_FRAGMENT_SPV}"
+            "-DNAMESPACE=aeg::triangle_shaders"
+            -P "${AEG_SHADER_HEADER_SCRIPT}"
+        DEPENDS
+            "${AEG_TRIANGLE_VERTEX_SPV}"
+            "${AEG_TRIANGLE_FRAGMENT_SPV}"
+            "${AEG_SHADER_HEADER_SCRIPT}"
+        COMMENT "Generating C++ shader header from SPIR-V"
+        VERBATIM
+    )
+
     add_executable(aeg_triangle
         tests/triangle.cpp
-        tests/triangle_shaders.hpp
-        tests/shaders/triangle.vert
-        tests/shaders/triangle.frag
+        "${AEG_TRIANGLE_SHADER_HEADER}"
+        "${AEG_TRIANGLE_VERTEX_HLSL}"
+        "${AEG_TRIANGLE_FRAGMENT_HLSL}"
+    )
+    set_source_files_properties(
+        "${AEG_TRIANGLE_VERTEX_HLSL}"
+        "${AEG_TRIANGLE_FRAGMENT_HLSL}"
+        PROPERTIES HEADER_FILE_ONLY TRUE
+    )
+    target_include_directories(aeg_triangle PRIVATE
+        "${CMAKE_CURRENT_BINARY_DIR}/generated"
     )
     target_link_libraries(aeg_triangle PRIVATE aeg_rhi aeg_math aeg_resource user32 gdi32)
     target_compile_definitions(aeg_triangle PRIVATE _CRT_SECURE_NO_WARNINGS)
