@@ -1,6 +1,6 @@
 struct VertexOutput {
     float4 position : SV_Position;
-    [[vk::location(0)]] float2 uv : TEXCOORD0;
+    float2 uv : TEXCOORD0;
 };
 
 VertexOutput main(uint vertex_id : SV_VertexID) {

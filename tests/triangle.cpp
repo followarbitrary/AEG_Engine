@@ -15,6 +15,7 @@
 #include <material.hpp>
 #include <memory>
 #include <math.hpp>
+#include <new>
 #include <render_target.hpp>
 #include <render_graph.hpp>
 #include <resource_uploader.hpp>
@@ -22,6 +23,7 @@
 #include <span>
 #include <string_view>
 #include <texture_uploader.hpp>
+#include <vector>
 
 #include "offscreen_composite_shaders.hpp"
 #include "triangle_shaders.hpp"
@@ -30,7 +32,14 @@ namespace {
     using aeg::rhi::BufferCapability;
     using aeg::rhi::BufferDesc;
     using aeg::rhi::BufferHandle;
+    using aeg::rhi::BindingFlags;
+    using aeg::rhi::BindingLayoutEntry;
     using aeg::rhi::BindingLayoutHandle;
+    using aeg::rhi::BindingResource;
+    using aeg::rhi::BindingSetHandle;
+    using aeg::rhi::BindingType;
+    using aeg::rhi::BindingWrite;
+    using aeg::rhi::BufferRange;
     using aeg::rhi::Device;
     using aeg::rhi::DeviceCreateDesc;
     using aeg::rhi::DrawDesc;
@@ -39,7 +48,6 @@ namespace {
     using aeg::rhi::Format;
     using aeg::rhi::FrameAcquireResult;
     using aeg::rhi::GraphicsPipelineState;
-    using aeg::rhi::InlineConstantRange;
     using aeg::rhi::LoadOp;
     using aeg::rhi::MemoryClass;
     using aeg::rhi::PipelineDesc;
@@ -227,7 +235,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
             resource_uploader_ = std::make_unique<ResourceUploader>(*device_);
             texture_uploader_ = std::make_unique<TextureUploader>(*device_);
             if (!create_mesh() || !create_texture() || !create_offscreen_render_target() ||
-                !create_texture_materials() || !create_pipelines()) {
+                !create_texture_materials() || !create_transform_binding() || !create_pipelines()) {
                 return false;
             }
             return true;
@@ -557,6 +565,79 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
             return true;
         }
 
+        [[nodiscard]] bool create_transform_binding() {
+            const std::array<BindingLayoutEntry, 1> layout_entries{
+                BindingLayoutEntry{
+                    aeg::rhi::BindingLocation{1, 0},
+                    BindingType::kUniformBuffer,
+                    aeg::rhi::BindingArrayMode::kSingle,
+                    1,
+                    ShaderStage::kVertex,
+                    BindingFlags::kNone
+                }
+            };
+            const aeg::rhi::BindingLayoutDesc layout_desc{
+                layout_entries,
+                aeg::rhi::DebugName{"Triangle.TransformBindingLayout"}
+            };
+            auto layout_result = device_->create_binding_layout(layout_desc);
+            if (!check_result(layout_result, "create_transform_binding_layout")) {
+                return false;
+            }
+            transform_binding_layout_ = layout_result.value;
+
+            try {
+                transform_buffers_.resize(frame_context_->frames_in_flight());
+                transform_binding_sets_.resize(frame_context_->frames_in_flight());
+            } catch (const std::bad_alloc&) {
+                AEG_LOG_ERROR(aeg::logging::Category::kTest,
+                              "Transform binding allocation failed");
+                return false;
+            }
+
+            for (uint32_t index = 0; index < frame_context_->frames_in_flight(); ++index) {
+                BufferDesc buffer_desc{};
+                buffer_desc.size = sizeof(Mat4);
+                buffer_desc.capabilities = BufferCapability::kUniform;
+                buffer_desc.memory = MemoryClass::kUpload;
+                buffer_desc.initial_usage = ResourceUsage::kUniformRead;
+                buffer_desc.initial_stages = PipelineStage::kVertexShader;
+                buffer_desc.initial_queue = QueueClass::kGraphics;
+                buffer_desc.name = aeg::rhi::DebugName{"Triangle.TransformBuffer"};
+                auto buffer_result = device_->create_buffer(buffer_desc);
+                if (!check_result(buffer_result, "create_transform_buffer")) {
+                    return false;
+                }
+                transform_buffers_[index] = buffer_result.value;
+
+                auto set_result = device_->create_binding_set(transform_binding_layout_);
+                if (!check_result(set_result, "create_transform_binding_set")) {
+                    return false;
+                }
+                transform_binding_sets_[index] = set_result.value;
+
+                BindingWrite write{};
+                write.location = aeg::rhi::BindingLocation{1, 0};
+                write.resource = BindingResource{};
+                write.resource.type = BindingType::kUniformBuffer;
+                write.resource.buffer_range = BufferRange{transform_buffers_[index], 0, sizeof(Mat4)};
+                if (!check_result(device_->update_binding_set(transform_binding_sets_[index],
+                                                              std::span{&write, 1}),
+                                  "update_transform_binding_set")) {
+                    return false;
+                }
+            }
+
+            transform_state_ = aeg::rhi::ResourceState{
+                ResourceUsage::kUniformRead,
+                ShaderStage::kVertex,
+                QueueClass::kGraphics,
+                false,
+                PipelineStage::kVertexShader
+            };
+            return true;
+        }
+
         [[nodiscard]] bool create_scene_pipeline() {
             if (!scene_material_.is_valid()) {
                 AEG_LOG_ERROR(aeg::logging::Category::kTest,
@@ -565,11 +646,11 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
             }
             const std::array<ShaderStageDesc, 2> shader_stages{
                 ShaderStageDesc{
-                    ShaderStage::kVertex, std::as_bytes(std::span{aeg::triangle_shaders::kVertex}), "main",
+                    ShaderStage::kVertex, aeg::shaders::kTriangleVertex.as_span(), "main",
                     aeg::rhi::DebugName{"Triangle.VertexShader"}
                 },
                 ShaderStageDesc{
-                    ShaderStage::kFragment, std::as_bytes(std::span{aeg::triangle_shaders::kFragment}), "main",
+                    ShaderStage::kFragment, aeg::shaders::kTriangleFragment.as_span(), "main",
                     aeg::rhi::DebugName{"Triangle.FragmentShader"}
                 },
             };
@@ -582,7 +663,10 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
                 VertexAttributeDesc{2, 0, Format::kRg32Float, sizeof(float) * 6},
             };
             const std::array<Format, 1> color_formats{offscreen_target_.texture_desc.format};
-            const std::array<BindingLayoutHandle, 1> binding_layouts{scene_material_.binding_layout};
+            const std::array<BindingLayoutHandle, 2> binding_layouts{
+                scene_material_.binding_layout,
+                transform_binding_layout_
+            };
 
             GraphicsPipelineState graphics_state{};
             graphics_state.vertex_bindings = vertex_bindings;
@@ -591,14 +675,9 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
             graphics_state.cull_mode = aeg::rhi::CullMode::kNone;
             graphics_state.color_formats = color_formats;
 
-            const std::array<InlineConstantRange, 1> inline_constant_ranges{
-                InlineConstantRange{ShaderStage::kVertex, 0, sizeof(Mat4)}
-            };
-
             PipelineDesc pipeline_desc{};
             pipeline_desc.type = PipelineType::kGraphics;
             pipeline_desc.layout.binding_layouts = binding_layouts;
-            pipeline_desc.layout.inline_constant_ranges = inline_constant_ranges;
             pipeline_desc.shader_stages = shader_stages;
             pipeline_desc.graphics = graphics_state;
             pipeline_desc.name = aeg::rhi::DebugName{"Triangle.GraphicsPipeline"};
@@ -619,13 +698,13 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
             const std::array<ShaderStageDesc, 2> shader_stages{
                 ShaderStageDesc{
                     ShaderStage::kVertex,
-                    std::as_bytes(std::span{aeg::offscreen_composite_shaders::kVertex}),
+                    aeg::shaders::kOffscreenCompositeVertex.as_span(),
                     "main",
                     aeg::rhi::DebugName{"Triangle.CompositeVertexShader"}
                 },
                 ShaderStageDesc{
                     ShaderStage::kFragment,
-                    std::as_bytes(std::span{aeg::offscreen_composite_shaders::kFragment}),
+                    aeg::shaders::kOffscreenCompositeFragment.as_span(),
                     "main",
                     aeg::rhi::DebugName{"Triangle.CompositeFragmentShader"}
                 },
@@ -743,6 +822,23 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
                 60.0f * aeg::math::kPi / 180.0f, aspect_ratio, 0.1f, 100.0f, ClipSpaceConvention{true, false});
             model_view_projection_ = projection * view * model;
 
+            const uint32_t transform_slot = frame_context_->frame_slot_index();
+            if (transform_slot >= transform_buffers_.size() ||
+                transform_slot >= transform_binding_sets_.size()) {
+                AEG_LOG_ERROR(aeg::logging::Category::kTest,
+                              "Frame slot exceeds transform binding storage");
+                return false;
+            }
+            const BufferHandle transform_buffer = transform_buffers_[transform_slot];
+            const aeg::rhi::BindingSetHandle transform_binding_set =
+                transform_binding_sets_[transform_slot];
+            if (!check_result(device_->write_buffer(
+                                      transform_buffer, 0,
+                                      std::as_bytes(std::span{&model_view_projection_, 1})),
+                              "write_transform_constants")) {
+                return false;
+            }
+
             render_graph_->reset();
 
             BufferDesc vertex_desc{};
@@ -772,6 +868,20 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
             auto texture_resource_result = render_graph_->import_texture(
                     texture_.texture, texture_.sampled_view, texture_desc_, texture_state_);
             if (!check_result(texture_resource_result, "import_texture")) {
+                return false;
+            }
+
+            BufferDesc transform_desc{};
+            transform_desc.size = sizeof(Mat4);
+            transform_desc.capabilities = BufferCapability::kUniform;
+            transform_desc.memory = MemoryClass::kUpload;
+            transform_desc.initial_usage = ResourceUsage::kUniformRead;
+            transform_desc.initial_stages = PipelineStage::kVertexShader;
+            transform_desc.initial_queue = QueueClass::kGraphics;
+            transform_desc.name = aeg::rhi::DebugName{"Triangle.TransformBuffer"};
+            auto transform_resource_result = render_graph_->import_buffer(
+                transform_buffer, transform_desc, transform_state_);
+            if (!check_result(transform_resource_result, "import_transform_buffer")) {
                 return false;
             }
 
@@ -807,13 +917,15 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
 
             const RenderGraphBuffer vertex_resource = vertex_resource_result.value;
             const RenderGraphBuffer index_resource = index_resource_result.value;
+            const RenderGraphBuffer transform_resource = transform_resource_result.value;
             const RenderGraphTexture texture_resource = texture_resource_result.value;
             const RenderGraphTexture offscreen_resource = offscreen_resource_result.value;
             const RenderGraphTexture swapchain_resource = swapchain_resource_result.value;
 
             auto scene_pass_result = render_graph_->add_pass(
                     "Triangle.OffscreenScene", QueueClass::kGraphics,
-                    [vertex_resource, index_resource, texture_resource, offscreen_resource](PassBuilder &builder) {
+                    [vertex_resource, index_resource, transform_resource, texture_resource,
+                     offscreen_resource](PassBuilder &builder) {
                         if (const Result result = builder.read(vertex_resource, ResourceUsage::kVertexInput,
                                                                PipelineStage::kVertexInput, ShaderStage::kVertex, {});
                             !result) {
@@ -821,6 +933,11 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
                         }
                         if (const Result result = builder.read(index_resource, ResourceUsage::kIndexInput,
                                                                PipelineStage::kVertexInput, ShaderStage::kVertex, {});
+                            !result) {
+                            return result;
+                        }
+                        if (const Result result = builder.read(transform_resource, ResourceUsage::kUniformRead,
+                                                               PipelineStage::kVertexShader, ShaderStage::kVertex, {});
                             !result) {
                             return result;
                         }
@@ -834,7 +951,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
                                 aeg::rhi::ClearColorValue{0.025f, 0.035f, 0.06f, 1.0f},
                                 ResourceUsage::kSampledRead);
                     },
-                    [this, vertex_resource, index_resource](PassExecutionContext &context) {
+                    [this, vertex_resource, index_resource, transform_binding_set](PassExecutionContext &context) {
                         auto vertex_buffer_result = context.buffer(vertex_resource);
                         if (!vertex_buffer_result) {
                             return vertex_buffer_result.result;
@@ -853,9 +970,8 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
                             !result) {
                             return result;
                         }
-                        if (const Result result = context.device().set_inline_constants(
-                                    context.command_list(), 0, ShaderStage::kVertex,
-                                    std::as_bytes(std::span{&model_view_projection_, 1}));
+                        if (const Result result = context.device().bind_binding_set(
+                                    context.command_list(), 1, transform_binding_set);
                             !result) {
                             return result;
                         }
@@ -988,6 +1104,24 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
                 (void) device_->destroy_pipeline(scene_pipeline_);
                 scene_pipeline_ = {};
             }
+            for (BindingSetHandle& binding_set : transform_binding_sets_) {
+                if (binding_set.is_valid()) {
+                    (void) device_->destroy_binding_set(binding_set);
+                    binding_set = {};
+                }
+            }
+            if (transform_binding_layout_.is_valid()) {
+                (void) device_->destroy_binding_layout(transform_binding_layout_);
+                transform_binding_layout_ = {};
+            }
+            for (BufferHandle& buffer : transform_buffers_) {
+                if (buffer.is_valid()) {
+                    (void) device_->destroy_buffer(buffer);
+                    buffer = {};
+                }
+            }
+            transform_binding_sets_.clear();
+            transform_buffers_.clear();
             (void) aeg::resource::destroy_texture_material(*device_, composite_material_);
             (void) aeg::resource::destroy_texture_material(*device_, scene_material_);
             (void) aeg::resource::destroy_offscreen_render_target(*device_, offscreen_target_);
@@ -1025,6 +1159,9 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
         OffscreenRenderTarget offscreen_target_{};
         TextureMaterial scene_material_{};
         TextureMaterial composite_material_{};
+        std::vector<BufferHandle> transform_buffers_{};
+        std::vector<BindingSetHandle> transform_binding_sets_{};
+        BindingLayoutHandle transform_binding_layout_{};
         PipelineHandle scene_pipeline_{};
         PipelineHandle composite_pipeline_{};
         Format color_format_{Format::kUnknown};
@@ -1037,6 +1174,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
         aeg::rhi::ResourceState texture_upload_state_{};
         aeg::rhi::ResourceState texture_sampled_graphics_state_{};
         aeg::rhi::ResourceState texture_state_{};
+        aeg::rhi::ResourceState transform_state_{};
         aeg::rhi::ResourceState offscreen_sampled_graphics_state_{};
         aeg::rhi::ResourceState offscreen_state_{};
         Mat4 model_view_projection_{};

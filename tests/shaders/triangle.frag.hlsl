@@ -1,9 +1,9 @@
-[[vk::binding(0, 0)]] Texture2D<float4> texture_image;
-[[vk::binding(1, 0)]] SamplerState texture_sampler;
+Texture2D<float4> texture_image : register(t0, space0);
+SamplerState texture_sampler : register(s1, space0);
 
 struct FragmentInput {
-    [[vk::location(0)]] float4 color : COLOR0;
-    [[vk::location(1)]] float2 uv : TEXCOORD0;
+    float4 color : COLOR0;
+    float2 uv : TEXCOORD0;
 };
 
 float4 main(FragmentInput input) : SV_Target0 {
