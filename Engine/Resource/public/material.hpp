@@ -7,6 +7,7 @@ namespace aeg::resource {
     struct TextureMaterialDesc {
         rhi::TextureViewHandle texture_view{};
         rhi::SamplerDesc sampler{};
+        rhi::BindingLayoutHandle binding_layout{};
         rhi::DebugName name{};
     };
 
@@ -15,6 +16,7 @@ namespace aeg::resource {
         rhi::SamplerHandle sampler{};
         rhi::BindingLayoutHandle binding_layout{};
         rhi::BindingSetHandle binding_set{};
+        bool owns_binding_layout{false};
 
         [[nodiscard]] bool is_valid() const noexcept {
             return texture_view.is_valid() && sampler.is_valid() && binding_layout.is_valid() &&

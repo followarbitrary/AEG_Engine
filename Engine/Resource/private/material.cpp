@@ -61,35 +61,43 @@ namespace aeg::resource {
         material.texture_view = desc.texture_view;
         material.sampler = sampler_result.value;
 
-        const std::array<rhi::BindingLayoutEntry, 2> layout_entries{
-                rhi::BindingLayoutEntry{
-                        rhi::BindingLocation{0, 0},
-                        rhi::BindingType::kSampledTexture,
-                        rhi::BindingArrayMode::kSingle,
-                        1,
-                        rhi::ShaderStage::kFragment,
-                        rhi::BindingFlags::kNone
-                },
-                rhi::BindingLayoutEntry{
-                        rhi::BindingLocation{0, 1},
-                        rhi::BindingType::kSampler,
-                        rhi::BindingArrayMode::kSingle,
-                        1,
-                        rhi::ShaderStage::kFragment,
-                        rhi::BindingFlags::kNone
-                }
-        };
-        const rhi::BindingLayoutDesc layout_desc{layout_entries, desc.name};
-        auto layout_result = device.create_binding_layout(layout_desc);
-        if (!layout_result) {
-            (void) destroy_if_valid(device, material.sampler);
-            return {layout_result.result, {}};
+        if (desc.binding_layout.is_valid()) {
+            material.binding_layout = desc.binding_layout;
+            material.owns_binding_layout = false;
+        } else {
+            const std::array<rhi::BindingLayoutEntry, 2> layout_entries{
+                    rhi::BindingLayoutEntry{
+                            rhi::BindingLocation{0, 0},
+                            rhi::BindingType::kSampledTexture,
+                            rhi::BindingArrayMode::kSingle,
+                            1,
+                            rhi::ShaderStage::kFragment,
+                            rhi::BindingFlags::kNone
+                    },
+                    rhi::BindingLayoutEntry{
+                            rhi::BindingLocation{0, 1},
+                            rhi::BindingType::kSampler,
+                            rhi::BindingArrayMode::kSingle,
+                            1,
+                            rhi::ShaderStage::kFragment,
+                            rhi::BindingFlags::kNone
+                    }
+            };
+            const rhi::BindingLayoutDesc layout_desc{layout_entries, desc.name};
+            auto layout_result = device.create_binding_layout(layout_desc);
+            if (!layout_result) {
+                (void) destroy_if_valid(device, material.sampler);
+                return {layout_result.result, {}};
+            }
+            material.binding_layout = layout_result.value;
+            material.owns_binding_layout = true;
         }
-        material.binding_layout = layout_result.value;
 
         auto set_result = device.create_binding_set(material.binding_layout);
         if (!set_result) {
-            (void) destroy_if_valid(device, material.binding_layout);
+            if (material.owns_binding_layout) {
+                (void) destroy_if_valid(device, material.binding_layout);
+            }
             (void) destroy_if_valid(device, material.sampler);
             return {set_result.result, {}};
         }
@@ -124,9 +132,12 @@ namespace aeg::resource {
         const foundation::Result update_result = device.update_binding_set(material.binding_set, writes);
         if (!update_result) {
             (void) destroy_if_valid(device, material.binding_set);
-            (void) destroy_if_valid(device, material.binding_layout);
+            if (material.owns_binding_layout) {
+                (void) destroy_if_valid(device, material.binding_layout);
+            }
             (void) destroy_if_valid(device, material.sampler);
             material.texture_view = {};
+            material.owns_binding_layout = false;
             return {update_result, {}};
         }
 
@@ -170,13 +181,19 @@ namespace aeg::resource {
         }
 
         foundation::Result first_error = destroy_if_valid(device, material.sampler);
-        const foundation::Result layout_result = destroy_if_valid(device, material.binding_layout);
+        foundation::Result layout_result = foundation::Result::success();
+        if (material.owns_binding_layout) {
+            layout_result = destroy_if_valid(device, material.binding_layout);
+        } else {
+            material.binding_layout = {};
+        }
         if (first_error && !layout_result) {
             first_error = layout_result;
         }
         if (!material.sampler.is_valid() && !material.binding_layout.is_valid() &&
             !material.binding_set.is_valid()) {
             material.texture_view = {};
+            material.owns_binding_layout = false;
         }
         return first_error;
     }

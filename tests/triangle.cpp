@@ -20,20 +20,18 @@
 #include <render_graph.hpp>
 #include <resource_uploader.hpp>
 #include <rhi.hpp>
+#include <shader_contract.hpp>
 #include <span>
 #include <string_view>
 #include <texture_uploader.hpp>
 #include <vector>
 
-#include "offscreen_composite_shaders.hpp"
-#include "triangle_shaders.hpp"
+#include "presentation_fullscreen_texture_blit_shaders.hpp"
 
 namespace {
     using aeg::rhi::BufferCapability;
     using aeg::rhi::BufferDesc;
     using aeg::rhi::BufferHandle;
-    using aeg::rhi::BindingFlags;
-    using aeg::rhi::BindingLayoutEntry;
     using aeg::rhi::BindingLayoutHandle;
     using aeg::rhi::BindingResource;
     using aeg::rhi::BindingSetHandle;
@@ -94,6 +92,10 @@ namespace {
     using aeg::resource::TextureMaterialDesc;
     using aeg::resource::TextureSubresourceData;
     using aeg::resource::TextureUploader;
+    using aeg::shader::ShaderManager;
+    using aeg::shader::ShaderPipelineDesc;
+    using aeg::shader::ShaderPipelineLayout;
+    using aeg::shader::ShaderProgram;
 
     bool check_result(const Result &result, std::string_view operation) {
         if (result) {
@@ -216,6 +218,20 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
                 return false;
             }
             device_ = std::move(device_result.value);
+
+            auto shader_program_result = aeg::shader::load_shader_program(
+                    AEG_TRIANGLE_SHADER_PACKAGE_PATH);
+            if (!check_result(shader_program_result, "load_triangle_shader_program")) {
+                return false;
+            }
+            gameplay_shader_program_ = std::move(shader_program_result.value);
+            shader_manager_ = std::make_unique<ShaderManager>(*device_);
+            auto shader_layout_result = shader_manager_->build_pipeline_layout(
+                    gameplay_shader_program_, aeg::rhi::DebugName{"Triangle.GameplayLayout"});
+            if (!check_result(shader_layout_result, "build_triangle_shader_layout")) {
+                return false;
+            }
+            gameplay_shader_layout_ = std::move(shader_layout_result.value);
 
             SurfaceDesc surface_desc{};
             surface_desc.native_display_handle = GetModuleHandleW(nullptr);
@@ -542,6 +558,11 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
             scene_material_desc.sampler.max_lod = 0.0f;
             scene_material_desc.sampler.name = aeg::rhi::DebugName{"Triangle.TextureSampler"};
             scene_material_desc.name = aeg::rhi::DebugName{"Triangle.TextureMaterial"};
+            auto scene_layout_result = shader_manager_->binding_layout(gameplay_shader_layout_, 0);
+            if (!check_result(scene_layout_result, "get_scene_binding_layout")) {
+                return false;
+            }
+            scene_material_desc.binding_layout = scene_layout_result.value;
             auto scene_material_result = aeg::resource::create_texture_material(*device_, scene_material_desc);
             if (!check_result(scene_material_result, "create_texture_material")) {
                 return false;
@@ -566,21 +587,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
         }
 
         [[nodiscard]] bool create_transform_binding() {
-            const std::array<BindingLayoutEntry, 1> layout_entries{
-                BindingLayoutEntry{
-                    aeg::rhi::BindingLocation{1, 0},
-                    BindingType::kUniformBuffer,
-                    aeg::rhi::BindingArrayMode::kSingle,
-                    1,
-                    ShaderStage::kVertex,
-                    BindingFlags::kNone
-                }
-            };
-            const aeg::rhi::BindingLayoutDesc layout_desc{
-                layout_entries,
-                aeg::rhi::DebugName{"Triangle.TransformBindingLayout"}
-            };
-            auto layout_result = device_->create_binding_layout(layout_desc);
+            auto layout_result = shader_manager_->binding_layout(gameplay_shader_layout_, 1);
             if (!check_result(layout_result, "create_transform_binding_layout")) {
                 return false;
             }
@@ -639,21 +646,11 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
         }
 
         [[nodiscard]] bool create_scene_pipeline() {
-            if (!scene_material_.is_valid()) {
+            if (!scene_material_.is_valid() || !gameplay_shader_layout_.is_valid()) {
                 AEG_LOG_ERROR(aeg::logging::Category::kTest,
-                              "Scene pipeline requires a valid texture material");
+                              "Scene pipeline requires a valid material and shader contract layout");
                 return false;
             }
-            const std::array<ShaderStageDesc, 2> shader_stages{
-                ShaderStageDesc{
-                    ShaderStage::kVertex, aeg::shaders::kTriangleVertex.as_span(), "main",
-                    aeg::rhi::DebugName{"Triangle.VertexShader"}
-                },
-                ShaderStageDesc{
-                    ShaderStage::kFragment, aeg::shaders::kTriangleFragment.as_span(), "main",
-                    aeg::rhi::DebugName{"Triangle.FragmentShader"}
-                },
-            };
             const std::array<VertexBindingDesc, 1> vertex_bindings{
                 VertexBindingDesc{0, sizeof(Vertex), VertexInputRate::kVertex},
             };
@@ -663,10 +660,6 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
                 VertexAttributeDesc{2, 0, Format::kRg32Float, sizeof(float) * 6},
             };
             const std::array<Format, 1> color_formats{offscreen_target_.texture_desc.format};
-            const std::array<BindingLayoutHandle, 2> binding_layouts{
-                scene_material_.binding_layout,
-                transform_binding_layout_
-            };
 
             GraphicsPipelineState graphics_state{};
             graphics_state.vertex_bindings = vertex_bindings;
@@ -675,13 +668,12 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
             graphics_state.cull_mode = aeg::rhi::CullMode::kNone;
             graphics_state.color_formats = color_formats;
 
-            PipelineDesc pipeline_desc{};
+            ShaderPipelineDesc pipeline_desc{};
             pipeline_desc.type = PipelineType::kGraphics;
-            pipeline_desc.layout.binding_layouts = binding_layouts;
-            pipeline_desc.shader_stages = shader_stages;
             pipeline_desc.graphics = graphics_state;
             pipeline_desc.name = aeg::rhi::DebugName{"Triangle.GraphicsPipeline"};
-            auto pipeline_result = device_->create_pipeline(pipeline_desc);
+            auto pipeline_result = shader_manager_->create_pipeline(
+                    gameplay_shader_program_, gameplay_shader_layout_, pipeline_desc);
             if (!check_result(pipeline_result, "create_scene_pipeline")) {
                 return false;
             }
@@ -698,15 +690,15 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
             const std::array<ShaderStageDesc, 2> shader_stages{
                 ShaderStageDesc{
                     ShaderStage::kVertex,
-                    aeg::shaders::kOffscreenCompositeVertex.as_span(),
+                    aeg::shaders::kPresentationFullscreenTextureBlitVertex.as_span(),
                     "main",
-                    aeg::rhi::DebugName{"Triangle.CompositeVertexShader"}
+                    aeg::rhi::DebugName{"Triangle.FullscreenTextureBlitVertexShader"}
                 },
                 ShaderStageDesc{
                     ShaderStage::kFragment,
-                    aeg::shaders::kOffscreenCompositeFragment.as_span(),
+                    aeg::shaders::kPresentationFullscreenTextureBlitFragment.as_span(),
                     "main",
-                    aeg::rhi::DebugName{"Triangle.CompositeFragmentShader"}
+                    aeg::rhi::DebugName{"Triangle.FullscreenTextureBlitFragmentShader"}
                 },
             };
             const std::array<Format, 1> color_formats{color_format_};
@@ -722,7 +714,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
             pipeline_desc.layout.binding_layouts = binding_layouts;
             pipeline_desc.shader_stages = shader_stages;
             pipeline_desc.graphics = graphics_state;
-            pipeline_desc.name = aeg::rhi::DebugName{"Triangle.CompositePipeline"};
+            pipeline_desc.name = aeg::rhi::DebugName{"Triangle.FullscreenTextureBlitPipeline"};
             auto pipeline_result = device_->create_pipeline(pipeline_desc);
             if (!check_result(pipeline_result, "create_composite_pipeline")) {
                 return false;
@@ -1110,10 +1102,6 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
                     binding_set = {};
                 }
             }
-            if (transform_binding_layout_.is_valid()) {
-                (void) device_->destroy_binding_layout(transform_binding_layout_);
-                transform_binding_layout_ = {};
-            }
             for (BufferHandle& buffer : transform_buffers_) {
                 if (buffer.is_valid()) {
                     (void) device_->destroy_buffer(buffer);
@@ -1131,6 +1119,15 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
             if (resource_uploader_ != nullptr && mesh_.is_valid()) {
                 (void) resource_uploader_->destroy_mesh(mesh_);
             }
+            if (shader_manager_ != nullptr) {
+                const Result layout_result = shader_manager_->clear_layout_cache();
+                if (!check_result(layout_result, "clear_gameplay_shader_layout_cache")) {
+                    AEG_LOG_ERROR(aeg::logging::Category::kTest,
+                                  "Gameplay shader layout cache still contains live layouts");
+                }
+                gameplay_shader_layout_ = {};
+                shader_manager_.reset();
+            }
             texture_uploader_.reset();
             resource_uploader_.reset();
             if (swapchain_.is_valid()) {
@@ -1147,6 +1144,9 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
         HWND window_{nullptr};
         WindowState &window_state_;
         std::unique_ptr<Device> device_{};
+        std::unique_ptr<ShaderManager> shader_manager_{};
+        ShaderProgram gameplay_shader_program_{};
+        ShaderPipelineLayout gameplay_shader_layout_{};
         std::unique_ptr<FrameContext> frame_context_{};
         std::unique_ptr<RenderGraph> render_graph_{};
         std::unique_ptr<ResourceUploader> resource_uploader_{};

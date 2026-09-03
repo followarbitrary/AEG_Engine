@@ -210,6 +210,33 @@ if (NOT EXISTS "${AEG_VMA_INCLUDE_DIR}/vk_mem_alloc.h")
         "${AEG_VMA_INCLUDE_DIR}/vk_mem_alloc.h")
 endif()
 
+set(AEG_SPIRV_REFLECT_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/SPIRV-Reflect")
+set(AEG_SPIRV_REFLECT_INCLUDE_DIR
+    "${AEG_SPIRV_REFLECT_DIR}/include")
+if (NOT EXISTS "${AEG_SPIRV_REFLECT_DIR}/spirv_reflect.h" OR
+    NOT EXISTS "${AEG_SPIRV_REFLECT_DIR}/src/spirv_reflect.cpp" OR
+    NOT EXISTS "${AEG_SPIRV_REFLECT_INCLUDE_DIR}/spirv/unified1/spirv.h")
+    message(FATAL_ERROR
+        "Vendored SPIRV-Reflect source is incomplete. Expected headers and source under ThirdParty/SPIRV-Reflect.")
+endif()
+
+add_library(aeg_spirv_reflect STATIC
+    ThirdParty/SPIRV-Reflect/src/spirv_reflect.cpp
+)
+target_compile_features(aeg_spirv_reflect PUBLIC cxx_std_20)
+target_include_directories(aeg_spirv_reflect
+    SYSTEM PUBLIC
+        ${AEG_SPIRV_REFLECT_DIR}
+        ${AEG_SPIRV_REFLECT_INCLUDE_DIR}
+)
+
+if (MSVC)
+    target_compile_options(aeg_spirv_reflect PRIVATE /W0)
+else()
+    target_compile_options(aeg_spirv_reflect PRIVATE -w)
+endif()
+
 add_library(aeg_rhi_core STATIC
         Engine/RHI/private/rhi_factory.cpp
 )
@@ -257,9 +284,26 @@ else()
     target_compile_options(aeg_rhi_vulkan PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
+add_library(aeg_shader STATIC
+    Engine/Shader/private/shader_manager.cpp
+)
+target_compile_features(aeg_shader PUBLIC cxx_std_20)
+target_include_directories(aeg_shader
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Shader/public
+)
+target_link_libraries(aeg_shader PUBLIC aeg_foundation aeg_rhi_core)
+
+if (MSVC)
+    target_compile_options(aeg_shader PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(aeg_shader PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
 # The runtime RHI links only production backends.
 add_library(aeg_rhi INTERFACE)
-if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang" AND
+    CMAKE_LINK_GROUP_USING_RESCAN_SUPPORTED)
     target_link_libraries(aeg_rhi INTERFACE
         "$<LINK_GROUP:RESCAN,aeg_rhi_core,aeg_rhi_vulkan>")
 else()
@@ -328,6 +372,22 @@ if (WIN32)
 endif()
 
 if (WIN32)
+    add_executable(aeg_shader_contract_tool
+        tools/shader_contract_tool.cpp
+    )
+    target_compile_features(aeg_shader_contract_tool PRIVATE cxx_std_20)
+    target_include_directories(aeg_shader_contract_tool
+        PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Shader/public
+            ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RHI/public
+    )
+    target_link_libraries(aeg_shader_contract_tool PRIVATE aeg_spirv_reflect)
+    if (MSVC)
+        target_compile_options(aeg_shader_contract_tool PRIVATE /W4 /permissive-)
+    else()
+        target_compile_options(aeg_shader_contract_tool PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+
     set(AEG_SHADER_OUTPUT_DIR
         "${CMAKE_CURRENT_BINARY_DIR}/generated/shaders")
     set(AEG_SHADER_PUBLIC_DIR
@@ -338,8 +398,29 @@ if (WIN32)
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/private/generated")
     set(AEG_SHADER_NAMESPACE
         aeg::shaders)
+    set(AEG_COMMON_SHADER_SOURCE_DIR
+        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/common")
+    set(AEG_CORE_SHADER_SOURCE_DIR
+        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/core")
     set(AEG_TEST_SHADER_SOURCE_DIR
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders")
+
+    add_library(aeg_core_shaders STATIC)
+    target_compile_features(aeg_core_shaders PUBLIC cxx_std_20)
+    target_include_directories(aeg_core_shaders
+        PUBLIC
+            ${AEG_SHADER_PUBLIC_DIR}
+    )
+    aeg_add_hlsl_shader_directory(
+        TARGET aeg_core_shaders
+        SHADER_DIRECTORY "${AEG_CORE_SHADER_SOURCE_DIR}"
+        COMMON_SHADER_DIRECTORY "${AEG_COMMON_SHADER_SOURCE_DIR}"
+        NAMESPACE "${AEG_SHADER_NAMESPACE}"
+        OUTPUT_DIRECTORY "${AEG_SHADER_OUTPUT_DIR}/core"
+        GENERATED_INCLUDE_DIRECTORY "${AEG_SHADER_GENERATED_INCLUDE_DIR}"
+        GENERATED_SOURCE_DIRECTORY "${AEG_SHADER_GENERATED_SOURCE_DIR}"
+        MODE CORE
+    )
 
     add_executable(aeg_triangle
         tests/triangle.cpp
@@ -347,13 +428,28 @@ if (WIN32)
     aeg_add_hlsl_shader_directory(
         TARGET aeg_triangle
         SHADER_DIRECTORY "${AEG_TEST_SHADER_SOURCE_DIR}"
+        COMMON_SHADER_DIRECTORY "${AEG_COMMON_SHADER_SOURCE_DIR}"
         NAMESPACE "${AEG_SHADER_NAMESPACE}"
-        OUTPUT_DIRECTORY "${AEG_SHADER_OUTPUT_DIR}"
+        OUTPUT_DIRECTORY "${AEG_SHADER_OUTPUT_DIR}/gameplay"
         GENERATED_INCLUDE_DIRECTORY "${AEG_SHADER_GENERATED_INCLUDE_DIR}"
         GENERATED_SOURCE_DIRECTORY "${AEG_SHADER_GENERATED_SOURCE_DIR}"
+        MODE GAMEPLAY
+        CONTRACT_TOOL aeg_shader_contract_tool
+        PACKAGE_OUTPUT_VARIABLE AEG_TRIANGLE_SHADER_PACKAGE
     )
-    target_link_libraries(aeg_triangle PRIVATE aeg_rhi aeg_math aeg_resource user32 gdi32)
-    target_compile_definitions(aeg_triangle PRIVATE _CRT_SECURE_NO_WARNINGS)
+    target_link_libraries(aeg_triangle PRIVATE
+        aeg_rhi
+        aeg_math
+        aeg_resource
+        aeg_shader
+        aeg_core_shaders
+        user32
+        gdi32
+    )
+    target_compile_definitions(aeg_triangle PRIVATE
+        _CRT_SECURE_NO_WARNINGS
+        AEG_TRIANGLE_SHADER_PACKAGE_PATH="${AEG_TRIANGLE_SHADER_PACKAGE}"
+    )
 endif()
 
 if (BUILD_TESTING)
