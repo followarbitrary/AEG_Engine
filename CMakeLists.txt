@@ -285,7 +285,9 @@ set(AEG_RESOURCE_PUBLIC_DIR
     "${CMAKE_CURRENT_SOURCE_DIR}/Engine/Resource/public")
 
 add_library(aeg_resource STATIC
+    Engine/Resource/private/material.cpp
     Engine/Resource/private/mesh.cpp
+    Engine/Resource/private/render_target.cpp
     Engine/Resource/private/resource_uploader.cpp
     Engine/Resource/private/texture.cpp
     Engine/Resource/private/texture_uploader.cpp
@@ -326,8 +328,10 @@ endif()
 if (WIN32)
     set(AEG_TRIANGLE_SHADER_OUTPUT_DIR
         "${CMAKE_CURRENT_BINARY_DIR}/generated/shaders")
+    set(AEG_SHADER_GENERATED_INCLUDE_DIR
+        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/include/generated")
     set(AEG_TRIANGLE_SHADER_HEADER
-        "${CMAKE_CURRENT_BINARY_DIR}/generated/triangle_shaders.hpp")
+        "${AEG_SHADER_GENERATED_INCLUDE_DIR}/triangle_shaders.hpp")
     set(AEG_SHADER_HEADER_SCRIPT
         "${CMAKE_CURRENT_SOURCE_DIR}/cmake/generate_spirv_header.cmake")
 
@@ -339,6 +343,17 @@ if (WIN32)
         "${AEG_TRIANGLE_SHADER_OUTPUT_DIR}/triangle.vert.spv")
     set(AEG_TRIANGLE_FRAGMENT_SPV
         "${AEG_TRIANGLE_SHADER_OUTPUT_DIR}/triangle.frag.spv")
+
+    set(AEG_OFFSCREEN_SHADER_HEADER
+        "${AEG_SHADER_GENERATED_INCLUDE_DIR}/offscreen_composite_shaders.hpp")
+    set(AEG_OFFSCREEN_VERTEX_HLSL
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/offscreen_composite.vert.hlsl")
+    set(AEG_OFFSCREEN_FRAGMENT_HLSL
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/offscreen_composite.frag.hlsl")
+    set(AEG_OFFSCREEN_VERTEX_SPV
+        "${AEG_TRIANGLE_SHADER_OUTPUT_DIR}/offscreen_composite.vert.spv")
+    set(AEG_OFFSCREEN_FRAGMENT_SPV
+        "${AEG_TRIANGLE_SHADER_OUTPUT_DIR}/offscreen_composite.frag.spv")
 
     add_custom_command(
         OUTPUT "${AEG_TRIANGLE_VERTEX_SPV}"
@@ -396,19 +411,80 @@ if (WIN32)
         VERBATIM
     )
 
+    add_custom_command(
+        OUTPUT "${AEG_OFFSCREEN_VERTEX_SPV}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory
+            "${AEG_TRIANGLE_SHADER_OUTPUT_DIR}"
+        COMMAND "${AEG_DXC_EXECUTABLE}"
+            -spirv
+            -fspv-target-env=vulkan1.3
+            -fvk-use-dx-layout
+            -O3
+            -T vs_6_0
+            -E main
+            -Fo "${AEG_OFFSCREEN_VERTEX_SPV}"
+            "${AEG_OFFSCREEN_VERTEX_HLSL}"
+        DEPENDS
+            "${AEG_OFFSCREEN_VERTEX_HLSL}"
+            "${AEG_DXC_EXECUTABLE}"
+        COMMENT "Compiling HLSL offscreen composite vertex shader"
+        VERBATIM
+    )
+
+    add_custom_command(
+        OUTPUT "${AEG_OFFSCREEN_FRAGMENT_SPV}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory
+            "${AEG_TRIANGLE_SHADER_OUTPUT_DIR}"
+        COMMAND "${AEG_DXC_EXECUTABLE}"
+            -spirv
+            -fspv-target-env=vulkan1.3
+            -fvk-use-dx-layout
+            -O3
+            -T ps_6_0
+            -E main
+            -Fo "${AEG_OFFSCREEN_FRAGMENT_SPV}"
+            "${AEG_OFFSCREEN_FRAGMENT_HLSL}"
+        DEPENDS
+            "${AEG_OFFSCREEN_FRAGMENT_HLSL}"
+            "${AEG_DXC_EXECUTABLE}"
+        COMMENT "Compiling HLSL offscreen composite fragment shader"
+        VERBATIM
+    )
+
+    add_custom_command(
+        OUTPUT "${AEG_OFFSCREEN_SHADER_HEADER}"
+        COMMAND "${CMAKE_COMMAND}"
+            "-DOUTPUT=${AEG_OFFSCREEN_SHADER_HEADER}"
+            "-DVERTEX_SPV=${AEG_OFFSCREEN_VERTEX_SPV}"
+            "-DFRAGMENT_SPV=${AEG_OFFSCREEN_FRAGMENT_SPV}"
+            "-DNAMESPACE=aeg::offscreen_composite_shaders"
+            -P "${AEG_SHADER_HEADER_SCRIPT}"
+        DEPENDS
+            "${AEG_OFFSCREEN_VERTEX_SPV}"
+            "${AEG_OFFSCREEN_FRAGMENT_SPV}"
+            "${AEG_SHADER_HEADER_SCRIPT}"
+        COMMENT "Generating C++ offscreen composite shader header from SPIR-V"
+        VERBATIM
+    )
+
     add_executable(aeg_triangle
         tests/triangle.cpp
         "${AEG_TRIANGLE_SHADER_HEADER}"
+        "${AEG_OFFSCREEN_SHADER_HEADER}"
         "${AEG_TRIANGLE_VERTEX_HLSL}"
         "${AEG_TRIANGLE_FRAGMENT_HLSL}"
+        "${AEG_OFFSCREEN_VERTEX_HLSL}"
+        "${AEG_OFFSCREEN_FRAGMENT_HLSL}"
     )
     set_source_files_properties(
         "${AEG_TRIANGLE_VERTEX_HLSL}"
         "${AEG_TRIANGLE_FRAGMENT_HLSL}"
+        "${AEG_OFFSCREEN_VERTEX_HLSL}"
+        "${AEG_OFFSCREEN_FRAGMENT_HLSL}"
         PROPERTIES HEADER_FILE_ONLY TRUE
     )
     target_include_directories(aeg_triangle PRIVATE
-        "${CMAKE_CURRENT_BINARY_DIR}/generated"
+        "${AEG_SHADER_GENERATED_INCLUDE_DIR}"
     )
     target_link_libraries(aeg_triangle PRIVATE aeg_rhi aeg_math aeg_resource user32 gdi32)
     target_compile_definitions(aeg_triangle PRIVATE _CRT_SECURE_NO_WARNINGS)

@@ -4,6 +4,7 @@
 /out/
 
 # CMake generated files
+/shaders/include/generated/
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake

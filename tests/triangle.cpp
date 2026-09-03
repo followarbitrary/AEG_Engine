@@ -12,8 +12,10 @@
 #include <cstdlib>
 #include <limits>
 #include <logging.hpp>
+#include <material.hpp>
 #include <memory>
 #include <math.hpp>
+#include <render_target.hpp>
 #include <render_graph.hpp>
 #include <resource_uploader.hpp>
 #include <rhi.hpp>
@@ -21,20 +23,17 @@
 #include <string_view>
 #include <texture_uploader.hpp>
 
+#include "offscreen_composite_shaders.hpp"
 #include "triangle_shaders.hpp"
 
 namespace {
     using aeg::rhi::BufferCapability;
     using aeg::rhi::BufferDesc;
     using aeg::rhi::BufferHandle;
-    using aeg::rhi::BindingLayoutDesc;
-    using aeg::rhi::BindingLayoutEntry;
     using aeg::rhi::BindingLayoutHandle;
-    using aeg::rhi::BindingSetHandle;
-    using aeg::rhi::BindingType;
-    using aeg::rhi::BindingWrite;
     using aeg::rhi::Device;
     using aeg::rhi::DeviceCreateDesc;
+    using aeg::rhi::DrawDesc;
     using aeg::rhi::DrawIndexedDesc;
     using aeg::rhi::Filter;
     using aeg::rhi::Format;
@@ -51,8 +50,6 @@ namespace {
     using aeg::rhi::PrimitiveTopology;
     using aeg::rhi::QueueClass;
     using aeg::rhi::ResourceUsage;
-    using aeg::rhi::SamplerDesc;
-    using aeg::rhi::SamplerHandle;
     using aeg::foundation::Result;
     using aeg::foundation::ResultCode;
     using aeg::rhi::ShaderStage;
@@ -81,8 +78,12 @@ namespace {
     using aeg::resource::GpuMesh;
     using aeg::resource::MeshData;
     using aeg::resource::GpuTexture;
+    using aeg::resource::OffscreenRenderTarget;
+    using aeg::resource::OffscreenRenderTargetDesc;
     using aeg::resource::ResourceUploader;
     using aeg::resource::TextureData;
+    using aeg::resource::TextureMaterial;
+    using aeg::resource::TextureMaterialDesc;
     using aeg::resource::TextureSubresourceData;
     using aeg::resource::TextureUploader;
 
@@ -225,7 +226,8 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
             render_graph_ = std::make_unique<RenderGraph>(*device_);
             resource_uploader_ = std::make_unique<ResourceUploader>(*device_);
             texture_uploader_ = std::make_unique<TextureUploader>(*device_);
-            if (!create_mesh() || !create_texture() || !create_texture_bindings() || !create_pipeline()) {
+            if (!create_mesh() || !create_texture() || !create_offscreen_render_target() ||
+                !create_texture_materials() || !create_pipelines()) {
                 return false;
             }
             return true;
@@ -309,6 +311,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
                 mesh_vertex_state_ = mesh_vertex_graphics_state_;
                 mesh_index_state_ = mesh_index_graphics_state_;
                 texture_state_ = texture_sampled_graphics_state_;
+                offscreen_state_ = offscreen_sampled_graphics_state_;
 
                 rotation_angle_ += 0.02f;
                 ++frame_count;
@@ -369,13 +372,53 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
             if (!update_swapchain_info()) {
                 return false;
             }
-            render_graph_->reset();
-            if (previous_format != color_format_) {
-                if (!check_result(device_->destroy_pipeline(pipeline_), "destroy_pipeline_for_recreate")) {
+
+            OffscreenRenderTarget replacement{};
+            const OffscreenRenderTargetDesc target_desc{
+                    {swapchain_info_.extent.width, swapchain_info_.extent.height},
+                    color_format_,
+                    aeg::rhi::SampleCount::kX1,
+                    true,
+                    aeg::rhi::DebugName{"Triangle.Offscreen"}
+            };
+            auto target_result = aeg::resource::create_offscreen_render_target(*device_, target_desc);
+            if (!check_result(target_result, "recreate_offscreen_render_target")) {
+                return false;
+            }
+            replacement = target_result.value;
+
+            const aeg::rhi::TextureViewHandle previous_sampled_view = offscreen_target_.sampled_view;
+            if (composite_material_.is_valid()) {
+                const Result material_result = aeg::resource::update_texture_material(
+                        *device_, composite_material_, replacement.sampled_view);
+                if (!check_result(material_result, "update_offscreen_material")) {
+                    (void) aeg::resource::destroy_offscreen_render_target(*device_, replacement);
                     return false;
                 }
-                pipeline_ = {};
-                return create_pipeline();
+            }
+            const Result destroy_result = aeg::resource::destroy_offscreen_render_target(*device_, offscreen_target_);
+            if (!destroy_result) {
+                if (composite_material_.is_valid() && previous_sampled_view.is_valid()) {
+                    (void) aeg::resource::update_texture_material(
+                            *device_, composite_material_, previous_sampled_view);
+                }
+                (void) aeg::resource::destroy_offscreen_render_target(*device_, replacement);
+                return check_result(destroy_result, "destroy_previous_offscreen_render_target");
+            }
+            offscreen_target_ = replacement;
+            offscreen_state_ = {};
+            render_graph_->reset();
+            if (previous_format != color_format_) {
+                if (!check_result(device_->destroy_pipeline(scene_pipeline_), "destroy_scene_pipeline_for_recreate")) {
+                    return false;
+                }
+                scene_pipeline_ = {};
+                if (!check_result(device_->destroy_pipeline(composite_pipeline_),
+                                  "destroy_composite_pipeline_for_recreate")) {
+                    return false;
+                }
+                composite_pipeline_ = {};
+                return create_pipelines();
             }
             return true;
         }
@@ -449,7 +492,77 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
             return true;
         }
 
-        [[nodiscard]] bool create_pipeline() {
+        [[nodiscard]] bool create_offscreen_render_target() {
+            const OffscreenRenderTargetDesc target_desc{
+                    {swapchain_info_.extent.width, swapchain_info_.extent.height},
+                    color_format_,
+                    aeg::rhi::SampleCount::kX1,
+                    true,
+                    aeg::rhi::DebugName{"Triangle.Offscreen"}
+            };
+            auto target_result = aeg::resource::create_offscreen_render_target(*device_, target_desc);
+            if (!check_result(target_result, "create_offscreen_render_target")) {
+                return false;
+            }
+            offscreen_target_ = target_result.value;
+            offscreen_sampled_graphics_state_ = aeg::rhi::ResourceState{
+                ResourceUsage::kSampledRead,
+                ShaderStage::kAll,
+                QueueClass::kGraphics,
+                false,
+                PipelineStage::kAllCommands
+            };
+            offscreen_state_ = {};
+            return true;
+        }
+
+        [[nodiscard]] bool create_texture_materials() {
+            if (!texture_.has_sampled_view() || !offscreen_target_.sampled_view.is_valid()) {
+                AEG_LOG_ERROR(aeg::logging::Category::kTest,
+                              "Texture material creation requires sampled texture views");
+                return false;
+            }
+
+            TextureMaterialDesc scene_material_desc{};
+            scene_material_desc.texture_view = texture_.sampled_view;
+            scene_material_desc.sampler.min_filter = Filter::kNearest;
+            scene_material_desc.sampler.mag_filter = Filter::kNearest;
+            scene_material_desc.sampler.mip_filter = Filter::kNearest;
+            scene_material_desc.sampler.address_u = aeg::rhi::AddressMode::kClampToEdge;
+            scene_material_desc.sampler.address_v = aeg::rhi::AddressMode::kClampToEdge;
+            scene_material_desc.sampler.address_w = aeg::rhi::AddressMode::kClampToEdge;
+            scene_material_desc.sampler.max_lod = 0.0f;
+            scene_material_desc.sampler.name = aeg::rhi::DebugName{"Triangle.TextureSampler"};
+            scene_material_desc.name = aeg::rhi::DebugName{"Triangle.TextureMaterial"};
+            auto scene_material_result = aeg::resource::create_texture_material(*device_, scene_material_desc);
+            if (!check_result(scene_material_result, "create_texture_material")) {
+                return false;
+            }
+            scene_material_ = scene_material_result.value;
+
+            TextureMaterialDesc composite_material_desc{};
+            composite_material_desc.texture_view = offscreen_target_.sampled_view;
+            composite_material_desc.sampler.address_u = aeg::rhi::AddressMode::kClampToEdge;
+            composite_material_desc.sampler.address_v = aeg::rhi::AddressMode::kClampToEdge;
+            composite_material_desc.sampler.address_w = aeg::rhi::AddressMode::kClampToEdge;
+            composite_material_desc.sampler.max_lod = 0.0f;
+            composite_material_desc.sampler.name = aeg::rhi::DebugName{"Triangle.OffscreenSampler"};
+            composite_material_desc.name = aeg::rhi::DebugName{"Triangle.OffscreenMaterial"};
+            auto composite_material_result = aeg::resource::create_texture_material(
+                    *device_, composite_material_desc);
+            if (!check_result(composite_material_result, "create_offscreen_material")) {
+                return false;
+            }
+            composite_material_ = composite_material_result.value;
+            return true;
+        }
+
+        [[nodiscard]] bool create_scene_pipeline() {
+            if (!scene_material_.is_valid()) {
+                AEG_LOG_ERROR(aeg::logging::Category::kTest,
+                              "Scene pipeline requires a valid texture material");
+                return false;
+            }
             const std::array<ShaderStageDesc, 2> shader_stages{
                 ShaderStageDesc{
                     ShaderStage::kVertex, std::as_bytes(std::span{aeg::triangle_shaders::kVertex}), "main",
@@ -468,8 +581,8 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
                 VertexAttributeDesc{1, 0, Format::kRgba32Float, sizeof(float) * 2},
                 VertexAttributeDesc{2, 0, Format::kRg32Float, sizeof(float) * 6},
             };
-            const std::array<Format, 1> color_formats{color_format_};
-            const std::array<aeg::rhi::BindingLayoutHandle, 1> binding_layouts{texture_binding_layout_};
+            const std::array<Format, 1> color_formats{offscreen_target_.texture_desc.format};
+            const std::array<BindingLayoutHandle, 1> binding_layouts{scene_material_.binding_layout};
 
             GraphicsPipelineState graphics_state{};
             graphics_state.vertex_bindings = vertex_bindings;
@@ -490,11 +603,57 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
             pipeline_desc.graphics = graphics_state;
             pipeline_desc.name = aeg::rhi::DebugName{"Triangle.GraphicsPipeline"};
             auto pipeline_result = device_->create_pipeline(pipeline_desc);
-            if (!check_result(pipeline_result, "create_graphics_pipeline")) {
+            if (!check_result(pipeline_result, "create_scene_pipeline")) {
                 return false;
             }
-            pipeline_ = pipeline_result.value;
+            scene_pipeline_ = pipeline_result.value;
             return true;
+        }
+
+        [[nodiscard]] bool create_composite_pipeline() {
+            if (!composite_material_.is_valid()) {
+                AEG_LOG_ERROR(aeg::logging::Category::kTest,
+                              "Composite pipeline requires a valid texture material");
+                return false;
+            }
+            const std::array<ShaderStageDesc, 2> shader_stages{
+                ShaderStageDesc{
+                    ShaderStage::kVertex,
+                    std::as_bytes(std::span{aeg::offscreen_composite_shaders::kVertex}),
+                    "main",
+                    aeg::rhi::DebugName{"Triangle.CompositeVertexShader"}
+                },
+                ShaderStageDesc{
+                    ShaderStage::kFragment,
+                    std::as_bytes(std::span{aeg::offscreen_composite_shaders::kFragment}),
+                    "main",
+                    aeg::rhi::DebugName{"Triangle.CompositeFragmentShader"}
+                },
+            };
+            const std::array<Format, 1> color_formats{color_format_};
+            const std::array<BindingLayoutHandle, 1> binding_layouts{composite_material_.binding_layout};
+
+            GraphicsPipelineState graphics_state{};
+            graphics_state.topology = PrimitiveTopology::kTriangleList;
+            graphics_state.cull_mode = aeg::rhi::CullMode::kNone;
+            graphics_state.color_formats = color_formats;
+
+            PipelineDesc pipeline_desc{};
+            pipeline_desc.type = PipelineType::kGraphics;
+            pipeline_desc.layout.binding_layouts = binding_layouts;
+            pipeline_desc.shader_stages = shader_stages;
+            pipeline_desc.graphics = graphics_state;
+            pipeline_desc.name = aeg::rhi::DebugName{"Triangle.CompositePipeline"};
+            auto pipeline_result = device_->create_pipeline(pipeline_desc);
+            if (!check_result(pipeline_result, "create_composite_pipeline")) {
+                return false;
+            }
+            composite_pipeline_ = pipeline_result.value;
+            return true;
+        }
+
+        [[nodiscard]] bool create_pipelines() {
+            return create_scene_pipeline() && create_composite_pipeline();
         }
 
         [[nodiscard]] bool create_texture() {
@@ -569,62 +728,6 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
             return true;
         }
 
-        [[nodiscard]] bool create_texture_bindings() {
-            if (!texture_.has_sampled_view()) {
-                AEG_LOG_ERROR(aeg::logging::Category::kTest,
-                              "Texture upload did not create a sampled texture view");
-                return false;
-            }
-
-            SamplerDesc sampler_desc{};
-            sampler_desc.min_filter = Filter::kNearest;
-            sampler_desc.mag_filter = Filter::kNearest;
-            sampler_desc.mip_filter = Filter::kNearest;
-            sampler_desc.address_u = aeg::rhi::AddressMode::kClampToEdge;
-            sampler_desc.address_v = aeg::rhi::AddressMode::kClampToEdge;
-            sampler_desc.address_w = aeg::rhi::AddressMode::kClampToEdge;
-            sampler_desc.max_lod = 0.0f;
-            sampler_desc.name = aeg::rhi::DebugName{"Triangle.TextureSampler"};
-            auto sampler_result = device_->create_sampler(sampler_desc);
-            if (!check_result(sampler_result, "create_texture_sampler")) {
-                return false;
-            }
-            sampler_ = sampler_result.value;
-
-            std::array<BindingLayoutEntry, 2> layout_entries{};
-            layout_entries[0].location = {0, 0};
-            layout_entries[0].type = BindingType::kSampledTexture;
-            layout_entries[0].shader_stages = ShaderStage::kFragment;
-            layout_entries[1].location = {0, 1};
-            layout_entries[1].type = BindingType::kSampler;
-            layout_entries[1].shader_stages = ShaderStage::kFragment;
-
-            BindingLayoutDesc layout_desc{};
-            layout_desc.entries = layout_entries;
-            layout_desc.name = aeg::rhi::DebugName{"Triangle.TextureBindingLayout"};
-            auto layout_result = device_->create_binding_layout(layout_desc);
-            if (!check_result(layout_result, "create_texture_binding_layout")) {
-                return false;
-            }
-            texture_binding_layout_ = layout_result.value;
-
-            auto set_result = device_->create_binding_set(texture_binding_layout_);
-            if (!check_result(set_result, "create_texture_binding_set")) {
-                return false;
-            }
-            texture_binding_set_ = set_result.value;
-
-            std::array<BindingWrite, 2> writes{};
-            writes[0].location = {0, 0};
-            writes[0].resource.type = BindingType::kSampledTexture;
-            writes[0].resource.texture_view = texture_.sampled_view;
-            writes[1].location = {0, 1};
-            writes[1].resource.type = BindingType::kSampler;
-            writes[1].resource.sampler = sampler_;
-            return check_result(device_->update_binding_set(texture_binding_set_, writes),
-                                "update_texture_binding_set");
-        }
-
         [[nodiscard]] bool record_frame(const FrameAcquireResult &acquired) {
             const float aspect_ratio = static_cast<float>(swapchain_info_.extent.width) /
                                        static_cast<float>(swapchain_info_.extent.height);
@@ -672,15 +775,23 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
                 return false;
             }
 
-            aeg::rhi::TextureDesc color_desc{};
-            color_desc.extent = {swapchain_info_.extent.width, swapchain_info_.extent.height, 1};
-            color_desc.format = color_format_;
-            color_desc.capabilities = aeg::rhi::TextureCapability::kColorAttachment;
-            color_desc.memory = MemoryClass::kDeviceLocal;
-            color_desc.initial_usage = ResourceUsage::kPresent;
-            color_desc.initial_stages = PipelineStage::kAllCommands;
-            color_desc.initial_queue = QueueClass::kGraphics;
-            color_desc.name = aeg::rhi::DebugName{"Triangle.SwapchainImage"};
+            TextureDesc offscreen_desc = offscreen_target_.texture_desc;
+            offscreen_desc.name = aeg::rhi::DebugName{"Triangle.Offscreen"};
+            auto offscreen_resource_result = render_graph_->import_texture(
+                    offscreen_target_.texture, offscreen_target_.color_view, offscreen_desc, offscreen_state_);
+            if (!check_result(offscreen_resource_result, "import_offscreen_texture")) {
+                return false;
+            }
+
+            TextureDesc swapchain_desc{};
+            swapchain_desc.extent = {swapchain_info_.extent.width, swapchain_info_.extent.height, 1};
+            swapchain_desc.format = color_format_;
+            swapchain_desc.capabilities = TextureCapability::kColorAttachment;
+            swapchain_desc.memory = MemoryClass::kDeviceLocal;
+            swapchain_desc.initial_usage = ResourceUsage::kPresent;
+            swapchain_desc.initial_stages = PipelineStage::kAllCommands;
+            swapchain_desc.initial_queue = QueueClass::kGraphics;
+            swapchain_desc.name = aeg::rhi::DebugName{"Triangle.SwapchainImage"};
             const aeg::rhi::ResourceState present_state{
                 ResourceUsage::kPresent,
                 ShaderStage::kAll,
@@ -688,27 +799,28 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
                 false,
                 PipelineStage::kAllCommands
             };
-            auto color_resource_result = render_graph_->import_swapchain_image(acquired, color_desc, present_state);
-            if (!check_result(color_resource_result, "import_swapchain_image")) {
+            auto swapchain_resource_result = render_graph_->import_swapchain_image(
+                    acquired, swapchain_desc, present_state);
+            if (!check_result(swapchain_resource_result, "import_swapchain_image")) {
                 return false;
             }
 
             const RenderGraphBuffer vertex_resource = vertex_resource_result.value;
             const RenderGraphBuffer index_resource = index_resource_result.value;
             const RenderGraphTexture texture_resource = texture_resource_result.value;
-            const auto color_resource = color_resource_result.value;
-            auto pass_result = render_graph_->add_pass(
-                    "Triangle.Graphics", QueueClass::kGraphics,
-                    [vertex_resource, index_resource, texture_resource, color_resource](PassBuilder &builder) {
+            const RenderGraphTexture offscreen_resource = offscreen_resource_result.value;
+            const RenderGraphTexture swapchain_resource = swapchain_resource_result.value;
+
+            auto scene_pass_result = render_graph_->add_pass(
+                    "Triangle.OffscreenScene", QueueClass::kGraphics,
+                    [vertex_resource, index_resource, texture_resource, offscreen_resource](PassBuilder &builder) {
                         if (const Result result = builder.read(vertex_resource, ResourceUsage::kVertexInput,
-                                                               PipelineStage::kVertexInput, ShaderStage::kVertex,
-                                                               {});
+                                                               PipelineStage::kVertexInput, ShaderStage::kVertex, {});
                             !result) {
                             return result;
                         }
                         if (const Result result = builder.read(index_resource, ResourceUsage::kIndexInput,
-                                                               PipelineStage::kVertexInput, ShaderStage::kVertex,
-                                                               {});
+                                                               PipelineStage::kVertexInput, ShaderStage::kVertex, {});
                             !result) {
                             return result;
                         }
@@ -717,15 +829,10 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
                             !result) {
                             return result;
                         }
-                        if (const Result result = builder.use_color_attachment(
-                                    color_resource, LoadOp::kClear, aeg::rhi::StoreOp::kStore,
-                                    aeg::rhi::ClearColorValue{0.025f, 0.035f, 0.06f, 1.0f},
-                                    ResourceUsage::kPresent);
-                            !result) {
-                            return result;
-                        }
-                        builder.set_side_effects();
-                        return Result::success();
+                        return builder.use_color_attachment(
+                                offscreen_resource, LoadOp::kClear, aeg::rhi::StoreOp::kStore,
+                                aeg::rhi::ClearColorValue{0.025f, 0.035f, 0.06f, 1.0f},
+                                ResourceUsage::kSampledRead);
                     },
                     [this, vertex_resource, index_resource](PassExecutionContext &context) {
                         auto vertex_buffer_result = context.buffer(vertex_resource);
@@ -736,12 +843,13 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
                         if (!index_buffer_result) {
                             return index_buffer_result.result;
                         }
-                        if (const Result result = context.device().bind_pipeline(context.command_list(), pipeline_);
+                        if (const Result result = context.device().bind_pipeline(
+                                    context.command_list(), scene_pipeline_);
                             !result) {
                             return result;
                         }
                         if (const Result result = context.device().bind_binding_set(
-                                    context.command_list(), 0, texture_binding_set_);
+                                    context.command_list(), 0, scene_material_.binding_set);
                             !result) {
                             return result;
                         }
@@ -767,13 +875,16 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
                         const Viewport viewport{
                             0.0f,
                             0.0f,
-                            static_cast<float>(swapchain_info_.extent.width),
-                            static_cast<float>(swapchain_info_.extent.height),
+                            static_cast<float>(offscreen_target_.texture_desc.extent.width),
+                            static_cast<float>(offscreen_target_.texture_desc.extent.height),
                             0.0f,
                             1.0f
                         };
                         const aeg::rhi::ScissorRect scissor{
-                            0, 0, swapchain_info_.extent.width, swapchain_info_.extent.height
+                            0,
+                            0,
+                            offscreen_target_.texture_desc.extent.width,
+                            offscreen_target_.texture_desc.extent.height
                         };
                         if (const Result result = context.device().set_viewport(context.command_list(), viewport);
                             !result) {
@@ -790,7 +901,72 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
                         }
                         return context.end_rendering();
                     });
-            if (!check_result(pass_result, "add_triangle_pass")) {
+            if (!check_result(scene_pass_result, "add_offscreen_scene_pass")) {
+                return false;
+            }
+
+            auto composite_pass_result = render_graph_->add_pass(
+                    "Triangle.OffscreenComposite", QueueClass::kGraphics,
+                    [offscreen_resource, swapchain_resource](PassBuilder &builder) {
+                        if (const Result result = builder.read(offscreen_resource, ResourceUsage::kSampledRead,
+                                                               PipelineStage::kAllCommands, ShaderStage::kAll, {});
+                            !result) {
+                            return result;
+                        }
+                        if (const Result result = builder.use_color_attachment(
+                                    swapchain_resource, LoadOp::kClear, aeg::rhi::StoreOp::kStore,
+                                    aeg::rhi::ClearColorValue{0.0f, 0.0f, 0.0f, 1.0f},
+                                    ResourceUsage::kPresent);
+                            !result) {
+                            return result;
+                        }
+                        builder.set_side_effects();
+                        return Result::success();
+                    },
+                    [this](PassExecutionContext &context) {
+                        if (const Result result = context.device().bind_pipeline(
+                                    context.command_list(), composite_pipeline_);
+                            !result) {
+                            return result;
+                        }
+                        if (const Result result = context.device().bind_binding_set(
+                                    context.command_list(), 0, composite_material_.binding_set);
+                            !result) {
+                            return result;
+                        }
+                        if (const Result result = context.begin_rendering(); !result) {
+                            return result;
+                        }
+                        const Viewport viewport{
+                            0.0f,
+                            0.0f,
+                            static_cast<float>(swapchain_info_.extent.width),
+                            static_cast<float>(swapchain_info_.extent.height),
+                            0.0f,
+                            1.0f
+                        };
+                        const aeg::rhi::ScissorRect scissor{
+                            0,
+                            0,
+                            swapchain_info_.extent.width,
+                            swapchain_info_.extent.height
+                        };
+                        if (const Result result = context.device().set_viewport(context.command_list(), viewport);
+                            !result) {
+                            return result;
+                        }
+                        if (const Result result = context.device().set_scissor(context.command_list(), scissor);
+                            !result) {
+                            return result;
+                        }
+                        if (const Result result = context.device().draw(
+                                    context.command_list(), DrawDesc{3, 1, 0, 0});
+                            !result) {
+                            return result;
+                        }
+                        return context.end_rendering();
+                    });
+            if (!check_result(composite_pass_result, "add_offscreen_composite_pass")) {
                 return false;
             }
             return true;
@@ -804,22 +980,17 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
             render_graph_.reset();
             frame_context_.reset();
 
-            if (texture_binding_set_.is_valid()) {
-                (void) device_->destroy_binding_set(texture_binding_set_);
-                texture_binding_set_ = {};
+            if (composite_pipeline_.is_valid()) {
+                (void) device_->destroy_pipeline(composite_pipeline_);
+                composite_pipeline_ = {};
             }
-            if (pipeline_.is_valid()) {
-                (void) device_->destroy_pipeline(pipeline_);
-                pipeline_ = {};
+            if (scene_pipeline_.is_valid()) {
+                (void) device_->destroy_pipeline(scene_pipeline_);
+                scene_pipeline_ = {};
             }
-            if (texture_binding_layout_.is_valid()) {
-                (void) device_->destroy_binding_layout(texture_binding_layout_);
-                texture_binding_layout_ = {};
-            }
-            if (sampler_.is_valid()) {
-                (void) device_->destroy_sampler(sampler_);
-                sampler_ = {};
-            }
+            (void) aeg::resource::destroy_texture_material(*device_, composite_material_);
+            (void) aeg::resource::destroy_texture_material(*device_, scene_material_);
+            (void) aeg::resource::destroy_offscreen_render_target(*device_, offscreen_target_);
             if (texture_uploader_ != nullptr && texture_.is_valid()) {
                 (void) texture_uploader_->destroy_texture(texture_);
             }
@@ -851,10 +1022,11 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
         SwapchainInfo swapchain_info_{};
         GpuMesh mesh_{};
         GpuTexture texture_{};
-        PipelineHandle pipeline_{};
-        BindingLayoutHandle texture_binding_layout_{};
-        BindingSetHandle texture_binding_set_{};
-        SamplerHandle sampler_{};
+        OffscreenRenderTarget offscreen_target_{};
+        TextureMaterial scene_material_{};
+        TextureMaterial composite_material_{};
+        PipelineHandle scene_pipeline_{};
+        PipelineHandle composite_pipeline_{};
         Format color_format_{Format::kUnknown};
         aeg::rhi::ResourceState mesh_upload_state_{};
         aeg::rhi::ResourceState mesh_vertex_graphics_state_{};
@@ -865,6 +1037,8 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
         aeg::rhi::ResourceState texture_upload_state_{};
         aeg::rhi::ResourceState texture_sampled_graphics_state_{};
         aeg::rhi::ResourceState texture_state_{};
+        aeg::rhi::ResourceState offscreen_sampled_graphics_state_{};
+        aeg::rhi::ResourceState offscreen_state_{};
         Mat4 model_view_projection_{};
         float rotation_angle_{0.0f};
     };
