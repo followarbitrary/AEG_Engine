@@ -1,3 +1,7 @@
+/**
+ * @file textured_triangle.vert.hlsl
+ * @brief Applies the test transform and forwards textured vertex attributes.
+ */
 struct VertexInput {
     float2 position : POSITION;
     float4 color : COLOR0;

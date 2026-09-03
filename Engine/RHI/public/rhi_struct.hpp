@@ -1,3 +1,11 @@
+/**
+ * @file rhi_struct.hpp
+ * @brief Backend-neutral RHI handles, enums, resource descriptions, commands, and synchronization data.
+ *
+ * All spans and string views in this file are non-owning. Unless a function
+ * explicitly says otherwise, callers must keep referenced storage alive until
+ * the receiving RHI call returns.
+ */
 #pragma once
 
 #include <cstddef>
@@ -11,6 +19,12 @@
 #include "rhi_config.hpp"
 
 namespace aeg::rhi {
+    /**
+     * @brief Strongly typed opaque handle used to identify an RHI object.
+     *
+     * Zero is reserved for the invalid handle. The numeric value has no
+     * backend-visible meaning and must not be serialized as a native handle.
+     */
     template<class Tag>
     struct Handle {
         uint64_t value{0};
@@ -49,6 +63,12 @@ namespace aeg::rhi {
     using SurfaceHandle = Handle<SurfaceTag>;
     using SwapchainHandle = Handle<SwapchainTag>;
 
+    /**
+     * @brief Opt-in trait enabling bitwise operators for an enum.
+     *
+     * The primary template disables operators. Specialize it with
+     * std::true_type only for flag-style enums.
+     */
     template<typename E>
     struct EnableBitmaskOperators : std::false_type {
     };
@@ -98,10 +118,17 @@ namespace aeg::rhi {
         return (static_cast<U>(value) & static_cast<U>(flag)) == static_cast<U>(flag);
     }
 
+    /**
+     * @brief Optional non-owning debug name for an RHI object.
+     *
+     * The referenced characters must remain alive until the consuming create
+     * call returns; the backend may copy them when debug names are enabled.
+     */
     struct DebugName {
         std::string_view value{};
     };
 
+    /** @brief Two-dimensional unsigned extent, normally measured in pixels. */
     struct Extent2D {
         uint32_t width{0};
         uint32_t height{0};
@@ -109,17 +136,25 @@ namespace aeg::rhi {
         friend constexpr bool operator==(Extent2D, Extent2D) = default;
     };
 
+    /** @brief Three-dimensional unsigned extent, normally measured in texels. */
     struct Extent3D {
         uint32_t width{1};
         uint32_t height{1};
         uint32_t depth{1};
     };
 
+    /** @brief Kind of presentation surface supplied to create_surface(). */
     enum class SurfaceType : uint8_t { kWindow, kHeadless };
 
-    // Selects an implementation without exposing any native graphics API type.
+    /** @brief Selects an RHI implementation without exposing native API types. */
     enum class BackendType : uint8_t { kVulkan };
 
+    /**
+     * @brief Backend-neutral description of a presentation surface.
+     *
+     * Native handles are opaque and interpreted only by the selected backend.
+     * For headless surfaces both native handles should be null.
+     */
     struct SurfaceDesc {
         SurfaceType type{SurfaceType::kWindow};
 
@@ -130,6 +165,7 @@ namespace aeg::rhi {
         DebugName name{};
     };
 
+    /** @brief Texture and buffer format identifiers understood by the RHI. */
     enum class Format : uint16_t {
         kUnknown,
         kR8Unorm,
@@ -151,12 +187,16 @@ namespace aeg::rhi {
         kBc7RgbaUnorm
     };
 
+    /** @brief Supported multisample sample counts. */
     enum class SampleCount : uint8_t { kX1 = 1, kX2 = 2, kX4 = 4, kX8 = 8, kX16 = 16, kX32 = 32, kX64 = 64 };
 
+    /** @brief Dimensionality of a texture resource. */
     enum class TextureDimension : uint8_t { kTex1D, kTex2D, kTex3D };
 
+    /** @brief Preferred memory residency and CPU visibility class. */
     enum class MemoryClass : uint8_t { kAuto, kDeviceLocal, kUpload, kReadback };
 
+    /** @brief Resource creation flags that may be combined with bitwise operators. */
     enum class ResourceFlags : uint32_t {
         kNone = 0,
         kAllowAlias = 1u << 0,
@@ -169,6 +209,7 @@ namespace aeg::rhi {
     struct EnableBitmaskOperators<ResourceFlags> : std::true_type {
     };
 
+    /** @brief Operations and views a buffer is allowed to support. */
     enum class BufferCapability : uint64_t {
         kNone = 0,
         kTransferSource = 1ull << 0,
@@ -187,6 +228,7 @@ namespace aeg::rhi {
     struct EnableBitmaskOperators<BufferCapability> : std::true_type {
     };
 
+    /** @brief Operations and views a texture is allowed to support. */
     enum class TextureCapability : uint64_t {
         kNone = 0,
         kTransferSource = 1ull << 0,
@@ -201,6 +243,7 @@ namespace aeg::rhi {
     struct EnableBitmaskOperators<TextureCapability> : std::true_type {
     };
 
+    /** @brief Texture aspect bits used for subresource selection. */
     enum class Aspect : uint8_t { kColor = 1u << 0, kDepth = 1u << 1, kStencil = 1u << 2 };
 
     template<>
@@ -209,6 +252,12 @@ namespace aeg::rhi {
 
     using AspectMask = Aspect;
 
+    /**
+     * @brief Abstract resource usage requested by a command or graph pass.
+     *
+     * Usage is a semantic access category; the backend derives native layout,
+     * access masks, and synchronization from it together with stage and queue.
+     */
     enum class ResourceUsage : uint8_t {
         kUndefined,
         kCopySource,
@@ -236,8 +285,10 @@ namespace aeg::rhi {
         kAccelerationStructureBuildWrite
     };
 
+    /** @brief Logical queue class used for scheduling and synchronization. */
     enum class QueueClass : uint8_t { kAuto, kGraphics, kCompute, kCopy, kPresent };
 
+    /** @brief Shader stage bits used in binding visibility and synchronization. */
     enum class ShaderStage : uint32_t {
         kNone = 0,
         kVertex = 1u << 0,
@@ -257,9 +308,14 @@ namespace aeg::rhi {
 
     using ShaderStageMask = ShaderStage;
 
+    /**
+     * @brief Compiled shader stage input for pipeline creation.
+     *
+     * The code span is consumed synchronously by create_pipeline(); the RHI
+     * does not retain caller-owned bytecode storage after that call returns.
+     */
     struct ShaderStageDesc {
         ShaderStage stage{ShaderStage::kNone};
-        // The shader system supplies a compiled binary compatible with the active device.
         std::span<const std::byte> code{};
         std::string_view entry_point{"main"};
         DebugName name{};
@@ -267,8 +323,10 @@ namespace aeg::rhi {
 
     using ShaderModuleDesc = ShaderStageDesc;
 
+    /** @brief Pipeline category selected by PipelineDesc. */
     enum class PipelineType : uint8_t { kGraphics, kCompute };
 
+    /** @brief Primitive assembly topology for graphics pipelines. */
     enum class PrimitiveTopology : uint8_t {
         kPointList,
         kLineList,
@@ -283,18 +341,24 @@ namespace aeg::rhi {
         kPatchList
     };
 
+    /** @brief Frequency at which a vertex binding advances. */
     enum class VertexInputRate : uint8_t { kVertex, kInstance };
 
+    /** @brief Rasterizer polygon representation. */
     enum class PolygonMode : uint8_t { kFill, kLine, kPoint };
 
+    /** @brief Faces removed by rasterizer culling. */
     enum class CullMode : uint8_t { kNone, kFront, kBack, kFrontAndBack };
 
+    /** @brief Winding order considered front-facing. */
     enum class FrontFace : uint8_t { kCounterClockwise, kClockwise };
 
+    /** @brief Comparison operation used by depth and stencil tests. */
     enum class CompareOp : uint8_t {
         kNever, kLess, kEqual, kLessOrEqual, kGreater, kNotEqual, kGreaterOrEqual, kAlways
     };
 
+    /** @brief Source or destination factor used by color blending. */
     enum class BlendFactor : uint8_t {
         kZero,
         kOne,
@@ -317,8 +381,10 @@ namespace aeg::rhi {
         kOneMinusSourceOneAlpha
     };
 
+    /** @brief Arithmetic operation used by color blending. */
     enum class BlendOp : uint8_t { kAdd, kSubtract, kReverseSubtract, kMin, kMax };
 
+    /** @brief Color channels enabled for a blend attachment write. */
     enum class ColorComponent : uint8_t {
         kNone = 0, kR = 1u << 0, kG = 1u << 1, kB = 1u << 2, kA = 1u << 3, kAll = 0x0fu
     };
@@ -327,6 +393,12 @@ namespace aeg::rhi {
     struct EnableBitmaskOperators<ColorComponent> : std::true_type {
     };
 
+    /**
+     * @brief Pipeline execution stage mask used for barriers and waits.
+     *
+     * Values are combinable flags; kAllCommands requests backend-wide ordering
+     * when a more precise stage cannot be expressed.
+     */
     enum class PipelineStage : uint32_t {
         kNone = 0,
         kCopy = 1u << 0,
@@ -348,8 +420,10 @@ namespace aeg::rhi {
 
     using PipelineStageMask = PipelineStage;
 
+    /** @brief Source selector for one texture-view component. */
     enum class ComponentSwizzle : uint8_t { kIdentity, kZero, kOne, kR, kG, kB, kA };
 
+    /** @brief Per-component swizzle applied by a texture view. */
     struct ComponentMapping {
         ComponentSwizzle r{ComponentSwizzle::kIdentity};
         ComponentSwizzle g{ComponentSwizzle::kIdentity};
@@ -357,8 +431,10 @@ namespace aeg::rhi {
         ComponentSwizzle a{ComponentSwizzle::kIdentity};
     };
 
+    /** @brief Sentinel requesting all remaining mip levels or array layers. */
     constexpr uint32_t kRemaining = std::numeric_limits<uint32_t>::max();
 
+    /** @brief Mip, array-layer, and aspect range of a texture. */
     struct SubresourceRange {
         AspectMask aspects{Aspect::kColor};
         uint32_t base_mip{0};
@@ -367,12 +443,19 @@ namespace aeg::rhi {
         uint32_t layer_count{kRemaining};
     };
 
+    /** @brief Byte range referencing a buffer handle. */
     struct BufferRange {
         BufferHandle buffer{};
         uint64_t offset{0};
         uint64_t size{std::numeric_limits<uint64_t>::max()};
     };
 
+    /**
+     * @brief Creation and initial-state description for a buffer.
+     *
+     * The capabilities must include every operation and view that will be used
+     * for the buffer during its lifetime.
+     */
     struct BufferDesc {
         uint64_t size{0};
         BufferCapability capabilities{BufferCapability::kNone};
@@ -384,6 +467,12 @@ namespace aeg::rhi {
         DebugName name{};
     };
 
+    /**
+     * @brief Creation and initial-state description for a texture.
+     *
+     * compatible_view_formats is borrowed for the duration of the create call.
+     * Dimensions and mip/layer counts are expressed in texels and subresources.
+     */
     struct TextureDesc {
         TextureDimension dimension{TextureDimension::kTex2D};
         Extent3D extent{};
@@ -401,8 +490,15 @@ namespace aeg::rhi {
         DebugName name{};
     };
 
+    /** @brief Presentation pacing policy requested for a swapchain. */
     enum class PresentMode : uint8_t { kImmediate, kLowLatency, kVsync, kAdaptiveVsync };
 
+    /**
+     * @brief Creation and pacing description for a presentation swapchain.
+     *
+     * The backend may choose a nearby supported format, image count, or present
+     * mode and reports the effective values through SwapchainInfo.
+     */
     struct SwapchainDesc {
         SurfaceHandle surface{};
         Extent2D extent{};
@@ -414,11 +510,18 @@ namespace aeg::rhi {
         DebugName name{};
     };
 
+    /** @brief Native texture and default view for one swapchain image. */
     struct SwapchainImage {
         TextureHandle texture{};
         TextureViewHandle view{};
     };
 
+    /**
+     * @brief Effective swapchain configuration and image list.
+     *
+     * The images span is owned by the swapchain and remains valid until the
+     * swapchain is recreated or destroyed.
+     */
     struct SwapchainInfo {
         Extent2D extent{};
         Format format{Format::kUnknown};
@@ -429,8 +532,10 @@ namespace aeg::rhi {
         std::span<const SwapchainImage> images{};
     };
 
+    /** @brief Interpretation of a buffer view when bound to a shader. */
     enum class BufferViewKind : uint8_t { kUniform, kStorage, kRaw, kStructured, kTyped };
 
+    /** @brief Description of a view into a buffer. */
     struct BufferViewDesc {
         BufferHandle buffer{};
         BufferViewKind kind{BufferViewKind::kStorage};
@@ -441,6 +546,7 @@ namespace aeg::rhi {
         DebugName name{};
     };
 
+    /** @brief Intended use of a texture view. */
     enum class TextureViewKind : uint8_t {
         kSampled,
         kStorage,
@@ -448,6 +554,7 @@ namespace aeg::rhi {
         kDepthStencil
     };
 
+    /** @brief View dimensionality, including array and cube interpretations. */
     enum class TextureViewDimension : uint8_t {
         kAuto,
         kTex1D,
@@ -459,6 +566,7 @@ namespace aeg::rhi {
         kTex3D
     };
 
+    /** @brief Description of a view into a texture subresource range. */
     struct TextureViewDesc {
         TextureHandle texture{};
         TextureViewKind kind{TextureViewKind::kSampled};
@@ -469,10 +577,13 @@ namespace aeg::rhi {
         DebugName name{};
     };
 
+    /** @brief Minification, magnification, or mip filtering mode. */
     enum class Filter : uint8_t { kNearest, kLinear };
 
+    /** @brief Addressing behavior outside the normalized texture coordinate range. */
     enum class AddressMode : uint8_t { kRepeat, kMirroredRepeat, kClampToEdge, kClampToBorder };
 
+    /** @brief Sampling parameters used to create a sampler object. */
     struct SamplerDesc {
         Filter min_filter{Filter::kLinear};
         Filter mag_filter{Filter::kLinear};
@@ -488,6 +599,7 @@ namespace aeg::rhi {
         DebugName name{};
     };
 
+    /** @brief Resource category stored at one binding location. */
     enum class BindingType : uint8_t {
         kSampler,
         kSampledTexture,
@@ -499,15 +611,19 @@ namespace aeg::rhi {
         kAccelerationStructure
     };
 
+    /** @brief Shader-visible binding coordinates, expressed as group and binding. */
     struct BindingLocation {
         uint16_t group{0};
         uint16_t binding{0};
 
+        /** @brief Compares both binding coordinates. */
         friend constexpr bool operator==(BindingLocation, BindingLocation) = default;
     };
 
+    /** @brief Number and growth policy of resources at a binding. */
     enum class BindingArrayMode : uint8_t { kSingle, kFixed, kVariable, kUnbounded };
 
+    /** @brief Optional binding behavior flags that may be combined. */
     enum class BindingFlags : uint32_t {
         kNone = 0,
         kBindless = 1u << 0,
@@ -520,6 +636,7 @@ namespace aeg::rhi {
     struct EnableBitmaskOperators<BindingFlags> : std::true_type {
     };
 
+    /** @brief One binding declaration within a binding layout. */
     struct BindingLayoutEntry {
         BindingLocation location{};
         BindingType type{BindingType::kSampledTexture};
@@ -529,28 +646,33 @@ namespace aeg::rhi {
         BindingFlags flags{BindingFlags::kNone};
     };
 
+    /** @brief Non-owning list of declarations used to create a binding layout. */
     struct BindingLayoutDesc {
         std::span<const BindingLayoutEntry> entries{};
         DebugName name{};
     };
 
+    /** @brief Inline constant range exposed by a pipeline layout. */
     struct InlineConstantRange {
         ShaderStageMask shader_stages{ShaderStage::kNone};
         uint32_t offset{0};
         uint32_t size{0};
     };
 
+    /** @brief Non-owning pipeline-layout binding groups and inline constants. */
     struct PipelineLayoutDesc {
         std::span<const BindingLayoutHandle> binding_layouts{};
         std::span<const InlineConstantRange> inline_constant_ranges{};
     };
 
+    /** @brief Stride and stepping policy for one vertex-buffer binding. */
     struct VertexBindingDesc {
         uint32_t binding{0};
         uint32_t stride{0};
         VertexInputRate input_rate{VertexInputRate::kVertex};
     };
 
+    /** @brief Format and byte offset of one vertex shader input attribute. */
     struct VertexAttributeDesc {
         uint32_t location{0};
         uint32_t binding{0};
@@ -558,6 +680,7 @@ namespace aeg::rhi {
         uint32_t offset{0};
     };
 
+    /** @brief Blend and write-mask state for one color attachment. */
     struct BlendAttachmentDesc {
         bool blend_enable{false};
         BlendFactor source_color_factor{BlendFactor::kOne};
@@ -569,6 +692,12 @@ namespace aeg::rhi {
         ColorComponent color_write_mask{ColorComponent::kAll};
     };
 
+    /**
+     * @brief Fixed-function state for a graphics pipeline.
+     *
+     * The color_formats and blend_attachments spans are ordered by color
+     * attachment index and are borrowed for the duration of pipeline creation.
+     */
     struct GraphicsPipelineState {
         std::span<const VertexBindingDesc> vertex_bindings{};
         std::span<const VertexAttributeDesc> vertex_attributes{};
@@ -595,6 +724,12 @@ namespace aeg::rhi {
         std::span<const BlendAttachmentDesc> blend_attachments{};
     };
 
+    /**
+     * @brief Complete graphics or compute pipeline creation description.
+     *
+     * Shader stage bytecode and layout handles are borrowed for the duration of
+     * create_pipeline(). The graphics member is ignored for compute pipelines.
+     */
     struct PipelineDesc {
         PipelineType type{PipelineType::kGraphics};
         PipelineLayoutDesc layout{};
@@ -603,10 +738,13 @@ namespace aeg::rhi {
         DebugName name{};
     };
 
+    /** @brief Operation used to initialize an attachment at rendering begin. */
     enum class LoadOp : uint8_t { kLoad, kClear, kDontCare };
 
+    /** @brief Operation used to preserve or discard an attachment at rendering end. */
     enum class StoreOp : uint8_t { kStore, kDontCare };
 
+    /** @brief Four-component floating-point clear value. */
     struct ClearColorValue {
         float r{0.0f};
         float g{0.0f};
@@ -614,6 +752,7 @@ namespace aeg::rhi {
         float a{1.0f};
     };
 
+    /** @brief Color attachment view and load/store state for dynamic rendering. */
     struct ColorAttachmentDesc {
         TextureViewHandle view{};
         LoadOp load_op{LoadOp::kClear};
@@ -622,6 +761,7 @@ namespace aeg::rhi {
         ResourceUsage final_usage{ResourceUsage::kColorAttachmentWrite};
     };
 
+    /** @brief Depth/stencil attachment view and load/store state for dynamic rendering. */
     struct DepthStencilAttachmentDesc {
         TextureViewHandle view{};
         LoadOp depth_load_op{LoadOp::kClear};
@@ -631,12 +771,14 @@ namespace aeg::rhi {
         ResourceUsage final_usage{ResourceUsage::kDepthStencilWrite};
     };
 
+    /** @brief Dynamic-rendering attachments and optional debug name. */
     struct RenderingDesc {
         std::span<const ColorAttachmentDesc> color_attachments{};
         DepthStencilAttachmentDesc depth_stencil{};
         DebugName name{};
     };
 
+    /** @brief Viewport rectangle and normalized depth interval. */
     struct Viewport {
         float x{0.0f};
         float y{0.0f};
@@ -646,6 +788,7 @@ namespace aeg::rhi {
         float max_depth{1.0f};
     };
 
+    /** @brief Integer scissor rectangle in framebuffer coordinates. */
     struct ScissorRect {
         int32_t x{0};
         int32_t y{0};
@@ -653,6 +796,7 @@ namespace aeg::rhi {
         uint32_t height{0};
     };
 
+    /** @brief Direct draw parameters for non-indexed geometry. */
     struct DrawDesc {
         uint32_t vertex_count{0};
         uint32_t instance_count{1};
@@ -660,8 +804,10 @@ namespace aeg::rhi {
         uint32_t first_instance{0};
     };
 
+    /** @brief Element width used by an indexed draw. */
     enum class IndexFormat : uint8_t { kUint16, kUint32 };
 
+    /** @brief Direct draw parameters for indexed geometry. */
     struct DrawIndexedDesc {
         uint32_t index_count{0};
         uint32_t instance_count{1};
@@ -670,12 +816,14 @@ namespace aeg::rhi {
         uint32_t first_instance{0};
     };
 
+    /** @brief Compute workgroup counts for a direct dispatch. */
     struct DispatchDesc {
         uint32_t group_count_x{0};
         uint32_t group_count_y{0};
         uint32_t group_count_z{0};
     };
 
+    /** @brief Indirect draw arguments stored in a GPU buffer. */
     struct DrawIndirectDesc {
         BufferHandle buffer{};
         uint64_t offset{0};
@@ -683,17 +831,20 @@ namespace aeg::rhi {
         uint32_t stride{sizeof(uint32_t) * 4};
     };
 
+    /** @brief Indirect dispatch arguments stored in a GPU buffer. */
     struct DispatchIndirectDesc {
         BufferHandle buffer{};
         uint64_t offset{0};
     };
 
+    /** @brief Signed texel or voxel offset used by copy operations. */
     struct Offset3D {
         int32_t x{0};
         int32_t y{0};
         int32_t z{0};
     };
 
+    /** @brief One mip level and array-layer range used by a copy operation. */
     struct TextureSubresourceLayers {
         AspectMask aspects{Aspect::kColor};
         uint32_t mip_level{0};
@@ -701,6 +852,7 @@ namespace aeg::rhi {
         uint32_t layer_count{1};
     };
 
+    /** @brief Buffer-to-buffer copy parameters. */
     struct BufferCopyDesc {
         BufferHandle source{};
         BufferHandle destination{};
@@ -709,6 +861,7 @@ namespace aeg::rhi {
         uint64_t size{0};
     };
 
+    /** @brief Buffer-to-texture copy parameters. */
     struct BufferTextureCopyDesc {
         BufferHandle source{};
         uint64_t source_offset{0};
@@ -720,6 +873,7 @@ namespace aeg::rhi {
         Extent3D extent{};
     };
 
+    /** @brief Texture-to-buffer copy parameters. */
     struct TextureBufferCopyDesc {
         TextureHandle source{};
         TextureSubresourceLayers source_subresources{};
@@ -731,6 +885,7 @@ namespace aeg::rhi {
         uint32_t destination_image_height{0};
     };
 
+    /** @brief Texture-to-texture copy parameters. */
     struct TextureCopyDesc {
         TextureHandle source{};
         TextureSubresourceLayers source_subresources{};
@@ -741,6 +896,7 @@ namespace aeg::rhi {
         Extent3D extent{};
     };
 
+    /** @brief Texture clear parameters for color, depth, or stencil aspects. */
     struct ClearTextureDesc {
         TextureHandle texture{};
         SubresourceRange subresources{};
@@ -749,6 +905,12 @@ namespace aeg::rhi {
         uint32_t stencil{0};
     };
 
+    /**
+     * @brief One resource payload written into a binding set.
+     *
+     * Only the member matching type is consumed by the backend. Handles are
+     * borrowed and must remain valid until the binding set is no longer used.
+     */
     struct BindingResource {
         BindingType type{BindingType::kSampledTexture};
         TextureViewHandle texture_view{};
@@ -758,12 +920,20 @@ namespace aeg::rhi {
         AccelerationStructureHandle acceleration_structure{};
     };
 
+    /** @brief One array element update applied to a binding set. */
     struct BindingWrite {
         BindingLocation location{};
         uint32_t array_index{0};
         BindingResource resource{};
     };
 
+    /**
+     * @brief Backend-neutral resource state used by barriers and graph imports.
+     *
+     * discard_contents permits a transition to treat prior contents as
+     * undefined. queue identifies logical ownership; kAuto lets the backend or
+     * scheduler select the queue.
+     */
     struct ResourceState {
         ResourceUsage usage{ResourceUsage::kUndefined};
         ShaderStageMask shader_stages{ShaderStage::kAll};
@@ -774,6 +944,7 @@ namespace aeg::rhi {
         friend constexpr bool operator==(const ResourceState &, const ResourceState &) = default;
     };
 
+    /** @brief State transition for a buffer range. */
     struct BufferBarrier {
         BufferHandle buffer{};
         uint64_t offset{0};
@@ -782,6 +953,7 @@ namespace aeg::rhi {
         ResourceState after{};
     };
 
+    /** @brief State transition for a texture subresource range. */
     struct TextureBarrier {
         TextureHandle texture{};
         SubresourceRange subresources{};
@@ -789,11 +961,18 @@ namespace aeg::rhi {
         ResourceState after{};
     };
 
+    /** @brief Batch of buffer and texture barriers recorded on a command list. */
     struct BarrierDesc {
         std::span<const BufferBarrier> buffers{};
         std::span<const TextureBarrier> textures{};
     };
 
+    /**
+     * @brief Monotonic GPU completion point on a timeline.
+     *
+     * A sync point is valid only when both timeline and value are non-zero. It
+     * can be waited on or queried through Device and is immutable after submit.
+     */
     struct GpuSyncPoint {
         TimelineHandle timeline{};
         uint64_t value{0};
@@ -801,11 +980,18 @@ namespace aeg::rhi {
         [[nodiscard]] constexpr bool is_valid() const noexcept { return timeline.is_valid() && value != 0; }
     };
 
+    /** @brief One GPU wait and the first pipeline stages that depend on it. */
     struct GpuWait {
         GpuSyncPoint point{};
         PipelineStageMask destination_stages{PipelineStage::kAllCommands};
     };
 
+    /**
+     * @brief Opaque token tying acquire, submit, and present to one swapchain frame.
+     *
+     * The token is single-use and must be passed back to the same swapchain
+     * lifecycle sequence that produced it.
+     */
     struct FrameToken {
         SwapchainHandle swapchain{};
         uint32_t frame_slot{kRemaining};
@@ -817,28 +1003,33 @@ namespace aeg::rhi {
         }
     };
 
+    /** @brief Result of acquiring a swapchain image. */
     struct FrameAcquireResult {
         FrameToken frame{};
         SwapchainImage image{};
         bool suboptimal{false};
     };
 
+    /** @brief Command-list creation options. */
     struct CommandListDesc {
         QueueClass queue{QueueClass::kGraphics};
         bool one_time_submit{true};
         DebugName name{};
     };
 
+    /** @brief Submission description for ordinary command lists. */
     struct SubmitDesc {
         QueueClass queue{QueueClass::kGraphics};
         std::span<const CommandListHandle> command_lists{};
         std::span<const GpuWait> waits{};
     };
 
+    /** @brief Completion point returned by a queue submission. */
     struct SubmitResult {
         GpuSyncPoint completion{};
     };
 
+    /** @brief Submission description associated with an acquired swapchain frame. */
     struct FrameSubmitDesc {
         FrameToken frame{};
         QueueClass queue{QueueClass::kGraphics};
@@ -846,14 +1037,24 @@ namespace aeg::rhi {
         std::span<const GpuWait> waits{};
     };
 
+    /** @brief Presentation request for an acquired frame. */
     struct PresentDesc {
         FrameToken frame{};
     };
 
+    /** @brief Presentation status returned by present(). */
     struct PresentResult {
         bool suboptimal{false};
     };
 
+    /**
+     * @brief Backend-neutral device creation preferences.
+     *
+     * application_name is borrowed for the duration of device creation. An
+     * adapter index of UINT32_MAX requests the backend's comprehensive automatic
+     * selection policy; another value requests that enumerated adapter after
+     * validation.
+     */
     struct DeviceCreateDesc {
         BackendType backend{BackendType::kVulkan};
         std::string_view application_name{"AEG Engine"};
@@ -864,8 +1065,10 @@ namespace aeg::rhi {
         bool enable_debug{config::kDebugEnabled};
     };
 
+    /** @brief Broad hardware class reported by DeviceCapabilities. */
     enum class AdapterType : uint8_t { kOther, kIntegrated, kDiscrete, kVirtual, kCpu };
 
+    /** @brief Optional device features exposed as a combinable mask. */
     enum class DeviceFeature : uint64_t {
         kNone = 0,
         kTimelineSynchronization = 1ull << 0,
@@ -879,6 +1082,13 @@ namespace aeg::rhi {
 
     using DeviceFeatureMask = DeviceFeature;
 
+    /**
+     * @brief Stable capability summary for the selected physical adapter.
+     *
+     * Values describe support available through the common RHI, not native API
+     * extension details. The adapter_name string is owned by the capabilities
+     * object and remains valid for the lifetime of its Device.
+     */
     struct DeviceCapabilities {
         uint32_t vendor_id{0};
         uint32_t device_id{0};

@@ -1,3 +1,7 @@
+/**
+ * @file result.cpp
+ * @brief Implements the textual mapping for common operation results.
+ */
 #include "../public/result.hpp"
 
 namespace aeg::foundation {

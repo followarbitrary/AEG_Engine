@@ -1,3 +1,7 @@
+/**
+ * @file fullscreen_texture_blit.vert.hlsl
+ * @brief Generates the fullscreen triangle used by the presentation pass.
+ */
 struct VertexOutput {
     float4 position : SV_Position;
     float2 uv : TEXCOORD0;

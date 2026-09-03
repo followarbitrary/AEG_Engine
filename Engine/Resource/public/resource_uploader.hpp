@@ -1,3 +1,7 @@
+/**
+ * @file resource_uploader.hpp
+ * @brief Frame-local staging helpers for buffer and mesh uploads.
+ */
 #pragma once
 
 #include <cstddef>
@@ -10,6 +14,7 @@
 #include "render_graph.hpp"
 
 namespace aeg::resource {
+    /** @brief Describes a byte upload into a newly created destination buffer. */
     struct BufferUploadDesc {
         std::span<const std::byte> data{};
         rhi::BufferDesc destination{};
@@ -17,8 +22,12 @@ namespace aeg::resource {
         uint64_t alignment{0};
     };
 
-    // The graph handles are valid until the graph is reset. The RHI destination
-    // remains valid until it is destroyed by the caller.
+    /**
+     * @brief Result of a buffer upload recorded into a render graph.
+     *
+     * The graph handles are valid until the graph is reset. The RHI destination
+     * remains valid until it is destroyed by the caller.
+     */
     struct BufferUpload {
         render_graph::FrameAllocation staging{};
         rhi::BufferHandle destination{};
@@ -34,8 +43,12 @@ namespace aeg::resource {
         }
     };
 
-    // Mesh graph handles are scoped to the graph used for the upload. The
-    // buffers in mesh remain valid independently and are owned by the caller.
+    /**
+     * @brief Result of uploading an indexed mesh through a render graph.
+     *
+     * Mesh graph handles are scoped to the graph used for the upload. The
+     * buffers in mesh remain valid independently and are owned by the caller.
+     */
     struct MeshUpload {
         GpuMesh mesh{};
         render_graph::RenderGraphBuffer vertex_resource{};
@@ -46,22 +59,34 @@ namespace aeg::resource {
         }
     };
 
+    /**
+     * @brief Records frame-local uploads and creates their destination resources.
+     *
+     * The uploader borrows the device and does not outlive it. Upload methods
+     * require an active FrameContext frame and a graph that is compiled after
+     * the returned upload declarations are added.
+     */
     class ResourceUploader final {
     public:
+        /** @brief Binds the uploader to a device without taking ownership. */
         explicit ResourceUploader(rhi::Device& device) noexcept : device_(device) {
         }
 
+        /** @brief Creates a destination buffer and records a copy from staging data. */
         [[nodiscard]] foundation::ResultValue<BufferUpload> upload_buffer(
                 render_graph::FrameContext& frame_context, render_graph::RenderGraph& graph,
                 const BufferUploadDesc& desc);
 
+        /** @brief Creates vertex/index buffers and records an indexed mesh upload. */
         [[nodiscard]] foundation::ResultValue<MeshUpload> upload_mesh(
                 render_graph::FrameContext& frame_context, render_graph::RenderGraph& graph,
                 const MeshData& mesh, std::string_view name = {});
 
+        /** @brief Defers destruction of mesh buffers until the frame is reusable. */
         [[nodiscard]] foundation::Result defer_destroy_mesh(
                 render_graph::FrameContext& frame_context, GpuMesh& mesh) const;
 
+        /** @brief Immediately destroys mesh buffers and clears the mesh value. */
         [[nodiscard]] foundation::Result destroy_mesh(GpuMesh& mesh) const;
 
     private:

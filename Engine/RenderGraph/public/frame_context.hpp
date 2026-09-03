@@ -1,3 +1,7 @@
+/**
+ * @file frame_context.hpp
+ * @brief Per-frame command, staging-allocation, submission, and retirement state.
+ */
 #pragma once
 
 #include <array>
@@ -11,8 +15,10 @@
 #include "rhi.hpp"
 
 namespace aeg::render_graph {
+    /** @brief Number of queue classes tracked by the frame scheduler. */
     inline constexpr uint32_t kQueueCount = 3;
 
+    /** @brief Maps a public queue class to its frame-local queue slot. */
     [[nodiscard]] constexpr uint32_t queue_index(rhi::QueueClass queue) noexcept {
         switch (queue) {
             case rhi::QueueClass::kCompute:
@@ -27,10 +33,12 @@ namespace aeg::render_graph {
         return 0;
     }
 
+    /** @brief Resolves QueueClass::kAuto to the graphics queue. */
     [[nodiscard]] constexpr rhi::QueueClass normalize_queue(rhi::QueueClass queue) noexcept {
         return queue == rhi::QueueClass::kAuto ? rhi::QueueClass::kGraphics : queue;
     }
 
+    /** @brief Configuration for frame-slot reuse and transient staging buffers. */
     struct FrameContextDesc {
         uint32_t frames_in_flight{2};
         uint64_t upload_chunk_size{4u * 1024u * 1024u};
@@ -39,6 +47,12 @@ namespace aeg::render_graph {
         uint64_t wait_timeout_nanoseconds{std::numeric_limits<uint64_t>::max()};
     };
 
+    /**
+     * @brief A frame-local suballocation from an upload or readback buffer.
+     *
+     * The allocation is valid only while its owning frame slot remains in use.
+     * It must not be retained across frame-slot reuse.
+     */
     struct FrameAllocation {
         rhi::BufferHandle buffer{};
         uint64_t offset{0};
@@ -58,6 +72,13 @@ namespace aeg::render_graph {
         }
     };
 
+    /**
+     * @brief Owns reusable frame slots and coordinates per-frame GPU work.
+     *
+     * A FrameContext borrows its RHI device. Exactly one frame may be active at
+     * a time. Staging allocations, command lists, and deferred destructions are
+     * associated with the active slot and become reusable after its completions.
+     */
     class FrameContext final {
     public:
         explicit FrameContext(rhi::Device& device, const FrameContextDesc& desc = {});
@@ -75,39 +96,63 @@ namespace aeg::render_graph {
         [[nodiscard]] uint32_t frames_in_flight() const noexcept { return desc_.frames_in_flight; }
         [[nodiscard]] uint64_t frame_number() const noexcept { return frame_number_; }
 
+        /** @brief Waits for the next slot and begins a new frame. */
         [[nodiscard]] foundation::Result begin_frame();
+        /** @brief Ends the active frame after all submitted work is recorded. */
         [[nodiscard]] foundation::Result end_frame();
+        /** @brief Aborts the active frame and releases its unsubmitted work. */
         [[nodiscard]] foundation::Result abort_frame();
 
+        /** @brief Acquires the next swapchain image for the active frame. */
         [[nodiscard]] foundation::ResultValue<rhi::FrameAcquireResult> acquire_next_image(
             rhi::SwapchainHandle swapchain);
+        /** @brief Returns the image acquired for the active frame, if any. */
         [[nodiscard]] const rhi::FrameAcquireResult* acquired_frame() const noexcept;
+        /** @brief Cancels an acquired image without presenting it. */
         [[nodiscard]] foundation::Result cancel_frame();
+        /** @brief Presents the image acquired for the active frame. */
         [[nodiscard]] foundation::ResultValue<rhi::PresentResult> present();
 
+        /** @brief Creates and begins a command list in the active frame slot. */
         [[nodiscard]] foundation::ResultValue<rhi::CommandListHandle> begin_command_list(
                 rhi::QueueClass queue, uint32_t batch_index = 0);
+        /** @brief Ends a command list created by begin_command_list(). */
         [[nodiscard]] foundation::Result end_command_list(rhi::CommandListHandle command_list);
 
+        /** @brief Allocates frame-local upload memory. */
         [[nodiscard]] foundation::ResultValue<FrameAllocation> allocate_upload(uint64_t size, uint64_t alignment = 0);
+        /** @brief Copies bytes into an upload allocation. */
         [[nodiscard]] foundation::Result write_upload(const FrameAllocation& allocation,
                                                std::span<const std::byte> data);
+        /** @brief Copies bytes into an upload allocation at a relative offset. */
         [[nodiscard]] foundation::Result write_upload(const FrameAllocation& allocation, uint64_t relative_offset,
                                                std::span<const std::byte> data);
 
+        /** @brief Allocates frame-local readback memory. */
         [[nodiscard]] foundation::ResultValue<FrameAllocation> allocate_readback(uint64_t size, uint64_t alignment = 0);
+        /** @brief Reads bytes from a readback allocation after its GPU work completes. */
         [[nodiscard]] foundation::Result read_readback(const FrameAllocation& allocation, std::span<std::byte> data);
 
+        /** @brief Submits ordinary command lists and records their completion point. */
         [[nodiscard]] foundation::ResultValue<rhi::SubmitResult> submit(const rhi::SubmitDesc& desc);
+        /** @brief Submits command lists associated with an acquired swapchain frame. */
         [[nodiscard]] foundation::ResultValue<rhi::SubmitResult> submit_frame(const rhi::FrameSubmitDesc& desc);
 
+        /** @brief Defers buffer destruction until the active frame slot is reusable. */
         [[nodiscard]] foundation::Result defer_destroy_buffer(rhi::BufferHandle buffer);
+        /** @brief Defers texture destruction until the active frame slot is reusable. */
         [[nodiscard]] foundation::Result defer_destroy_texture(rhi::TextureHandle texture);
+        /** @brief Defers buffer-view destruction until the active frame slot is reusable. */
         [[nodiscard]] foundation::Result defer_destroy_buffer_view(rhi::BufferViewHandle view);
+        /** @brief Defers texture-view destruction until the active frame slot is reusable. */
         [[nodiscard]] foundation::Result defer_destroy_texture_view(rhi::TextureViewHandle view);
+        /** @brief Defers sampler destruction until the active frame slot is reusable. */
         [[nodiscard]] foundation::Result defer_destroy_sampler(rhi::SamplerHandle sampler);
+        /** @brief Defers binding-layout destruction until the active frame slot is reusable. */
         [[nodiscard]] foundation::Result defer_destroy_binding_layout(rhi::BindingLayoutHandle layout);
+        /** @brief Defers binding-set destruction until the active frame slot is reusable. */
         [[nodiscard]] foundation::Result defer_destroy_binding_set(rhi::BindingSetHandle set);
+        /** @brief Defers pipeline destruction until the active frame slot is reusable. */
         [[nodiscard]] foundation::Result defer_destroy_pipeline(rhi::PipelineHandle pipeline);
 
     private:

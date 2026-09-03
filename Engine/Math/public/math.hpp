@@ -1,3 +1,7 @@
+/**
+ * @file math.hpp
+ * @brief Public SIMD-independent vector, quaternion, matrix, and transform API.
+ */
 #pragma once
 
 #include <array>
@@ -53,7 +57,12 @@ namespace aeg::math {
 inline constexpr float kPi = 3.14159265358979323846f;
 inline constexpr float kEpsilon = 1.0e-6f;
 
-// Two-dimensional value type. Indices are ordered x, y.
+/**
+ * @brief Two-dimensional floating-point value type.
+ *
+ * Components are ordered x, y. Arithmetic operators are component-wise unless
+ * a scalar operand is explicitly present.
+ */
 struct Vec2 {
     float x{0.0f};
     float y{0.0f};
@@ -61,13 +70,16 @@ struct Vec2 {
     constexpr Vec2() = default;
     constexpr Vec2(float x_value, float y_value) : x(x_value), y(y_value) {}
 
-    // index must be in [0, 1]. Debug builds assert on an invalid index.
     [[nodiscard]] float& operator[](std::size_t index) noexcept;
     [[nodiscard]] const float& operator[](std::size_t index) const noexcept;
 };
 
-// Three-dimensional value type. The private fourth float exists only for
-// alignment and must not be treated as a fourth semantic component.
+/**
+ * @brief 16-byte-aligned three-dimensional floating-point value type.
+ *
+ * The private fourth float exists only for alignment and is not a semantic
+ * component. Do not serialize Vec3 as a packed three-float object.
+ */
 struct alignas(16) Vec3 {
     float x{0.0f};
     float y{0.0f};
@@ -76,7 +88,6 @@ struct alignas(16) Vec3 {
     constexpr Vec3() = default;
     constexpr Vec3(float x_value, float y_value, float z_value) : x(x_value), y(y_value), z(z_value) {}
 
-    // index must be in [0, 2]. Debug builds assert on an invalid index.
     [[nodiscard]] float& operator[](std::size_t index) noexcept;
     [[nodiscard]] const float& operator[](std::size_t index) const noexcept;
 
@@ -84,7 +95,12 @@ private:
     float padding_{0.0f};
 };
 
-// Four-dimensional value type. Indices are ordered x, y, z, w.
+/**
+ * @brief Four-dimensional floating-point value type.
+ *
+ * Components are ordered x, y, z, w. It is suitable for homogeneous vectors
+ * and direct upload to a matching four-float shader value.
+ */
 struct alignas(16) Vec4 {
     float x{0.0f};
     float y{0.0f};
@@ -99,7 +115,13 @@ struct alignas(16) Vec4 {
     [[nodiscard]] const float& operator[](std::size_t index) const noexcept;
 };
 
-// Quaternion stored in (x, y, z, w) order. The default value is identity.
+/**
+ * @brief Unit-quaternion value type used for 3D rotation.
+ *
+ * Components are stored in x, y, z, w order. The default value is the identity
+ * rotation (0, 0, 0, 1). Rotation APIs expect radians and normalized input is
+ * produced by normalize() when required.
+ */
 struct alignas(16) Quat {
     float x{0.0f};
     float y{0.0f};
@@ -111,30 +133,34 @@ struct alignas(16) Quat {
         : x(x_value), y(y_value), z(z_value), w(w_value) {}
 };
 
-// Column-major 4x4 matrix. at(row, column) is the canonical element accessor.
+/**
+ * @brief Column-major 4x4 matrix.
+ *
+ * The matrix stores four column vectors. at(row, column) is the canonical
+ * element accessor; operator[] selects a column.
+ */
 struct alignas(16) Mat4 {
     std::array<Vec4, 4> columns{};
 
-    // index must be in [0, 3]. operator[] selects a column, not a row.
     [[nodiscard]] Vec4& operator[](std::size_t column) noexcept;
     [[nodiscard]] const Vec4& operator[](std::size_t column) const noexcept;
 
-    // row and column must be in [0, 3].
     [[nodiscard]] float& at(std::size_t row, std::size_t column) noexcept;
     [[nodiscard]] const float& at(std::size_t row, std::size_t column) const noexcept;
 };
 
-// Options that adapt projection matrices to the active graphics clip space.
 struct ClipSpaceConvention {
-    // When true, NDC +Y points down instead of up.
     bool y_down{false};
 
-    // When true, depth is reverse-Z: near maps to 1 and far maps to 0.
     bool reversed_z{false};
 };
 
-// Affine transform represented as translation, rotation, and non-uniform scale.
-// Its matrix form is translation * rotation * scale.
+/**
+ * @brief Affine transform represented by translation, rotation, and scale.
+ *
+ * Its matrix form is translation * rotation * scale. The default scale is one
+ * on every axis and the default rotation is identity.
+ */
 struct Transform {
     Vec3 translation{};
     Quat rotation{};

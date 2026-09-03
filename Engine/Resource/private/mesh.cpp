@@ -1,3 +1,7 @@
+/**
+ * @file mesh.cpp
+ * @brief Implements indexed mesh data validation.
+ */
 #include "../public/mesh.hpp"
 
 #include <cstdint>

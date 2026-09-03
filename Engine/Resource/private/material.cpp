@@ -1,3 +1,7 @@
+/**
+ * @file material.cpp
+ * @brief Implements texture-material binding creation, updates, and cleanup.
+ */
 #include "../public/material.hpp"
 
 #include <array>

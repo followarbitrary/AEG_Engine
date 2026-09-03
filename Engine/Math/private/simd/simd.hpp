@@ -1,3 +1,10 @@
+/**
+ * @file simd.hpp
+ * @brief Private SSE2 primitives used by the public math implementation.
+ *
+ * This header is an implementation detail. The public math contract remains
+ * independent of the selected SIMD instruction set.
+ */
 #pragma once
 
 #include "../../public/math.hpp"

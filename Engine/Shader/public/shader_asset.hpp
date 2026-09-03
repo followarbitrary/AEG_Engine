@@ -1,3 +1,10 @@
+/**
+ * @file shader_asset.hpp
+ * @brief Stable binary record layout for compiled AEG shader packages.
+ *
+ * Records contain offsets into one package byte stream. Readers must validate
+ * every offset, size, count, enum value, and reserved field before use.
+ */
 #pragma once
 
 #include <cstddef>
@@ -5,9 +12,12 @@
 #include <type_traits>
 
 namespace aeg::shader::asset {
+    /** @brief Little-endian package magic identifying an AEG shader asset. */
     inline constexpr std::uint32_t kMagic = 0x31474541u;
+    /** @brief Current binary package format version. */
     inline constexpr std::uint16_t kVersion = 2u;
 
+    /** @brief Root record describing all regions of a serialized shader package. */
     struct FileHeader {
         std::uint32_t magic{0};
         std::uint16_t version{0};
@@ -28,6 +38,7 @@ namespace aeg::shader::asset {
         std::uint32_t string_size{0};
     };
 
+    /** @brief Serialized shader-stage bytecode and entry-point reference. */
     struct StageRecord {
         std::uint32_t stage{0};
         std::uint32_t entry_point_offset{0};
@@ -37,6 +48,7 @@ namespace aeg::shader::asset {
         std::uint32_t reserved{0};
     };
 
+    /** @brief Serialized reflection record for one shader resource binding. */
     struct ResourceRecord {
         std::uint16_t group{0};
         std::uint16_t binding{0};
@@ -50,6 +62,7 @@ namespace aeg::shader::asset {
         std::uint32_t reserved{0};
     };
 
+    /** @brief Serialized reflection record for one vertex shader input. */
     struct VertexInputRecord {
         std::uint32_t location{0};
         std::uint16_t format{0};
@@ -60,6 +73,7 @@ namespace aeg::shader::asset {
         std::uint32_t semantic_size{0};
     };
 
+    /** @brief Serialized reflection record for one inline constant range. */
     struct ConstantRangeRecord {
         std::uint32_t offset{0};
         std::uint32_t size{0};

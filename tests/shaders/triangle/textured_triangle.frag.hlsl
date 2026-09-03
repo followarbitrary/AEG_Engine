@@ -1,3 +1,7 @@
+/**
+ * @file textured_triangle.frag.hlsl
+ * @brief Modulates sampled texture color by the interpolated vertex color.
+ */
 Texture2D<float4> texture_image : register(t0, space0);
 SamplerState texture_sampler : register(s1, space0);
 

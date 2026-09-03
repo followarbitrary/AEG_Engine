@@ -1,3 +1,11 @@
+/**
+ * @file triangle.cpp
+ * @brief Runs the Windows triangle rendering example through the public engine APIs.
+ *
+ * The sample exercises device creation, shader contracts, indexed mesh upload,
+ * texture binding, offscreen rendering, render-graph execution, and frame
+ * presentation in one small application.
+ */
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -202,6 +210,13 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
                                window_rect.bottom - window_rect.top,
                                nullptr, nullptr, instance, &state);
     }
+
+    /**
+     * @brief Owns the sample's RHI objects and records its two-pass frame graph.
+     *
+     * The demo borrows the native window state and owns all engine resources it
+     * creates until cleanup() runs from the destructor.
+     */
 
     class TriangleDemo final {
     public:

@@ -1,3 +1,11 @@
+/**
+ * @file vulkan_device.cpp
+ * @brief Implements the Vulkan backend behind the backend-neutral RHI.
+ *
+ * This translation unit owns Vulkan object creation, command recording,
+ * resource state tracking, queue synchronization, presentation, and deferred
+ * destruction. Vulkan types intentionally remain private to this backend.
+ */
 #include "vulkan_config.hpp"
 
 #include <logging.hpp>
@@ -35,6 +43,13 @@ namespace aeg::rhi {
 
     namespace {
         constexpr uint32_t kInvalidIndex = std::numeric_limits<uint32_t>::max();
+
+        /**
+         * @brief Stores handles in dense storage while preserving generation checks.
+         *
+         * Dense storage keeps iteration and resource scans cache-friendly;
+         * sparse slots make stale handles fail validation after deletion.
+         */
 
         template<typename T, typename Tag>
         class SlotMap {
@@ -1727,6 +1742,14 @@ namespace aeg::rhi {
             uint64_t generation{1};
             bool needs_recreate{false};
         };
+
+        /**
+         * @brief Vulkan implementation of the backend-neutral RHI device.
+         *
+         * The class owns all native Vulkan objects and maps them to typed RHI
+         * handles. Its command recording path also tracks resource states so
+         * barriers and queue ownership transfers can be emitted consistently.
+         */
 
         class VulkanDevice final : public Device {
         public:

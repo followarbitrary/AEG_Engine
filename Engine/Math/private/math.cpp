@@ -1,3 +1,7 @@
+/**
+ * @file math.cpp
+ * @brief Implements the scalar and optional SSE2 math operations.
+ */
 #include "../public/math.hpp"
 
 #include "simd/simd.hpp"

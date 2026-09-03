@@ -1,3 +1,7 @@
+/**
+ * @file shader_manager.cpp
+ * @brief Implements shader-package parsing, reflection validation, and layout caching.
+ */
 #include "../public/shader_contract.hpp"
 
 #include "../public/shader_asset.hpp"

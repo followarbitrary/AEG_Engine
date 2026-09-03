@@ -1,3 +1,4 @@
+#[[ Configure shared HLSL compilation and shader-program generation helpers. ]]
 include(CMakeParseArguments)
 
 get_filename_component(AEG_CXX_COMPILER_DIRECTORY
@@ -23,6 +24,8 @@ if (NOT DEFINED AEG_DXC_SPIRV_OPTIONS)
         -fvk-use-dx-layout
     )
 endif()
+
+#[[ Maps a shader filename suffix to a normalized stage and DXC profile. ]]
 
 function(aeg_get_hlsl_stage_info stage_suffix stage_output profile_output)
     string(TOLOWER "${stage_suffix}" normalized_suffix)
@@ -70,6 +73,8 @@ function(aeg_get_hlsl_stage_info stage_suffix stage_output profile_output)
     set(${profile_output} "${shader_profile}" PARENT_SCOPE)
 endfunction()
 
+#[[ Converts a shader path key into generated program and symbol names. ]]
+
 function(aeg_make_shader_program_names program_key name_output prefix_output package_output)
     string(REGEX REPLACE "[^A-Za-z0-9]+" "_" normalized_name "${program_key}")
     string(REGEX REPLACE "_+" "_" normalized_name "${normalized_name}")
@@ -100,6 +105,8 @@ function(aeg_make_shader_program_names program_key name_output prefix_output pac
     set(${prefix_output} "${symbol_prefix}" PARENT_SCOPE)
     set(${package_output} "${normalized_name}" PARENT_SCOPE)
 endfunction()
+
+#[[ Adds one DXC invocation for a single HLSL shader stage. ]]
 
 function(aeg_add_hlsl_shader_stage)
     set(one_value_args
@@ -145,6 +152,8 @@ function(aeg_add_hlsl_shader_stage)
         VERBATIM
     )
 endfunction()
+
+#[[ Adds a built-in shader program with generated C++ declarations and data. ]]
 
 function(aeg_add_hlsl_shader_program)
     set(one_value_args
@@ -286,6 +295,8 @@ function(aeg_add_hlsl_shader_program)
     )
 endfunction()
 
+#[[ Adds a gameplay shader program that produces a reflected contract package. ]]
+
 function(aeg_add_hlsl_gameplay_shader_program)
     set(one_value_args
         TARGET
@@ -422,6 +433,7 @@ endfunction()
 # Shader sources use <program>.<stage>.hlsl. Files without a recognized stage
 # suffix are treated as shared HLSL include files and are not compiled alone.
 # Shared includes can also live in a separate common shader directory.
+#[[ Scans a shader directory and registers every supported shader program. ]]
 function(aeg_add_hlsl_shader_directory)
     set(one_value_args
         TARGET

@@ -1,3 +1,7 @@
+/**
+ * @file mesh.hpp
+ * @brief CPU mesh input and GPU mesh ownership types.
+ */
 #pragma once
 
 #include <cstddef>
@@ -8,6 +12,12 @@
 #include "rhi_struct.hpp"
 
 namespace aeg::resource {
+    /**
+     * @brief Non-owning CPU-side vertex and index data for an indexed mesh.
+     *
+     * The byte spans must remain alive while an upload operation consumes them.
+     * Counts are element counts, while vertex_stride is measured in bytes.
+     */
     struct MeshData {
         std::span<const std::byte> vertex_data{};
         uint32_t vertex_stride{0};
@@ -18,6 +28,12 @@ namespace aeg::resource {
         uint32_t index_count{0};
     };
 
+    /**
+     * @brief GPU-resident buffers and draw metadata for an indexed mesh.
+     *
+     * The buffers are owned by the caller and must be destroyed through the RHI
+     * or ResourceUploader before this value is discarded.
+     */
     struct GpuMesh {
         rhi::BufferHandle vertex_buffer{};
         rhi::BufferHandle index_buffer{};
@@ -36,5 +52,6 @@ namespace aeg::resource {
         }
     };
 
+    /** @brief Validates byte ranges, strides, counts, and index format consistency. */
     [[nodiscard]] foundation::Result validate_mesh_data(const MeshData& mesh) noexcept;
 } // namespace aeg::resource

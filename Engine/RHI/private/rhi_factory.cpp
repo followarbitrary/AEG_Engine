@@ -1,3 +1,7 @@
+/**
+ * @file rhi_factory.cpp
+ * @brief Selects and constructs the compiled RHI backend.
+ */
 #include "../public/rhi.hpp"
 
 #include "vulkan/vulkan_device.hpp"

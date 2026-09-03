@@ -1,3 +1,7 @@
+/**
+ * @file logging_smoke.cpp
+ * @brief Exercises logging lifecycle, filtering, rotation, and thread context.
+ */
 #include <filesystem>
 #include <fstream>
 #include <iostream>

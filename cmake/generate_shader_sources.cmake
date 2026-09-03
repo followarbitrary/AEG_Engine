@@ -1,3 +1,4 @@
+#[[ Generate C++ declarations and definitions for embedded SPIR-V binaries. ]]
 if (NOT DEFINED OUTPUT_HEADER OR
     NOT DEFINED OUTPUT_SOURCE OR
     NOT DEFINED NAMESPACE OR
@@ -12,6 +13,7 @@ if (NOT SYMBOL_PREFIX MATCHES "^[A-Za-z_][A-Za-z0-9_]*$")
         "Shader symbol prefix is not a valid identifier: ${SYMBOL_PREFIX}")
 endif()
 
+#[[ Writes a generated file only when its content differs from the existing file. ]]
 function(write_if_different output_file content)
     set(should_write TRUE)
     if (EXISTS "${output_file}")
@@ -26,6 +28,7 @@ function(write_if_different output_file content)
     endif()
 endfunction()
 
+#[[ Converts a SPIR-V file into a formatted constexpr uint32_t array definition. ]]
 function(generate_spirv_array input_file data_symbol output_variable)
     if (NOT EXISTS "${input_file}")
         message(FATAL_ERROR "SPIR-V input file does not exist: ${input_file}")
@@ -82,11 +85,19 @@ get_filename_component(header_name "${OUTPUT_HEADER}" NAME)
 file(MAKE_DIRECTORY "${header_directory}")
 file(MAKE_DIRECTORY "${source_directory}")
 
-set(header_content "#pragma once\n\n")
+set(header_content "/**\n")
+string(APPEND header_content " * @file ${header_name}\n")
+string(APPEND header_content " * @brief Generated declarations for embedded shader binaries.\n")
+string(APPEND header_content " */\n")
+string(APPEND header_content "#pragma once\n\n")
 string(APPEND header_content "#include \"shader_binary.hpp\"\n\n")
 string(APPEND header_content "namespace ${NAMESPACE} {\n")
 
-set(source_content "#include \"${header_name}\"\n\n")
+set(source_content "/**\n")
+string(APPEND source_content " * @file ${header_name} source\n")
+string(APPEND source_content " * @brief Defines embedded shader binaries generated from compiled SPIR-V.\n")
+string(APPEND source_content " */\n")
+string(APPEND source_content "#include \"${header_name}\"\n\n")
 string(APPEND source_content "#include <array>\n")
 string(APPEND source_content "#include <cstdint>\n\n")
 string(APPEND source_content "namespace ${NAMESPACE} {\n")

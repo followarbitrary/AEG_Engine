@@ -1,3 +1,7 @@
+/**
+ * @file frame_context.cpp
+ * @brief Implements frame-slot reuse, staging allocation, and deferred cleanup.
+ */
 #include "../public/frame_context.hpp"
 
 #include <algorithm>

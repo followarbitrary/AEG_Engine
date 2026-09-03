@@ -1,3 +1,7 @@
+/**
+ * @file shader_contract_tool.cpp
+ * @brief Builds serialized shader contracts from SPIR-V reflection data.
+ */
 #include "shader_asset.hpp"
 #include "rhi_struct.hpp"
 

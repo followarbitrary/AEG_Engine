@@ -1,3 +1,7 @@
+/**
+ * @file result_smoke.cpp
+ * @brief Exercises the common Foundation result value types.
+ */
 #include <string_view>
 
 #include <result.hpp>

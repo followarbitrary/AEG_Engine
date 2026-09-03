@@ -1,3 +1,7 @@
+/**
+ * @file vulkan_device.hpp
+ * @brief Private declaration of the Vulkan backend factory entry point.
+ */
 #pragma once
 
 #include <memory>

@@ -1,3 +1,7 @@
+/**
+ * @file math_smoke.cpp
+ * @brief Exercises the public vector, quaternion, matrix, and transform API.
+ */
 #include <cmath>
 #include <iostream>
 

@@ -1,3 +1,7 @@
+/**
+ * @file texture.cpp
+ * @brief Implements CPU texture description and subresource validation.
+ */
 #include "../public/texture.hpp"
 
 #include <limits>

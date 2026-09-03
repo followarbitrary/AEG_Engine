@@ -1,3 +1,7 @@
+/**
+ * @file logging.hpp
+ * @brief Public logging configuration, lifecycle, context, and macros.
+ */
 #pragma once
 
 // Quill also provides non-prefixed LOG_* macros. Keep those names private to
@@ -20,8 +24,10 @@
 #include <utility>
 
 namespace aeg::logging {
+    /** @brief Severity threshold used by the logging facade. */
     enum class Level : uint8_t { kTrace, kDebug, kInfo, kNotice, kWarning, kError, kCritical, kOff };
 
+    /** @brief Independent logger channels exposed by the engine. */
     enum class Category : uint8_t {
         kCore, kRhi, kRenderGraph, kResource, kApplication, kShader, kAsset, kTest, kCount
     };
@@ -34,6 +40,12 @@ namespace aeg::logging {
     inline constexpr Level kDefaultRuntimeLevel = Level::kDebug;
 #endif
 
+    /**
+     * @brief Complete configuration used by initialize().
+     *
+     * Optional category levels override default_level. String and path values
+     * are copied by the logging system during initialization.
+     */
     struct Config {
         Level default_level{kDefaultRuntimeLevel};
         std::array<std::optional<Level>, kCategoryCount> category_levels{};
@@ -59,6 +71,7 @@ namespace aeg::logging {
         bool use_utc_timestamps{false};
     };
 
+    /** @brief Status returned by logging lifecycle and configuration operations. */
     struct Status {
         bool succeeded{true};
         std::string message{};
@@ -72,27 +85,53 @@ namespace aeg::logging {
         }
     };
 
+    /** @brief Returns the stable display name for a logging category. */
     [[nodiscard]] std::string_view category_name(Category category) noexcept;
 
+    /**
+     * @brief Initializes the logging backend and its sinks.
+     *
+     * Calling initialize() while logging is already active is idempotent when
+     * the existing configuration is still usable.
+     */
     [[nodiscard]] Status initialize(const Config &config = {});
 
+    /**
+     * @brief Stops logging and releases backend-owned resources.
+     *
+     * The function is safe to call more than once. Calls made after shutdown
+     * are ignored until the next successful initialize().
+     */
     void shutdown() noexcept;
 
+    /** @brief Flushes all active sinks, if logging is initialized. */
     void flush() noexcept;
 
+    /** @brief Reports whether the logging runtime is currently initialized. */
     [[nodiscard]] bool is_initialized() noexcept;
 
+    /** @brief Changes the runtime threshold for one category. */
     [[nodiscard]] bool set_category_level(Category category, Level level) noexcept;
 
+    /** @brief Reads the effective runtime threshold for a category. */
     [[nodiscard]] Level category_level(Category category) noexcept;
 
+    /** @brief Adds or replaces a key/value pair on the calling thread's log context. */
     void set_thread_context(std::string_view key, std::string_view value) noexcept;
 
+    /** @brief Removes one key from the calling thread's log context. */
     void erase_thread_context(std::string_view key) noexcept;
 
+    /** @brief Removes all context values associated with the calling thread. */
     void clear_thread_context() noexcept;
 
     namespace detail {
+        /**
+         * @brief Quill frontend policy used by the AEG logging facade.
+         *
+         * This type is public only because Quill's logger template requires it;
+         * application code should use the AEG_LOG_* macros instead.
+         */
         struct QuillFrontendOptions : quill::FrontendOptions {
             // A bounded blocking queue keeps logging lossless while placing an upper
             // bound on per-thread memory use during bursts.
@@ -101,14 +140,20 @@ namespace aeg::logging {
             static constexpr uint32_t kBlockingQueueRetryIntervalNs = 1000u;
         };
 
+        /** @brief Quill logger type configured for AEG's frontend policy. */
         using QuillLogger = quill::LoggerImpl<QuillFrontendOptions>;
 
+        /** @brief Returns the logger for a category without throwing. */
         [[nodiscard]] QuillLogger *logger(Category category) noexcept;
     } // namespace detail
 } // namespace aeg::logging
 
-// Keep compile-time filtering in Quill's macro layer. Disabled levels are
-// removed before argument evaluation and therefore have no runtime overhead.
+/**
+ * @brief Compile-time filtered logging macros.
+ *
+ * Disabled levels are removed before argument evaluation, so their arguments
+ * have no runtime cost. The category argument must be an aeg::logging::Category.
+ */
 #if QUILL_COMPILE_ACTIVE_LOG_LEVEL <= QUILL_COMPILE_ACTIVE_LOG_LEVEL_TRACE_L3
 #define AEG_LOG_TRACE_L3(category, fmt, ...)                                          \
     do {                                                                              \

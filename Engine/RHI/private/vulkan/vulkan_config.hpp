@@ -1,3 +1,7 @@
+/**
+ * @file vulkan_config.hpp
+ * @brief Vulkan-only compile-time aliases for common RHI diagnostics.
+ */
 #pragma once
 
 #include "../../public/rhi_config.hpp"

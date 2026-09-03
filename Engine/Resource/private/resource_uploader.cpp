@@ -1,3 +1,7 @@
+/**
+ * @file resource_uploader.cpp
+ * @brief Implements frame-local buffer and indexed-mesh uploads.
+ */
 #include "../public/resource_uploader.hpp"
 
 #include <array>

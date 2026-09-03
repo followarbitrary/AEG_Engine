@@ -1,3 +1,7 @@
+/**
+ * @file logging.cpp
+ * @brief Implements the Quill-backed logging lifecycle and thread context.
+ */
 #include "../public/logging.hpp"
 
 #include <quill/Backend.h>

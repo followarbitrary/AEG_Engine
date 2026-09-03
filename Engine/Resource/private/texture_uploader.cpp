@@ -1,3 +1,7 @@
+/**
+ * @file texture_uploader.cpp
+ * @brief Implements format-aware frame-local texture uploads.
+ */
 #include "../public/texture_uploader.hpp"
 
 #include <algorithm>

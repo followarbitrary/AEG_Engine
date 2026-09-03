@@ -1,3 +1,7 @@
+/**
+ * @file render_target.cpp
+ * @brief Implements offscreen color target creation and destruction.
+ */
 #include "../public/render_target.hpp"
 
 namespace aeg::resource {

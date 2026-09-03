@@ -1,3 +1,7 @@
+/**
+ * @file render_graph.cpp
+ * @brief Implements render-graph compilation, transient allocation, and execution.
+ */
 #include "../public/render_graph.hpp"
 
 #include <algorithm>
@@ -392,6 +396,14 @@ namespace aeg::render_graph {
             return state;
         }
     } // namespace
+
+    /**
+     * @brief Private render-graph storage and compiler implementation.
+     *
+     * The implementation owns logical declarations, compiled dependency data,
+     * transient pools, and execution-time state while the public RenderGraph
+     * keeps the device-facing API small.
+     */
 
     struct RenderGraph::Impl {
         explicit Impl(rhi::Device& device_reference) : device(device_reference) {

@@ -1,3 +1,7 @@
+/**
+ * @file rhi_smoke.cpp
+ * @brief Exercises backend-neutral resource, binding, command, and sync APIs.
+ */
 #include <array>
 #include <cstddef>
 #include <limits>
