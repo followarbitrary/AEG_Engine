@@ -854,7 +854,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
             render_graph_->reset();
 
             BufferDesc vertex_desc{};
-            vertex_desc.size = sizeof(kTriangleVertices);
+            vertex_desc.size = mesh_.vertex_buffer_size;
             vertex_desc.capabilities = BufferCapability::kTransferDestination | BufferCapability::kVertex;
             vertex_desc.memory = MemoryClass::kDeviceLocal;
             vertex_desc.name = aeg::rhi::DebugName{"Triangle.VertexBuffer"};
@@ -865,9 +865,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
             }
 
             BufferDesc index_desc{};
-            index_desc.size = static_cast<uint64_t>(mesh_.index_count) *
-                              (mesh_.index_format == aeg::rhi::IndexFormat::kUint16 ? sizeof(uint16_t)
-                                                                                     : sizeof(uint32_t));
+            index_desc.size = mesh_.index_buffer_size;
             index_desc.capabilities = BufferCapability::kTransferDestination | BufferCapability::kIndex;
             index_desc.memory = MemoryClass::kDeviceLocal;
             index_desc.name = aeg::rhi::DebugName{"Triangle.IndexBuffer"};

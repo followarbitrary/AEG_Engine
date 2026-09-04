@@ -372,6 +372,8 @@ namespace aeg::resource {
         GpuMesh gpu_mesh{};
         gpu_mesh.vertex_buffer = vertex.destination;
         gpu_mesh.index_buffer = index.destination;
+        gpu_mesh.vertex_buffer_size = vertex.transfer_size;
+        gpu_mesh.index_buffer_size = index.transfer_size;
         gpu_mesh.vertex_stride = mesh.vertex_stride;
         gpu_mesh.vertex_count = mesh.vertex_count;
         gpu_mesh.index_count = mesh.index_count;

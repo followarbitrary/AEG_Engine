@@ -12,6 +12,7 @@
 #include <memory>
 #include <span>
 #include <string_view>
+#include <vector>
 
 #include "result.hpp"
 #include "frame_context.hpp"
@@ -75,6 +76,86 @@ namespace aeg::render_graph {
     /** @brief Declares whether a pass reads, writes, or both reads and writes a resource. */
     enum class ResourceAccess : uint8_t { kRead, kWrite, kReadWrite };
 
+    /** @brief Position of a compiled barrier in a pass command stream. */
+    enum class RenderGraphBarrierPhase : uint8_t { kBeforePass, kAfterPass };
+
+    /** @brief Semantic reason for a compiled render-graph barrier. */
+    enum class RenderGraphBarrierKind : uint8_t {
+        kTransition,
+        kMemoryDependency,
+        kQueueTransfer,
+    };
+
+    /** @brief Resource kind referenced by a compiled render-graph barrier. */
+    enum class RenderGraphResourceKind : uint8_t { kBuffer, kTexture };
+
+    /**
+     * @brief Logical barrier requirement emitted by RenderGraph::compile().
+     *
+     * Handles are intentionally not stored here. Physical handles are resolved
+     * for the active frame slot during execute(). The before state is the
+     * compiler's expected state; execution resolves the actual runtime state
+     * before recording the explicit barrier.
+     */
+    struct RenderGraphBarrierPlan {
+        RenderGraphResourceKind resource_kind{RenderGraphResourceKind::kBuffer};
+        uint32_t resource_index{kInvalidHandleIndex};
+        uint32_t resource_generation{0};
+        RenderGraphBarrierPhase phase{RenderGraphBarrierPhase::kBeforePass};
+        RenderGraphBarrierKind kind{RenderGraphBarrierKind::kTransition};
+        ResourceAccess access{ResourceAccess::kRead};
+        rhi::ResourceState before{};
+        rhi::ResourceState after{};
+        RenderGraphBufferRange buffer_range{};
+        rhi::SubresourceRange subresources{};
+        bool discard_contents{false};
+        bool requires_memory_dependency{false};
+        bool requires_queue_transfer{false};
+    };
+
+    /** @brief Compiled pass topology and barrier requirements. */
+    struct RenderGraphPassPlan {
+        RenderGraphPass pass{};
+        uint32_t batch_index{kInvalidHandleIndex};
+        uint32_t topological_index{kInvalidHandleIndex};
+        bool live{false};
+        std::vector<RenderGraphBarrierPlan> barriers{};
+    };
+
+    /** @brief Audited dependency between two queue submission batches. */
+    struct RenderGraphQueueDependency {
+        uint32_t source_batch{kInvalidHandleIndex};
+        uint32_t destination_batch{kInvalidHandleIndex};
+        rhi::QueueClass source_queue{rhi::QueueClass::kAuto};
+        rhi::QueueClass destination_queue{rhi::QueueClass::kAuto};
+        rhi::PipelineStageMask destination_stages{rhi::PipelineStage::kNone};
+        uint32_t resource_hazard_count{0};
+    };
+
+    /** @brief Compiled queue batch and its pass membership. */
+    struct RenderGraphBatchPlan {
+        uint32_t index{kInvalidHandleIndex};
+        rhi::QueueClass queue{rhi::QueueClass::kGraphics};
+        std::vector<uint32_t> pass_indices{};
+        std::vector<RenderGraphQueueDependency> dependencies{};
+        bool submits_frame{false};
+    };
+
+    /**
+     * @brief Immutable logical execution plan produced by RenderGraph::compile().
+     *
+     * The plan is invalidated by reset(), clear_passes(), imported-resource
+     * replacement, or any declaration change that requires recompilation. It
+     * contains no backend-native data.
+     */
+    struct RenderGraphPlan {
+        uint64_t revision{0};
+        std::vector<uint32_t> topological_order{};
+        std::vector<RenderGraphPassPlan> pass_plans{};
+        std::vector<RenderGraphBatchPlan> batches{};
+        std::vector<RenderGraphQueueDependency> queue_dependencies{};
+    };
+
     /**
      * @brief Statistics produced by compile().
      *
@@ -89,6 +170,8 @@ namespace aeg::render_graph {
         uint32_t transient_buffer_slot_count{0};
         uint32_t transient_texture_slot_count{0};
         uint32_t barrier_count{0};
+        uint32_t barrier_point_count{0};
+        uint32_t queue_dependency_count{0};
     };
 
     /** @brief Options controlling execution of a compiled graph. */
@@ -343,6 +426,8 @@ namespace aeg::render_graph {
         [[nodiscard]] foundation::Result compile();
         /** @brief Returns statistics from the last successful compile(). */
         [[nodiscard]] const RenderGraphCompileInfo& compile_info() const noexcept { return compile_info_; }
+        /** @brief Returns the backend-neutral plan from the last successful compile(). */
+        [[nodiscard]] const RenderGraphPlan& plan() const noexcept;
         /** @brief Executes the last successful compilation in a frame context. */
         [[nodiscard]] foundation::ResultValue<RenderGraphExecutionResult> execute(
                 FrameContext& frame_context, const RenderGraphExecuteDesc& desc = {});

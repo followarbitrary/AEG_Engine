@@ -363,8 +363,8 @@ namespace aeg::render_graph {
         return result;
     }
 
-    foundation::ResultValue<rhi::CommandListHandle> FrameContext::begin_command_list(rhi::QueueClass queue,
-                                                                                uint32_t batch_index) {
+    foundation::ResultValue<rhi::CommandListHandle> FrameContext::begin_command_list(
+            rhi::QueueClass queue, uint32_t batch_index, rhi::BarrierMode barrier_mode) {
         if (!frame_active_) {
             return {foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                          "Cannot begin a command list without an active frame"), {}};
@@ -388,16 +388,20 @@ namespace aeg::render_graph {
 
         CommandRecord& command = commands[batch_index];
         if (!command.handle.is_valid()) {
-            const rhi::CommandListDesc desc{queue, true, {}};
+            const rhi::CommandListDesc desc{queue, true, {}, barrier_mode};
             auto create_result = device_.create_command_list(desc);
             if (!create_result) {
                 return create_result;
             }
             command.handle = create_result.value;
             command.queue = queue;
+            command.barrier_mode = barrier_mode;
         } else if (command.queue != queue) {
             return {foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                          "FrameContext command-list cache queue mismatch"), {}};
+        } else if (command.barrier_mode != barrier_mode) {
+            return {foundation::Result::failure(foundation::ResultCode::kInvalidState,
+                                         "FrameContext command-list cache barrier mode mismatch"), {}};
         }
 
         if (command.recording || command.ended || command.submitted) {

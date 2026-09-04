@@ -1381,10 +1381,89 @@ namespace aeg::rhi {
             return true;
         }
 
+        [[nodiscard]] bool is_storage_usage(ResourceUsage usage) noexcept {
+            return usage == ResourceUsage::kStorageRead || usage == ResourceUsage::kStorageWrite ||
+                   usage == ResourceUsage::kStorageReadWrite;
+        }
+
+        struct BufferStateSegment {
+            uint64_t offset{0};
+            uint64_t size{0};
+            ResourceState state{};
+        };
+
+        [[nodiscard]] bool resource_usage_matches(const ResourceState &actual,
+                                                  const ResourceState &expected) noexcept {
+            const bool exact_usage_match = actual.usage == expected.usage;
+            const bool compatible_storage_usage = is_storage_usage(actual.usage) &&
+                                                   is_storage_usage(expected.usage) &&
+                                                   (actual.usage == ResourceUsage::kStorageReadWrite ||
+                                                    expected.usage == ResourceUsage::kStorageReadWrite);
+            return (exact_usage_match || compatible_storage_usage) &&
+                   (expected.queue == QueueClass::kAuto || actual.queue == expected.queue);
+        }
+
+        void split_buffer_state_segment(std::vector<BufferStateSegment> &segments, uint64_t position) {
+            for (size_t index = 0; index < segments.size(); ++index) {
+                BufferStateSegment &segment = segments[index];
+                const uint64_t segment_end = segment.offset + segment.size;
+                if (position <= segment.offset || position >= segment_end) {
+                    continue;
+                }
+                const BufferStateSegment right{position, segment_end - position, segment.state};
+                segment.size = position - segment.offset;
+                segments.insert(segments.begin() + static_cast<std::ptrdiff_t>(index + 1), right);
+                return;
+            }
+        }
+
+        void merge_buffer_state_segments(std::vector<BufferStateSegment> &segments) noexcept {
+            for (size_t index = 1; index < segments.size();) {
+                BufferStateSegment &previous = segments[index - 1];
+                BufferStateSegment &current = segments[index];
+                if (previous.offset + previous.size == current.offset && previous.state == current.state) {
+                    previous.size += current.size;
+                    segments.erase(segments.begin() + static_cast<std::ptrdiff_t>(index));
+                    continue;
+                }
+                ++index;
+            }
+        }
+
+        void initialize_buffer_state_segments(std::vector<BufferStateSegment> &segments, uint64_t buffer_size,
+                                              const ResourceState &initial_state) {
+            if (segments.empty() && buffer_size != 0) {
+                segments.push_back(BufferStateSegment{0, buffer_size, initial_state});
+            }
+        }
+
+        [[nodiscard]] bool resolve_buffer_range(uint64_t buffer_size, uint64_t offset, uint64_t size,
+                                                uint64_t &end) noexcept {
+            if (offset > buffer_size) {
+                return false;
+            }
+            if (size == std::numeric_limits<uint64_t>::max()) {
+                end = buffer_size;
+                return true;
+            }
+            if (size > buffer_size - offset) {
+                return false;
+            }
+            end = offset + size;
+            return true;
+        }
+
         struct BufferStateChange {
             BufferHandle buffer{};
+            uint64_t offset{0};
+            uint64_t size{0};
             ResourceState before{};
             ResourceState after{};
+        };
+
+        struct CommandBufferState {
+            BufferHandle buffer{};
+            std::vector<BufferStateSegment> segments{};
         };
 
         struct TextureStateChange {
@@ -1559,7 +1638,8 @@ namespace aeg::rhi {
         [[nodiscard]] Result validate_copy_buffer_range(Format format, AspectMask aspects,
                                                         uint32_t layer_count, const Extent3D &extent,
                                                         uint32_t row_length, uint32_t image_height,
-                                                        uint64_t buffer_offset, uint64_t buffer_size) {
+                                                        uint64_t buffer_offset, uint64_t buffer_size,
+                                                        uint64_t *required_end = nullptr) {
             const std::optional<CopyFormatInfo> info = copy_format_info(format, aspects);
             if (!info.has_value() || layer_count == 0 || extent.width == 0 || extent.height == 0 ||
                 extent.depth == 0) {
@@ -1616,6 +1696,9 @@ namespace aeg::rhi {
                 !checked_add_u64(last_offset, copied_row, last_offset) ||
                 !checked_add_u64(buffer_offset, last_offset, required_bytes) || required_bytes > buffer_size) {
                 return Result::failure(ResultCode::kInvalidArgument, "Texture copy exceeds the buffer range");
+            }
+            if (required_end != nullptr) {
+                *required_end = required_bytes;
             }
             return Result::success();
         }
@@ -1683,6 +1766,7 @@ namespace aeg::rhi {
             uint64_t size{0};
             BufferCapability capabilities{BufferCapability::kNone};
             ResourceState state{};
+            std::vector<BufferStateSegment> state_segments{};
             QueueValues last_use{};
             void *mapped_data{nullptr};
         };
@@ -1919,6 +2003,7 @@ namespace aeg::rhi {
             VkCommandBuffer command_buffer{VK_NULL_HANDLE};
             QueueClass queue{QueueClass::kGraphics};
             bool one_time_submit{true};
+            BarrierMode barrier_mode{BarrierMode::kImplicit};
             bool recording{false};
             bool ended{false};
             bool rendering{false};
@@ -1938,6 +2023,7 @@ namespace aeg::rhi {
             std::vector<BufferViewHandle> referenced_buffer_views{};
             std::vector<SamplerHandle> referenced_samplers{};
             std::vector<BufferStateChange> buffer_state_changes{};
+            std::vector<CommandBufferState> buffer_states{};
             std::vector<TextureStateChange> texture_state_changes{};
             std::vector<BufferOwnershipTransfer> buffer_ownership_transfers{};
             std::vector<TextureOwnershipTransfer> texture_ownership_transfers{};
@@ -2227,8 +2313,14 @@ namespace aeg::rhi {
 
             [[nodiscard]] Result validate_command_recording(const CommandListResource &command) const;
 
-            [[nodiscard]] ResourceState current_buffer_state(const CommandListResource &command,
-                                                             BufferHandle buffer) const;
+            [[nodiscard]] Result ensure_command_buffer_state(CommandListResource &command, BufferHandle buffer);
+
+            [[nodiscard]] CommandBufferState *find_command_buffer_state(CommandListResource &command,
+                                                                         BufferHandle buffer) noexcept;
+
+            [[nodiscard]] Result validate_buffer_usage(CommandListResource &command, BufferHandle buffer,
+                                                        uint64_t offset, uint64_t size,
+                                                        const ResourceState &expected);
 
             [[nodiscard]] ResourceState current_texture_state(const CommandListResource &command,
                                                               TextureHandle texture, uint32_t subresource_index) const;
@@ -2257,7 +2349,7 @@ namespace aeg::rhi {
             void commit_command_states(const CommandListResource &command);
 
             [[nodiscard]] Result validate_command_batch_states(
-                    std::span<const CommandListHandle> command_lists) const;
+                    std::span<const CommandListHandle> command_lists);
 
             void mark_command_resources_in_use(const CommandListResource &command, const GpuSyncPoint &completion);
 
@@ -3097,8 +3189,10 @@ namespace aeg::rhi {
         const auto append_wait = [&](QueueState &source_queue, uint64_t signal_value,
                                      VkPipelineStageFlags destination_stages) {
             const auto iterator = std::find(wait_semaphores.begin(), wait_semaphores.end(), source_queue.timeline);
-            const VkPipelineStageFlags stages = destination_stages == 0 ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT
-                                                                          : destination_stages;
+            const VkPipelineStageFlags stages =
+                    destination_stages == 0
+                            ? static_cast<VkPipelineStageFlags>(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT)
+                            : destination_stages;
             if (iterator == wait_semaphores.end()) {
                 wait_semaphores.push_back(source_queue.timeline);
                 wait_stages.push_back(stages);
@@ -4606,16 +4700,60 @@ namespace aeg::rhi {
         return Result::success();
     }
 
-    ResourceState VulkanDevice::current_buffer_state(const CommandListResource &command,
-                                                     BufferHandle buffer) const {
-        for (auto iterator = command.buffer_state_changes.rbegin();
-             iterator != command.buffer_state_changes.rend(); ++iterator) {
-            if (iterator->buffer == buffer) {
-                return iterator->after;
+    Result VulkanDevice::ensure_command_buffer_state(CommandListResource &command, BufferHandle buffer) {
+        if (find_command_buffer_state(command, buffer) != nullptr) {
+            return Result::success();
+        }
+        BufferResource *resource = buffers_.get(buffer);
+        if (resource == nullptr) {
+            return Result::failure(ResultCode::kNotFound, "Invalid buffer handle");
+        }
+        try {
+            CommandBufferState state{};
+            state.buffer = buffer;
+            state.segments = resource->state_segments;
+            initialize_buffer_state_segments(state.segments, resource->size, resource->state);
+            command.buffer_states.push_back(std::move(state));
+        } catch (const std::bad_alloc &) {
+            return Result::failure(ResultCode::kOutOfMemory, "Buffer state tracking allocation failed");
+        }
+        return Result::success();
+    }
+
+    CommandBufferState *VulkanDevice::find_command_buffer_state(CommandListResource &command,
+                                                                 BufferHandle buffer) noexcept {
+        const auto iterator = std::find_if(
+                command.buffer_states.begin(), command.buffer_states.end(),
+                [buffer](const CommandBufferState &state) { return state.buffer == buffer; });
+        return iterator == command.buffer_states.end() ? nullptr : &*iterator;
+    }
+
+    Result VulkanDevice::validate_buffer_usage(CommandListResource &command, BufferHandle buffer, uint64_t offset,
+                                               uint64_t size, const ResourceState &expected) {
+        const Result state_result = ensure_command_buffer_state(command, buffer);
+        if (!state_result) {
+            return state_result;
+        }
+        BufferResource *resource = buffers_.get(buffer);
+        CommandBufferState *local = find_command_buffer_state(command, buffer);
+        if (resource == nullptr || local == nullptr) {
+            return Result::failure(ResultCode::kInvalidState, "Buffer state tracking is unavailable");
+        }
+        uint64_t end = 0;
+        if (!resolve_buffer_range(resource->size, offset, size, end)) {
+            return Result::failure(ResultCode::kInvalidArgument, "Buffer range exceeds buffer size");
+        }
+        for (const BufferStateSegment &segment: local->segments) {
+            const uint64_t segment_end = segment.offset + segment.size;
+            if (segment_end <= offset || segment.offset >= end) {
+                continue;
+            }
+            if (!resource_usage_matches(segment.state, expected)) {
+                return Result::failure(ResultCode::kInvalidState,
+                                       "Explicit command list buffer state does not match the declared usage");
             }
         }
-        const BufferResource *resource = buffers_.get(buffer);
-        return resource == nullptr ? ResourceState{} : resource->state;
+        return Result::success();
     }
 
     ResourceState VulkanDevice::current_texture_state(const CommandListResource &command, TextureHandle texture,
@@ -4769,8 +4907,7 @@ namespace aeg::rhi {
             ResourceState before{};
             ResourceState after{};
             bool discard_contents{false};
-            bool before_queue_explicit{false};
-            bool after_queue_explicit{false};
+            bool requires_memory_dependency{false};
         };
         struct ResolvedTextureBarrier {
             TextureHandle handle{};
@@ -4778,15 +4915,38 @@ namespace aeg::rhi {
             ResourceState before{};
             ResourceState after{};
             bool discard_contents{false};
+            bool requires_memory_dependency{false};
             std::vector<uint32_t> state_indices{};
-            bool before_queue_explicit{false};
-            bool after_queue_explicit{false};
         };
 
+        struct WorkingBufferState {
+            BufferHandle buffer{};
+            std::vector<BufferStateSegment> segments{};
+        };
+
+        std::vector<WorkingBufferState> working_buffer_states;
         std::vector<ResolvedBufferBarrier> resolved_buffers;
         std::vector<ResolvedTextureBarrier> resolved_textures;
-        resolved_buffers.reserve(buffers.size());
-        resolved_textures.reserve(textures.size());
+        std::vector<BufferStateChange> staged_buffer_changes;
+        std::vector<TextureStateChange> staged_texture_changes;
+        std::vector<BufferOwnershipTransfer> staged_buffer_ownership_transfers;
+        std::vector<TextureOwnershipTransfer> staged_texture_ownership_transfers;
+        std::vector<BufferHandle> staged_referenced_buffers;
+        std::vector<TextureHandle> staged_referenced_textures;
+
+        try {
+            working_buffer_states.reserve(buffers.size());
+            resolved_buffers.reserve(buffers.size());
+            resolved_textures.reserve(textures.size());
+            staged_buffer_changes.reserve(buffers.size());
+            staged_texture_changes.reserve(textures.size());
+            staged_buffer_ownership_transfers.reserve(buffers.size());
+            staged_texture_ownership_transfers.reserve(textures.size());
+            staged_referenced_buffers.reserve(buffers.size());
+            staged_referenced_textures.reserve(textures.size());
+        } catch (const std::bad_alloc &) {
+            return Result::failure(ResultCode::kOutOfMemory, "Barrier state staging allocation failed");
+        }
 
         const auto normalize_after_state = [&](ResourceState state) {
             if (state.queue == QueueClass::kAuto) {
@@ -4794,18 +4954,52 @@ namespace aeg::rhi {
             }
             return state;
         };
-        const auto has_local_buffer_state = [&](BufferHandle buffer) {
-            return std::any_of(command.buffer_state_changes.begin(), command.buffer_state_changes.end(),
-                               [buffer](const BufferStateChange &change) {
-                                   return change.buffer == buffer;
-                               });
-        };
         const auto has_local_texture_state = [&](TextureHandle texture, uint32_t subresource_index) {
             return std::any_of(command.texture_state_changes.begin(), command.texture_state_changes.end(),
                                [texture, subresource_index](const TextureStateChange &change) {
                                    return change.texture == texture &&
                                           change.subresource_index == subresource_index;
-                               });
+                                });
+        };
+        const auto find_working_buffer_state = [&](BufferHandle buffer) -> WorkingBufferState * {
+            const auto iterator = std::find_if(
+                    working_buffer_states.begin(), working_buffer_states.end(),
+                    [buffer](const WorkingBufferState &state) { return state.buffer == buffer; });
+            return iterator == working_buffer_states.end() ? nullptr : &*iterator;
+        };
+        const auto find_staged_texture_state = [&](TextureHandle texture,
+                                                   uint32_t subresource_index) -> const TextureStateChange * {
+            const auto iterator = std::find_if(
+                    staged_texture_changes.rbegin(), staged_texture_changes.rend(),
+                    [texture, subresource_index](const TextureStateChange &change) {
+                        return change.texture == texture && change.subresource_index == subresource_index;
+                    });
+            return iterator == staged_texture_changes.rend() ? nullptr : &*iterator;
+        };
+        const auto current_staged_texture_state = [&](TextureHandle texture,
+                                                      uint32_t subresource_index) {
+            if (const TextureStateChange *change = find_staged_texture_state(texture, subresource_index);
+                change != nullptr) {
+                return change->after;
+            }
+            return current_texture_state(command, texture, subresource_index);
+        };
+        const auto stage_texture_state = [&](TextureHandle texture, uint32_t subresource_index,
+                                             ResourceState before, ResourceState after) {
+            if (before == after) {
+                return;
+            }
+            auto iterator = std::find_if(
+                    staged_texture_changes.begin(), staged_texture_changes.end(),
+                    [texture, subresource_index](const TextureStateChange &change) {
+                        return change.texture == texture && change.subresource_index == subresource_index;
+                    });
+            if (iterator == staged_texture_changes.end()) {
+                staged_texture_changes.push_back(
+                        TextureStateChange{texture, subresource_index, before, after});
+            } else {
+                iterator->after = after;
+            }
         };
         const auto queue_family = [&](QueueClass queue) {
             if (queue == QueueClass::kAuto) {
@@ -4829,237 +5023,312 @@ namespace aeg::rhi {
                    source_family != destination_family;
         };
 
-        for (const BufferBarrier &barrier: buffers) {
-            const BufferResource *resource = buffers_.get(barrier.buffer);
-            if (resource == nullptr) {
-                return Result::failure(ResultCode::kNotFound, "Barrier contains an invalid buffer handle");
-            }
-            const Result range_result = validate_buffer_range(barrier.buffer, barrier.offset, barrier.size);
-            if (!range_result) {
-                return range_result;
-            }
-            if (has_local_buffer_state(barrier.buffer) &&
-                !resource_state_matches(current_buffer_state(command, barrier.buffer), barrier.before)) {
-                return Result::failure(ResultCode::kInvalidState,
-                                       "Buffer barrier before-state does not match the tracked state");
-            }
-            ResourceState after = normalize_after_state(barrier.after);
-            const bool discard_contents = after.discard_contents;
-            after.discard_contents = false;
-            resolved_buffers.push_back(ResolvedBufferBarrier{
-                barrier.buffer,
-                barrier.offset,
-                barrier.size == std::numeric_limits<uint64_t>::max() ? resource->size - barrier.offset : barrier.size,
-                barrier.before,
-                after,
-                discard_contents,
-                barrier.before.queue != QueueClass::kAuto,
-                barrier.after.queue != QueueClass::kAuto
-            });
-        }
-
-        for (const TextureBarrier &barrier: textures) {
-            const TextureResource *resource = textures_.get(barrier.texture);
-            if (resource == nullptr) {
-                return Result::failure(ResultCode::kNotFound, "Barrier contains an invalid texture handle");
-            }
-            const Result range_result = validate_texture_subresource(*resource, barrier.subresources);
-            if (!range_result) {
-                return range_result;
-            }
-
-            const uint32_t mip_count = barrier.subresources.mip_count == kRemaining
-                                           ? resource->desc.mip_levels - barrier.subresources.base_mip
-                                           : barrier.subresources.mip_count;
-            const uint32_t layer_count = barrier.subresources.layer_count == kRemaining
-                                             ? resource->desc.array_layers - barrier.subresources.base_layer
-                                             : barrier.subresources.layer_count;
-            ResourceState after = normalize_after_state(barrier.after);
-            const bool discard_contents = after.discard_contents;
-            after.discard_contents = false;
-            std::array<Aspect, 3> aspects{Aspect::kColor, Aspect::kDepth, Aspect::kStencil};
-            for (const Aspect aspect: aspects) {
-                if (!has_flag(barrier.subresources.aspects, aspect)) {
-                    continue;
+        try {
+            for (const BufferBarrier &barrier: buffers) {
+                BufferResource *resource = buffers_.get(barrier.buffer);
+                if (resource == nullptr) {
+                    return Result::failure(ResultCode::kNotFound, "Barrier contains an invalid buffer handle");
                 }
-
-                std::vector<uint32_t> indices;
-                indices.reserve(static_cast<size_t>(mip_count) * layer_count);
-                for (uint32_t mip = barrier.subresources.base_mip; mip < barrier.subresources.base_mip + mip_count;
-                     ++mip) {
-                    for (uint32_t layer = barrier.subresources.base_layer;
-                         layer < barrier.subresources.base_layer + layer_count; ++layer) {
-                        const uint32_t index = texture_subresource_index(*resource, aspect, mip, layer);
-                        const ResourceState current = current_texture_state(command, barrier.texture, index);
-                        if (has_local_texture_state(barrier.texture, index) &&
-                            !resource_state_matches(current, barrier.before)) {
-                            return Result::failure(ResultCode::kInvalidState,
-                                                   "Texture barrier before-state does not match the tracked state");
-                        }
-                        indices.push_back(index);
+                const Result range_result = validate_buffer_range(barrier.buffer, barrier.offset, barrier.size);
+                if (!range_result) {
+                    return range_result;
+                }
+                WorkingBufferState *local = find_working_buffer_state(barrier.buffer);
+                if (local == nullptr) {
+                    WorkingBufferState working{};
+                    working.buffer = barrier.buffer;
+                    if (const CommandBufferState *command_state = find_command_buffer_state(command, barrier.buffer);
+                        command_state != nullptr) {
+                        working.segments = command_state->segments;
+                    } else {
+                        working.segments = resource->state_segments;
+                        initialize_buffer_state_segments(working.segments, resource->size, resource->state);
                     }
+                    try {
+                        working_buffer_states.push_back(std::move(working));
+                    } catch (const std::bad_alloc &) {
+                        return Result::failure(ResultCode::kOutOfMemory, "Buffer state tracking allocation failed");
+                    }
+                    local = &working_buffer_states.back();
+                }
+                uint64_t range_end = 0;
+                if (!resolve_buffer_range(resource->size, barrier.offset, barrier.size, range_end)) {
+                    return Result::failure(ResultCode::kInvalidArgument, "Buffer range exceeds buffer size");
+                }
+                try {
+                    split_buffer_state_segment(local->segments, barrier.offset);
+                    split_buffer_state_segment(local->segments, range_end);
+                } catch (const std::bad_alloc &) {
+                    return Result::failure(ResultCode::kOutOfMemory, "Buffer state tracking allocation failed");
+                }
+                ResourceState after = normalize_after_state(barrier.after);
+                const bool discard_contents = after.discard_contents;
+                after.discard_contents = false;
+                for (BufferStateSegment &segment: local->segments) {
+                    const uint64_t segment_end = segment.offset + segment.size;
+                    if (segment.offset < barrier.offset || segment_end > range_end) {
+                        continue;
+                    }
+                    if (!resource_state_matches(segment.state, barrier.before)) {
+                        return Result::failure(ResultCode::kInvalidState,
+                                               "Buffer barrier before-state does not match the tracked state");
+                    }
+                    resolved_buffers.push_back(ResolvedBufferBarrier{
+                        barrier.buffer,
+                        segment.offset,
+                        segment.size,
+                        segment.state,
+                        after,
+                        discard_contents,
+                        barrier.requires_memory_dependency
+                    });
+                    if (segment.state != after) {
+                        staged_buffer_changes.push_back(
+                                BufferStateChange{barrier.buffer, segment.offset, segment.size,
+                                                  segment.state, after});
+                    }
+                    segment.state = after;
+                }
+                merge_buffer_state_segments(local->segments);
+            }
+
+            for (const TextureBarrier& barrier : textures) {
+                const TextureResource* resource = textures_.get(barrier.texture);
+                if (resource == nullptr) {
+                    return Result::failure(ResultCode::kNotFound, "Barrier contains an invalid texture handle");
+                }
+                const Result range_result = validate_texture_subresource(*resource, barrier.subresources);
+                if (!range_result) {
+                    return range_result;
                 }
 
-                if (indices.empty()) {
+                const uint32_t mip_count = barrier.subresources.mip_count == kRemaining
+                                               ? resource->desc.mip_levels - barrier.subresources.base_mip
+                                               : barrier.subresources.mip_count;
+                const uint32_t layer_count = barrier.subresources.layer_count == kRemaining
+                                                 ? resource->desc.array_layers - barrier.subresources.base_layer
+                                                 : barrier.subresources.layer_count;
+                ResourceState after = normalize_after_state(barrier.after);
+                const bool discard_contents = after.discard_contents;
+                after.discard_contents = false;
+                std::array<Aspect, 3> aspects{Aspect::kColor, Aspect::kDepth, Aspect::kStencil};
+                for (const Aspect aspect : aspects) {
+                    if (!has_flag(barrier.subresources.aspects, aspect)) {
+                        continue;
+                    }
+
+                    std::vector<uint32_t> indices;
+                    indices.reserve(static_cast<size_t>(mip_count) * layer_count);
+                    for (uint32_t mip = barrier.subresources.base_mip; mip < barrier.subresources.base_mip + mip_count;
+                         ++mip) {
+                        for (uint32_t layer = barrier.subresources.base_layer;
+                             layer < barrier.subresources.base_layer + layer_count; ++layer) {
+                            const uint32_t index = texture_subresource_index(*resource, aspect, mip, layer);
+                            const ResourceState current = current_staged_texture_state(barrier.texture, index);
+                            if ((command.barrier_mode == BarrierMode::kExplicit ||
+                                 has_local_texture_state(barrier.texture, index) ||
+                                 find_staged_texture_state(barrier.texture, index) != nullptr) &&
+                                !resource_state_matches(current, barrier.before)) {
+                                return Result::failure(ResultCode::kInvalidState,
+                                                       "Texture barrier before-state does not match the tracked state");
+                            }
+                            indices.push_back(index);
+                            stage_texture_state(barrier.texture, index, current, after);
+                        }
+                    }
+
+                    if (indices.empty()) {
+                        continue;
+                    }
+                    VkImageSubresourceRange range{};
+                    range.aspectMask = to_vk_aspect(aspect);
+                    range.baseMipLevel = barrier.subresources.base_mip;
+                    range.levelCount = mip_count;
+                    range.baseArrayLayer = barrier.subresources.base_layer;
+                    range.layerCount = layer_count;
+                    resolved_textures.push_back(
+                        ResolvedTextureBarrier{barrier.texture, range, barrier.before, after, discard_contents,
+                                               barrier.requires_memory_dependency, std::move(indices)});
+                    add_unique(staged_referenced_textures, barrier.texture);
+                }
+            }
+
+            for (const ResolvedBufferBarrier &resolved: resolved_buffers) {
+                uint32_t source_family = VK_QUEUE_FAMILY_IGNORED;
+                uint32_t destination_family = VK_QUEUE_FAMILY_IGNORED;
+                if (is_cross_family_transfer(resolved.before, resolved.after, source_family, destination_family) &&
+                    resolved.after.queue != command.queue) {
+                    return Result::failure(ResultCode::kInvalidArgument,
+                                           "Cross-queue buffer barriers must be recorded on the destination queue");
+                }
+            }
+            for (const ResolvedTextureBarrier &resolved: resolved_textures) {
+                uint32_t source_family = VK_QUEUE_FAMILY_IGNORED;
+                uint32_t destination_family = VK_QUEUE_FAMILY_IGNORED;
+                if (is_cross_family_transfer(resolved.before, resolved.after, source_family, destination_family) &&
+                    resolved.after.queue != command.queue) {
+                    return Result::failure(ResultCode::kInvalidArgument,
+                                           "Cross-queue texture barriers must be recorded on the destination queue");
+                }
+            }
+
+            std::vector<VkBufferMemoryBarrier2> buffer_barriers2;
+            std::vector<VkImageMemoryBarrier2> image_barriers2;
+            std::vector<VkBufferMemoryBarrier> buffer_barriers;
+            std::vector<VkImageMemoryBarrier> image_barriers;
+            buffer_barriers2.reserve(resolved_buffers.size());
+            image_barriers2.reserve(resolved_textures.size());
+            buffer_barriers.reserve(resolved_buffers.size());
+            image_barriers.reserve(resolved_textures.size());
+
+            VkPipelineStageFlags legacy_source_stages = 0;
+            VkPipelineStageFlags legacy_destination_stages = 0;
+            for (const ResolvedBufferBarrier &resolved: resolved_buffers) {
+                add_unique(staged_referenced_buffers, resolved.handle);
+                const VulkanResourceState source = resolved.discard_contents
+                                                           ? to_vk_discard_source_state(resolved.before, false)
+                                                           : to_vk_resource_state(resolved.before, false);
+                const VulkanResourceState destination = to_vk_resource_state(resolved.after, false);
+                if (!resolved.discard_contents && !resolved.requires_memory_dependency &&
+                    source.access2 == destination.access2 &&
+                    source.stages2 == destination.stages2 &&
+                    resolved.before.queue == resolved.after.queue) {
                     continue;
                 }
-                VkImageSubresourceRange range{};
-                range.aspectMask = to_vk_aspect(aspect);
-                range.baseMipLevel = barrier.subresources.base_mip;
-                range.levelCount = mip_count;
-                range.baseArrayLayer = barrier.subresources.base_layer;
-                range.layerCount = layer_count;
-                resolved_textures.push_back(
-                        ResolvedTextureBarrier{barrier.texture,
-                                               range,
-                                               barrier.before,
-                                               after,
-                                               discard_contents,
-                                               std::move(indices),
-                                               barrier.before.queue != QueueClass::kAuto,
-                                               barrier.after.queue != QueueClass::kAuto});
+
+                uint32_t source_family = VK_QUEUE_FAMILY_IGNORED;
+                uint32_t destination_family = VK_QUEUE_FAMILY_IGNORED;
+                const bool cross_family = is_cross_family_transfer(resolved.before, resolved.after,
+                                                                   source_family, destination_family);
+                VkBufferMemoryBarrier2 barrier{};
+                barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
+                barrier.srcStageMask = cross_family ? VK_PIPELINE_STAGE_2_NONE : source.stages2;
+                barrier.srcAccessMask = cross_family ? 0 : source.access2;
+                barrier.dstStageMask = destination.stages2;
+                barrier.dstAccessMask = destination.access2;
+                barrier.srcQueueFamilyIndex = cross_family ? source_family : VK_QUEUE_FAMILY_IGNORED;
+                barrier.dstQueueFamilyIndex = cross_family ? destination_family : VK_QUEUE_FAMILY_IGNORED;
+                barrier.buffer = buffers_.get(resolved.handle)->buffer;
+                barrier.offset = resolved.offset;
+                barrier.size = resolved.size;
+                buffer_barriers2.push_back(barrier);
+
+                VkBufferMemoryBarrier legacy{};
+                legacy.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+                legacy.srcAccessMask = cross_family ? 0 : source.access;
+                legacy.dstAccessMask = destination.access;
+                legacy.srcQueueFamilyIndex = cross_family ? source_family : VK_QUEUE_FAMILY_IGNORED;
+                legacy.dstQueueFamilyIndex = cross_family ? destination_family : VK_QUEUE_FAMILY_IGNORED;
+                legacy.buffer = barrier.buffer;
+                legacy.offset = barrier.offset;
+                legacy.size = barrier.size;
+                buffer_barriers.push_back(legacy);
+                legacy_source_stages |= cross_family
+                                                ? static_cast<VkPipelineStageFlags>(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT)
+                                                : source.stages;
+                legacy_destination_stages |= destination.stages;
+
+                if (cross_family) {
+                    staged_buffer_ownership_transfers.push_back(
+                            BufferOwnershipTransfer{resolved.handle,
+                                                    resolved.offset,
+                                                    resolved.size,
+                                                    resolved.before,
+                                                    resolved.after,
+                                                    resolved.discard_contents,
+                                                    source_family,
+                                                    destination_family,
+                                                    QueueOwnershipPhase::kAcquire});
+                }
+            }
+
+            for (const ResolvedTextureBarrier &resolved: resolved_textures) {
+                const VulkanResourceState source = resolved.discard_contents
+                                                           ? to_vk_discard_source_state(resolved.before, true)
+                                                           : to_vk_resource_state(resolved.before, true);
+                const VulkanResourceState destination = to_vk_resource_state(resolved.after, true);
+                if (!resolved.discard_contents && !resolved.requires_memory_dependency &&
+                    source.layout == destination.layout &&
+                    source.access2 == destination.access2 &&
+                    source.stages2 == destination.stages2 && resolved.before.queue == resolved.after.queue) {
+                    continue;
+                }
+
+                uint32_t source_family = VK_QUEUE_FAMILY_IGNORED;
+                uint32_t destination_family = VK_QUEUE_FAMILY_IGNORED;
+                const bool cross_family = is_cross_family_transfer(resolved.before, resolved.after,
+                                                                   source_family, destination_family);
+                VkImageMemoryBarrier2 barrier{};
+                barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+                barrier.srcStageMask = cross_family ? VK_PIPELINE_STAGE_2_NONE : source.stages2;
+                barrier.srcAccessMask = cross_family ? 0 : source.access2;
+                barrier.dstStageMask = destination.stages2;
+                barrier.dstAccessMask = destination.access2;
+                barrier.oldLayout = source.layout;
+                barrier.newLayout = destination.layout;
+                barrier.srcQueueFamilyIndex = cross_family ? source_family : VK_QUEUE_FAMILY_IGNORED;
+                barrier.dstQueueFamilyIndex = cross_family ? destination_family : VK_QUEUE_FAMILY_IGNORED;
+                barrier.image = textures_.get(resolved.handle)->image;
+                barrier.subresourceRange = resolved.range;
+                image_barriers2.push_back(barrier);
+
+                VkImageMemoryBarrier legacy{};
+                legacy.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                legacy.srcAccessMask = cross_family ? 0 : source.access;
+                legacy.dstAccessMask = destination.access;
+                legacy.oldLayout = source.layout;
+                legacy.newLayout = destination.layout;
+                legacy.srcQueueFamilyIndex = cross_family ? source_family : VK_QUEUE_FAMILY_IGNORED;
+                legacy.dstQueueFamilyIndex = cross_family ? destination_family : VK_QUEUE_FAMILY_IGNORED;
+                legacy.image = barrier.image;
+                legacy.subresourceRange = barrier.subresourceRange;
+                image_barriers.push_back(legacy);
+                legacy_source_stages |= cross_family
+                                                ? static_cast<VkPipelineStageFlags>(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT)
+                                                : source.stages;
+                legacy_destination_stages |= destination.stages;
+
+                if (cross_family) {
+                    staged_texture_ownership_transfers.push_back(
+                            TextureOwnershipTransfer{resolved.handle,
+                                                      resolved.range,
+                                                      resolved.before,
+                                                      resolved.after,
+                                                      resolved.discard_contents,
+                                                      source_family,
+                                                      destination_family,
+                                                      QueueOwnershipPhase::kAcquire});
+                }
+            }
+
+        const auto reserve_additional = [](auto &values, size_t additional) {
+            if (additional > std::numeric_limits<size_t>::max() - values.size()) {
+                return false;
+            }
+            values.reserve(values.size() + additional);
+            return true;
+        };
+        size_t new_buffer_state_count = 0;
+        for (const WorkingBufferState &working: working_buffer_states) {
+            if (find_command_buffer_state(command, working.buffer) == nullptr) {
+                if (new_buffer_state_count == std::numeric_limits<size_t>::max()) {
+                    return Result::failure(ResultCode::kOutOfMemory, "Buffer state count overflowed");
+                }
+                ++new_buffer_state_count;
             }
         }
-
-        for (const ResolvedBufferBarrier &resolved: resolved_buffers) {
-            uint32_t source_family = VK_QUEUE_FAMILY_IGNORED;
-            uint32_t destination_family = VK_QUEUE_FAMILY_IGNORED;
-            if (is_cross_family_transfer(resolved.before, resolved.after, source_family, destination_family) &&
-                resolved.after.queue != command.queue) {
-                return Result::failure(ResultCode::kInvalidArgument,
-                                       "Cross-queue buffer barriers must be recorded on the destination queue");
+        try {
+            if (!reserve_additional(command.buffer_states, new_buffer_state_count) ||
+                !reserve_additional(command.buffer_state_changes, staged_buffer_changes.size()) ||
+                !reserve_additional(command.texture_state_changes, staged_texture_changes.size()) ||
+                !reserve_additional(command.buffer_ownership_transfers, staged_buffer_ownership_transfers.size()) ||
+                !reserve_additional(command.texture_ownership_transfers, staged_texture_ownership_transfers.size()) ||
+                !reserve_additional(command.referenced_buffers, staged_referenced_buffers.size()) ||
+                !reserve_additional(command.referenced_textures, staged_referenced_textures.size())) {
+                return Result::failure(ResultCode::kOutOfMemory, "Barrier state capacity calculation overflowed");
             }
-        }
-        for (const ResolvedTextureBarrier &resolved: resolved_textures) {
-            uint32_t source_family = VK_QUEUE_FAMILY_IGNORED;
-            uint32_t destination_family = VK_QUEUE_FAMILY_IGNORED;
-            if (is_cross_family_transfer(resolved.before, resolved.after, source_family, destination_family) &&
-                resolved.after.queue != command.queue) {
-                return Result::failure(ResultCode::kInvalidArgument,
-                                       "Cross-queue texture barriers must be recorded on the destination queue");
-            }
-        }
-
-        std::vector<VkBufferMemoryBarrier2> buffer_barriers2;
-        std::vector<VkImageMemoryBarrier2> image_barriers2;
-        std::vector<VkBufferMemoryBarrier> buffer_barriers;
-        std::vector<VkImageMemoryBarrier> image_barriers;
-        buffer_barriers2.reserve(resolved_buffers.size());
-        image_barriers2.reserve(resolved_textures.size());
-        buffer_barriers.reserve(resolved_buffers.size());
-        image_barriers.reserve(resolved_textures.size());
-
-        VkPipelineStageFlags legacy_source_stages = 0;
-        VkPipelineStageFlags legacy_destination_stages = 0;
-        for (const ResolvedBufferBarrier &resolved: resolved_buffers) {
-            const VulkanResourceState source = resolved.discard_contents
-                                                       ? to_vk_discard_source_state(resolved.before, false)
-                                                       : to_vk_resource_state(resolved.before, false);
-            const VulkanResourceState destination = to_vk_resource_state(resolved.after, false);
-            if (!resolved.discard_contents && source.access2 == destination.access2 &&
-                source.stages2 == destination.stages2 &&
-                resolved.before.queue == resolved.after.queue) {
-                continue;
-            }
-
-            uint32_t source_family = VK_QUEUE_FAMILY_IGNORED;
-            uint32_t destination_family = VK_QUEUE_FAMILY_IGNORED;
-            const bool cross_family = is_cross_family_transfer(resolved.before, resolved.after,
-                                                               source_family, destination_family);
-            VkBufferMemoryBarrier2 barrier{};
-            barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
-            barrier.srcStageMask = cross_family ? VK_PIPELINE_STAGE_2_NONE : source.stages2;
-            barrier.srcAccessMask = cross_family ? 0 : source.access2;
-            barrier.dstStageMask = destination.stages2;
-            barrier.dstAccessMask = destination.access2;
-            barrier.srcQueueFamilyIndex = cross_family ? source_family : VK_QUEUE_FAMILY_IGNORED;
-            barrier.dstQueueFamilyIndex = cross_family ? destination_family : VK_QUEUE_FAMILY_IGNORED;
-            barrier.buffer = buffers_.get(resolved.handle)->buffer;
-            barrier.offset = resolved.offset;
-            barrier.size = resolved.size;
-            buffer_barriers2.push_back(barrier);
-
-            VkBufferMemoryBarrier legacy{};
-            legacy.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-            legacy.srcAccessMask = cross_family ? 0 : source.access;
-            legacy.dstAccessMask = destination.access;
-            legacy.srcQueueFamilyIndex = cross_family ? source_family : VK_QUEUE_FAMILY_IGNORED;
-            legacy.dstQueueFamilyIndex = cross_family ? destination_family : VK_QUEUE_FAMILY_IGNORED;
-            legacy.buffer = barrier.buffer;
-            legacy.offset = barrier.offset;
-            legacy.size = barrier.size;
-            buffer_barriers.push_back(legacy);
-            legacy_source_stages |= cross_family ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : source.stages;
-            legacy_destination_stages |= destination.stages;
-
-            if (cross_family) {
-                command.buffer_ownership_transfers.push_back(
-                        BufferOwnershipTransfer{resolved.handle,
-                                                 resolved.offset,
-                                                 resolved.size,
-                                                 resolved.before,
-                                                 resolved.after,
-                                                 resolved.discard_contents,
-                                                 source_family,
-                                                 destination_family,
-                                                 QueueOwnershipPhase::kAcquire});
-            }
-        }
-
-        for (const ResolvedTextureBarrier &resolved: resolved_textures) {
-            const VulkanResourceState source = resolved.discard_contents
-                                                       ? to_vk_discard_source_state(resolved.before, true)
-                                                       : to_vk_resource_state(resolved.before, true);
-            const VulkanResourceState destination = to_vk_resource_state(resolved.after, true);
-            if (!resolved.discard_contents && source.layout == destination.layout &&
-                source.access2 == destination.access2 &&
-                source.stages2 == destination.stages2 && resolved.before.queue == resolved.after.queue) {
-                continue;
-            }
-
-            uint32_t source_family = VK_QUEUE_FAMILY_IGNORED;
-            uint32_t destination_family = VK_QUEUE_FAMILY_IGNORED;
-            const bool cross_family = is_cross_family_transfer(resolved.before, resolved.after,
-                                                               source_family, destination_family);
-            VkImageMemoryBarrier2 barrier{};
-            barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-            barrier.srcStageMask = cross_family ? VK_PIPELINE_STAGE_2_NONE : source.stages2;
-            barrier.srcAccessMask = cross_family ? 0 : source.access2;
-            barrier.dstStageMask = destination.stages2;
-            barrier.dstAccessMask = destination.access2;
-            barrier.oldLayout = source.layout;
-            barrier.newLayout = destination.layout;
-            barrier.srcQueueFamilyIndex = cross_family ? source_family : VK_QUEUE_FAMILY_IGNORED;
-            barrier.dstQueueFamilyIndex = cross_family ? destination_family : VK_QUEUE_FAMILY_IGNORED;
-            barrier.image = textures_.get(resolved.handle)->image;
-            barrier.subresourceRange = resolved.range;
-            image_barriers2.push_back(barrier);
-
-            VkImageMemoryBarrier legacy{};
-            legacy.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            legacy.srcAccessMask = cross_family ? 0 : source.access;
-            legacy.dstAccessMask = destination.access;
-            legacy.oldLayout = source.layout;
-            legacy.newLayout = destination.layout;
-            legacy.srcQueueFamilyIndex = cross_family ? source_family : VK_QUEUE_FAMILY_IGNORED;
-            legacy.dstQueueFamilyIndex = cross_family ? destination_family : VK_QUEUE_FAMILY_IGNORED;
-            legacy.image = barrier.image;
-            legacy.subresourceRange = barrier.subresourceRange;
-            image_barriers.push_back(legacy);
-            legacy_source_stages |= cross_family ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : source.stages;
-            legacy_destination_stages |= destination.stages;
-
-            if (cross_family) {
-                command.texture_ownership_transfers.push_back(
-                        TextureOwnershipTransfer{resolved.handle,
-                                                  resolved.range,
-                                                  resolved.before,
-                                                  resolved.after,
-                                                  resolved.discard_contents,
-                                                  source_family,
-                                                  destination_family,
-                                                  QueueOwnershipPhase::kAcquire});
-            }
+        } catch (const std::bad_alloc &) {
+            return Result::failure(ResultCode::kOutOfMemory, "Barrier state commit allocation failed");
         }
 
         if (!buffer_barriers2.empty() || !image_barriers2.empty()) {
@@ -5084,57 +5353,51 @@ namespace aeg::rhi {
             }
         }
 
-        const auto append_buffer_change = [&](const ResolvedBufferBarrier &resolved) {
-            if (resolved.before == resolved.after) {
-                return;
-            }
-            auto iterator = std::find_if(command.buffer_state_changes.begin(), command.buffer_state_changes.end(),
-                                         [&](const BufferStateChange &change) {
-                                             return change.buffer == resolved.handle;
-                                         });
-            if (iterator == command.buffer_state_changes.end()) {
-                command.buffer_state_changes.push_back(
-                    BufferStateChange{resolved.handle, resolved.before, resolved.after});
+        for (WorkingBufferState &working: working_buffer_states) {
+            CommandBufferState *existing = find_command_buffer_state(command, working.buffer);
+            if (existing == nullptr) {
+                command.buffer_states.push_back(
+                        CommandBufferState{working.buffer, std::move(working.segments)});
             } else {
-                iterator->after = resolved.after;
+                existing->segments = std::move(working.segments);
             }
-        };
-        const auto append_texture_change = [&](const ResolvedTextureBarrier &resolved) {
-            for (const uint32_t index: resolved.state_indices) {
-                if (resolved.before == resolved.after) {
-                    continue;
-                }
-                auto iterator = std::find_if(command.texture_state_changes.begin(), command.texture_state_changes.end(),
-                                             [&](const TextureStateChange &change) {
-                                                 return change.texture == resolved.handle &&
-                                                        change.subresource_index == index;
-                                             });
-                if (iterator == command.texture_state_changes.end()) {
-                    command.texture_state_changes.push_back(
-                        TextureStateChange{resolved.handle, index, resolved.before, resolved.after});
-                } else {
-                    iterator->after = resolved.after;
-                }
+        }
+        for (BufferStateChange &change: staged_buffer_changes) {
+            command.buffer_state_changes.push_back(std::move(change));
+        }
+        for (TextureStateChange &change: staged_texture_changes) {
+            auto iterator = std::find_if(command.texture_state_changes.begin(), command.texture_state_changes.end(),
+                                         [&](const TextureStateChange &existing) {
+                                             return existing.texture == change.texture &&
+                                                    existing.subresource_index == change.subresource_index;
+                                         });
+            if (iterator == command.texture_state_changes.end()) {
+                command.texture_state_changes.push_back(std::move(change));
+            } else {
+                iterator->after = change.after;
             }
-        };
-        for (const ResolvedBufferBarrier &resolved: resolved_buffers) {
-            append_buffer_change(resolved);
         }
-        for (const ResolvedTextureBarrier &resolved: resolved_textures) {
-            append_texture_change(resolved);
+        for (BufferOwnershipTransfer &transfer: staged_buffer_ownership_transfers) {
+            command.buffer_ownership_transfers.push_back(std::move(transfer));
         }
-        for (const ResolvedBufferBarrier &resolved: resolved_buffers) {
-            add_unique(command.referenced_buffers, resolved.handle);
+        for (TextureOwnershipTransfer &transfer: staged_texture_ownership_transfers) {
+            command.texture_ownership_transfers.push_back(std::move(transfer));
         }
-        for (const ResolvedTextureBarrier &resolved: resolved_textures) {
-            add_unique(command.referenced_textures, resolved.handle);
+        for (const BufferHandle buffer: staged_referenced_buffers) {
+            add_unique(command.referenced_buffers, buffer);
+        }
+        for (const TextureHandle texture: staged_referenced_textures) {
+            add_unique(command.referenced_textures, texture);
         }
         return Result::success();
+        } catch (const std::bad_alloc &) {
+            return Result::failure(ResultCode::kOutOfMemory, "Barrier state staging allocation failed");
+        }
     }
 
     Result VulkanDevice::transition_buffer(CommandListResource &command, BufferHandle buffer, uint64_t offset,
                                            uint64_t size, const ResourceState &after) {
-        const BufferResource *resource = buffers_.get(buffer);
+        BufferResource *resource = buffers_.get(buffer);
         if (resource == nullptr) {
             return Result::failure(ResultCode::kNotFound, "Invalid buffer handle");
         }
@@ -5142,16 +5405,56 @@ namespace aeg::rhi {
         if (!range_result) {
             return range_result;
         }
-        const ResourceState before = current_buffer_state(command, buffer);
         ResourceState normalized_after = after;
         if (normalized_after.queue == QueueClass::kAuto) {
             normalized_after.queue = command.queue;
         }
-        if (before == normalized_after) {
+
+        const Result state_result = ensure_command_buffer_state(command, buffer);
+        if (!state_result) {
+            return state_result;
+        }
+        CommandBufferState *local = find_command_buffer_state(command, buffer);
+        if (local == nullptr) {
+            return Result::failure(ResultCode::kInvalidState, "Buffer state tracking is unavailable");
+        }
+
+        uint64_t end = 0;
+        if (!resolve_buffer_range(resource->size, offset, size, end)) {
+            return Result::failure(ResultCode::kInvalidArgument, "Buffer range exceeds buffer size");
+        }
+        if (command.barrier_mode == BarrierMode::kExplicit) {
+            return validate_buffer_usage(command, buffer, offset, size, normalized_after);
+        }
+
+        try {
+            split_buffer_state_segment(local->segments, offset);
+            split_buffer_state_segment(local->segments, end);
+        } catch (const std::bad_alloc &) {
+            return Result::failure(ResultCode::kOutOfMemory, "Buffer state tracking allocation failed");
+        }
+
+        std::vector<BufferBarrier> barriers;
+        try {
+            barriers.reserve(local->segments.size());
+            for (const BufferStateSegment &segment: local->segments) {
+                const uint64_t segment_end = segment.offset + segment.size;
+                if (segment_end <= offset || segment.offset >= end) {
+                    continue;
+                }
+                if (segment.state != normalized_after) {
+                    barriers.push_back(BufferBarrier{buffer, segment.offset, segment.size,
+                                                     segment.state, normalized_after, false});
+                }
+            }
+        } catch (const std::bad_alloc &) {
+            return Result::failure(ResultCode::kOutOfMemory, "Buffer state transition allocation failed");
+        }
+
+        if (barriers.empty()) {
             return Result::success();
         }
-        const BufferBarrier barrier{buffer, offset, size, before, normalized_after};
-        return record_barriers(command, std::span<const BufferBarrier>{&barrier, 1}, {});
+        return record_barriers(command, barriers, {});
     }
 
     Result VulkanDevice::transition_texture(CommandListResource &command, TextureHandle texture,
@@ -5175,6 +5478,26 @@ namespace aeg::rhi {
         const uint32_t layer_count = subresources.layer_count == kRemaining
                                          ? resource->desc.array_layers - subresources.base_layer
                                          : subresources.layer_count;
+        if (command.barrier_mode == BarrierMode::kExplicit) {
+            const std::array<Aspect, 3> aspects{Aspect::kColor, Aspect::kDepth, Aspect::kStencil};
+            for (const Aspect aspect: aspects) {
+                if (!has_flag(subresources.aspects, aspect)) {
+                    continue;
+                }
+                for (uint32_t mip = subresources.base_mip; mip < subresources.base_mip + mip_count; ++mip) {
+                    for (uint32_t layer = subresources.base_layer;
+                         layer < subresources.base_layer + layer_count; ++layer) {
+                        const uint32_t index = texture_subresource_index(*resource, aspect, mip, layer);
+                        if (!resource_usage_matches(current_texture_state(command, texture, index), normalized_after)) {
+                            return Result::failure(
+                                    ResultCode::kInvalidState,
+                                    "Explicit command list texture state does not match the declared usage");
+                        }
+                    }
+                }
+            }
+            return Result::success();
+        }
         std::vector<TextureBarrier> barriers;
         barriers.reserve(3);
         std::array<Aspect, 3> aspects{Aspect::kColor, Aspect::kDepth, Aspect::kStencil};
@@ -7240,6 +7563,7 @@ namespace aeg::rhi {
         resource.pool = queue->command_pool;
         resource.queue = queue->logical_class;
         resource.one_time_submit = desc.one_time_submit;
+        resource.barrier_mode = desc.barrier_mode;
         const VkResult result = vkAllocateCommandBuffers(device_, &allocate_info, &resource.command_buffer);
         if (result != VK_SUCCESS) {
             return {make_vulkan_result(result, "vkAllocateCommandBuffers"), {}};
@@ -7465,6 +7789,12 @@ namespace aeg::rhi {
 
         vkCmdEndRendering(command->command_buffer);
         command->rendering = false;
+
+        if (command->barrier_mode == BarrierMode::kExplicit) {
+            command->active_color_attachments.clear();
+            command->active_depth_stencil = {};
+            return Result::success();
+        }
 
         Result transition_result = Result::success();
         for (const ColorAttachmentDesc &attachment: command->active_color_attachments) {
@@ -8093,10 +8423,11 @@ namespace aeg::rhi {
             !result) {
             return result;
         }
+        uint64_t source_required_end = 0;
         if (const Result result = validate_copy_buffer_range(
                     destination->desc.format, desc.destination_subresources.aspects,
                     desc.destination_subresources.layer_count, desc.extent, desc.source_row_length,
-                    desc.source_image_height, desc.source_offset, source->size);
+                    desc.source_image_height, desc.source_offset, source->size, &source_required_end);
             !result) {
             return result;
         }
@@ -8104,8 +8435,8 @@ namespace aeg::rhi {
                                          PipelineStage::kCopy};
         const ResourceState destination_state{ResourceUsage::kCopyDestination, ShaderStage::kAll, command->queue,
                                               false, PipelineStage::kCopy};
-        if (const Result result = transition_buffer(*command, desc.source, desc.source_offset,
-                                                    std::numeric_limits<uint64_t>::max(), source_state);
+        if (const Result result = transition_buffer(
+                    *command, desc.source, desc.source_offset, source_required_end - desc.source_offset, source_state);
             !result) {
             return result;
         }
@@ -8157,10 +8488,12 @@ namespace aeg::rhi {
             !result) {
             return result;
         }
+        uint64_t destination_required_end = 0;
         if (const Result result = validate_copy_buffer_range(
                     source->desc.format, desc.source_subresources.aspects,
                     desc.source_subresources.layer_count, desc.extent, desc.destination_row_length,
-                    desc.destination_image_height, desc.destination_offset, destination->size);
+                    desc.destination_image_height, desc.destination_offset, destination->size,
+                    &destination_required_end);
             !result) {
             return result;
         }
@@ -8171,8 +8504,9 @@ namespace aeg::rhi {
         if (const Result result = transition_texture(*command, desc.source, range, source_state); !result) {
             return result;
         }
-        if (const Result result = transition_buffer(*command, desc.destination, desc.destination_offset,
-                                                    std::numeric_limits<uint64_t>::max(), destination_state);
+        if (const Result result = transition_buffer(
+                    *command, desc.destination, desc.destination_offset,
+                    destination_required_end - desc.destination_offset, destination_state);
             !result) {
             return result;
         }
@@ -8384,6 +8718,7 @@ namespace aeg::rhi {
         resource->referenced_buffer_views.clear();
         resource->referenced_samplers.clear();
         resource->buffer_state_changes.clear();
+        resource->buffer_states.clear();
         resource->texture_state_changes.clear();
         resource->buffer_ownership_transfers.clear();
         resource->texture_ownership_transfers.clear();
@@ -8575,12 +8910,55 @@ namespace aeg::rhi {
     }
 
     Result VulkanDevice::validate_command_batch_states(
-            std::span<const CommandListHandle> command_lists) const {
-        std::unordered_map<uint64_t, ResourceState> buffer_overrides;
+            std::span<const CommandListHandle> command_lists) {
+        std::unordered_map<uint64_t, size_t> buffer_change_counts;
+        std::unordered_map<uint64_t, std::vector<BufferStateSegment>> buffer_overrides;
         std::unordered_map<TextureStateKey, ResourceState, TextureStateKeyHash> texture_overrides;
         try {
+            buffer_change_counts.reserve(command_lists.size());
             buffer_overrides.reserve(command_lists.size());
             texture_overrides.reserve(command_lists.size());
+
+            for (const CommandListHandle command_list: command_lists) {
+                const CommandListResource *command = command_lists_.get(command_list);
+                if (command == nullptr) {
+                    return Result::failure(ResultCode::kNotFound, "Submit contains an invalid command list");
+                }
+                for (const BufferStateChange &change: command->buffer_state_changes) {
+                    BufferResource *resource = buffers_.get(change.buffer);
+                    if (resource == nullptr) {
+                        return Result::failure(ResultCode::kNotFound, "Command references a destroyed buffer");
+                    }
+
+                    uint64_t range_end = 0;
+                    if (!resolve_buffer_range(resource->size, change.offset, change.size, range_end)) {
+                        return Result::failure(ResultCode::kInvalidArgument,
+                                               "Command contains a buffer state range outside the resource");
+                    }
+
+                    auto [iterator, inserted] = buffer_change_counts.try_emplace(change.buffer.value, 0);
+                    (void) inserted;
+                    if (iterator->second == std::numeric_limits<size_t>::max()) {
+                        return Result::failure(ResultCode::kOutOfMemory,
+                                               "Command buffer state change count overflowed");
+                    }
+                    ++iterator->second;
+                }
+            }
+
+            for (const auto &[buffer_value, change_count]: buffer_change_counts) {
+                BufferResource *resource = buffers_.get(BufferHandle{buffer_value});
+                if (resource == nullptr) {
+                    return Result::failure(ResultCode::kNotFound, "Command references a destroyed buffer");
+                }
+                const size_t base_size = std::max<size_t>(resource->state_segments.size(), 1);
+                if (change_count > (std::numeric_limits<size_t>::max() - base_size) / 2) {
+                    return Result::failure(ResultCode::kOutOfMemory,
+                                           "Buffer state segment capacity calculation overflowed");
+                }
+                resource->state_segments.reserve(base_size + change_count * 2);
+            }
+
             for (const CommandListHandle command_list: command_lists) {
                 const CommandListResource *command = command_lists_.get(command_list);
                 if (command == nullptr) {
@@ -8593,17 +8971,47 @@ namespace aeg::rhi {
                         return Result::failure(ResultCode::kNotFound, "Command references a destroyed buffer");
                     }
 
-                    const auto iterator = buffer_overrides.find(change.buffer.value);
-                    const ResourceState actual = iterator == buffer_overrides.end() ? resource->state : iterator->second;
-                    if (!resource_state_matches(actual, change.before)) {
-                        return Result::failure(ResultCode::kInvalidState,
-                                               "Command batch contains a conflicting buffer state transition");
+                    uint64_t range_end = 0;
+                    if (!resolve_buffer_range(resource->size, change.offset, change.size, range_end)) {
+                        return Result::failure(ResultCode::kInvalidArgument,
+                                               "Command contains a buffer state range outside the resource");
                     }
+
+                    auto iterator = buffer_overrides.find(change.buffer.value);
                     if (iterator == buffer_overrides.end()) {
-                        buffer_overrides.emplace(change.buffer.value, change.after);
-                    } else {
-                        iterator->second = change.after;
+                        auto inserted = buffer_overrides.emplace(change.buffer.value, resource->state_segments);
+                        iterator = inserted.first;
+                        initialize_buffer_state_segments(iterator->second, resource->size, resource->state);
                     }
+
+                    std::vector<BufferStateSegment> &segments = iterator->second;
+                    split_buffer_state_segment(segments, change.offset);
+                    split_buffer_state_segment(segments, range_end);
+
+                    uint64_t cursor = change.offset;
+                    for (BufferStateSegment &segment: segments) {
+                        const uint64_t segment_end = segment.offset + segment.size;
+                        if (segment_end <= change.offset) {
+                            continue;
+                        }
+                        if (segment.offset >= range_end) {
+                            break;
+                        }
+                        if (segment.offset != cursor || segment_end > range_end ||
+                            !resource_state_matches(segment.state, change.before)) {
+                            return Result::failure(
+                                    ResultCode::kInvalidState,
+                                    "Command batch contains a conflicting buffer state transition");
+                        }
+                        segment.state = change.after;
+                        cursor = segment_end;
+                    }
+                    if (cursor != range_end) {
+                        return Result::failure(
+                                ResultCode::kInvalidState,
+                                "Command batch buffer state tracking does not cover the requested range");
+                    }
+                    merge_buffer_state_segments(segments);
                 }
 
                 for (const TextureStateChange &change: command->texture_state_changes) {
@@ -8637,7 +9045,28 @@ namespace aeg::rhi {
     void VulkanDevice::commit_command_states(const CommandListResource &command) {
         for (const BufferStateChange &change: command.buffer_state_changes) {
             if (BufferResource *resource = buffers_.get(change.buffer); resource != nullptr) {
-                resource->state = change.after;
+                uint64_t range_end = 0;
+                if (!resolve_buffer_range(resource->size, change.offset, change.size, range_end)) {
+                    continue;
+                }
+                initialize_buffer_state_segments(resource->state_segments, resource->size, resource->state);
+                split_buffer_state_segment(resource->state_segments, change.offset);
+                split_buffer_state_segment(resource->state_segments, range_end);
+                for (BufferStateSegment &segment: resource->state_segments) {
+                    const uint64_t segment_end = segment.offset + segment.size;
+                    if (segment.offset < change.offset || segment_end > range_end) {
+                        continue;
+                    }
+                    segment.state = change.after;
+                }
+                merge_buffer_state_segments(resource->state_segments);
+                if (!resource->state_segments.empty()) {
+                    const ResourceState state = resource->state_segments.front().state;
+                    const bool uniform = std::all_of(
+                            resource->state_segments.begin(), resource->state_segments.end(),
+                            [state](const BufferStateSegment &segment) { return segment.state == state; });
+                    resource->state = uniform ? state : ResourceState{};
+                }
             }
         }
         for (const TextureStateChange &change: command.texture_state_changes) {

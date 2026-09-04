@@ -115,7 +115,8 @@ namespace aeg::render_graph {
 
         /** @brief Creates and begins a command list in the active frame slot. */
         [[nodiscard]] foundation::ResultValue<rhi::CommandListHandle> begin_command_list(
-                rhi::QueueClass queue, uint32_t batch_index = 0);
+                rhi::QueueClass queue, uint32_t batch_index = 0,
+                rhi::BarrierMode barrier_mode = rhi::BarrierMode::kImplicit);
         /** @brief Ends a command list created by begin_command_list(). */
         [[nodiscard]] foundation::Result end_command_list(rhi::CommandListHandle command_list);
 
@@ -159,6 +160,7 @@ namespace aeg::render_graph {
         struct CommandRecord {
             rhi::CommandListHandle handle{};
             rhi::QueueClass queue{rhi::QueueClass::kGraphics};
+            rhi::BarrierMode barrier_mode{rhi::BarrierMode::kImplicit};
             bool recording{false};
             bool ended{false};
             bool submitted{false};

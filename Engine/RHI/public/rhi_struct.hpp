@@ -967,6 +967,7 @@ namespace aeg::rhi {
         uint64_t size{std::numeric_limits<uint64_t>::max()};
         ResourceState before{};
         ResourceState after{};
+        bool requires_memory_dependency{false};
     };
 
     /** @brief State transition for a texture subresource range. */
@@ -975,6 +976,7 @@ namespace aeg::rhi {
         SubresourceRange subresources{};
         ResourceState before{};
         ResourceState after{};
+        bool requires_memory_dependency{false};
     };
 
     /** @brief Batch of buffer and texture barriers recorded on a command list. */
@@ -1074,11 +1076,15 @@ namespace aeg::rhi {
         bool suboptimal{false};
     };
 
+    /** @brief Selects whether resource commands may insert implicit transitions. */
+    enum class BarrierMode : uint8_t { kImplicit, kExplicit };
+
     /** @brief Command-list creation options. */
     struct CommandListDesc {
         QueueClass queue{QueueClass::kGraphics};
         bool one_time_submit{true};
         DebugName name{};
+        BarrierMode barrier_mode{BarrierMode::kImplicit};
     };
 
     /** @brief Submission description for ordinary command lists. */

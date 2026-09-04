@@ -54,10 +54,17 @@ namespace aeg::render_graph {
             rhi::BufferViewHandle handle{};
         };
 
+        struct BufferStateSegment {
+            uint64_t offset{0};
+            uint64_t size{0};
+            rhi::ResourceState state{};
+        };
+
         struct PhysicalBuffer {
             rhi::BufferHandle handle{};
             OwnedBufferDesc desc{};
             rhi::ResourceState state{};
+            std::vector<BufferStateSegment> states{};
             std::vector<BufferViewCacheEntry> views{};
             bool owns_handle{false};
         };
@@ -86,6 +93,8 @@ namespace aeg::render_graph {
             RenderGraphBufferRange buffer_range{};
             rhi::SubresourceRange subresources{};
             bool discard_on_first_use{false};
+            bool requires_memory_dependency{false};
+            bool requires_queue_transfer{false};
         };
 
         struct ColorAttachment {
@@ -166,10 +175,16 @@ namespace aeg::render_graph {
             std::vector<PhysicalTexture> textures{};
         };
 
+        struct BatchDependency {
+            uint32_t source_batch{kInvalidHandleIndex};
+            rhi::PipelineStageMask destination_stages{rhi::PipelineStage::kNone};
+            uint32_t resource_hazard_count{0};
+        };
+
         struct Batch {
             rhi::QueueClass queue{rhi::QueueClass::kGraphics};
             std::vector<uint32_t> passes{};
-            std::vector<uint32_t> wait_batches{};
+            std::vector<BatchDependency> dependencies{};
             rhi::GpuSyncPoint completion{};
             bool submits_frame{false};
         };
@@ -195,7 +210,7 @@ namespace aeg::render_graph {
 
         struct RuntimeBufferState {
             PhysicalBuffer* physical{nullptr};
-            rhi::ResourceState state{};
+            std::vector<BufferStateSegment> states{};
             RuntimeBufferState* shared{nullptr};
         };
 
@@ -238,6 +253,67 @@ namespace aeg::render_graph {
             }
             state.discard_contents = false;
             return state;
+        }
+
+        [[nodiscard]] bool resolve_buffer_range(uint64_t buffer_size, RenderGraphBufferRange range,
+                                                 uint64_t& end) noexcept {
+            if (range.offset > buffer_size) {
+                return false;
+            }
+            if (range.size == std::numeric_limits<uint64_t>::max()) {
+                end = buffer_size;
+                return true;
+            }
+            if (range.size > buffer_size - range.offset) {
+                return false;
+            }
+            end = range.offset + range.size;
+            return true;
+        }
+
+        void split_buffer_state_segment(std::vector<BufferStateSegment>& states, uint64_t position) {
+            for (size_t index = 0; index < states.size(); ++index) {
+                BufferStateSegment& segment = states[index];
+                const uint64_t segment_end = segment.offset + segment.size;
+                if (position <= segment.offset || position >= segment_end) {
+                    continue;
+                }
+                const BufferStateSegment right{position, segment_end - position, segment.state};
+                segment.size = position - segment.offset;
+                states.insert(states.begin() + static_cast<std::ptrdiff_t>(index + 1), right);
+                return;
+            }
+        }
+
+        void merge_buffer_state_segments(std::vector<BufferStateSegment>& states) noexcept {
+            for (size_t index = 1; index < states.size();) {
+                BufferStateSegment& previous = states[index - 1];
+                BufferStateSegment& current = states[index];
+                if (previous.offset + previous.size == current.offset && previous.state == current.state) {
+                    previous.size += current.size;
+                    states.erase(states.begin() + static_cast<std::ptrdiff_t>(index));
+                    continue;
+                }
+                ++index;
+            }
+        }
+
+        void initialize_buffer_state_segments(std::vector<BufferStateSegment>& states, uint64_t buffer_size,
+                                              const rhi::ResourceState& initial_state) {
+            if (states.empty() && buffer_size != 0) {
+                states.push_back(BufferStateSegment{0, buffer_size, initial_state});
+            }
+        }
+
+        void refresh_physical_buffer_state(PhysicalBuffer& physical) noexcept {
+            if (physical.states.empty()) {
+                return;
+            }
+            const rhi::ResourceState state = physical.states.front().state;
+            const bool uniform = std::all_of(
+                    physical.states.begin(), physical.states.end(),
+                    [state](const BufferStateSegment& segment) { return segment.state == state; });
+            physical.state = uniform ? state : rhi::ResourceState{};
         }
 
         [[nodiscard]] bool buffer_desc_equal(const OwnedBufferDesc& lhs, const OwnedBufferDesc& rhs) noexcept {
@@ -427,6 +503,7 @@ namespace aeg::render_graph {
         std::vector<TransientBufferSlotPlan> transient_buffer_slots{};
         std::vector<TransientTextureSlotPlan> transient_texture_slots{};
         std::vector<uint32_t> pass_to_batch{};
+        RenderGraphPlan plan{};
 
         [[nodiscard]] uint32_t allocate_generation() noexcept {
             const uint32_t generation = next_generation++;
@@ -438,6 +515,7 @@ namespace aeg::render_graph {
 
         void mark_dirty() noexcept {
             compiled = false;
+            plan = {};
             ++revision;
             if (revision == 0) {
                 revision = 1;
@@ -505,6 +583,11 @@ namespace aeg::render_graph {
         [[nodiscard]] foundation::Result release_physical_buffer(PhysicalBuffer& physical);
         [[nodiscard]] foundation::Result release_physical_texture(PhysicalTexture& physical);
         [[nodiscard]] foundation::Result release_all();
+        [[nodiscard]] foundation::Result build_plan(RenderGraphCompileInfo& info);
+        [[nodiscard]] foundation::Result audit_cross_queue_dependencies() const;
+        [[nodiscard]] bool resource_uses_overlap(const ResourceUse& lhs,
+                                                  const ResourceUse& rhs) const noexcept;
+        [[nodiscard]] uint32_t resource_hazard_count(const Edge& edge) const noexcept;
         [[nodiscard]] foundation::ResultValue<rhi::BufferHandle> resolve_buffer(RenderGraphBuffer handle,
                                                                           uint32_t frame_slot) const;
         [[nodiscard]] foundation::ResultValue<rhi::TextureHandle> resolve_texture(RenderGraphTexture handle,
@@ -515,16 +598,13 @@ namespace aeg::render_graph {
         [[nodiscard]] foundation::ResultValue<rhi::TextureViewHandle> resolve_texture_view(
                 RenderGraphTexture handle, uint32_t frame_slot, rhi::TextureViewKind kind,
                 rhi::SubresourceRange subresources, rhi::Format format, rhi::TextureViewDimension dimension);
-        [[nodiscard]] foundation::Result record_barriers(rhi::CommandListHandle command_list,
-                                                   uint32_t frame_slot, uint32_t topological_index,
-                                                   const ResourceUse& use,
-                                                   std::vector<RuntimeBufferState>& buffer_states,
-                                                   std::vector<RuntimeTextureState>& texture_states);
-        [[nodiscard]] foundation::Result update_runtime_state(const ResourceUse& use, uint32_t frame_slot,
-                                                        std::vector<RuntimeBufferState>& buffer_states,
-                                                        std::vector<RuntimeTextureState>& texture_states);
+        [[nodiscard]] foundation::Result record_barrier_batch(
+                rhi::CommandListHandle command_list, uint32_t frame_slot,
+                const RenderGraphPassPlan& pass_plan, RenderGraphBarrierPhase phase,
+                std::vector<RuntimeBufferState>& buffer_states,
+                std::vector<RuntimeTextureState>& texture_states);
         void commit_runtime_states(const std::vector<RuntimeBufferState>& buffer_states,
-                                   const std::vector<RuntimeTextureState>& texture_states) noexcept;
+                                   const std::vector<RuntimeTextureState>& texture_states);
         [[nodiscard]] PhysicalBuffer* physical_buffer(BufferRecord& record, uint32_t frame_slot) noexcept;
         [[nodiscard]] const PhysicalBuffer* physical_buffer(const BufferRecord& record,
                                                              uint32_t frame_slot) const noexcept;
@@ -548,6 +628,10 @@ namespace aeg::render_graph {
         }
     }
 
+    const RenderGraphPlan& RenderGraph::plan() const noexcept {
+        return impl_->plan;
+    }
+
     void RenderGraph::clear_passes() noexcept {
         if (impl_ == nullptr) {
             return;
@@ -569,6 +653,7 @@ namespace aeg::render_graph {
         impl_->pass_to_batch.clear();
         impl_->transient_buffer_slots.clear();
         impl_->transient_texture_slots.clear();
+        impl_->plan = {};
         for (BufferRecord& record: impl_->buffers) {
             record.has_use = false;
             record.first_use = kInvalidHandleIndex;
@@ -601,6 +686,7 @@ namespace aeg::render_graph {
         impl_->pass_to_batch.clear();
         impl_->transient_buffer_slots.clear();
         impl_->transient_texture_slots.clear();
+        impl_->plan = {};
         impl_->mark_dirty();
         compile_info_ = {};
     }
@@ -715,6 +801,8 @@ namespace aeg::render_graph {
                                          ? rhi::ResourceState{desc.initial_usage, rhi::ShaderStage::kAll,
                                                               desc.initial_queue, false, desc.initial_stages}
                                          : initial_state;
+        record->physical.states.clear();
+        initialize_buffer_state_segments(record->physical.states, desc.size, record->physical.state);
         impl_->mark_dirty();
         return resource_result;
     }
@@ -775,8 +863,18 @@ namespace aeg::render_graph {
         record->imported = buffer;
         record->physical.handle = buffer;
         record->physical.owns_handle = false;
-        record->physical.state = initial_state;
+        record->physical.state = initial_state.usage == rhi::ResourceUsage::kUndefined &&
+                                         record->desc.desc.initial_usage != rhi::ResourceUsage::kUndefined
+                                     ? rhi::ResourceState{record->desc.desc.initial_usage,
+                                                          rhi::ShaderStage::kAll,
+                                                          record->desc.desc.initial_queue,
+                                                          false,
+                                                           record->desc.desc.initial_stages}
+                                      : initial_state;
+        record->physical.states.clear();
+        initialize_buffer_state_segments(record->physical.states, record->desc.desc.size, record->physical.state);
         record->last_completions.clear();
+        impl_->mark_dirty();
         return foundation::Result::success();
     }
 
@@ -792,11 +890,20 @@ namespace aeg::render_graph {
             return foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                         "Imported texture handle must be valid");
         }
+        const rhi::ResourceState resolved_state =
+                initial_state.usage == rhi::ResourceUsage::kUndefined &&
+                        record->desc.desc.initial_usage != rhi::ResourceUsage::kUndefined
+                    ? rhi::ResourceState{record->desc.desc.initial_usage,
+                                         rhi::ShaderStage::kAll,
+                                         record->desc.desc.initial_queue,
+                                         false,
+                                         record->desc.desc.initial_stages}
+                    : initial_state;
         std::vector<rhi::ResourceState> new_states;
         try {
             new_states.assign(static_cast<size_t>(kAspectPlaneCount) * record->desc.desc.mip_levels *
                                       record->desc.desc.array_layers,
-                              initial_state);
+                              resolved_state);
         } catch (const std::bad_alloc&) {
             return foundation::Result::failure(foundation::ResultCode::kOutOfMemory,
                                         "Render graph imported texture state allocation failed");
@@ -812,8 +919,9 @@ namespace aeg::render_graph {
         record->physical.handle = texture;
         record->physical.owns_handle = false;
         record->physical.states.swap(new_states);
-        record->imported_state = initial_state;
+        record->imported_state = resolved_state;
         record->last_completions.clear();
+        impl_->mark_dirty();
         return foundation::Result::success();
     }
 
@@ -903,7 +1011,11 @@ namespace aeg::render_graph {
             return foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                         "Render graph implementation is not initialized");
         }
-        return impl_->compile_graph(compile_info_);
+        const foundation::Result result = impl_->compile_graph(compile_info_);
+        if (!result) {
+            compile_info_ = {};
+        }
+        return result;
     }
 
     foundation::Result PassBuilder::read(RenderGraphBuffer buffer, rhi::ResourceUsage usage,
@@ -1413,15 +1525,30 @@ namespace aeg::render_graph {
 
     foundation::Result RenderGraph::Impl::compile_graph(RenderGraphCompileInfo& info) {
         if (compiled && compiled_revision == revision) {
-            info = RenderGraphCompileInfo{
-                static_cast<uint32_t>(buffers.size() + textures.size()),
-                static_cast<uint32_t>(passes.size()),
-                info.culled_pass_count,
-                static_cast<uint32_t>(batches.size()),
-                static_cast<uint32_t>(transient_buffer_slots.size()),
-                static_cast<uint32_t>(transient_texture_slots.size()),
-                info.barrier_count
-            };
+            info.resource_count = static_cast<uint32_t>(buffers.size() + textures.size());
+            info.pass_count = static_cast<uint32_t>(passes.size());
+            info.culled_pass_count = static_cast<uint32_t>(std::count(live_passes.begin(), live_passes.end(), 0));
+            info.batch_count = static_cast<uint32_t>(batches.size());
+            info.transient_buffer_slot_count = static_cast<uint32_t>(transient_buffer_slots.size());
+            info.transient_texture_slot_count = static_cast<uint32_t>(transient_texture_slots.size());
+            info.barrier_count = 0;
+            info.barrier_point_count = 0;
+            for (const RenderGraphPassPlan& pass_plan: plan.pass_plans) {
+                info.barrier_count += static_cast<uint32_t>(pass_plan.barriers.size());
+                const bool has_before = std::any_of(
+                        pass_plan.barriers.begin(), pass_plan.barriers.end(),
+                        [](const RenderGraphBarrierPlan& barrier) {
+                            return barrier.phase == RenderGraphBarrierPhase::kBeforePass;
+                        });
+                const bool has_after = std::any_of(
+                        pass_plan.barriers.begin(), pass_plan.barriers.end(),
+                        [](const RenderGraphBarrierPlan& barrier) {
+                            return barrier.phase == RenderGraphBarrierPhase::kAfterPass;
+                        });
+                info.barrier_point_count += has_before ? 1u : 0u;
+                info.barrier_point_count += has_after ? 1u : 0u;
+            }
+            info.queue_dependency_count = static_cast<uint32_t>(plan.queue_dependencies.size());
             return foundation::Result::success();
         }
 
@@ -1433,6 +1560,7 @@ namespace aeg::render_graph {
             pass_to_batch.assign(passes.size(), kInvalidHandleIndex);
             transient_buffer_slots.clear();
             transient_texture_slots.clear();
+            plan = {};
 
             for (BufferRecord& record: buffers) {
                 record.has_use = false;
@@ -1489,8 +1617,10 @@ namespace aeg::render_graph {
             std::vector<std::vector<UseReference>> buffer_history(buffers.size());
             std::vector<std::vector<UseReference>> texture_history(textures.size());
             for (uint32_t pass_index = 0; pass_index < passes.size(); ++pass_index) {
-                const PassRecord& pass = passes[pass_index];
-                for (const ResourceUse& use: pass.uses) {
+                PassRecord& pass = passes[pass_index];
+                for (ResourceUse& use: pass.uses) {
+                    use.requires_memory_dependency = false;
+                    use.requires_queue_transfer = false;
                     std::vector<UseReference>& history = use.kind == ResourceKind::kBuffer
                                                                ? buffer_history[use.resource_index]
                                                                : texture_history[use.resource_index];
@@ -1507,6 +1637,12 @@ namespace aeg::render_graph {
                         }
                         const bool hazard = is_write_access(previous.use->access) || is_write_access(use.access);
                         const bool state_change = !state_matches(previous.use->after_state, use.before_state);
+                        if (hazard) {
+                            use.requires_memory_dependency = true;
+                        }
+                        if (previous.use->after_state.queue != use.before_state.queue) {
+                            use.requires_queue_transfer = true;
+                        }
                         if (hazard || state_change) {
                             add_edge(previous.pass_index, pass_index);
                         }
@@ -1745,6 +1881,45 @@ namespace aeg::render_graph {
                 pass_to_batch[pass_index] = batch_index;
             }
 
+            const auto dependency_stages = [&](const Edge& edge) noexcept {
+                rhi::PipelineStageMask stages = rhi::PipelineStage::kNone;
+                const PassRecord& source_pass = passes[edge.source];
+                const PassRecord& destination_pass = passes[edge.destination];
+                for (const ResourceUse& destination_use: destination_pass.uses) {
+                    bool related = false;
+                    for (const ResourceUse& source_use: source_pass.uses) {
+                        if (resource_uses_overlap(source_use, destination_use)) {
+                            related = true;
+                            break;
+                        }
+                    }
+                    if (related) {
+                        stages |= destination_use.before_state.pipeline_stages;
+                    }
+                }
+                if (stages == rhi::PipelineStage::kNone) {
+                    for (const ResourceUse& use: destination_pass.uses) {
+                        stages |= use.before_state.pipeline_stages;
+                    }
+                }
+                return stages == rhi::PipelineStage::kNone ? rhi::PipelineStage::kAllCommands : stages;
+            };
+
+            const auto add_batch_dependency = [](Batch& destination, uint32_t source_batch,
+                                                 rhi::PipelineStageMask stages, uint32_t hazard_count) {
+                for (BatchDependency& dependency: destination.dependencies) {
+                    if (dependency.source_batch != source_batch) {
+                        continue;
+                    }
+                    dependency.destination_stages |= stages;
+                    const uint32_t remaining = std::numeric_limits<uint32_t>::max() -
+                                               dependency.resource_hazard_count;
+                    dependency.resource_hazard_count += std::min(remaining, hazard_count);
+                    return;
+                }
+                destination.dependencies.push_back(BatchDependency{source_batch, stages, hazard_count});
+            };
+
             for (const Edge& edge: edges) {
                 if (live_passes[edge.source] == 0 || live_passes[edge.destination] == 0) {
                     continue;
@@ -1754,10 +1929,13 @@ namespace aeg::render_graph {
                 if (source_batch == destination_batch || batches[source_batch].queue == batches[destination_batch].queue) {
                     continue;
                 }
-                std::vector<uint32_t>& waits = batches[destination_batch].wait_batches;
-                if (std::find(waits.begin(), waits.end(), source_batch) == waits.end()) {
-                    waits.push_back(source_batch);
-                }
+                const uint32_t hazard_count = std::max(1u, resource_hazard_count(edge));
+                add_batch_dependency(batches[destination_batch], source_batch, dependency_stages(edge), hazard_count);
+            }
+
+            const foundation::Result audit_result = audit_cross_queue_dependencies();
+            if (!audit_result) {
+                return audit_result;
             }
 
             uint32_t frame_output_batches = 0;
@@ -1785,21 +1963,10 @@ namespace aeg::render_graph {
                                             "A render graph can have only one present output batch");
             }
 
-            uint32_t culled_count = 0;
-            for (const uint8_t live: live_passes) {
-                culled_count += live == 0 ? 1u : 0u;
+            const foundation::Result plan_result = build_plan(info);
+            if (!plan_result) {
+                return plan_result;
             }
-            info = RenderGraphCompileInfo{
-                static_cast<uint32_t>(buffers.size() + textures.size()),
-                static_cast<uint32_t>(passes.size()),
-                culled_count,
-                static_cast<uint32_t>(batches.size()),
-                static_cast<uint32_t>(transient_buffer_slots.size()),
-                static_cast<uint32_t>(transient_texture_slots.size()),
-                static_cast<uint32_t>(std::count_if(passes.begin(), passes.end(), [](const PassRecord& pass) {
-                    return !pass.uses.empty();
-                }))
-            };
             compiled_revision = revision;
             compiled = true;
             return foundation::Result::success();
@@ -1807,6 +1974,495 @@ namespace aeg::render_graph {
             compiled = false;
             return foundation::Result::failure(foundation::ResultCode::kOutOfMemory,
                                         "Render graph compilation allocation failed");
+        }
+    }
+
+    bool RenderGraph::Impl::resource_uses_overlap(const ResourceUse& lhs,
+                                                   const ResourceUse& rhs) const noexcept {
+        if (lhs.kind != rhs.kind || lhs.resource_index != rhs.resource_index ||
+            lhs.resource_generation != rhs.resource_generation) {
+            return false;
+        }
+        if (lhs.kind == ResourceKind::kBuffer) {
+            return lhs.resource_index < buffers.size() && ranges_overlap(lhs.buffer_range, rhs.buffer_range);
+        }
+        return lhs.resource_index < textures.size() &&
+               ranges_overlap(lhs.subresources, rhs.subresources, textures[lhs.resource_index].desc.desc);
+    }
+
+    uint32_t RenderGraph::Impl::resource_hazard_count(const Edge& edge) const noexcept {
+        if (edge.source >= passes.size() || edge.destination >= passes.size()) {
+            return 0;
+        }
+
+        uint32_t count = 0;
+        const PassRecord& source_pass = passes[edge.source];
+        const PassRecord& destination_pass = passes[edge.destination];
+        for (const ResourceUse& source_use: source_pass.uses) {
+            for (const ResourceUse& destination_use: destination_pass.uses) {
+                if (!resource_uses_overlap(source_use, destination_use)) {
+                    continue;
+                }
+                const bool hazard = is_write_access(source_use.access) || is_write_access(destination_use.access);
+                const bool state_change = !state_matches(source_use.after_state, destination_use.before_state);
+                if (hazard || state_change) {
+                    if (count != std::numeric_limits<uint32_t>::max()) {
+                        ++count;
+                    }
+                }
+            }
+        }
+        return count;
+    }
+
+    foundation::Result RenderGraph::Impl::audit_cross_queue_dependencies() const {
+        const auto dependency_for_batches = [&](uint32_t source_batch,
+                                                  uint32_t destination_batch) noexcept {
+            if (destination_batch >= batches.size()) {
+                return static_cast<const BatchDependency*>(nullptr);
+            }
+            const Batch& destination = batches[destination_batch];
+            const auto iterator = std::find_if(
+                    destination.dependencies.begin(), destination.dependencies.end(),
+                    [source_batch](const BatchDependency& dependency) {
+                        return dependency.source_batch == source_batch;
+                    });
+            return iterator == destination.dependencies.end() ? nullptr : &*iterator;
+        };
+
+        for (uint32_t destination_batch_index = 0; destination_batch_index < batches.size();
+             ++destination_batch_index) {
+            const Batch& destination = batches[destination_batch_index];
+            for (const BatchDependency& dependency: destination.dependencies) {
+                if (dependency.source_batch >= batches.size() || dependency.source_batch >= destination_batch_index) {
+                    return foundation::Result::failure(
+                            foundation::ResultCode::kInvalidState,
+                            "Render graph queue dependency does not follow batch topology");
+                }
+                const Batch& source = batches[dependency.source_batch];
+                if (source.queue == destination.queue) {
+                    return foundation::Result::failure(
+                            foundation::ResultCode::kInvalidState,
+                            "Render graph queue dependency references the same queue");
+                }
+                if (dependency.destination_stages == rhi::PipelineStage::kNone ||
+                    dependency.resource_hazard_count == 0) {
+                    return foundation::Result::failure(
+                            foundation::ResultCode::kInvalidState,
+                            "Render graph queue dependency has no destination stage or resource hazard");
+                }
+
+                uint32_t hazard_count = 0;
+                for (const Edge& edge: edges) {
+                    if (edge.source >= live_passes.size() || edge.destination >= live_passes.size() ||
+                        live_passes[edge.source] == 0 || live_passes[edge.destination] == 0 ||
+                        pass_to_batch[edge.source] != dependency.source_batch ||
+                        pass_to_batch[edge.destination] != destination_batch_index) {
+                        continue;
+                    }
+                    const uint32_t contribution = std::max(1u, resource_hazard_count(edge));
+                    const uint32_t remaining = std::numeric_limits<uint32_t>::max() - hazard_count;
+                    hazard_count += std::min(remaining, contribution);
+                }
+                if (hazard_count == 0 || hazard_count != dependency.resource_hazard_count) {
+                    return foundation::Result::failure(
+                            foundation::ResultCode::kInvalidState,
+                            "Render graph queue dependency is not backed by the expected resource hazards");
+                }
+            }
+        }
+
+        for (const Edge& edge: edges) {
+            if (edge.source >= live_passes.size() || edge.destination >= live_passes.size() ||
+                live_passes[edge.source] == 0 || live_passes[edge.destination] == 0) {
+                continue;
+            }
+            const uint32_t source_batch = pass_to_batch[edge.source];
+            const uint32_t destination_batch = pass_to_batch[edge.destination];
+            if (source_batch == kInvalidHandleIndex || destination_batch == kInvalidHandleIndex ||
+                source_batch >= batches.size() || destination_batch >= batches.size()) {
+                return foundation::Result::failure(
+                        foundation::ResultCode::kInvalidState,
+                        "Render graph edge is not assigned to a queue batch");
+            }
+            if (batches[source_batch].queue == batches[destination_batch].queue) {
+                continue;
+            }
+            if (source_batch >= destination_batch || dependency_for_batches(source_batch, destination_batch) == nullptr) {
+                return foundation::Result::failure(
+                        foundation::ResultCode::kInvalidState,
+                        "Render graph cross-queue edge has no audited dependency");
+            }
+        }
+
+        return foundation::Result::success();
+    }
+
+    foundation::Result RenderGraph::Impl::build_plan(RenderGraphCompileInfo& info) {
+        try {
+            RenderGraphPlan built_plan{};
+            built_plan.revision = revision;
+            built_plan.topological_order = topological_order;
+            built_plan.pass_plans.resize(passes.size());
+            built_plan.batches.reserve(batches.size());
+            built_plan.queue_dependencies.reserve(batches.size());
+
+            std::vector<uint32_t> topological_positions(passes.size(), kInvalidHandleIndex);
+            for (uint32_t topological_index = 0; topological_index < topological_order.size();
+                 ++topological_index) {
+                topological_positions[topological_order[topological_index]] = topological_index;
+            }
+
+            for (uint32_t pass_index = 0; pass_index < passes.size(); ++pass_index) {
+                RenderGraphPassPlan& pass_plan = built_plan.pass_plans[pass_index];
+                const PassRecord& pass = passes[pass_index];
+                pass_plan.pass = RenderGraphPass{pass_index, pass.generation};
+                pass_plan.live = live_passes[pass_index] != 0;
+                pass_plan.topological_index = topological_positions[pass_index];
+                pass_plan.batch_index = pass_plan.live ? pass_to_batch[pass_index] : kInvalidHandleIndex;
+            }
+
+            for (uint32_t batch_index = 0; batch_index < batches.size(); ++batch_index) {
+                const Batch& batch = batches[batch_index];
+                RenderGraphBatchPlan batch_plan{};
+                batch_plan.index = batch_index;
+                batch_plan.queue = batch.queue;
+                batch_plan.pass_indices = batch.passes;
+                batch_plan.submits_frame = batch.submits_frame;
+                batch_plan.dependencies.reserve(batch.dependencies.size());
+                for (const BatchDependency& dependency: batch.dependencies) {
+                    if (dependency.source_batch >= batches.size()) {
+                        return foundation::Result::failure(
+                                foundation::ResultCode::kInvalidState,
+                                "Render graph plan contains an invalid source batch");
+                    }
+                    batch_plan.dependencies.push_back(RenderGraphQueueDependency{
+                            dependency.source_batch,
+                            batch_index,
+                            batches[dependency.source_batch].queue,
+                            batch.queue,
+                            dependency.destination_stages,
+                            dependency.resource_hazard_count
+                    });
+                    built_plan.queue_dependencies.push_back(batch_plan.dependencies.back());
+                }
+                built_plan.batches.push_back(std::move(batch_plan));
+            }
+
+            std::vector<std::vector<BufferStateSegment>> buffer_states(buffers.size());
+            std::vector<std::vector<rhi::ResourceState>> texture_states(textures.size());
+            for (uint32_t index = 0; index < buffers.size(); ++index) {
+                const BufferRecord& record = buffers[index];
+                if (record.lifetime != ResourceLifetime::kTransient && record.physical.handle.is_valid() &&
+                    !record.physical.states.empty()) {
+                    buffer_states[index] = record.physical.states;
+                } else {
+                    initialize_buffer_state_segments(
+                            buffer_states[index], record.desc.desc.size,
+                            rhi::ResourceState{record.desc.desc.initial_usage,
+                                               rhi::ShaderStage::kAll,
+                                               record.desc.desc.initial_queue,
+                                               false,
+                                               record.desc.desc.initial_stages});
+                }
+            }
+            for (uint32_t index = 0; index < textures.size(); ++index) {
+                const TextureRecord& record = textures[index];
+                if (record.lifetime != ResourceLifetime::kTransient && !record.physical.states.empty()) {
+                    texture_states[index] = record.physical.states;
+                } else {
+                    texture_states[index].assign(
+                            static_cast<size_t>(kAspectPlaneCount) * record.desc.desc.mip_levels *
+                                    record.desc.desc.array_layers,
+                            rhi::ResourceState{
+                                    record.desc.desc.initial_usage,
+                                    rhi::ShaderStage::kAll,
+                                    record.desc.desc.initial_queue,
+                                    false,
+                                    record.desc.desc.initial_stages
+                            });
+                }
+            }
+
+            std::vector<std::vector<BufferStateSegment>> transient_buffer_states(transient_buffer_slots.size());
+            for (uint32_t index = 0; index < transient_buffer_slots.size(); ++index) {
+                const OwnedBufferDesc& desc = transient_buffer_slots[index].desc;
+                initialize_buffer_state_segments(
+                        transient_buffer_states[index], desc.desc.size,
+                        rhi::ResourceState{desc.desc.initial_usage,
+                                           rhi::ShaderStage::kAll,
+                                           desc.desc.initial_queue,
+                                           false,
+                                           desc.desc.initial_stages});
+            }
+            std::vector<std::vector<rhi::ResourceState>> transient_texture_states(transient_texture_slots.size());
+            for (uint32_t index = 0; index < transient_texture_slots.size(); ++index) {
+                const OwnedTextureDesc& desc = transient_texture_slots[index].desc;
+                transient_texture_states[index].assign(
+                        static_cast<size_t>(kAspectPlaneCount) * desc.desc.mip_levels * desc.desc.array_layers,
+                        rhi::ResourceState{
+                                desc.desc.initial_usage,
+                                rhi::ShaderStage::kAll,
+                                desc.desc.initial_queue,
+                                false,
+                                desc.desc.initial_stages
+                        });
+            }
+
+            const auto append_barrier = [](std::vector<RenderGraphBarrierPlan>& barriers,
+                                           RenderGraphResourceKind resource_kind, uint32_t resource_index,
+                                           uint32_t resource_generation, RenderGraphBarrierPhase phase,
+                                           RenderGraphBarrierKind kind, ResourceAccess access,
+                                           const rhi::ResourceState& before, const rhi::ResourceState& after,
+                                           RenderGraphBufferRange buffer_range,
+                                           rhi::SubresourceRange subresources, bool discard_contents,
+                                           bool requires_memory_dependency, bool requires_queue_transfer) {
+                barriers.push_back(RenderGraphBarrierPlan{
+                        resource_kind,
+                        resource_index,
+                        resource_generation,
+                        phase,
+                        kind,
+                        access,
+                        before,
+                        after,
+                        buffer_range,
+                        subresources,
+                        discard_contents,
+                        requires_memory_dependency,
+                        requires_queue_transfer
+                });
+            };
+
+            for (const uint32_t pass_index: topological_order) {
+                const PassRecord& pass = passes[pass_index];
+                RenderGraphPassPlan& pass_plan = built_plan.pass_plans[pass_index];
+                std::vector<RenderGraphBarrierPlan> before_barriers;
+                std::vector<RenderGraphBarrierPlan> after_barriers;
+                before_barriers.reserve(pass.uses.size());
+                after_barriers.reserve(pass.uses.size());
+
+                for (const ResourceUse& use: pass.uses) {
+                    const bool first_use = use.kind == ResourceKind::kBuffer
+                                                   ? buffers[use.resource_index].first_use == pass_plan.topological_index
+                                                   : textures[use.resource_index].first_use == pass_plan.topological_index;
+                    if (use.kind == ResourceKind::kBuffer) {
+                        BufferRecord& record = buffers[use.resource_index];
+                        if (first_use && record.lifetime == ResourceLifetime::kTransient) {
+                            if (record.physical_slot >= transient_buffer_states.size()) {
+                                return foundation::Result::failure(
+                                        foundation::ResultCode::kInvalidState,
+                                        "Render graph transient buffer slot is unavailable while building its plan");
+                            }
+                            buffer_states[use.resource_index] = transient_buffer_states[record.physical_slot];
+                        }
+
+                        uint64_t range_end = 0;
+                        if (!resolve_buffer_range(record.desc.desc.size, use.buffer_range, range_end)) {
+                            return foundation::Result::failure(
+                                    foundation::ResultCode::kInvalidArgument,
+                                    "Render graph buffer barrier range is out of bounds");
+                        }
+                        initialize_buffer_state_segments(
+                                buffer_states[use.resource_index], record.desc.desc.size,
+                                rhi::ResourceState{record.desc.desc.initial_usage,
+                                                   rhi::ShaderStage::kAll,
+                                                   record.desc.desc.initial_queue,
+                                                   false,
+                                                   record.desc.desc.initial_stages});
+                        std::vector<BufferStateSegment>& states = buffer_states[use.resource_index];
+                        split_buffer_state_segment(states, use.buffer_range.offset);
+                        split_buffer_state_segment(states, range_end);
+                        const rhi::ResourceState target_before = normalize_state(use.before_state, pass.queue);
+                        const bool discard = first_use && use.discard_on_first_use && is_write_access(use.access);
+                        for (BufferStateSegment& segment: states) {
+                            const uint64_t segment_end = segment.offset + segment.size;
+                            if (segment.offset < use.buffer_range.offset || segment_end > range_end) {
+                                continue;
+                            }
+                            const rhi::ResourceState before = segment.state;
+                            const bool queue_transfer = use.requires_queue_transfer ||
+                                                        before.queue != target_before.queue;
+                            const bool transition = !state_matches(before, target_before) || discard;
+                            const bool memory_dependency = use.requires_memory_dependency;
+                            if (transition || memory_dependency || queue_transfer) {
+                                const RenderGraphBarrierKind kind = queue_transfer
+                                                                             ? RenderGraphBarrierKind::kQueueTransfer
+                                                                             : transition
+                                                                                       ? RenderGraphBarrierKind::kTransition
+                                                                                       : RenderGraphBarrierKind::kMemoryDependency;
+                                append_barrier(before_barriers,
+                                               RenderGraphResourceKind::kBuffer,
+                                               use.resource_index,
+                                               use.resource_generation,
+                                               RenderGraphBarrierPhase::kBeforePass,
+                                               kind,
+                                               use.access,
+                                               before,
+                                               target_before,
+                                               RenderGraphBufferRange{segment.offset, segment.size},
+                                               {},
+                                               discard,
+                                               memory_dependency,
+                                               queue_transfer);
+                            }
+                            segment.state = target_before;
+                        }
+
+                        const rhi::ResourceState target_after = normalize_state(use.after_state, pass.queue);
+                        for (BufferStateSegment& segment: states) {
+                            const uint64_t segment_end = segment.offset + segment.size;
+                            if (segment.offset < use.buffer_range.offset || segment_end > range_end) {
+                                continue;
+                            }
+                            if (!state_matches(target_before, target_after)) {
+                                append_barrier(after_barriers,
+                                               RenderGraphResourceKind::kBuffer,
+                                               use.resource_index,
+                                               use.resource_generation,
+                                               RenderGraphBarrierPhase::kAfterPass,
+                                               RenderGraphBarrierKind::kTransition,
+                                               use.access,
+                                               target_before,
+                                               target_after,
+                                               RenderGraphBufferRange{segment.offset, segment.size},
+                                               {},
+                                               false,
+                                               false,
+                                               target_before.queue != target_after.queue);
+                            }
+                            segment.state = target_after;
+                        }
+                        merge_buffer_state_segments(states);
+                        if (record.lifetime == ResourceLifetime::kTransient &&
+                            record.physical_slot < transient_buffer_states.size()) {
+                            transient_buffer_states[record.physical_slot] = states;
+                        }
+                        continue;
+                    }
+
+                    TextureRecord& record = textures[use.resource_index];
+                    if (first_use && record.lifetime == ResourceLifetime::kTransient) {
+                        if (record.physical_slot >= transient_texture_states.size()) {
+                            return foundation::Result::failure(
+                                    foundation::ResultCode::kInvalidState,
+                                    "Render graph transient texture slot is unavailable while building its plan");
+                        }
+                        texture_states[use.resource_index] = transient_texture_states[record.physical_slot];
+                    }
+
+                    const rhi::ResourceState target_before = normalize_state(use.before_state, pass.queue);
+                    const rhi::ResourceState target_after = normalize_state(use.after_state, pass.queue);
+                    const rhi::Aspect aspects[] = {
+                            rhi::Aspect::kColor,
+                            rhi::Aspect::kDepth,
+                            rhi::Aspect::kStencil
+                    };
+                    for (const rhi::Aspect aspect: aspects) {
+                        if (!rhi::has_flag(use.subresources.aspects, aspect)) {
+                            continue;
+                        }
+                        for (uint32_t mip = use.subresources.base_mip;
+                             mip < use.subresources.base_mip + use.subresources.mip_count; ++mip) {
+                            for (uint32_t layer = use.subresources.base_layer;
+                                 layer < use.subresources.base_layer + use.subresources.layer_count; ++layer) {
+                                const uint32_t state_index = texture_state_index(
+                                        aspect, record.desc.desc, mip, layer);
+                                if (state_index >= texture_states[use.resource_index].size()) {
+                                    return foundation::Result::failure(
+                                            foundation::ResultCode::kInvalidState,
+                                            "Render graph texture state is unavailable while building its plan");
+                                }
+                                const rhi::ResourceState before = texture_states[use.resource_index][state_index];
+                                const bool discard = first_use && use.discard_on_first_use && is_write_access(use.access);
+                                const bool queue_transfer = use.requires_queue_transfer ||
+                                                            before.queue != target_before.queue;
+                                const bool transition = !state_matches(before, target_before) || discard;
+                                const bool memory_dependency = use.requires_memory_dependency;
+                                if (transition || memory_dependency || queue_transfer) {
+                                    const RenderGraphBarrierKind kind = queue_transfer
+                                                                                 ? RenderGraphBarrierKind::kQueueTransfer
+                                                                                 : transition
+                                                                                           ? RenderGraphBarrierKind::kTransition
+                                                                                           : RenderGraphBarrierKind::kMemoryDependency;
+                                    append_barrier(before_barriers,
+                                                   RenderGraphResourceKind::kTexture,
+                                                   use.resource_index,
+                                                   use.resource_generation,
+                                                   RenderGraphBarrierPhase::kBeforePass,
+                                                   kind,
+                                                   use.access,
+                                                   before,
+                                                   target_before,
+                                                   {},
+                                                   rhi::SubresourceRange{aspect, mip, 1, layer, 1},
+                                                   discard,
+                                                   memory_dependency,
+                                                   queue_transfer);
+                                }
+                                if (!state_matches(target_before, target_after)) {
+                                    append_barrier(after_barriers,
+                                                   RenderGraphResourceKind::kTexture,
+                                                   use.resource_index,
+                                                   use.resource_generation,
+                                                   RenderGraphBarrierPhase::kAfterPass,
+                                                   RenderGraphBarrierKind::kTransition,
+                                                   use.access,
+                                                   target_before,
+                                                   target_after,
+                                                   {},
+                                                   rhi::SubresourceRange{aspect, mip, 1, layer, 1},
+                                                   false,
+                                                   false,
+                                                   target_before.queue != target_after.queue);
+                                }
+                                texture_states[use.resource_index][state_index] = target_after;
+                                if (record.lifetime == ResourceLifetime::kTransient &&
+                                    record.physical_slot < transient_texture_states.size()) {
+                                    transient_texture_states[record.physical_slot][state_index] = target_after;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                pass_plan.barriers.reserve(before_barriers.size() + after_barriers.size());
+                pass_plan.barriers.insert(pass_plan.barriers.end(), before_barriers.begin(), before_barriers.end());
+                pass_plan.barriers.insert(pass_plan.barriers.end(), after_barriers.begin(), after_barriers.end());
+            }
+
+            uint32_t barrier_count = 0;
+            uint32_t barrier_point_count = 0;
+            for (const RenderGraphPassPlan& pass_plan: built_plan.pass_plans) {
+                barrier_count += static_cast<uint32_t>(pass_plan.barriers.size());
+                const bool has_before = std::any_of(
+                        pass_plan.barriers.begin(), pass_plan.barriers.end(), [](const RenderGraphBarrierPlan& barrier) {
+                            return barrier.phase == RenderGraphBarrierPhase::kBeforePass;
+                        });
+                const bool has_after = std::any_of(
+                        pass_plan.barriers.begin(), pass_plan.barriers.end(), [](const RenderGraphBarrierPlan& barrier) {
+                            return barrier.phase == RenderGraphBarrierPhase::kAfterPass;
+                        });
+                barrier_point_count += has_before ? 1u : 0u;
+                barrier_point_count += has_after ? 1u : 0u;
+            }
+
+            info.resource_count = static_cast<uint32_t>(buffers.size() + textures.size());
+            info.pass_count = static_cast<uint32_t>(passes.size());
+            info.culled_pass_count = static_cast<uint32_t>(
+                    std::count(live_passes.begin(), live_passes.end(), static_cast<uint8_t>(0)));
+            info.batch_count = static_cast<uint32_t>(batches.size());
+            info.transient_buffer_slot_count = static_cast<uint32_t>(transient_buffer_slots.size());
+            info.transient_texture_slot_count = static_cast<uint32_t>(transient_texture_slots.size());
+            info.barrier_count = barrier_count;
+            info.barrier_point_count = barrier_point_count;
+            info.queue_dependency_count = static_cast<uint32_t>(built_plan.queue_dependencies.size());
+            plan = std::move(built_plan);
+            return foundation::Result::success();
+        } catch (const std::bad_alloc&) {
+            return foundation::Result::failure(
+                    foundation::ResultCode::kOutOfMemory,
+                    "Render graph plan allocation failed");
         }
     }
 
@@ -1918,6 +2574,8 @@ namespace aeg::render_graph {
             physical.desc = plan.desc;
             physical.state = rhi::ResourceState{desc.initial_usage, rhi::ShaderStage::kAll,
                                                 desc.initial_queue, false, desc.initial_stages};
+            physical.states.clear();
+            initialize_buffer_state_segments(physical.states, desc.size, physical.state);
             physical.owns_handle = true;
         } catch (const std::bad_alloc&) {
             (void) device.destroy_buffer(create_result.value);
@@ -1983,6 +2641,8 @@ namespace aeg::render_graph {
             record.physical.desc = record.desc;
             record.physical.state = rhi::ResourceState{desc.initial_usage, rhi::ShaderStage::kAll,
                                                        desc.initial_queue, false, desc.initial_stages};
+            record.physical.states.clear();
+            initialize_buffer_state_segments(record.physical.states, desc.size, record.physical.state);
             record.physical.owns_handle = true;
         } catch (const std::bad_alloc&) {
             (void) device.destroy_buffer(create_result.value);
@@ -2267,7 +2927,8 @@ namespace aeg::render_graph {
                     }
                 }
                 if (runtime.shared == &runtime) {
-                    runtime.state = physical->state;
+                    runtime.states = physical->states;
+                    initialize_buffer_state_segments(runtime.states, physical->desc.desc.size, physical->state);
                 }
             }
             for (uint32_t index = 0; index < textures.size(); ++index) {
@@ -2302,156 +2963,233 @@ namespace aeg::render_graph {
         return foundation::Result::success();
     }
 
-    foundation::Result RenderGraph::Impl::record_barriers(
-            rhi::CommandListHandle command_list, uint32_t frame_slot, uint32_t topological_index,
-            const ResourceUse& use, std::vector<RuntimeBufferState>& buffer_states,
+    foundation::Result RenderGraph::Impl::record_barrier_batch(
+            rhi::CommandListHandle command_list, uint32_t frame_slot,
+            const RenderGraphPassPlan& pass_plan, RenderGraphBarrierPhase phase,
+            std::vector<RuntimeBufferState>& buffer_states,
             std::vector<RuntimeTextureState>& texture_states) {
         (void) frame_slot;
-        const bool first_use = use.kind == ResourceKind::kBuffer
-                                       ? buffers[use.resource_index].first_use == topological_index
-                                       : textures[use.resource_index].first_use == topological_index;
-        if (use.kind == ResourceKind::kBuffer) {
-            if (use.resource_index >= buffer_states.size() ||
-                buffer_states[use.resource_index].physical == nullptr ||
-                buffer_states[use.resource_index].shared == nullptr) {
-                return foundation::Result::failure(foundation::ResultCode::kInvalidState,
-                                            "Render graph buffer runtime state is unavailable");
-            }
-            PhysicalBuffer* physical = buffer_states[use.resource_index].physical;
-            RuntimeBufferState& runtime = *buffer_states[use.resource_index].shared;
-            const rhi::ResourceState before = runtime.state;
-            rhi::ResourceState after = use.before_state;
-            const bool discard = first_use && use.discard_on_first_use && is_write_access(use.access);
-            after.discard_contents = discard;
-            const rhi::ResourceState stored_after = normalize_state(after, use.before_state.queue);
-            if (!state_matches(before, stored_after) || discard) {
-                const rhi::BufferBarrier barrier{physical->handle, 0,
-                                                 std::numeric_limits<uint64_t>::max(), before, after};
-                const foundation::Result barrier_result = device.barrier(
-                        command_list, rhi::BarrierDesc{std::span<const rhi::BufferBarrier>{&barrier, 1}, {}});
-                if (!barrier_result) {
-                    return barrier_result;
-                }
-            }
-            runtime.state = stored_after;
-            return foundation::Result::success();
+        const PassRecord* pass = get_pass(pass_plan.pass);
+        if (pass == nullptr || !pass_plan.live) {
+            return foundation::Result::failure(
+                    foundation::ResultCode::kInvalidState,
+                    "Render graph barrier plan references an inactive pass");
         }
 
-        if (use.resource_index >= texture_states.size() || texture_states[use.resource_index].physical == nullptr ||
-            texture_states[use.resource_index].shared == nullptr) {
-            return foundation::Result::failure(foundation::ResultCode::kInvalidState,
-                                        "Render graph texture runtime state is unavailable");
-        }
-        PhysicalTexture* physical = texture_states[use.resource_index].physical;
-        RuntimeTextureState& runtime = *texture_states[use.resource_index].shared;
-        std::vector<rhi::TextureBarrier> barriers;
-        std::vector<std::pair<uint32_t, rhi::ResourceState>> pending_states;
+        std::vector<rhi::BufferBarrier> buffer_barriers;
+        std::vector<rhi::TextureBarrier> texture_barriers;
         try {
-            const rhi::TextureDesc& desc = physical->desc.desc;
-            const rhi::SubresourceRange& range = use.subresources;
-            const rhi::Aspect aspects[] = {rhi::Aspect::kColor, rhi::Aspect::kDepth, rhi::Aspect::kStencil};
-            for (const rhi::Aspect aspect: aspects) {
-                if (!rhi::has_flag(range.aspects, aspect)) {
+            buffer_barriers.reserve(pass_plan.barriers.size());
+            texture_barriers.reserve(pass_plan.barriers.size());
+
+            const auto append_buffer_barrier = [&](const rhi::BufferBarrier& candidate) {
+                for (rhi::BufferBarrier& existing: buffer_barriers) {
+                    if (existing.buffer != candidate.buffer || existing.before != candidate.before ||
+                        existing.after != candidate.after ||
+                        existing.requires_memory_dependency != candidate.requires_memory_dependency) {
+                        continue;
+                    }
+                    if (existing.offset == candidate.offset && existing.size == candidate.size) {
+                        existing.after.discard_contents =
+                                existing.after.discard_contents || candidate.after.discard_contents;
+                        return;
+                    }
+                }
+                buffer_barriers.push_back(candidate);
+            };
+
+            const auto append_texture_barrier = [&](const rhi::TextureBarrier& candidate) {
+                for (rhi::TextureBarrier& existing: texture_barriers) {
+                    if (existing.texture != candidate.texture || existing.before != candidate.before ||
+                        existing.after != candidate.after ||
+                        existing.requires_memory_dependency != candidate.requires_memory_dependency ||
+                        existing.subresources.aspects != candidate.subresources.aspects) {
+                        continue;
+                    }
+                    const bool same_mip = existing.subresources.base_mip == candidate.subresources.base_mip &&
+                                          existing.subresources.mip_count == candidate.subresources.mip_count;
+                    const bool adjacent_layers =
+                            same_mip &&
+                            (existing.subresources.base_layer + existing.subresources.layer_count ==
+                             candidate.subresources.base_layer ||
+                             candidate.subresources.base_layer + candidate.subresources.layer_count ==
+                             existing.subresources.base_layer);
+                    if (adjacent_layers) {
+                        existing.subresources.base_layer =
+                                std::min(existing.subresources.base_layer, candidate.subresources.base_layer);
+                        const uint32_t end = std::max(
+                                existing.subresources.base_layer + existing.subresources.layer_count,
+                                candidate.subresources.base_layer + candidate.subresources.layer_count);
+                        existing.subresources.layer_count = end - existing.subresources.base_layer;
+                        existing.after.discard_contents =
+                                existing.after.discard_contents || candidate.after.discard_contents;
+                        return;
+                    }
+                    const bool same_layers = existing.subresources.base_layer == candidate.subresources.base_layer &&
+                                             existing.subresources.layer_count == candidate.subresources.layer_count;
+                    const bool adjacent_mips =
+                            same_layers &&
+                            (existing.subresources.base_mip + existing.subresources.mip_count ==
+                             candidate.subresources.base_mip ||
+                             candidate.subresources.base_mip + candidate.subresources.mip_count ==
+                             existing.subresources.base_mip);
+                    if (adjacent_mips) {
+                        existing.subresources.base_mip =
+                                std::min(existing.subresources.base_mip, candidate.subresources.base_mip);
+                        const uint32_t end = std::max(
+                                existing.subresources.base_mip + existing.subresources.mip_count,
+                                candidate.subresources.base_mip + candidate.subresources.mip_count);
+                        existing.subresources.mip_count = end - existing.subresources.base_mip;
+                        existing.after.discard_contents =
+                                existing.after.discard_contents || candidate.after.discard_contents;
+                        return;
+                    }
+                }
+                texture_barriers.push_back(candidate);
+            };
+
+            for (const RenderGraphBarrierPlan& barrier_plan: pass_plan.barriers) {
+                if (barrier_plan.phase != phase) {
                     continue;
                 }
-                for (uint32_t mip = range.base_mip; mip < range.base_mip + range.mip_count; ++mip) {
-                    for (uint32_t layer = range.base_layer; layer < range.base_layer + range.layer_count; ++layer) {
-                        const uint32_t state_index = texture_state_index(aspect, desc, mip, layer);
-                        if (state_index >= physical->states.size()) {
-                            return foundation::Result::failure(foundation::ResultCode::kInvalidState,
-                                                        "Render graph texture state index is out of bounds");
+                if (barrier_plan.resource_kind == RenderGraphResourceKind::kBuffer) {
+                    if (barrier_plan.resource_index >= buffer_states.size()) {
+                        return foundation::Result::failure(
+                                foundation::ResultCode::kInvalidState,
+                                "Render graph buffer barrier resource index is out of bounds");
+                    }
+                    if (barrier_plan.resource_index >= buffers.size() ||
+                        buffers[barrier_plan.resource_index].generation != barrier_plan.resource_generation) {
+                        return foundation::Result::failure(
+                                foundation::ResultCode::kInvalidState,
+                                "Render graph buffer barrier resource generation is stale");
+                    }
+                    RuntimeBufferState& state = buffer_states[barrier_plan.resource_index];
+                    if (state.physical == nullptr || state.shared == nullptr ||
+                        state.physical->handle.is_valid() == false) {
+                        return foundation::Result::failure(
+                                foundation::ResultCode::kInvalidState,
+                                "Render graph buffer barrier has no physical resource");
+                    }
+                    uint64_t range_end = 0;
+                    if (!resolve_buffer_range(state.physical->desc.desc.size, barrier_plan.buffer_range, range_end)) {
+                        return foundation::Result::failure(
+                                foundation::ResultCode::kInvalidArgument,
+                                "Render graph buffer barrier range is out of bounds");
+                    }
+                    initialize_buffer_state_segments(
+                            state.shared->states, state.physical->desc.desc.size, state.physical->state);
+                    split_buffer_state_segment(state.shared->states, barrier_plan.buffer_range.offset);
+                    split_buffer_state_segment(state.shared->states, range_end);
+                    const rhi::ResourceState after = normalize_state(barrier_plan.after, pass->queue);
+                    for (BufferStateSegment& segment: state.shared->states) {
+                        const uint64_t segment_end = segment.offset + segment.size;
+                        if (segment.offset < barrier_plan.buffer_range.offset || segment_end > range_end) {
+                            continue;
                         }
-                        if (state_index >= runtime.states.size()) {
-                            return foundation::Result::failure(foundation::ResultCode::kInvalidState,
-                                                        "Render graph texture shadow state index is out of bounds");
-                        }
-                        const rhi::ResourceState before = runtime.states[state_index];
-                        rhi::ResourceState after = use.before_state;
-                        const bool discard = first_use && use.discard_on_first_use && is_write_access(use.access);
-                        after.discard_contents = discard;
-                        const rhi::ResourceState stored_after = normalize_state(after, use.before_state.queue);
-                        if (!state_matches(before, stored_after) || discard) {
-                            barriers.push_back(rhi::TextureBarrier{
-                                    physical->handle,
-                                    rhi::SubresourceRange{aspect, mip, 1, layer, 1},
+                        const rhi::ResourceState before = segment.state;
+                        const bool emit = !state_matches(before, after) || barrier_plan.discard_contents ||
+                                          barrier_plan.requires_memory_dependency ||
+                                          barrier_plan.requires_queue_transfer;
+                        if (emit) {
+                            rhi::ResourceState barrier_after = after;
+                            barrier_after.discard_contents = barrier_plan.discard_contents;
+                            append_buffer_barrier(rhi::BufferBarrier{
+                                    state.physical->handle,
+                                    segment.offset,
+                                    segment.size,
                                     before,
-                                    after
+                                    barrier_after,
+                                    barrier_plan.requires_memory_dependency
                             });
                         }
-                        pending_states.emplace_back(state_index, stored_after);
+                        segment.state = after;
+                    }
+                    merge_buffer_state_segments(state.shared->states);
+                    continue;
+                }
+
+                if (barrier_plan.resource_index >= texture_states.size()) {
+                    return foundation::Result::failure(
+                            foundation::ResultCode::kInvalidState,
+                            "Render graph texture barrier resource index is out of bounds");
+                }
+                if (barrier_plan.resource_index >= textures.size() ||
+                    textures[barrier_plan.resource_index].generation != barrier_plan.resource_generation) {
+                    return foundation::Result::failure(
+                            foundation::ResultCode::kInvalidState,
+                            "Render graph texture barrier resource generation is stale");
+                }
+                RuntimeTextureState& state = texture_states[barrier_plan.resource_index];
+                if (state.physical == nullptr || state.shared == nullptr ||
+                    state.physical->handle.is_valid() == false) {
+                    return foundation::Result::failure(
+                            foundation::ResultCode::kInvalidState,
+                            "Render graph texture barrier has no physical resource");
+                }
+                const rhi::TextureDesc& desc = state.physical->desc.desc;
+                const rhi::ResourceState after = normalize_state(barrier_plan.after, pass->queue);
+                const rhi::Aspect aspects[] = {
+                        rhi::Aspect::kColor,
+                        rhi::Aspect::kDepth,
+                        rhi::Aspect::kStencil
+                };
+                for (const rhi::Aspect aspect: aspects) {
+                    if (!rhi::has_flag(barrier_plan.subresources.aspects, aspect)) {
+                        continue;
+                    }
+                    for (uint32_t mip = barrier_plan.subresources.base_mip;
+                         mip < barrier_plan.subresources.base_mip + barrier_plan.subresources.mip_count; ++mip) {
+                        for (uint32_t layer = barrier_plan.subresources.base_layer;
+                             layer < barrier_plan.subresources.base_layer + barrier_plan.subresources.layer_count;
+                             ++layer) {
+                            const uint32_t state_index = texture_state_index(aspect, desc, mip, layer);
+                            if (state_index >= state.shared->states.size()) {
+                                return foundation::Result::failure(
+                                        foundation::ResultCode::kInvalidState,
+                                        "Render graph texture barrier state index is out of bounds");
+                            }
+                            const rhi::ResourceState before = state.shared->states[state_index];
+                            const bool emit = !state_matches(before, after) || barrier_plan.discard_contents ||
+                                              barrier_plan.requires_memory_dependency ||
+                                              barrier_plan.requires_queue_transfer;
+                            if (emit) {
+                                rhi::ResourceState barrier_after = after;
+                                barrier_after.discard_contents = barrier_plan.discard_contents;
+                                append_texture_barrier(rhi::TextureBarrier{
+                                        state.physical->handle,
+                                        rhi::SubresourceRange{aspect, mip, 1, layer, 1},
+                                        before,
+                                        barrier_after,
+                                        barrier_plan.requires_memory_dependency
+                                });
+                            }
+                            state.shared->states[state_index] = after;
+                        }
                     }
                 }
             }
         } catch (const std::bad_alloc&) {
-            return foundation::Result::failure(foundation::ResultCode::kOutOfMemory,
-                                        "Render graph texture barrier allocation failed");
+            return foundation::Result::failure(
+                    foundation::ResultCode::kOutOfMemory,
+                    "Render graph barrier batch allocation failed");
         }
-        if (!barriers.empty()) {
-            const foundation::Result barrier_result = device.barrier(
-                    command_list, rhi::BarrierDesc{{}, std::span<const rhi::TextureBarrier>{barriers}});
-            if (!barrier_result) {
-                    return barrier_result;
-            }
-        }
-        for (const auto& pending_state: pending_states) {
-            runtime.states[pending_state.first] = pending_state.second;
-        }
-        return foundation::Result::success();
-    }
 
-    foundation::Result RenderGraph::Impl::update_runtime_state(
-            const ResourceUse& use, uint32_t frame_slot, std::vector<RuntimeBufferState>& buffer_states,
-            std::vector<RuntimeTextureState>& texture_states) {
-        (void) frame_slot;
-        if (use.kind == ResourceKind::kBuffer) {
-            if (use.resource_index >= buffer_states.size() ||
-                buffer_states[use.resource_index].physical == nullptr ||
-                buffer_states[use.resource_index].shared == nullptr) {
-                return foundation::Result::failure(foundation::ResultCode::kInvalidState,
-                                            "Render graph buffer runtime state is unavailable");
-            }
-            const rhi::ResourceState state = normalize_state(use.after_state, use.after_state.queue);
-            buffer_states[use.resource_index].shared->state = state;
+        if (buffer_barriers.empty() && texture_barriers.empty()) {
             return foundation::Result::success();
         }
-
-        if (use.resource_index >= texture_states.size() || texture_states[use.resource_index].physical == nullptr ||
-            texture_states[use.resource_index].shared == nullptr) {
-            return foundation::Result::failure(foundation::ResultCode::kInvalidState,
-                                        "Render graph texture runtime state is unavailable");
-        }
-        PhysicalTexture* physical = texture_states[use.resource_index].physical;
-        RuntimeTextureState& runtime = *texture_states[use.resource_index].shared;
-        const rhi::ResourceState state = normalize_state(use.after_state, use.after_state.queue);
-        const rhi::Aspect aspects[] = {rhi::Aspect::kColor, rhi::Aspect::kDepth, rhi::Aspect::kStencil};
-        for (const rhi::Aspect aspect: aspects) {
-            if (!rhi::has_flag(use.subresources.aspects, aspect)) {
-                continue;
-            }
-            for (uint32_t mip = use.subresources.base_mip;
-                 mip < use.subresources.base_mip + use.subresources.mip_count; ++mip) {
-                for (uint32_t layer = use.subresources.base_layer;
-                     layer < use.subresources.base_layer + use.subresources.layer_count; ++layer) {
-                    const uint32_t index = texture_state_index(aspect, physical->desc.desc, mip, layer);
-                    if (index >= physical->states.size() || index >= runtime.states.size()) {
-                        return foundation::Result::failure(foundation::ResultCode::kInvalidState,
-                                                    "Render graph texture state index is out of bounds");
-                    }
-                    runtime.states[index] = state;
-                }
-            }
-        }
-        return foundation::Result::success();
+        return device.barrier(command_list, rhi::BarrierDesc{buffer_barriers, texture_barriers});
     }
 
     void RenderGraph::Impl::commit_runtime_states(
             const std::vector<RuntimeBufferState>& buffer_states,
-            const std::vector<RuntimeTextureState>& texture_states) noexcept {
+            const std::vector<RuntimeTextureState>& texture_states) {
         for (const RuntimeBufferState& runtime: buffer_states) {
             if (runtime.shared != &runtime || runtime.physical == nullptr) {
                 continue;
             }
-            runtime.physical->state = runtime.state;
+            runtime.physical->states = runtime.states;
+            refresh_physical_buffer_state(*runtime.physical);
         }
         for (const RuntimeTextureState& runtime: texture_states) {
             if (runtime.shared != &runtime || runtime.physical == nullptr ||
@@ -2766,11 +3504,6 @@ namespace aeg::render_graph {
                 }
             }
 
-            std::vector<uint32_t> topological_positions(impl_->passes.size(), kInvalidHandleIndex);
-            for (uint32_t index = 0; index < impl_->topological_order.size(); ++index) {
-                topological_positions[impl_->topological_order[index]] = index;
-            }
-
             std::vector<RuntimeBufferState> buffer_states;
             std::vector<RuntimeTextureState> texture_states;
             const foundation::Result state_result = impl_->initialize_runtime_states(frame_slot, buffer_states,
@@ -2782,6 +3515,14 @@ namespace aeg::render_graph {
             RenderGraphExecutionResult execution_result{};
             execution_result.executed_pass_count = static_cast<uint32_t>(impl_->topological_order.size());
             std::vector<rhi::GpuWait> persistent_waits;
+            const RenderGraphPlan& execution_plan = impl_->plan;
+            if (execution_plan.revision != impl_->revision ||
+                execution_plan.batches.size() != impl_->batches.size() ||
+                execution_plan.pass_plans.size() != impl_->passes.size()) {
+                return fail_execution(foundation::Result::failure(
+                        foundation::ResultCode::kInvalidState,
+                        "Render graph execution plan is stale or incomplete"));
+            }
 
             const auto append_wait = [](std::vector<rhi::GpuWait>& waits, rhi::GpuSyncPoint point,
                                         rhi::PipelineStageMask stages) {
@@ -2798,8 +3539,8 @@ namespace aeg::render_graph {
             };
 
             const auto texture_requires_queue_wait = [](const PhysicalTexture& physical,
-                                                        const rhi::SubresourceRange& range,
-                                                        rhi::QueueClass queue) noexcept {
+                                                         const rhi::SubresourceRange& range,
+                                                         rhi::QueueClass queue) noexcept {
                 const rhi::Aspect aspects[] = {rhi::Aspect::kColor, rhi::Aspect::kDepth, rhi::Aspect::kStencil};
                 for (const rhi::Aspect aspect: aspects) {
                     if (!rhi::has_flag(range.aspects, aspect)) {
@@ -2818,27 +3559,64 @@ namespace aeg::render_graph {
                 return false;
             };
 
-            for (uint32_t batch_index = 0; batch_index < impl_->batches.size(); ++batch_index) {
+            const auto buffer_requires_queue_wait = [](const PhysicalBuffer& physical,
+                                                        RenderGraphBufferRange range,
+                                                        rhi::QueueClass queue) noexcept {
+                uint64_t range_end = 0;
+                if (!resolve_buffer_range(physical.desc.desc.size, range, range_end)) {
+                    return true;
+                }
+                if (physical.states.empty()) {
+                    return physical.state.queue != queue;
+                }
+                for (const BufferStateSegment& segment: physical.states) {
+                    const uint64_t segment_end = segment.offset + segment.size;
+                    if (segment_end <= range.offset || segment.offset >= range_end) {
+                        continue;
+                    }
+                    if (segment.state.queue != queue) {
+                        return true;
+                    }
+                }
+                return false;
+            };
+
+            for (uint32_t batch_index = 0; batch_index < execution_plan.batches.size(); ++batch_index) {
+                const RenderGraphBatchPlan& batch_plan = execution_plan.batches[batch_index];
+                if (batch_plan.index != batch_index || batch_index >= impl_->batches.size()) {
+                    return fail_execution(foundation::Result::failure(
+                            foundation::ResultCode::kInvalidState,
+                            "Render graph execution plan contains an invalid batch index"));
+                }
                 Batch& batch = impl_->batches[batch_index];
-                auto command_result = frame_context.begin_command_list(batch.queue, batch_index);
+                auto command_result = frame_context.begin_command_list(
+                        batch_plan.queue, batch_index, rhi::BarrierMode::kExplicit);
                 if (!command_result) {
                     return fail_execution(command_result.result);
                 }
                 const rhi::CommandListHandle command_list = command_result.value;
 
                 persistent_waits.clear();
-                for (const uint32_t source_batch_index: batch.wait_batches) {
+                for (const RenderGraphQueueDependency& dependency: batch_plan.dependencies) {
+                    const uint32_t source_batch_index = dependency.source_batch;
                     if (source_batch_index >= impl_->batches.size() ||
-                        !impl_->batches[source_batch_index].completion.is_valid()) {
+                        !impl_->batches[source_batch_index].completion.is_valid() ||
+                        dependency.destination_batch != batch_index ||
+                        dependency.destination_queue != batch_plan.queue) {
                         return fail_execution(foundation::Result::failure(
                                 foundation::ResultCode::kInvalidState,
                                 "Render graph batch dependency has no submitted completion point"));
                     }
                     append_wait(persistent_waits, impl_->batches[source_batch_index].completion,
-                                rhi::PipelineStage::kAllCommands);
+                                dependency.destination_stages);
                 }
 
-                for (const uint32_t pass_index: batch.passes) {
+                for (const uint32_t pass_index: batch_plan.pass_indices) {
+                    if (pass_index >= execution_plan.pass_plans.size()) {
+                        return fail_execution(foundation::Result::failure(
+                                foundation::ResultCode::kInvalidState,
+                                "Render graph batch contains an invalid pass index"));
+                    }
                     PassRecord& pass = impl_->passes[pass_index];
                     for (const ResourceUse& use: pass.uses) {
                         if (use.kind == ResourceKind::kBuffer) {
@@ -2846,7 +3624,8 @@ namespace aeg::render_graph {
                             if (record.lifetime != ResourceLifetime::kTransient &&
                                 !record.last_completions.empty()) {
                                 const PhysicalBuffer* physical = impl_->physical_buffer(record, frame_slot);
-                                if (physical != nullptr && physical->state.queue != batch.queue) {
+                                if (physical != nullptr &&
+                                    buffer_requires_queue_wait(*physical, use.buffer_range, batch_plan.queue)) {
                                     for (const rhi::GpuSyncPoint& completion: record.last_completions.points()) {
                                         append_wait(persistent_waits, completion, use.before_state.pipeline_stages);
                                     }
@@ -2858,7 +3637,7 @@ namespace aeg::render_graph {
                                 !record.last_completions.empty()) {
                                 const PhysicalTexture* physical = impl_->physical_texture(record, frame_slot);
                                 if (physical != nullptr &&
-                                    texture_requires_queue_wait(*physical, use.subresources, batch.queue)) {
+                                    texture_requires_queue_wait(*physical, use.subresources, batch_plan.queue)) {
                                     for (const rhi::GpuSyncPoint& completion: record.last_completions.points()) {
                                         append_wait(persistent_waits, completion, use.before_state.pipeline_stages);
                                     }
@@ -2868,15 +3647,19 @@ namespace aeg::render_graph {
                     }
                 }
 
-                for (const uint32_t pass_index: batch.passes) {
+                for (const uint32_t pass_index: batch_plan.pass_indices) {
+                    const RenderGraphPassPlan& pass_plan = execution_plan.pass_plans[pass_index];
+                    if (!pass_plan.live || pass_plan.batch_index != batch_index) {
+                        return fail_execution(foundation::Result::failure(
+                                foundation::ResultCode::kInvalidState,
+                                "Render graph pass plan does not match its batch"));
+                    }
                     PassRecord& pass = impl_->passes[pass_index];
-                    const uint32_t topo_index = topological_positions[pass_index];
-                    for (const ResourceUse& use: pass.uses) {
-                        const foundation::Result barrier_result = impl_->record_barriers(
-                                command_list, frame_slot, topo_index, use, buffer_states, texture_states);
-                        if (!barrier_result) {
-                            return fail_execution(barrier_result);
-                        }
+                    const foundation::Result before_barrier_result = impl_->record_barrier_batch(
+                            command_list, frame_slot, pass_plan, RenderGraphBarrierPhase::kBeforePass,
+                            buffer_states, texture_states);
+                    if (!before_barrier_result) {
+                        return fail_execution(before_barrier_result);
                     }
 
                     PassExecutionContext context(*this, device_, RenderGraphPass{pass_index, pass.generation},
@@ -2910,12 +3693,11 @@ namespace aeg::render_graph {
                                 "Pass ended with an active rendering scope"));
                     }
 
-                    for (const ResourceUse& use: pass.uses) {
-                        const foundation::Result state_update = impl_->update_runtime_state(
-                                use, frame_slot, buffer_states, texture_states);
-                        if (!state_update) {
-                            return fail_execution(state_update);
-                        }
+                    const foundation::Result after_barrier_result = impl_->record_barrier_batch(
+                            command_list, frame_slot, pass_plan, RenderGraphBarrierPhase::kAfterPass,
+                            buffer_states, texture_states);
+                    if (!after_barrier_result) {
+                        return fail_execution(after_barrier_result);
                     }
                 }
 
@@ -2925,18 +3707,18 @@ namespace aeg::render_graph {
                 }
                 const std::array<rhi::CommandListHandle, 1> command_lists{command_list};
                 foundation::ResultValue<rhi::SubmitResult> submit_result{};
-                if (batch.submits_frame) {
+                if (batch_plan.submits_frame) {
                     if (acquired == nullptr) {
                         return fail_execution(foundation::Result::failure(
                                 foundation::ResultCode::kInvalidState,
                                 "Present batch has no acquired frame token"));
                     }
                     submit_result = frame_context.submit_frame(rhi::FrameSubmitDesc{
-                            acquired->frame, batch.queue, command_lists, persistent_waits
+                            acquired->frame, batch_plan.queue, command_lists, persistent_waits
                     });
                 } else {
                     submit_result = frame_context.submit(rhi::SubmitDesc{
-                            batch.queue, command_lists, persistent_waits
+                            batch_plan.queue, command_lists, persistent_waits
                     });
                 }
                 if (!submit_result) {
@@ -2948,7 +3730,7 @@ namespace aeg::render_graph {
                 execution_result.completion = batch.completion;
                 ++execution_result.submitted_batch_count;
 
-                for (const uint32_t pass_index: batch.passes) {
+                for (const uint32_t pass_index: batch_plan.pass_indices) {
                     for (const ResourceUse& use: impl_->passes[pass_index].uses) {
                         if (use.kind == ResourceKind::kBuffer) {
                             BufferRecord& record = impl_->buffers[use.resource_index];
