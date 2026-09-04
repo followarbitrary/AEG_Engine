@@ -117,7 +117,7 @@ namespace aeg::rhi {
 
         /** @brief Allocates a binding set compatible with a layout. */
         [[nodiscard]] virtual foundation::ResultValue<BindingSetHandle> create_binding_set(
-            BindingLayoutHandle layout) = 0;
+            const BindingSetDesc &desc) = 0;
 
         /** @brief Writes resource handles into a binding set. */
         [[nodiscard]] virtual foundation::Result update_binding_set(

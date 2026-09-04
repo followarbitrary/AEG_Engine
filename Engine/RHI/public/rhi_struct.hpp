@@ -8,6 +8,7 @@
  */
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -652,6 +653,21 @@ namespace aeg::rhi {
         DebugName name{};
     };
 
+    /**
+     * @brief Controls the allocation class used for a binding set.
+     *
+     * Frame-local sets should be destroyed when their owning frame slot is
+     * recycled. Device still owns the native allocation until destruction.
+     */
+    enum class BindingSetLifetime : uint8_t { kPersistent, kFrameLocal };
+
+    /** @brief Backend-neutral description used to allocate a binding set. */
+    struct BindingSetDesc {
+        BindingLayoutHandle layout{};
+        BindingSetLifetime lifetime{BindingSetLifetime::kPersistent};
+        DebugName name{};
+    };
+
     /** @brief Inline constant range exposed by a pipeline layout. */
     struct InlineConstantRange {
         ShaderStageMask shader_stages{ShaderStage::kNone};
@@ -978,6 +994,54 @@ namespace aeg::rhi {
         uint64_t value{0};
 
         [[nodiscard]] constexpr bool is_valid() const noexcept { return timeline.is_valid() && value != 0; }
+
+        friend constexpr bool operator==(GpuSyncPoint, GpuSyncPoint) = default;
+    };
+
+    /**
+     * @brief Fixed-capacity collection of completion points across queues.
+     *
+     * Points using the same timeline are merged by retaining the greatest
+     * value. The collection stores opaque points by value and is suitable for
+     * frame retirement.
+     */
+    struct GpuCompletionSet {
+        static constexpr uint32_t kCapacity = 8;
+
+        [[nodiscard]] constexpr bool empty() const noexcept { return count_ == 0; }
+        [[nodiscard]] constexpr uint32_t size() const noexcept { return count_; }
+        [[nodiscard]] constexpr std::span<const GpuSyncPoint> points() const noexcept {
+            return std::span<const GpuSyncPoint>{values_.data(), count_};
+        }
+
+        /** @brief Adds a point, merging it with an existing timeline when possible. */
+        [[nodiscard]] constexpr bool add(GpuSyncPoint point) noexcept {
+            if (!point.is_valid()) {
+                return true;
+            }
+
+            for (uint32_t index = 0; index < count_; ++index) {
+                GpuSyncPoint& existing = values_[index];
+                if (existing.timeline != point.timeline) {
+                    continue;
+                }
+                existing.value = existing.value < point.value ? point.value : existing.value;
+                return true;
+            }
+
+            if (count_ >= kCapacity) {
+                return false;
+            }
+            values_[count_++] = point;
+            return true;
+        }
+
+        /** @brief Removes all stored completion points. */
+        constexpr void clear() noexcept { count_ = 0; }
+
+    private:
+        std::array<GpuSyncPoint, kCapacity> values_{};
+        uint32_t count_{0};
     };
 
     /** @brief One GPU wait and the first pipeline stages that depend on it. */

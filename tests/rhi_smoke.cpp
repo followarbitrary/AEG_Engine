@@ -189,7 +189,8 @@ int main() {
     }
     const PipelineHandle pipeline = pipeline_result.value;
 
-    auto set_result = device->create_binding_set(layout);
+    auto set_result = device->create_binding_set(
+            BindingSetDesc{layout, BindingSetLifetime::kPersistent, DebugName{"Smoke.BindingSet"}});
     if (!check(set_result, "create_binding_set")) {
         return 1;
     }

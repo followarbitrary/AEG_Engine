@@ -23,11 +23,15 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -1214,6 +1218,48 @@ namespace aeg::rhi {
             return std::nullopt;
         }
 
+        [[nodiscard]] std::optional<uint32_t> descriptor_type_index(VkDescriptorType type) noexcept {
+            switch (type) {
+                case VK_DESCRIPTOR_TYPE_SAMPLER:
+                    return 0;
+                case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+                    return 1;
+                case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+                    return 2;
+                case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+                    return 3;
+                case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+                    return 4;
+                case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+                    return 5;
+                case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+                    return 6;
+                default:
+                    return std::nullopt;
+            }
+        }
+
+        [[nodiscard]] VkDescriptorType descriptor_type_from_index(uint32_t index) noexcept {
+            switch (index) {
+                case 0:
+                    return VK_DESCRIPTOR_TYPE_SAMPLER;
+                case 1:
+                    return VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+                case 2:
+                    return VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+                case 3:
+                    return VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+                case 4:
+                    return VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                case 5:
+                    return VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
+                case 6:
+                    return VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER;
+                default:
+                    return VK_DESCRIPTOR_TYPE_SAMPLER;
+            }
+        }
+
         [[nodiscard]] VkImageViewType to_vk_image_view_type(TextureViewDimension dimension,
                                                             TextureDimension texture_dimension,
                                                             uint32_t layer_count) {
@@ -1281,7 +1327,28 @@ namespace aeg::rhi {
 
         constexpr size_t kQueueCount = 3;
         constexpr uint32_t kAspectPlaneCount = 3;
+        constexpr size_t kDescriptorTypeCount = 7;
+        constexpr uint32_t kDescriptorPageInitialSets = 64;
+        constexpr uint32_t kDescriptorPageMaxSets = 4096;
+        constexpr uint32_t kDescriptorPageMinimumDescriptors = 256;
+        constexpr uint32_t kDescriptorLifetimeCount = 2;
+        constexpr uint32_t kDescriptorFragmentationScoreMax = 1000;
+        constexpr uint32_t kDescriptorFragmentationScoreThreshold = 700;
+        constexpr uint32_t kDescriptorFragmentationFailurePenalty = 450;
+        constexpr uint32_t kDescriptorFragmentationSuccessDecay = 64;
         using QueueValues = std::array<uint64_t, kQueueCount>;
+        using DescriptorCounts = std::array<uint32_t, kDescriptorTypeCount>;
+
+        struct DescriptorPoolRequirements {
+            DescriptorCounts descriptor_counts{};
+            uint32_t descriptor_mask{0};
+            uint32_t total_descriptor_count{0};
+            uint32_t set_count{1};
+        };
+
+        [[nodiscard]] constexpr uint32_t descriptor_lifetime_index(BindingSetLifetime lifetime) noexcept {
+            return lifetime == BindingSetLifetime::kFrameLocal ? 1u : 0u;
+        }
 
         [[nodiscard]] uint32_t queue_value_index(QueueClass queue) noexcept {
             switch (queue) {
@@ -1588,7 +1655,10 @@ namespace aeg::rhi {
 
         struct RetireBindingSet {
             QueueValues required_values{};
-            VkDescriptorPool pool{VK_NULL_HANDLE};
+            BindingSetLifetime lifetime{BindingSetLifetime::kPersistent};
+            uint32_t page_index{kInvalidIndex};
+            VkDescriptorSet set{VK_NULL_HANDLE};
+            DescriptorPoolRequirements requirements{};
         };
 
         struct RetirePipeline {
@@ -1655,10 +1725,182 @@ namespace aeg::rhi {
             QueueValues last_use{};
         };
 
-        struct BindingSetResource {
+        enum class DescriptorPoolPageListState : uint8_t {
+            kPreferred,
+            kDeferred,
+            kFull
+        };
+
+        struct DescriptorPoolPage {
             VkDescriptorPool pool{VK_NULL_HANDLE};
+            BindingSetLifetime lifetime{BindingSetLifetime::kPersistent};
+            uint32_t max_sets{0};
+            uint32_t allocated_sets{0};
+            uint32_t live_sets{0};
+            DescriptorCounts descriptor_capacity{};
+            DescriptorCounts descriptor_usage{};
+            uint32_t descriptor_capacity_mask{0};
+            uint32_t available_descriptor_mask{0};
+            uint32_t fragmentation_score{0};
+            uint32_t allocation_failures{0};
+            uint32_t list_position{kInvalidIndex};
+            DescriptorPoolPageListState list_state{DescriptorPoolPageListState::kFull};
+            bool allocation_blocked{false};
+            bool driver_fragmented{false};
+        };
+
+        [[nodiscard]] bool descriptor_pool_can_fit(const DescriptorPoolPage &page,
+                                                   const DescriptorPoolRequirements &requirements) noexcept {
+            if (page.pool == VK_NULL_HANDLE || requirements.set_count == 0 ||
+                requirements.set_count > page.max_sets ||
+                page.allocated_sets > page.max_sets - requirements.set_count || page.allocation_blocked ||
+                page.driver_fragmented) {
+                return false;
+            }
+            if ((requirements.descriptor_mask & ~page.descriptor_capacity_mask) != 0 ||
+                (requirements.descriptor_mask & ~page.available_descriptor_mask) != 0) {
+                return false;
+            }
+
+            uint32_t descriptor_mask = requirements.descriptor_mask;
+            while (descriptor_mask != 0) {
+                const uint32_t index = std::countr_zero(descriptor_mask);
+                const uint32_t required = requirements.descriptor_counts[index];
+                if (required > page.descriptor_capacity[index] ||
+                    page.descriptor_usage[index] > page.descriptor_capacity[index] - required) {
+                    return false;
+                }
+                descriptor_mask &= descriptor_mask - 1u;
+            }
+            return true;
+        }
+
+        [[nodiscard]] uint32_t descriptor_pool_shape_fragmentation_score(const DescriptorPoolPage &page) noexcept {
+            if (page.max_sets == 0 || page.allocated_sets >= page.max_sets) {
+                return kDescriptorFragmentationScoreMax;
+            }
+
+            uint32_t minimum_free_ratio = kDescriptorFragmentationScoreMax;
+            uint32_t maximum_free_ratio = 0;
+            bool has_descriptor_capacity = false;
+            for (uint32_t index = 0; index < kDescriptorTypeCount; ++index) {
+                const uint32_t capacity = page.descriptor_capacity[index];
+                if (capacity == 0) {
+                    continue;
+                }
+
+                has_descriptor_capacity = true;
+                const uint32_t used = std::min(page.descriptor_usage[index], capacity);
+                const uint32_t available = capacity - used;
+                const uint32_t free_ratio = static_cast<uint32_t>(
+                        (static_cast<uint64_t>(available) * kDescriptorFragmentationScoreMax) / capacity);
+                minimum_free_ratio = std::min(minimum_free_ratio, free_ratio);
+                maximum_free_ratio = std::max(maximum_free_ratio, free_ratio);
+            }
+
+            if (!has_descriptor_capacity) {
+                return 0;
+            }
+            return maximum_free_ratio - minimum_free_ratio;
+        }
+
+        void refresh_descriptor_pool_page_state(DescriptorPoolPage &page) noexcept {
+            page.descriptor_capacity_mask = 0;
+            page.available_descriptor_mask = 0;
+            for (uint32_t index = 0; index < kDescriptorTypeCount; ++index) {
+                const uint32_t bit = 1u << index;
+                if (page.descriptor_capacity[index] == 0) {
+                    continue;
+                }
+                page.descriptor_capacity_mask |= bit;
+                if (page.descriptor_usage[index] < page.descriptor_capacity[index]) {
+                    page.available_descriptor_mask |= bit;
+                }
+            }
+
+            const uint32_t shape_score = descriptor_pool_shape_fragmentation_score(page);
+            page.fragmentation_score = std::max(page.fragmentation_score, shape_score);
+            if (page.driver_fragmented) {
+                page.fragmentation_score = kDescriptorFragmentationScoreMax;
+            }
+            if (page.allocation_blocked) {
+                page.fragmentation_score = std::max(page.fragmentation_score,
+                                                     kDescriptorFragmentationScoreThreshold);
+            }
+        }
+
+        [[nodiscard]] uint64_t descriptor_pool_fit_score(const DescriptorPoolPage &page,
+                                                 const DescriptorPoolRequirements &requirements) noexcept {
+            constexpr uint64_t kFitScale = 1'000'000ull;
+
+            // 碎片分主导
+            uint64_t score = static_cast<uint64_t>(page.fragmentation_score) * kFitScale;
+
+            // 剩余 set（防止下溢）
+            if (page.max_sets > 0) {
+                const uint32_t remaining_sets = page.max_sets - page.allocated_sets - requirements.set_count;
+                score += (static_cast<uint64_t>(remaining_sets) * kFitScale) / page.max_sets;
+            } else {
+                score += kFitScale; // 惩罚
+            }
+
+            uint32_t descriptor_mask = requirements.descriptor_mask;
+            while (descriptor_mask != 0) {
+                const uint32_t index = std::countr_zero(descriptor_mask);
+                const uint32_t capacity = page.descriptor_capacity[index];
+                if (capacity == 0) {
+                    score += kFitScale; // 不应发生，给惩罚
+                } else {
+                    const uint32_t remaining = capacity - page.descriptor_usage[index] - requirements.descriptor_counts[index];
+                    score += (static_cast<uint64_t>(remaining) * kFitScale) / capacity;
+                }
+                descriptor_mask &= descriptor_mask - 1u;
+            }
+            return score;
+        }
+
+        void record_descriptor_pool_allocation_failure(DescriptorPoolPage &page, VkResult result) noexcept {
+            if (page.allocation_failures != std::numeric_limits<uint32_t>::max()) {
+                ++page.allocation_failures;
+            }
+            page.allocation_blocked = true;
+            if (result == VK_ERROR_FRAGMENTED_POOL) {
+                page.driver_fragmented = true;
+                page.fragmentation_score = kDescriptorFragmentationScoreMax;
+            } else {
+                page.fragmentation_score = std::max(page.fragmentation_score,
+                                                     kDescriptorFragmentationFailurePenalty);
+            }
+        }
+
+        void record_descriptor_pool_allocation_success(DescriptorPoolPage &page) noexcept {
+            page.allocation_blocked = false;
+            if (!page.driver_fragmented) {
+                page.fragmentation_score = page.fragmentation_score > kDescriptorFragmentationSuccessDecay
+                                               ? page.fragmentation_score - kDescriptorFragmentationSuccessDecay
+                                               : 0;
+            }
+            refresh_descriptor_pool_page_state(page);
+        }
+
+        [[nodiscard]] bool descriptor_pool_page_has_free_capacity(const DescriptorPoolPage &page) noexcept {
+            if (page.pool == VK_NULL_HANDLE || page.max_sets == 0 || page.allocated_sets >= page.max_sets) {
+                return false;
+            }
+            return page.descriptor_capacity_mask == 0 || page.available_descriptor_mask != 0;
+        }
+
+        [[nodiscard]] bool descriptor_pool_page_is_preferred(const DescriptorPoolPage &page) noexcept {
+            return descriptor_pool_page_has_free_capacity(page) && !page.allocation_blocked &&
+                   !page.driver_fragmented && page.fragmentation_score < kDescriptorFragmentationScoreThreshold;
+        }
+
+        struct BindingSetResource {
             VkDescriptorSet set{VK_NULL_HANDLE};
             BindingLayoutHandle layout{};
+            BindingSetLifetime lifetime{BindingSetLifetime::kPersistent};
+            uint32_t descriptor_pool_page{kInvalidIndex};
+            DescriptorPoolRequirements requirements{};
             std::vector<BindingWrite> writes{};
             QueueValues last_use{};
         };
@@ -1814,7 +2056,7 @@ namespace aeg::rhi {
 
             [[nodiscard]] Result destroy_binding_layout(BindingLayoutHandle layout) override;
 
-            [[nodiscard]] ResultValue<BindingSetHandle> create_binding_set(BindingLayoutHandle layout) override;
+            [[nodiscard]] ResultValue<BindingSetHandle> create_binding_set(const BindingSetDesc &desc) override;
 
             [[nodiscard]] Result
             update_binding_set(BindingSetHandle set, std::span<const BindingWrite> writes) override;
@@ -2056,6 +2298,28 @@ namespace aeg::rhi {
             [[nodiscard]] Result validate_binding_resource(const BindingLayoutEntry &entry,
                                                            const BindingResource &resource) const;
 
+            [[nodiscard]] ResultValue<DescriptorPoolRequirements> descriptor_pool_requirements(
+                    const BindingLayoutResource &layout) const;
+
+            [[nodiscard]] ResultValue<uint32_t> create_descriptor_pool_page_locked(
+                    BindingSetLifetime lifetime, const DescriptorPoolRequirements &requirements);
+
+            struct DescriptorSetAllocation {
+                uint32_t page_index{kInvalidIndex};
+                VkDescriptorSet set{VK_NULL_HANDLE};
+            };
+
+            [[nodiscard]] ResultValue<DescriptorSetAllocation> allocate_descriptor_set(
+                    BindingSetLifetime lifetime, const DescriptorPoolRequirements &requirements,
+                    VkDescriptorSetLayout layout);
+
+            void release_descriptor_set(BindingSetLifetime lifetime, uint32_t page_index, VkDescriptorSet set,
+                                        const DescriptorPoolRequirements &requirements) noexcept;
+
+            void update_descriptor_pool_page_free_list_locked(uint32_t page_index) noexcept;
+
+            void destroy_descriptor_pool_pages() noexcept;
+
             [[nodiscard]] bool buffer_is_referenced(BufferHandle buffer) const;
 
             [[nodiscard]] bool texture_is_referenced(TextureHandle texture) const;
@@ -2109,6 +2373,14 @@ namespace aeg::rhi {
             SlotMap<SamplerResource, SamplerTag> samplers_{};
             SlotMap<BindingLayoutResource, BindingLayoutTag> binding_layouts_{};
             SlotMap<BindingSetResource, BindingSetTag> binding_sets_{};
+            std::array<std::mutex, kDescriptorLifetimeCount> descriptor_pool_lifetime_mutexes_{};
+            std::shared_mutex descriptor_pool_pages_mutex_{};
+            std::deque<DescriptorPoolPage> descriptor_pool_pages_{};
+            std::array<std::vector<uint32_t>, kDescriptorLifetimeCount> descriptor_pool_free_lists_{};
+            // The counters describe each lifetime's free-list partition. `free_count` is the exact number
+            // of pages with request-independent physical capacity; fit checks remain request-specific.
+            std::array<uint32_t, kDescriptorLifetimeCount> descriptor_pool_free_counts_{};
+            std::array<uint32_t, kDescriptorLifetimeCount> descriptor_pool_preferred_counts_{};
             SlotMap<PipelineResource, PipelineTag> pipelines_{};
             SlotMap<CommandListResource, CommandListTag> command_lists_{};
             SlotMap<SurfaceResource, SurfaceTag> surfaces_{};
@@ -6179,14 +6451,10 @@ namespace aeg::rhi {
         return {Result::success(), binding_layouts_.insert(std::move(resource))};
     }
 
-    ResultValue<BindingSetHandle> VulkanDevice::create_binding_set(BindingLayoutHandle layout) {
-        BindingLayoutResource *layout_resource = binding_layouts_.get(layout);
-        if (layout_resource == nullptr) {
-            return {Result::failure(ResultCode::kNotFound, "Invalid binding layout handle"), {}};
-        }
-
-        std::unordered_map<VkDescriptorType, uint32_t> descriptor_counts;
-        for (const BindingLayoutEntry &entry: layout_resource->entries) {
+    ResultValue<DescriptorPoolRequirements> VulkanDevice::descriptor_pool_requirements(
+            const BindingLayoutResource &layout) const {
+        DescriptorPoolRequirements requirements{};
+        for (const BindingLayoutEntry &entry: layout.entries) {
             const auto descriptor_type = to_vk_descriptor_type(entry.type);
             if (!descriptor_type.has_value()) {
                 return {
@@ -6194,42 +6462,565 @@ namespace aeg::rhi {
                     {}
                 };
             }
-            const uint32_t count = entry.array_mode == BindingArrayMode::kSingle ? 1 : entry.array_count;
-            descriptor_counts[descriptor_type.value()] += count;
+            const auto type_index = descriptor_type_index(descriptor_type.value());
+            if (!type_index.has_value()) {
+                return {
+                    Result::failure(ResultCode::kUnsupported, "Binding layout contains an unsupported descriptor type"),
+                    {}
+                };
+            }
+
+            const uint64_t count = entry.array_mode == BindingArrayMode::kSingle ? 1u : entry.array_count;
+            const uint64_t current = requirements.descriptor_counts[type_index.value()];
+            if (count > std::numeric_limits<uint32_t>::max() - current) {
+                return {
+                    Result::failure(ResultCode::kInvalidArgument,
+                                    "Binding layout descriptor count overflows the pool requirement"),
+                    {}
+                };
+            }
+            if (count > std::numeric_limits<uint32_t>::max() - requirements.total_descriptor_count) {
+                return {
+                    Result::failure(ResultCode::kInvalidArgument,
+                                    "Binding layout total descriptor count overflows the pool requirement"),
+                    {}
+                };
+            }
+            requirements.descriptor_counts[type_index.value()] = static_cast<uint32_t>(current + count);
+            requirements.descriptor_mask |= 1u << type_index.value();
+            requirements.total_descriptor_count += static_cast<uint32_t>(count);
         }
+        return {Result::success(), requirements};
+    }
+
+    ResultValue<uint32_t> VulkanDevice::create_descriptor_pool_page_locked(
+            BindingSetLifetime lifetime, const DescriptorPoolRequirements &requirements) {
+        uint32_t max_sets = kDescriptorPageInitialSets;
+        {
+            std::shared_lock<std::shared_mutex> pages_lock(descriptor_pool_pages_mutex_);
+            for (auto iterator = descriptor_pool_pages_.rbegin(); iterator != descriptor_pool_pages_.rend(); ++iterator) {
+                if (iterator->lifetime != lifetime) {
+                    continue;
+                }
+                max_sets = iterator->max_sets > kDescriptorPageMaxSets / 2
+                               ? kDescriptorPageMaxSets
+                               : std::min(kDescriptorPageMaxSets, iterator->max_sets * 2);
+                break;
+            }
+        }
+        max_sets = std::max(max_sets, requirements.set_count);
 
         std::vector<VkDescriptorPoolSize> pool_sizes;
-        pool_sizes.reserve(descriptor_counts.size());
-        for (const auto &[type, count]: descriptor_counts) {
-            pool_sizes.push_back(VkDescriptorPoolSize{type, count});
+        try {
+            pool_sizes.reserve(kDescriptorTypeCount);
+        } catch (const std::bad_alloc&) {
+            return {Result::failure(ResultCode::kOutOfMemory, "Descriptor pool page allocation failed"), {}};
         }
+
+        DescriptorPoolPage page{};
+        page.lifetime = lifetime;
+        page.max_sets = max_sets;
+        for (uint32_t index = 0; index < kDescriptorTypeCount; ++index) {
+            if (requirements.descriptor_counts[index] == 0) {
+                continue;
+            }
+            const uint64_t descriptor_capacity = std::max(
+                    static_cast<uint64_t>(kDescriptorPageMinimumDescriptors),
+                    static_cast<uint64_t>(requirements.descriptor_counts[index]) * max_sets);
+            if (descriptor_capacity > std::numeric_limits<uint32_t>::max()) {
+                return {
+                    Result::failure(ResultCode::kInvalidArgument,
+                                    "Descriptor pool page capacity exceeds the Vulkan limit"),
+                    {}
+                };
+            }
+            page.descriptor_capacity[index] = static_cast<uint32_t>(descriptor_capacity);
+            if (descriptor_capacity != 0) {
+                pool_sizes.push_back(VkDescriptorPoolSize{
+                        descriptor_type_from_index(index), static_cast<uint32_t>(descriptor_capacity)
+                });
+            }
+        }
+        refresh_descriptor_pool_page_state(page);
 
         VkDescriptorPoolCreateInfo pool_info{};
         pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-        pool_info.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-        pool_info.maxSets = 1;
+        pool_info.flags = lifetime == BindingSetLifetime::kPersistent
+                              ? VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT
+                              : 0;
+        pool_info.maxSets = page.max_sets;
         pool_info.poolSizeCount = static_cast<uint32_t>(pool_sizes.size());
         pool_info.pPoolSizes = pool_sizes.data();
 
-        BindingSetResource resource{};
-        resource.layout = layout;
-        VkResult result = vkCreateDescriptorPool(device_, &pool_info, nullptr, &resource.pool);
+        const VkResult result = vkCreateDescriptorPool(device_, &pool_info, nullptr, &page.pool);
         if (result != VK_SUCCESS) {
             return {make_vulkan_result(result, "vkCreateDescriptorPool"), {}};
         }
 
-        VkDescriptorSetAllocateInfo allocate_info{};
-        allocate_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-        allocate_info.descriptorPool = resource.pool;
-        allocate_info.descriptorSetCount = 1;
-        allocate_info.pSetLayouts = &layout_resource->layout;
-        result = vkAllocateDescriptorSets(device_, &allocate_info, &resource.set);
-        if (result != VK_SUCCESS) {
-            vkDestroyDescriptorPool(device_, resource.pool, nullptr);
+        std::unique_lock<std::shared_mutex> pages_lock(descriptor_pool_pages_mutex_);
+        const size_t page_count_before = descriptor_pool_pages_.size();
+        try {
+            descriptor_pool_pages_.push_back(std::move(page));
+            const uint32_t page_index = static_cast<uint32_t>(descriptor_pool_pages_.size() - 1);
+            const uint32_t lifetime_index = descriptor_lifetime_index(lifetime);
+            auto &free_list = descriptor_pool_free_lists_[lifetime_index];
+            free_list.push_back(page_index);
+            descriptor_pool_pages_[page_index].list_position =
+                    static_cast<uint32_t>(free_list.size() - 1);
+            update_descriptor_pool_page_free_list_locked(page_index);
+            return {Result::success(), page_index};
+        } catch (const std::bad_alloc&) {
+            if (descriptor_pool_pages_.size() > page_count_before) {
+                DescriptorPoolPage &stored_page = descriptor_pool_pages_.back();
+                if (stored_page.pool != VK_NULL_HANDLE) {
+                    vkDestroyDescriptorPool(device_, stored_page.pool, nullptr);
+                }
+                descriptor_pool_pages_.pop_back();
+            } else if (page.pool != VK_NULL_HANDLE) {
+                vkDestroyDescriptorPool(device_, page.pool, nullptr);
+            }
+            return {Result::failure(ResultCode::kOutOfMemory, "Descriptor pool page bookkeeping failed"), {}};
+        }
+    }
+
+    ResultValue<VulkanDevice::DescriptorSetAllocation> VulkanDevice::allocate_descriptor_set(
+            BindingSetLifetime lifetime, const DescriptorPoolRequirements &requirements,
+            VkDescriptorSetLayout layout) {
+        const uint32_t lifetime_index = descriptor_lifetime_index(lifetime);
+        std::unique_lock<std::mutex> lifetime_lock(descriptor_pool_lifetime_mutexes_[lifetime_index]);
+        auto &free_list = descriptor_pool_free_lists_[lifetime_index];
+
+        const auto allocate_from_page = [&](uint32_t page_index) -> ResultValue<DescriptorSetAllocation> {
+            DescriptorPoolPage *page = nullptr;
+            {
+                std::shared_lock<std::shared_mutex> pages_lock(descriptor_pool_pages_mutex_);
+                if (page_index >= descriptor_pool_pages_.size()) {
+                    return {Result::failure(ResultCode::kInvalidState, "Descriptor pool page index is invalid"), {}};
+                }
+                page = &descriptor_pool_pages_[page_index];
+                if (page->pool == VK_NULL_HANDLE || page->lifetime != lifetime) {
+                    return {Result::failure(ResultCode::kInvalidState, "Descriptor pool page is unavailable"), {}};
+                }
+            }
+
+            VkDescriptorSetAllocateInfo allocate_info{};
+            allocate_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+            allocate_info.descriptorPool = page->pool;
+            allocate_info.descriptorSetCount = requirements.set_count;
+            allocate_info.pSetLayouts = &layout;
+
+            VkDescriptorSet set{VK_NULL_HANDLE};
+            const VkResult result = vkAllocateDescriptorSets(device_, &allocate_info, &set);
+            if (result == VK_SUCCESS) {
+                page->allocated_sets += requirements.set_count;
+                page->live_sets += requirements.set_count;
+                uint32_t descriptor_mask = requirements.descriptor_mask;
+                while (descriptor_mask != 0) {
+                    const uint32_t index = std::countr_zero(descriptor_mask);
+                    page->descriptor_usage[index] += requirements.descriptor_counts[index];
+                    descriptor_mask &= descriptor_mask - 1u;
+                }
+                record_descriptor_pool_allocation_success(*page);
+                {
+                    std::shared_lock<std::shared_mutex> pages_lock(descriptor_pool_pages_mutex_);
+                    update_descriptor_pool_page_free_list_locked(page_index);
+                }
+                return {Result::success(), DescriptorSetAllocation{page_index, set}};
+            }
+            if (result == VK_ERROR_OUT_OF_POOL_MEMORY || result == VK_ERROR_FRAGMENTED_POOL) {
+                record_descriptor_pool_allocation_failure(*page, result);
+                {
+                    std::shared_lock<std::shared_mutex> pages_lock(descriptor_pool_pages_mutex_);
+                    update_descriptor_pool_page_free_list_locked(page_index);
+                }
+                return {Result::failure(ResultCode::kNotReady, "Descriptor pool page has no available capacity"), {}};
+            }
             return {make_vulkan_result(result, "vkAllocateDescriptorSets"), {}};
+        };
+
+        while (true) {
+            uint32_t best_page_index = kInvalidIndex;
+            uint64_t best_score = std::numeric_limits<uint64_t>::max();
+            bool free_list_is_valid = true;
+            {
+                std::shared_lock<std::shared_mutex> pages_lock(descriptor_pool_pages_mutex_);
+                const uint32_t free_count = descriptor_pool_free_counts_[lifetime_index];
+                const uint32_t preferred_count = descriptor_pool_preferred_counts_[lifetime_index];
+                if (free_count > free_list.size() || free_count > descriptor_pool_pages_.size() ||
+                    preferred_count > free_count) {
+                    free_list_is_valid = false;
+                } else {
+                    const auto find_best_page = [&](uint32_t begin, uint32_t end) {
+                        for (uint32_t position = begin; position < end; ++position) {
+                            const uint32_t candidate_index = free_list[position];
+                            if (candidate_index >= descriptor_pool_pages_.size()) {
+                                free_list_is_valid = false;
+                                continue;
+                            }
+                            const DescriptorPoolPage &page = descriptor_pool_pages_[candidate_index];
+                            const bool is_preferred = position < preferred_count;
+                            const bool state_matches =
+                                    is_preferred ? page.list_state == DescriptorPoolPageListState::kPreferred
+                                                 : page.list_state == DescriptorPoolPageListState::kDeferred;
+                            if (page.lifetime != lifetime || !state_matches ||
+                                !descriptor_pool_page_has_free_capacity(page)) {
+                                free_list_is_valid = false;
+                                continue;
+                            }
+                            if (!descriptor_pool_can_fit(page, requirements)) {
+                                continue;
+                            }
+
+                            const uint64_t score = descriptor_pool_fit_score(page, requirements);
+                            if (score < best_score) {
+                                best_score = score;
+                                best_page_index = candidate_index;
+                            }
+                        }
+                    };
+
+                    find_best_page(0, preferred_count);
+                    if (best_page_index == kInvalidIndex) {
+                        find_best_page(preferred_count, free_count);
+                    }
+                }
+            }
+
+            if (!free_list_is_valid) {
+                return {
+                    Result::failure(ResultCode::kInvalidState, "Descriptor pool free-list invariant is broken"), {}
+                };
+            }
+            if (best_page_index == kInvalidIndex) {
+                break;
+            }
+
+            auto allocation = allocate_from_page(best_page_index);
+            if (allocation || allocation.result.code != ResultCode::kNotReady) {
+                return allocation;
+            }
         }
 
-        return {Result::success(), binding_sets_.insert(std::move(resource))};
+        auto page_result = create_descriptor_pool_page_locked(lifetime, requirements);
+        if (!page_result) {
+            return {page_result.result, {}};
+        }
+        const uint32_t page_index = page_result.value;
+        auto allocation = allocate_from_page(page_index);
+        if (!allocation && allocation.result.code == ResultCode::kNotReady) {
+            allocation.result = Result::failure(ResultCode::kOutOfMemory,
+                                                "New descriptor pool page cannot allocate the requested set");
+        }
+        return allocation;
+    }
+
+    ResultValue<BindingSetHandle> VulkanDevice::create_binding_set(const BindingSetDesc &desc) {
+        if (device_ == VK_NULL_HANDLE) {
+            return {Result::failure(ResultCode::kInvalidState, "Vulkan device is not initialized"), {}};
+        }
+        if (desc.lifetime != BindingSetLifetime::kPersistent &&
+            desc.lifetime != BindingSetLifetime::kFrameLocal) {
+            return {Result::failure(ResultCode::kInvalidArgument, "Binding set lifetime is invalid"), {}};
+        }
+
+        BindingLayoutResource *layout_resource = binding_layouts_.get(desc.layout);
+        if (layout_resource == nullptr) {
+            return {Result::failure(ResultCode::kNotFound, "Invalid binding layout handle"), {}};
+        }
+
+        auto requirements_result = descriptor_pool_requirements(*layout_resource);
+        if (!requirements_result) {
+            return {requirements_result.result, {}};
+        }
+        const DescriptorPoolRequirements requirements = requirements_result.value;
+        auto allocation_result = allocate_descriptor_set(desc.lifetime, requirements, layout_resource->layout);
+        if (!allocation_result) {
+            return {allocation_result.result, {}};
+        }
+
+        BindingSetResource resource{};
+        resource.set = allocation_result.value.set;
+        resource.layout = desc.layout;
+        resource.lifetime = desc.lifetime;
+        resource.descriptor_pool_page = allocation_result.value.page_index;
+        resource.requirements = requirements;
+        try {
+#if AEG_VULKAN_ENABLE_DEBUG_NAMES
+            set_debug_name(VK_OBJECT_TYPE_DESCRIPTOR_SET, resource.set, desc.name);
+#endif
+            return {Result::success(), binding_sets_.insert(std::move(resource))};
+        } catch (const std::bad_alloc&) {
+            release_descriptor_set(desc.lifetime, allocation_result.value.page_index, allocation_result.value.set,
+                                   requirements);
+            return {Result::failure(ResultCode::kOutOfMemory, "Binding set bookkeeping allocation failed"), {}};
+        }
+    }
+
+    // The caller holds the page lifetime mutex and the page storage lock.
+    void VulkanDevice::update_descriptor_pool_page_free_list_locked(uint32_t page_index) noexcept {
+        if (page_index >= descriptor_pool_pages_.size()) {
+            return;
+        }
+
+        DescriptorPoolPage &page = descriptor_pool_pages_[page_index];
+        const uint32_t lifetime_index = descriptor_lifetime_index(page.lifetime);
+        auto &free_list = descriptor_pool_free_lists_[lifetime_index];
+        uint32_t &free_count = descriptor_pool_free_counts_[lifetime_index];
+        uint32_t &preferred_count = descriptor_pool_preferred_counts_[lifetime_index];
+
+        if (free_count > free_list.size() || free_count > descriptor_pool_pages_.size() ||
+            preferred_count > free_count) {
+            return;
+        }
+        if (page.list_position >= free_list.size() || free_list[page.list_position] != page_index) {
+            const auto iterator = std::find(free_list.begin(), free_list.end(), page_index);
+            if (iterator == free_list.end()) {
+                return;
+            }
+            page.list_position = static_cast<uint32_t>(std::distance(free_list.begin(), iterator));
+        }
+
+        const DescriptorPoolPageListState target_state = descriptor_pool_page_is_preferred(page)
+                                                              ? DescriptorPoolPageListState::kPreferred
+                                                              : (descriptor_pool_page_has_free_capacity(page)
+                                                                     ? DescriptorPoolPageListState::kDeferred
+                                                                     : DescriptorPoolPageListState::kFull);
+        if (page.list_state == target_state) {
+            return;
+        }
+
+        const uint32_t current_position = page.list_position;
+        if (current_position >= free_list.size()) {
+            return;
+        }
+
+        const auto can_swap_positions = [&](uint32_t lhs, uint32_t rhs) noexcept {
+            if (lhs >= free_list.size() || rhs >= free_list.size()) {
+                return false;
+            }
+            return free_list[lhs] < descriptor_pool_pages_.size() &&
+                   free_list[rhs] < descriptor_pool_pages_.size();
+        };
+
+        const auto swap_positions = [&](uint32_t lhs, uint32_t rhs) noexcept {
+            if (!can_swap_positions(lhs, rhs)) {
+                return false;
+            }
+            if (lhs == rhs) {
+                return true;
+            }
+            const uint32_t lhs_page_index = free_list[lhs];
+            const uint32_t rhs_page_index = free_list[rhs];
+            std::swap(free_list[lhs], free_list[rhs]);
+            descriptor_pool_pages_[lhs_page_index].list_position = rhs;
+            descriptor_pool_pages_[rhs_page_index].list_position = lhs;
+            return true;
+        };
+
+        switch (page.list_state) {
+            case DescriptorPoolPageListState::kPreferred: {
+                if (current_position >= preferred_count || preferred_count == 0) {
+                    return;
+                }
+                if (target_state == DescriptorPoolPageListState::kDeferred) {
+                    const uint32_t new_preferred_count = preferred_count - 1;
+                    if (!swap_positions(current_position, new_preferred_count)) {
+                        return;
+                    }
+                    preferred_count = new_preferred_count;
+                    page.list_state = target_state;
+                    return;
+                }
+                if (target_state != DescriptorPoolPageListState::kFull || free_count == 0) {
+                    return;
+                }
+                const uint32_t new_preferred_count = preferred_count - 1;
+                const uint32_t new_free_count = free_count - 1;
+                if (!can_swap_positions(current_position, new_preferred_count) ||
+                    !can_swap_positions(new_preferred_count, new_free_count)) {
+                    return;
+                }
+                swap_positions(current_position, new_preferred_count);
+                swap_positions(new_preferred_count, new_free_count);
+                preferred_count = new_preferred_count;
+                free_count = new_free_count;
+                page.list_state = DescriptorPoolPageListState::kFull;
+                return;
+            }
+            case DescriptorPoolPageListState::kDeferred: {
+                if (current_position < preferred_count || current_position >= free_count) {
+                    return;
+                }
+                if (target_state == DescriptorPoolPageListState::kPreferred) {
+                    if (!swap_positions(current_position, preferred_count)) {
+                        return;
+                    }
+                    ++preferred_count;
+                    page.list_state = target_state;
+                    return;
+                }
+                if (target_state != DescriptorPoolPageListState::kFull || free_count == 0) {
+                    return;
+                }
+                const uint32_t new_free_count = free_count - 1;
+                if (!swap_positions(current_position, new_free_count)) {
+                    return;
+                }
+                free_count = new_free_count;
+                page.list_state = DescriptorPoolPageListState::kFull;
+                return;
+            }
+            case DescriptorPoolPageListState::kFull: {
+                if (current_position < free_count) {
+                    return;
+                }
+                if (target_state == DescriptorPoolPageListState::kPreferred) {
+                    if (free_count >= free_list.size()) {
+                        return;
+                    }
+                    if (!swap_positions(current_position, preferred_count)) {
+                        return;
+                    }
+                    ++preferred_count;
+                    ++free_count;
+                    page.list_state = target_state;
+                    return;
+                }
+                if (target_state == DescriptorPoolPageListState::kDeferred) {
+                    if (free_count >= free_list.size()) {
+                        return;
+                    }
+                    if (!swap_positions(current_position, free_count)) {
+                        return;
+                    }
+                    ++free_count;
+                    page.list_state = target_state;
+                    return;
+                }
+                return;
+            }
+        }
+    }
+
+    void VulkanDevice::release_descriptor_set(BindingSetLifetime lifetime, uint32_t page_index, VkDescriptorSet set,
+                                               const DescriptorPoolRequirements &requirements) noexcept {
+        const uint32_t lifetime_index = descriptor_lifetime_index(lifetime);
+        std::lock_guard<std::mutex> lifetime_lock(descriptor_pool_lifetime_mutexes_[lifetime_index]);
+        DescriptorPoolPage *page = nullptr;
+        {
+            std::shared_lock<std::shared_mutex> pages_lock(descriptor_pool_pages_mutex_);
+            if (device_ == VK_NULL_HANDLE || set == VK_NULL_HANDLE || page_index >= descriptor_pool_pages_.size()) {
+                return;
+            }
+
+            page = &descriptor_pool_pages_[page_index];
+            if (page->pool == VK_NULL_HANDLE || page->lifetime != lifetime) {
+                return;
+            }
+        }
+
+        if (page->live_sets >= requirements.set_count) {
+            page->live_sets -= requirements.set_count;
+        } else {
+            page->live_sets = 0;
+        }
+
+        if (page->lifetime == BindingSetLifetime::kFrameLocal) {
+            if (page->live_sets != 0) {
+                return;
+            }
+            if (vkResetDescriptorPool(device_, page->pool, 0) == VK_SUCCESS) {
+                page->allocated_sets = 0;
+                page->descriptor_usage.fill(0);
+                page->fragmentation_score = 0;
+                page->allocation_failures = 0;
+                page->allocation_blocked = false;
+                page->driver_fragmented = false;
+                refresh_descriptor_pool_page_state(*page);
+            } else {
+                page->allocation_blocked = true;
+                page->fragmentation_score = kDescriptorFragmentationScoreMax;
+            }
+            {
+                std::shared_lock<std::shared_mutex> pages_lock(descriptor_pool_pages_mutex_);
+                update_descriptor_pool_page_free_list_locked(page_index);
+            }
+            return;
+        }
+
+        if (vkFreeDescriptorSets(device_, page->pool, 1, &set) != VK_SUCCESS) {
+            page->live_sets += requirements.set_count;
+            return;
+        }
+        if (page->allocated_sets >= requirements.set_count) {
+            page->allocated_sets -= requirements.set_count;
+        } else {
+            page->allocated_sets = 0;
+        }
+        uint32_t descriptor_mask = requirements.descriptor_mask;
+        while (descriptor_mask != 0) {
+            const uint32_t index = std::countr_zero(descriptor_mask);
+            if (page->descriptor_usage[index] >= requirements.descriptor_counts[index]) {
+                page->descriptor_usage[index] -= requirements.descriptor_counts[index];
+            } else {
+                page->descriptor_usage[index] = 0;
+            }
+            descriptor_mask &= descriptor_mask - 1u;
+        }
+
+        page->allocation_blocked = false;
+        if (!page->driver_fragmented) {
+            page->fragmentation_score = 0;
+        }
+        refresh_descriptor_pool_page_state(*page);
+
+        if (page->allocated_sets == 0) {
+            if (vkResetDescriptorPool(device_, page->pool, 0) == VK_SUCCESS) {
+                page->descriptor_usage.fill(0);
+                page->fragmentation_score = 0;
+                page->allocation_failures = 0;
+                page->allocation_blocked = false;
+                page->driver_fragmented = false;
+                refresh_descriptor_pool_page_state(*page);
+            } else {
+                page->allocation_blocked = true;
+                page->fragmentation_score = kDescriptorFragmentationScoreMax;
+            }
+        }
+        {
+            std::shared_lock<std::shared_mutex> pages_lock(descriptor_pool_pages_mutex_);
+            update_descriptor_pool_page_free_list_locked(page_index);
+        }
+    }
+
+    void VulkanDevice::destroy_descriptor_pool_pages() noexcept {
+        std::scoped_lock lifetime_lock(descriptor_pool_lifetime_mutexes_[0], descriptor_pool_lifetime_mutexes_[1]);
+        std::unique_lock<std::shared_mutex> pages_lock(descriptor_pool_pages_mutex_);
+        for (DescriptorPoolPage &page: descriptor_pool_pages_) {
+            if (page.pool != VK_NULL_HANDLE && device_ != VK_NULL_HANDLE) {
+                vkDestroyDescriptorPool(device_, page.pool, nullptr);
+            }
+            page.pool = VK_NULL_HANDLE;
+            page.max_sets = 0;
+            page.allocated_sets = 0;
+            page.live_sets = 0;
+            page.descriptor_capacity.fill(0);
+            page.descriptor_usage.fill(0);
+            page.descriptor_capacity_mask = 0;
+            page.available_descriptor_mask = 0;
+            page.fragmentation_score = 0;
+            page.allocation_failures = 0;
+            page.list_position = kInvalidIndex;
+            page.list_state = DescriptorPoolPageListState::kFull;
+            page.allocation_blocked = false;
+            page.driver_fragmented = false;
+        }
+        for (auto &free_list: descriptor_pool_free_lists_) {
+            free_list.clear();
+        }
+        descriptor_pool_free_counts_.fill(0);
+        descriptor_pool_preferred_counts_.fill(0);
+        descriptor_pool_pages_.clear();
     }
 
     Result VulkanDevice::update_binding_set(BindingSetHandle set, std::span<const BindingWrite> writes) {
@@ -6426,7 +7217,8 @@ namespace aeg::rhi {
                                    "Binding set is referenced by a command list that has not been submitted");
         }
 
-        RetireBindingSet retire{resource->last_use, resource->pool};
+        RetireBindingSet retire{resource->last_use, resource->lifetime, resource->descriptor_pool_page,
+                                resource->set, resource->requirements};
         (void) binding_sets_.erase(set);
         enqueue_retire(std::move(retire));
         return Result::success();
@@ -8092,10 +8884,9 @@ namespace aeg::rhi {
                 }
                 value.layout = VK_NULL_HANDLE;
             } else if constexpr (std::is_same_v<ValueType, RetireBindingSet>) {
-                if (value.pool != VK_NULL_HANDLE && device_ != VK_NULL_HANDLE) {
-                    vkDestroyDescriptorPool(device_, value.pool, nullptr);
-                }
-                value.pool = VK_NULL_HANDLE;
+                release_descriptor_set(value.lifetime, value.page_index, value.set, value.requirements);
+                value.page_index = kInvalidIndex;
+                value.set = VK_NULL_HANDLE;
             } else if constexpr (std::is_same_v<ValueType, RetirePipeline>) {
                 if (value.pipeline != VK_NULL_HANDLE && device_ != VK_NULL_HANDLE) {
                     vkDestroyPipeline(device_, value.pipeline, nullptr);
@@ -8260,12 +9051,10 @@ namespace aeg::rhi {
                 resource.binding_layouts.clear();
             });
             binding_sets_.for_each([&](BindingSetResource &resource) {
-                if (resource.pool != VK_NULL_HANDLE) {
-                    vkDestroyDescriptorPool(device_, resource.pool, nullptr);
-                    resource.pool = VK_NULL_HANDLE;
-                    resource.set = VK_NULL_HANDLE;
-                }
+                resource.descriptor_pool_page = kInvalidIndex;
+                resource.set = VK_NULL_HANDLE;
             });
+            destroy_descriptor_pool_pages();
             binding_layouts_.for_each([&](BindingLayoutResource &resource) {
                 if (resource.layout != VK_NULL_HANDLE) {
                     vkDestroyDescriptorSetLayout(device_, resource.layout, nullptr);

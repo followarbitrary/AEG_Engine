@@ -113,7 +113,7 @@ namespace aeg::render_graph {
             OwnedBufferDesc desc{};
             rhi::BufferHandle imported{};
             PhysicalBuffer physical{};
-            rhi::GpuSyncPoint last_completion{};
+            rhi::GpuCompletionSet last_completions{};
             bool exported{false};
             bool has_use{false};
             uint32_t first_use{kInvalidHandleIndex};
@@ -129,7 +129,7 @@ namespace aeg::render_graph {
             rhi::TextureViewHandle imported_default_view{};
             PhysicalTexture physical{};
             rhi::ResourceState imported_state{};
-            rhi::GpuSyncPoint last_completion{};
+            rhi::GpuCompletionSet last_completions{};
             bool exported{false};
             bool has_use{false};
             uint32_t first_use{kInvalidHandleIndex};
@@ -776,7 +776,7 @@ namespace aeg::render_graph {
         record->physical.handle = buffer;
         record->physical.owns_handle = false;
         record->physical.state = initial_state;
-        record->last_completion = {};
+        record->last_completions.clear();
         return foundation::Result::success();
     }
 
@@ -813,7 +813,7 @@ namespace aeg::render_graph {
         record->physical.owns_handle = false;
         record->physical.states.swap(new_states);
         record->imported_state = initial_state;
-        record->last_completion = {};
+        record->last_completions.clear();
         return foundation::Result::success();
     }
 
@@ -2844,20 +2844,24 @@ namespace aeg::render_graph {
                         if (use.kind == ResourceKind::kBuffer) {
                             BufferRecord& record = impl_->buffers[use.resource_index];
                             if (record.lifetime != ResourceLifetime::kTransient &&
-                                record.last_completion.is_valid()) {
+                                !record.last_completions.empty()) {
                                 const PhysicalBuffer* physical = impl_->physical_buffer(record, frame_slot);
                                 if (physical != nullptr && physical->state.queue != batch.queue) {
-                                    append_wait(persistent_waits, record.last_completion, use.before_state.pipeline_stages);
+                                    for (const rhi::GpuSyncPoint& completion: record.last_completions.points()) {
+                                        append_wait(persistent_waits, completion, use.before_state.pipeline_stages);
+                                    }
                                 }
                             }
                         } else {
                             TextureRecord& record = impl_->textures[use.resource_index];
                             if (record.lifetime != ResourceLifetime::kTransient &&
-                                record.last_completion.is_valid()) {
+                                !record.last_completions.empty()) {
                                 const PhysicalTexture* physical = impl_->physical_texture(record, frame_slot);
                                 if (physical != nullptr &&
                                     texture_requires_queue_wait(*physical, use.subresources, batch.queue)) {
-                                    append_wait(persistent_waits, record.last_completion, use.before_state.pipeline_stages);
+                                    for (const rhi::GpuSyncPoint& completion: record.last_completions.points()) {
+                                        append_wait(persistent_waits, completion, use.before_state.pipeline_stages);
+                                    }
                                 }
                             }
                         }
@@ -2940,7 +2944,7 @@ namespace aeg::render_graph {
                 }
                 batch.completion = submit_result.value.completion;
                 impl_->commit_runtime_states(buffer_states, texture_states);
-                execution_result.queue_completions[queue_index(batch.queue)] = batch.completion;
+                (void) execution_result.queue_completions.add(batch.completion);
                 execution_result.completion = batch.completion;
                 ++execution_result.submitted_batch_count;
 
@@ -2949,12 +2953,12 @@ namespace aeg::render_graph {
                         if (use.kind == ResourceKind::kBuffer) {
                             BufferRecord& record = impl_->buffers[use.resource_index];
                             if (record.lifetime != ResourceLifetime::kTransient) {
-                                record.last_completion = batch.completion;
+                                (void) record.last_completions.add(batch.completion);
                             }
                         } else {
                             TextureRecord& record = impl_->textures[use.resource_index];
                             if (record.lifetime != ResourceLifetime::kTransient) {
-                                record.last_completion = batch.completion;
+                                (void) record.last_completions.add(batch.completion);
                             }
                         }
                     }

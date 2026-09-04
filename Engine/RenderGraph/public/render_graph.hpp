@@ -98,7 +98,7 @@ namespace aeg::render_graph {
 
     /** @brief Submission and presentation results from execute(). */
     struct RenderGraphExecutionResult {
-        std::array<rhi::GpuSyncPoint, kQueueCount> queue_completions{};
+        rhi::GpuCompletionSet queue_completions{};
         rhi::GpuSyncPoint completion{};
         uint32_t executed_pass_count{0};
         uint32_t submitted_batch_count{0};

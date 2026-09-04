@@ -183,7 +183,7 @@ namespace aeg::render_graph {
 
         struct FrameSlot {
             uint64_t generation{0};
-            std::array<rhi::GpuSyncPoint, kQueueCount> completions{};
+            rhi::GpuCompletionSet completions{};
             std::array<std::vector<CommandRecord>, kQueueCount> command_lists{};
             std::vector<UploadChunk> upload_chunks{};
             std::vector<UploadChunk> readback_chunks{};

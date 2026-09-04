@@ -97,7 +97,8 @@ namespace aeg::resource {
             material.owns_binding_layout = true;
         }
 
-        auto set_result = device.create_binding_set(material.binding_layout);
+        auto set_result = device.create_binding_set(
+                rhi::BindingSetDesc{material.binding_layout, rhi::BindingSetLifetime::kPersistent, desc.name});
         if (!set_result) {
             if (material.owns_binding_layout) {
                 (void) destroy_if_valid(device, material.binding_layout);

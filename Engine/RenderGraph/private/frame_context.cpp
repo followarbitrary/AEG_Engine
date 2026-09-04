@@ -138,7 +138,7 @@ namespace aeg::render_graph {
         }
 
         slot.generation = frame_number_;
-        slot.completions.fill({});
+        slot.completions.clear();
         frame_active_ = true;
         has_acquired_frame_ = false;
         acquired_frame_submitted_ = false;
@@ -183,7 +183,7 @@ namespace aeg::render_graph {
 
         FrameSlot& slot = slots_[current_slot_];
 
-        for (const rhi::GpuSyncPoint& completion: slot.completions) {
+        for (const rhi::GpuSyncPoint& completion: slot.completions.points()) {
             if (!completion.is_valid()) {
                 continue;
             }
@@ -237,7 +237,7 @@ namespace aeg::render_graph {
             }
         }
 
-        slots_[current_slot_].completions.fill({});
+        slots_[current_slot_].completions.clear();
         for (UploadChunk& chunk: slots_[current_slot_].upload_chunks) {
             chunk.offset = 0;
         }
@@ -249,7 +249,7 @@ namespace aeg::render_graph {
     }
 
     foundation::Result FrameContext::prepare_slot(FrameSlot& slot) {
-        for (const rhi::GpuSyncPoint& completion: slot.completions) {
+        for (const rhi::GpuSyncPoint& completion: slot.completions.points()) {
             if (!completion.is_valid()) {
                 continue;
             }
@@ -606,7 +606,7 @@ namespace aeg::render_graph {
         }
 
         FrameSlot& slot = slots_[current_slot_];
-        slot.completions[queue_index(normalized_desc.queue)] = result.value.completion;
+        (void) slot.completions.add(result.value.completion);
         for (const rhi::CommandListHandle command_list: normalized_desc.command_lists) {
             if (CommandRecord* command = find_command(command_list); command != nullptr) {
                 command->submitted = true;
@@ -638,7 +638,7 @@ namespace aeg::render_graph {
             return result;
         }
 
-        slots_[current_slot_].completions[queue_index(normalized_desc.queue)] = result.value.completion;
+        (void) slots_[current_slot_].completions.add(result.value.completion);
         acquired_frame_submitted_ = true;
         for (const rhi::CommandListHandle command_list: normalized_desc.command_lists) {
             if (CommandRecord* command = find_command(command_list); command != nullptr) {

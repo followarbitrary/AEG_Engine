@@ -42,12 +42,15 @@ namespace {
     using aeg::rhi::BufferHandle;
     using aeg::rhi::BindingLayoutHandle;
     using aeg::rhi::BindingResource;
+    using aeg::rhi::BindingSetDesc;
     using aeg::rhi::BindingSetHandle;
+    using aeg::rhi::BindingSetLifetime;
     using aeg::rhi::BindingType;
     using aeg::rhi::BindingWrite;
     using aeg::rhi::BufferRange;
     using aeg::rhi::Device;
     using aeg::rhi::DeviceCreateDesc;
+    using aeg::rhi::DebugName;
     using aeg::rhi::DrawDesc;
     using aeg::rhi::DrawIndexedDesc;
     using aeg::rhi::Filter;
@@ -632,7 +635,9 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
                 }
                 transform_buffers_[index] = buffer_result.value;
 
-                auto set_result = device_->create_binding_set(transform_binding_layout_);
+                auto set_result = device_->create_binding_set(
+                        BindingSetDesc{transform_binding_layout_, BindingSetLifetime::kFrameLocal,
+                                       DebugName{"Triangle.TransformBindingSet"}});
                 if (!check_result(set_result, "create_transform_binding_set")) {
                     return false;
                 }
