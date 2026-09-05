@@ -80,6 +80,7 @@ namespace aeg::pipeline {
     using ArtifactTypeId = StableId<ArtifactTypeIdTag>;
 
     using PlanRevision = uint64_t;
+    using ArtifactRevision = uint64_t;
 
     /** @brief Scope that owns a pipeline instance or artifact. */
     enum class PipelineScope : uint8_t {
@@ -174,6 +175,7 @@ namespace aeg::pipeline {
         kMayCreateCopyPass = 1u << 3,
         kMayUseDedicatedQueue = 1u << 4,
         kMayWriteFinalOutput = 1u << 5,
+        kMayPublishSnapshot = 1u << 6,
     };
 
     constexpr FeaturePointFlags operator|(FeaturePointFlags left, FeaturePointFlags right) noexcept {
@@ -536,6 +538,7 @@ namespace aeg::pipeline {
         void* user_data{nullptr};
         bool synthetic{false};
         bool stage_parallelizable{false};
+        std::vector<ArtifactBinding> artifact_bindings{};
     };
 
     /** @brief One directed dependency edge between compiled nodes. */
@@ -564,6 +567,8 @@ namespace aeg::pipeline {
         std::vector<uint32_t> topological_order{};
         std::vector<PipelineExecutionBatch> batches{};
         std::vector<PipelineFeatureContributionRecord> feature_contributions{};
+        std::vector<ArtifactDescriptor> artifacts{};
+        std::vector<PipelineExposureRecord> exposures{};
 
         // Keeps definition callbacks and their owner object alive after registry removal.
         std::shared_ptr<const void> definition_owner{};

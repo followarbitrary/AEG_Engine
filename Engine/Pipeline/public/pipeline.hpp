@@ -4,7 +4,9 @@
  */
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -21,6 +23,8 @@
 
 namespace aeg::pipeline {
     class FeatureBuildContext;
+    class ArtifactRegistry;
+    class ArtifactScopeBridge;
 
     template <FeatureDomain Domain>
     class DomainGraphBuilder;
@@ -31,20 +35,310 @@ namespace aeg::pipeline {
     using AudioGraphBuilder = DomainGraphBuilder<FeatureDomain::kAudio>;
     using StreamGraphBuilder = DomainGraphBuilder<FeatureDomain::kStream>;
 
+    /** @brief Type-erased payload installed into an ArtifactRegistry. */
+    struct ArtifactPayload {
+        ArtifactTypeId type{};
+        std::shared_ptr<const void> owner{};
+        const void* data{nullptr};
+        std::size_t size{0};
+        std::size_t alignment{alignof(std::max_align_t)};
+        bool writable{false};
+
+        /** @brief Creates an owned payload backed by a shared object. */
+        template <typename Type>
+        [[nodiscard]] static ArtifactPayload owned(ArtifactTypeId type,
+                                                   std::shared_ptr<Type> value,
+                                                   bool allow_writes = true) {
+            ArtifactPayload payload;
+            payload.type = type;
+            payload.owner = std::move(value);
+            payload.data = payload.owner.get();
+            payload.size = sizeof(Type);
+            payload.alignment = alignof(Type);
+            payload.writable = allow_writes && !std::is_const_v<Type>;
+            return payload;
+        }
+
+        /** @brief Creates a non-owning immutable view over external memory. */
+        [[nodiscard]] static ArtifactPayload borrowed(ArtifactTypeId type,
+                                                       const void* data,
+                                                       std::size_t size,
+                                                       std::size_t alignment = alignof(std::max_align_t)) {
+            ArtifactPayload payload;
+            payload.type = type;
+            payload.owner = std::shared_ptr<const void>(data, [](const void*) {});
+            payload.data = data;
+            payload.size = size;
+            payload.alignment = alignment;
+            payload.writable = false;
+            return payload;
+        }
+    };
+
+    /** @brief Read-only runtime lease for one published artifact value. */
+    class ArtifactView final {
+    public:
+        ArtifactView() noexcept = default;
+
+        [[nodiscard]] bool is_valid() const noexcept { return valid_; }
+        [[nodiscard]] ArtifactId id() const noexcept { return id_; }
+        [[nodiscard]] ArtifactTypeId type() const noexcept { return type_; }
+        [[nodiscard]] PipelineScope owner_scope() const noexcept { return owner_scope_; }
+        [[nodiscard]] ArtifactStorage storage() const noexcept { return storage_; }
+        [[nodiscard]] uint32_t version() const noexcept { return version_; }
+        [[nodiscard]] ArtifactRevision revision() const noexcept { return revision_; }
+        [[nodiscard]] const void* data() const noexcept { return data_; }
+        [[nodiscard]] std::size_t size() const noexcept { return size_; }
+        [[nodiscard]] std::size_t alignment() const noexcept { return alignment_; }
+
+        template <typename Type>
+        [[nodiscard]] const Type* as(ArtifactTypeId expected_type) const noexcept {
+            if (!valid_ || type_ != expected_type || data_ == nullptr || size_ < sizeof(Type)) {
+                return nullptr;
+            }
+            return static_cast<const Type*>(data_);
+        }
+
+    private:
+        ArtifactView(ArtifactId id,
+                     ArtifactTypeId type,
+                     PipelineScope owner_scope,
+                     ArtifactStorage storage,
+                     uint32_t version,
+                     ArtifactRevision revision,
+                     const void* data,
+                     std::size_t size,
+                     std::size_t alignment,
+                     std::shared_ptr<const void> owner) noexcept
+            : id_(id),
+              type_(type),
+              owner_scope_(owner_scope),
+              storage_(storage),
+              version_(version),
+              revision_(revision),
+              data_(data),
+              size_(size),
+              alignment_(alignment),
+              owner_(std::move(owner)),
+              valid_(true) {
+        }
+
+        ArtifactId id_{};
+        ArtifactTypeId type_{};
+        PipelineScope owner_scope_{PipelineScope::kEngine};
+        ArtifactStorage storage_{ArtifactStorage::kValue};
+        uint32_t version_{0};
+        ArtifactRevision revision_{0};
+        const void* data_{nullptr};
+        std::size_t size_{0};
+        std::size_t alignment_{0};
+        std::shared_ptr<const void> owner_{};
+        bool valid_{false};
+
+        friend class ArtifactRegistry;
+        friend class ArtifactScopeBridge;
+    };
+
+    /** @brief Exclusive runtime lease for writing one artifact value. */
+    class ArtifactWriter final {
+    public:
+        ArtifactWriter() noexcept = default;
+        ~ArtifactWriter();
+
+        ArtifactWriter(const ArtifactWriter&) = delete;
+        ArtifactWriter& operator=(const ArtifactWriter&) = delete;
+        ArtifactWriter(ArtifactWriter&&) noexcept;
+        ArtifactWriter& operator=(ArtifactWriter&&) noexcept;
+
+        [[nodiscard]] bool is_valid() const noexcept;
+        [[nodiscard]] ArtifactId id() const noexcept;
+        [[nodiscard]] ArtifactTypeId type() const noexcept;
+        [[nodiscard]] PipelineScope owner_scope() const noexcept;
+        [[nodiscard]] ArtifactStorage storage() const noexcept;
+        [[nodiscard]] uint32_t version() const noexcept;
+        [[nodiscard]] ArtifactRevision revision() const noexcept;
+        [[nodiscard]] void* data() const noexcept;
+        [[nodiscard]] std::size_t size() const noexcept;
+        [[nodiscard]] std::size_t alignment() const noexcept;
+
+        template <typename Type>
+        [[nodiscard]] Type* as(ArtifactTypeId expected_type) const noexcept {
+            if (!is_valid() || type() != expected_type || data() == nullptr || size() < sizeof(Type)) {
+                return nullptr;
+            }
+            return static_cast<Type*>(data());
+        }
+
+        /** @brief Publishes the mutation and releases the exclusive lease. */
+        [[nodiscard]] foundation::Result commit();
+
+    private:
+        struct Impl;
+
+        explicit ArtifactWriter(std::unique_ptr<Impl> impl) noexcept;
+
+        std::unique_ptr<Impl> impl_{};
+
+        friend class ArtifactRegistry;
+    };
+
+    /** @brief Runtime storage and contract table for one pipeline Scope. */
+    class ArtifactRegistry final {
+    public:
+        explicit ArtifactRegistry(PipelineScope scope = PipelineScope::kEngine);
+        ~ArtifactRegistry();
+
+        ArtifactRegistry(const ArtifactRegistry&) = delete;
+        ArtifactRegistry& operator=(const ArtifactRegistry&) = delete;
+        ArtifactRegistry(ArtifactRegistry&&) = delete;
+        ArtifactRegistry& operator=(ArtifactRegistry&&) = delete;
+
+        [[nodiscard]] PipelineScope scope() const noexcept;
+        [[nodiscard]] bool contains(ArtifactId id) const noexcept;
+
+        /** @brief Installs one immutable artifact contract without publishing a value. */
+        [[nodiscard]] foundation::Result install_contract(const ArtifactDescriptor& descriptor);
+        /** @brief Installs all contracts carried by a compiled plan. */
+        [[nodiscard]] foundation::Result install_plan(const PipelinePlan& plan);
+        /** @brief Removes a contract and any value owned by this registry. */
+        [[nodiscard]] foundation::Result unregister_artifact(ArtifactId id);
+        /** @brief Returns the installed immutable contract for an artifact. */
+        [[nodiscard]] foundation::ResultValue<ArtifactDescriptor> find_descriptor(ArtifactId id) const;
+        /** @brief Reads the most recently published artifact value. */
+        [[nodiscard]] foundation::ResultValue<ArtifactView> read(
+            ArtifactId id,
+            ArtifactTypeId expected_type = {},
+            uint32_t required_version = 0) const;
+        /** @brief Acquires an exclusive lease for an artifact owned by this Scope. */
+        [[nodiscard]] foundation::ResultValue<ArtifactWriter> write(
+            ArtifactId id,
+            ArtifactTypeId expected_type = {},
+            uint32_t required_version = 0);
+        /** @brief Publishes or replaces an artifact value owned by this Scope. */
+        [[nodiscard]] foundation::Result publish(ArtifactId id, ArtifactPayload payload);
+        /** @brief Releases payloads whose lifetime has ended. */
+        [[nodiscard]] foundation::Result release_lifetime(ArtifactLifetime lifetime);
+
+        template <typename Type, typename... Arguments>
+        [[nodiscard]] foundation::Result emplace_artifact(ArtifactId id,
+                                                           ArtifactTypeId type,
+                                                           Arguments&&... arguments) {
+            try {
+                std::shared_ptr<Type> value = std::make_shared<Type>(
+                    std::forward<Arguments>(arguments)...);
+                const foundation::ResultValue<ArtifactDescriptor> descriptor = find_descriptor(id);
+                if (!descriptor) {
+                    return descriptor.result;
+                }
+                if (!type.is_valid() || descriptor.value.type != type) {
+                    return foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
+                                                        "artifact type does not match its contract");
+                }
+                const bool allow_writes = descriptor.value.storage != ArtifactStorage::kImmutableSnapshot &&
+                                          descriptor.value.ownership != OwnershipPolicy::kSharedImmutable;
+                return publish(id, ArtifactPayload::owned(descriptor.value.type,
+                                                           std::move(value),
+                                                           allow_writes));
+            } catch (const std::bad_alloc&) {
+                return foundation::Result::failure(foundation::ResultCode::kOutOfMemory,
+                                                    "artifact allocation failed");
+            } catch (const std::exception& exception) {
+                return foundation::Result::failure(foundation::ResultCode::kUnknown, exception.what());
+            } catch (...) {
+                return foundation::Result::failure(foundation::ResultCode::kUnknown,
+                                                    "artifact construction threw an unknown exception");
+            }
+        }
+
+    private:
+        struct Impl;
+        std::unique_ptr<Impl> impl_{};
+
+        friend class ArtifactScopeBridge;
+        friend class PipelineExecutionContext;
+    };
+
+    /** @brief Read-only snapshot bridge from a lower Scope to an upper Scope. */
+    class ArtifactScopeBridge final {
+    public:
+        ArtifactScopeBridge(PipelineScope source_scope,
+                            PipelineScope target_scope,
+                            const ArtifactRegistry& source_registry);
+        ~ArtifactScopeBridge();
+
+        ArtifactScopeBridge(const ArtifactScopeBridge&) = delete;
+        ArtifactScopeBridge& operator=(const ArtifactScopeBridge&) = delete;
+        ArtifactScopeBridge(ArtifactScopeBridge&&) = delete;
+        ArtifactScopeBridge& operator=(ArtifactScopeBridge&&) = delete;
+
+        [[nodiscard]] PipelineScope source_scope() const noexcept;
+        [[nodiscard]] PipelineScope target_scope() const noexcept;
+
+        /** @brief Allows one immutable snapshot contract to cross the Scope boundary. */
+        [[nodiscard]] foundation::Result expose(ArtifactId id);
+        /** @brief Captures all exposed source values and replaces the previous snapshot set. */
+        [[nodiscard]] foundation::Result capture();
+        /** @brief Reads a value from the most recently captured snapshot set. */
+        [[nodiscard]] foundation::ResultValue<ArtifactView> read(
+            ArtifactId id,
+            ArtifactTypeId expected_type = {},
+            uint32_t required_version = 0) const;
+
+    private:
+        struct Impl;
+        std::unique_ptr<Impl> impl_{};
+    };
+
     /** @brief Runtime context shared by tasks during one pipeline execution. */
     class PipelineExecutionContext final {
     public:
         explicit PipelineExecutionContext(void* user_data = nullptr,
-                                           PipelineScope scope = PipelineScope::kEngine) noexcept
-            : user_data_(user_data), scope_(scope) {
+                                           PipelineScope scope = PipelineScope::kEngine,
+                                           ArtifactRegistry* artifact_registry = nullptr,
+                                           const ArtifactScopeBridge* scope_bridge = nullptr) noexcept
+            : user_data_(user_data),
+              scope_(scope),
+              artifact_registry_(artifact_registry),
+              scope_bridge_(scope_bridge) {
         }
 
         [[nodiscard]] void* user_data() const noexcept { return user_data_; }
         [[nodiscard]] PipelineScope scope() const noexcept { return scope_; }
+        [[nodiscard]] ArtifactRegistry* artifact_registry() const noexcept { return artifact_registry_; }
+        [[nodiscard]] const ArtifactScopeBridge* scope_bridge() const noexcept { return scope_bridge_; }
+        void set_artifact_runtime(ArtifactRegistry* artifact_registry,
+                                   const ArtifactScopeBridge* scope_bridge = nullptr) noexcept {
+            artifact_registry_ = artifact_registry;
+            scope_bridge_ = scope_bridge;
+        }
 
     private:
         void* user_data_{nullptr};
         PipelineScope scope_{PipelineScope::kEngine};
+        ArtifactRegistry* artifact_registry_{nullptr};
+        const ArtifactScopeBridge* scope_bridge_{nullptr};
+        const PipelinePlan* active_plan_{nullptr};
+
+        [[nodiscard]] foundation::Result begin_plan(const PipelinePlan& plan) noexcept;
+        void end_plan() noexcept;
+        [[nodiscard]] foundation::ResultValue<ArtifactView> read_artifact(
+            const PipelineNode& node,
+            ArtifactId id,
+            ArtifactTypeId expected_type,
+            uint32_t required_version) const;
+        [[nodiscard]] foundation::ResultValue<ArtifactWriter> write_artifact(
+            const PipelineNode& node,
+            ArtifactId id,
+            ArtifactTypeId expected_type,
+            uint32_t required_version);
+        [[nodiscard]] foundation::Result publish_artifact(
+            const PipelineNode& node,
+            ArtifactId id,
+            ArtifactPayload payload);
+
+        friend class PipelineScheduler;
+        friend class PipelineScopeHost;
+        friend class PipelineTaskContext;
     };
 
     /** @brief Per-task view passed to a TaskExecutionFunction. */
@@ -57,6 +351,16 @@ namespace aeg::pipeline {
         [[nodiscard]] PipelineExecutionContext& execution_context() const noexcept { return execution_context_; }
         [[nodiscard]] const PipelineNode& node() const noexcept { return node_; }
         [[nodiscard]] void* user_data() const noexcept { return node_.user_data; }
+        [[nodiscard]] foundation::ResultValue<ArtifactView> read_artifact(
+            ArtifactId id,
+            ArtifactTypeId expected_type = {},
+            uint32_t required_version = 0) const;
+        [[nodiscard]] foundation::ResultValue<ArtifactWriter> write_artifact(
+            ArtifactId id,
+            ArtifactTypeId expected_type = {},
+            uint32_t required_version = 0) const;
+        [[nodiscard]] foundation::Result publish_artifact(ArtifactId id,
+                                                           ArtifactPayload payload) const;
 
     private:
         PipelineExecutionContext& execution_context_;
@@ -93,6 +397,9 @@ namespace aeg::pipeline {
         [[nodiscard]] foundation::Result writes(PipelineStageHandle stage, const ArtifactBinding& binding);
         /** @brief Declares a read/write access for a stage. */
         [[nodiscard]] foundation::Result reads_writes(PipelineStageHandle stage, const ArtifactBinding& binding);
+        /** @brief Declares immutable snapshot publication for a stage. */
+        [[nodiscard]] foundation::Result publish_snapshot(PipelineStageHandle stage,
+                                                           const ArtifactBinding& binding);
         /** @brief Requires one stage to execute before another stage. */
         [[nodiscard]] foundation::Result runs_before(PipelineStageHandle stage, StageId other);
         /** @brief Requires one stage to execute after another stage. */
@@ -260,6 +567,8 @@ namespace aeg::pipeline {
         [[nodiscard]] foundation::Result reads(PipelineStageHandle stage, const ArtifactBinding& binding);
         [[nodiscard]] foundation::Result writes(PipelineStageHandle stage, const ArtifactBinding& binding);
         [[nodiscard]] foundation::Result reads_writes(PipelineStageHandle stage, const ArtifactBinding& binding);
+        [[nodiscard]] foundation::Result publish_snapshot(PipelineStageHandle stage,
+                                                           const ArtifactBinding& binding);
         [[nodiscard]] foundation::Result runs_before(PipelineStageHandle stage, StageId other);
         [[nodiscard]] foundation::Result runs_after(PipelineStageHandle stage, StageId other);
         [[nodiscard]] foundation::Result expose_artifact(ArtifactId artifact, PipelineScope target_scope);
@@ -537,8 +846,8 @@ namespace aeg::pipeline {
     public:
         explicit PipelineScopeHost(PipelineScope scope,
                                    PipelineInstanceId instance = {},
-                                   void* owner = nullptr) noexcept
-            : scope_(scope), instance_(instance), owner_(owner) {
+                                   void* owner = nullptr)
+            : scope_(scope), instance_(instance), owner_(owner), artifacts_(scope) {
         }
 
         PipelineScopeHost(const PipelineScopeHost&) = delete;
@@ -552,6 +861,8 @@ namespace aeg::pipeline {
         [[nodiscard]] PipelineId pipeline_id() const noexcept override { return pipeline_; }
         [[nodiscard]] void* owner() const noexcept override { return owner_; }
         [[nodiscard]] bool is_active() const noexcept { return active_; }
+        [[nodiscard]] ArtifactRegistry& artifacts() noexcept { return artifacts_; }
+        [[nodiscard]] const ArtifactRegistry& artifacts() const noexcept { return artifacts_; }
         [[nodiscard]] const PipelinePlan* active_plan() const noexcept {
             return active_plan_.has_value() ? &*active_plan_ : nullptr;
         }
@@ -559,6 +870,9 @@ namespace aeg::pipeline {
         [[nodiscard]] foundation::Result bind_pipeline(PipelineId pipeline);
         [[nodiscard]] foundation::Result rebuild(const PipelineRegistry& registry,
                                                   CapabilityMask available_capabilities = 0);
+        void set_scope_bridge(const ArtifactScopeBridge* scope_bridge) noexcept {
+            scope_bridge_ = scope_bridge;
+        }
         [[nodiscard]] foundation::Result activate(const PipelineActivationContext& context) override;
         [[nodiscard]] foundation::Result deactivate(const PipelineDeactivationContext& context) override;
         [[nodiscard]] foundation::Result execute(PipelineScheduler& scheduler,
@@ -569,6 +883,8 @@ namespace aeg::pipeline {
         PipelineInstanceId instance_{};
         void* owner_{nullptr};
         PipelineId pipeline_{};
+        mutable ArtifactRegistry artifacts_;
+        const ArtifactScopeBridge* scope_bridge_{nullptr};
         std::optional<PipelinePlan> active_plan_{};
         bool active_{false};
     };
@@ -632,6 +948,21 @@ namespace aeg::pipeline {
         return is_usable() ? context_->builder_->reads_writes(stage, binding)
                            : context_->reject(foundation::ResultCode::kInvalidState,
                                               "feature builder domain is not active");
+    }
+
+    template <FeatureDomain Domain>
+    foundation::Result DomainGraphBuilder<Domain>::publish_snapshot(
+        PipelineStageHandle stage,
+        const ArtifactBinding& binding) {
+        if (!is_usable()) {
+            return context_->reject(foundation::ResultCode::kInvalidState,
+                                    "feature builder domain is not active");
+        }
+        if (!context_->allows(FeaturePointFlags::kMayPublishSnapshot)) {
+            return context_->reject(foundation::ResultCode::kUnsupported,
+                                    "feature point does not allow snapshot publication");
+        }
+        return context_->builder_->publish_snapshot(stage, binding);
     }
 
     template <FeatureDomain Domain>

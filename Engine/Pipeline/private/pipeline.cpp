@@ -15,6 +15,7 @@
 #include <queue>
 #include <span>
 #include <string>
+#include <shared_mutex>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -41,7 +42,8 @@ namespace aeg::pipeline {
             static_cast<uint32_t>(FeaturePointFlags::kMayCreateComputePass) |
             static_cast<uint32_t>(FeaturePointFlags::kMayCreateCopyPass) |
             static_cast<uint32_t>(FeaturePointFlags::kMayUseDedicatedQueue) |
-            static_cast<uint32_t>(FeaturePointFlags::kMayWriteFinalOutput);
+            static_cast<uint32_t>(FeaturePointFlags::kMayWriteFinalOutput) |
+            static_cast<uint32_t>(FeaturePointFlags::kMayPublishSnapshot);
 
         std::string append_message(std::string prefix, const foundation::Result& result) {
             if (!result.message.empty()) {
@@ -80,6 +82,79 @@ namespace aeg::pipeline {
 
         [[nodiscard]] bool is_valid_engine_phase(EnginePhase phase) noexcept {
             return static_cast<uint8_t>(phase) <= static_cast<uint8_t>(EnginePhase::kShutdown);
+        }
+
+        [[nodiscard]] bool is_valid_artifact_storage(ArtifactStorage storage) noexcept {
+            return static_cast<uint8_t>(storage) <= static_cast<uint8_t>(ArtifactStorage::kCompletionToken);
+        }
+
+        [[nodiscard]] bool is_valid_artifact_lifetime(ArtifactLifetime lifetime) noexcept {
+            return static_cast<uint8_t>(lifetime) <= static_cast<uint8_t>(ArtifactLifetime::kEngine);
+        }
+
+        [[nodiscard]] bool is_valid_ownership_policy(OwnershipPolicy ownership) noexcept {
+            return static_cast<uint8_t>(ownership) <= static_cast<uint8_t>(OwnershipPolicy::kExternalBorrowed);
+        }
+
+        [[nodiscard]] bool is_valid_artifact_access(ArtifactAccess access) noexcept {
+            return static_cast<uint8_t>(access) <= static_cast<uint8_t>(ArtifactAccess::kPublishSnapshot);
+        }
+
+        [[nodiscard]] int scope_rank(PipelineScope scope) noexcept {
+            return static_cast<int>(scope);
+        }
+
+        [[nodiscard]] PipelineScopeMask lower_scope_mask(PipelineScope scope) noexcept {
+            return (1u << static_cast<uint8_t>(scope)) - 1u;
+        }
+
+        [[nodiscard]] bool can_scope_read(PipelineScope observer, PipelineScope owner) noexcept {
+            return scope_rank(observer) >= scope_rank(owner);
+        }
+
+        [[nodiscard]] bool descriptors_match(const ArtifactDescriptor& left,
+                                              const ArtifactDescriptor& right) noexcept {
+            return left.id == right.id && left.type == right.type &&
+                   left.owner_scope == right.owner_scope && left.storage == right.storage &&
+                   left.lifetime == right.lifetime && left.ownership == right.ownership &&
+                   left.version == right.version && left.visible_to == right.visible_to &&
+                   left.external_input == right.external_input;
+        }
+
+        [[nodiscard]] bool artifact_is_exposed(const PipelinePlan& plan,
+                                                ArtifactId artifact,
+                                                PipelineScope target_scope) noexcept {
+            return std::any_of(plan.exposures.begin(), plan.exposures.end(), [&](const auto& exposure) {
+                return exposure.artifact == artifact && exposure.target_scope == target_scope;
+            });
+        }
+
+        [[nodiscard]] bool artifact_is_visible(const PipelinePlan& plan,
+                                                const ArtifactDescriptor& artifact,
+                                                PipelineScope target_scope) noexcept {
+            return target_scope == artifact.owner_scope ||
+                   (artifact.visible_to & to_mask(target_scope)) != 0 ||
+                   artifact_is_exposed(plan, artifact.id, target_scope);
+        }
+
+        [[nodiscard]] const ArtifactDescriptor* find_plan_artifact(const PipelinePlan& plan,
+                                                                    ArtifactId id) noexcept {
+            for (const ArtifactDescriptor& artifact : plan.artifacts) {
+                if (artifact.id == id) {
+                    return &artifact;
+                }
+            }
+            return nullptr;
+        }
+
+        [[nodiscard]] const ArtifactBinding* find_node_binding(const PipelineNode& node,
+                                                               ArtifactId id) noexcept {
+            for (const ArtifactBinding& binding : node.artifact_bindings) {
+                if (binding.artifact == id) {
+                    return &binding;
+                }
+            }
+            return nullptr;
         }
 
         [[nodiscard]] bool is_writer(ArtifactAccess access) noexcept {
@@ -289,6 +364,723 @@ namespace aeg::pipeline {
         };
     }  // namespace
 
+    struct ArtifactRuntimeEntry final {
+        ArtifactDescriptor descriptor{};
+        mutable std::shared_mutex mutex;
+        std::shared_ptr<const void> owner{};
+        const void* data{nullptr};
+        std::size_t size{0};
+        std::size_t alignment{alignof(std::max_align_t)};
+        bool writable{false};
+        bool has_value{false};
+        ArtifactRevision revision{0};
+    };
+
+    struct ArtifactWriter::Impl final {
+        std::shared_ptr<ArtifactRuntimeEntry> entry{};
+        std::unique_lock<std::shared_mutex> lock{};
+        void* data{nullptr};
+        std::size_t size{0};
+        std::size_t alignment{0};
+        bool committed{false};
+    };
+
+    struct ArtifactRegistry::Impl final {
+        explicit Impl(PipelineScope registry_scope) noexcept : scope(registry_scope) {
+        }
+
+        PipelineScope scope{PipelineScope::kEngine};
+        mutable std::shared_mutex mutex;
+        std::unordered_map<ArtifactId,
+                           std::shared_ptr<ArtifactRuntimeEntry>,
+                           StableIdHash<ArtifactIdTag>>
+            entries{};
+    };
+
+    struct ArtifactScopeBridge::Impl final {
+        Impl(PipelineScope bridge_source_scope,
+             PipelineScope bridge_target_scope,
+             const ArtifactRegistry& bridge_source_registry) noexcept
+            : source_scope(bridge_source_scope),
+              target_scope(bridge_target_scope),
+              source_registry(&bridge_source_registry) {
+        }
+
+        PipelineScope source_scope{PipelineScope::kEngine};
+        PipelineScope target_scope{PipelineScope::kFrame};
+        const ArtifactRegistry* source_registry{nullptr};
+        mutable std::shared_mutex mutex;
+        std::vector<ArtifactId> exposed_artifacts{};
+        std::unordered_map<ArtifactId,
+                           ArtifactView,
+                           StableIdHash<ArtifactIdTag>>
+            snapshots{};
+    };
+
+    ArtifactWriter::ArtifactWriter(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {
+    }
+
+    ArtifactWriter::~ArtifactWriter() {
+        static_cast<void>(commit());
+    }
+
+    ArtifactWriter::ArtifactWriter(ArtifactWriter&& other) noexcept : impl_(std::move(other.impl_)) {
+    }
+
+    ArtifactWriter& ArtifactWriter::operator=(ArtifactWriter&& other) noexcept {
+        if (this != &other) {
+            static_cast<void>(commit());
+            impl_ = std::move(other.impl_);
+        }
+        return *this;
+    }
+
+    bool ArtifactWriter::is_valid() const noexcept {
+        return impl_ != nullptr && impl_->entry != nullptr && !impl_->committed &&
+               impl_->lock.owns_lock();
+    }
+
+    ArtifactId ArtifactWriter::id() const noexcept {
+        return impl_ == nullptr || impl_->entry == nullptr ? ArtifactId{} : impl_->entry->descriptor.id;
+    }
+
+    ArtifactTypeId ArtifactWriter::type() const noexcept {
+        return impl_ == nullptr || impl_->entry == nullptr ? ArtifactTypeId{} : impl_->entry->descriptor.type;
+    }
+
+    PipelineScope ArtifactWriter::owner_scope() const noexcept {
+        return impl_ == nullptr || impl_->entry == nullptr ? PipelineScope::kEngine
+                                                             : impl_->entry->descriptor.owner_scope;
+    }
+
+    ArtifactStorage ArtifactWriter::storage() const noexcept {
+        return impl_ == nullptr || impl_->entry == nullptr ? ArtifactStorage::kValue
+                                                             : impl_->entry->descriptor.storage;
+    }
+
+    uint32_t ArtifactWriter::version() const noexcept {
+        return impl_ == nullptr || impl_->entry == nullptr ? 0 : impl_->entry->descriptor.version;
+    }
+
+    ArtifactRevision ArtifactWriter::revision() const noexcept {
+        return impl_ == nullptr || impl_->entry == nullptr ? 0 : impl_->entry->revision;
+    }
+
+    void* ArtifactWriter::data() const noexcept {
+        return is_valid() ? impl_->data : nullptr;
+    }
+
+    std::size_t ArtifactWriter::size() const noexcept {
+        return impl_ == nullptr ? 0 : impl_->size;
+    }
+
+    std::size_t ArtifactWriter::alignment() const noexcept {
+        return impl_ == nullptr ? 0 : impl_->alignment;
+    }
+
+    foundation::Result ArtifactWriter::commit() {
+        if (impl_ == nullptr) {
+            return invalid_state("artifact writer is not initialized");
+        }
+        if (impl_->committed) {
+            return invalid_state("artifact writer has already been committed");
+        }
+        if (!impl_->lock.owns_lock() || impl_->entry == nullptr) {
+            return invalid_state("artifact writer lease is not held");
+        }
+
+        ++impl_->entry->revision;
+        impl_->committed = true;
+        impl_->lock.unlock();
+        return foundation::Result::success();
+    }
+
+    ArtifactRegistry::ArtifactRegistry(PipelineScope scope)
+        : impl_(std::make_unique<Impl>(scope)) {
+    }
+
+    ArtifactRegistry::~ArtifactRegistry() = default;
+
+    PipelineScope ArtifactRegistry::scope() const noexcept {
+        return impl_ == nullptr ? PipelineScope::kEngine : impl_->scope;
+    }
+
+    bool ArtifactRegistry::contains(ArtifactId id) const noexcept {
+        if (impl_ == nullptr || !id.is_valid()) {
+            return false;
+        }
+        std::shared_lock lock(impl_->mutex);
+        return impl_->entries.find(id) != impl_->entries.end();
+    }
+
+    foundation::Result ArtifactRegistry::install_contract(const ArtifactDescriptor& descriptor) {
+        if (impl_ == nullptr) {
+            return invalid_state("artifact registry is not initialized");
+        }
+        if (!descriptor.id.is_valid() || !descriptor.type.is_valid()) {
+            return invalid_argument("artifact id or type is invalid");
+        }
+        if (descriptor.version == 0) {
+            return invalid_argument("artifact version must be non-zero");
+        }
+        if (!is_valid_scope(descriptor.owner_scope) ||
+            !is_valid_artifact_storage(descriptor.storage) ||
+            !is_valid_artifact_lifetime(descriptor.lifetime) ||
+            !is_valid_ownership_policy(descriptor.ownership)) {
+            return invalid_argument("artifact contract contains an invalid enum value");
+        }
+        if ((descriptor.visible_to & ~kAllPipelineScopes) != 0) {
+            return invalid_argument("artifact visibility mask is invalid");
+        }
+        if ((descriptor.visible_to & lower_scope_mask(descriptor.owner_scope)) != 0) {
+            return invalid_argument("artifact visibility cannot include a lower pipeline scope");
+        }
+        if (!is_valid_scope(descriptor.owner_scope)) {
+            return invalid_argument("artifact owner scope is invalid");
+        }
+
+        std::unique_lock lock(impl_->mutex);
+        const auto iterator = impl_->entries.find(descriptor.id);
+        if (iterator != impl_->entries.end()) {
+            if (!descriptors_match(iterator->second->descriptor, descriptor)) {
+                return invalid_state("artifact contract conflicts with an installed contract");
+            }
+            return foundation::Result::success();
+        }
+
+        auto entry = std::make_shared<ArtifactRuntimeEntry>();
+        entry->descriptor = descriptor;
+        impl_->entries.emplace(descriptor.id, std::move(entry));
+        return foundation::Result::success();
+    }
+
+    foundation::Result ArtifactRegistry::install_plan(const PipelinePlan& plan) {
+        if (impl_ == nullptr) {
+            return invalid_state("artifact registry is not initialized");
+        }
+        if (plan.revision == 0 || !plan.pipeline.is_valid()) {
+            return invalid_argument("pipeline plan is invalid");
+        }
+        if (plan.scope != impl_->scope) {
+            return invalid_state("artifact registry scope does not match pipeline plan scope");
+        }
+        for (const ArtifactDescriptor& descriptor : plan.artifacts) {
+            if (!descriptor.id.is_valid() || !descriptor.type.is_valid() || descriptor.version == 0 ||
+                !is_valid_scope(descriptor.owner_scope) || !is_valid_artifact_storage(descriptor.storage) ||
+                !is_valid_artifact_lifetime(descriptor.lifetime) ||
+                !is_valid_ownership_policy(descriptor.ownership) ||
+                (descriptor.visible_to & ~kAllPipelineScopes) != 0 ||
+                (descriptor.visible_to & lower_scope_mask(descriptor.owner_scope)) != 0) {
+                return invalid_argument("pipeline plan contains an invalid artifact contract");
+            }
+        }
+        for (const PipelineExposureRecord& exposure : plan.exposures) {
+            const ArtifactDescriptor* artifact = find_plan_artifact(plan, exposure.artifact);
+            if (artifact == nullptr || !is_valid_scope(exposure.target_scope) ||
+                !can_scope_read(exposure.target_scope, artifact->owner_scope) ||
+                exposure.target_scope == artifact->owner_scope) {
+                return invalid_argument("pipeline plan contains an invalid artifact exposure");
+            }
+        }
+
+        std::unique_lock lock(impl_->mutex);
+        for (const ArtifactDescriptor& descriptor : plan.artifacts) {
+            const auto iterator = impl_->entries.find(descriptor.id);
+            if (iterator != impl_->entries.end() &&
+                !descriptors_match(iterator->second->descriptor, descriptor)) {
+                return invalid_state("pipeline plan artifact conflicts with an installed contract");
+            }
+        }
+        for (const ArtifactDescriptor& descriptor : plan.artifacts) {
+            if (impl_->entries.find(descriptor.id) != impl_->entries.end()) {
+                continue;
+            }
+            auto entry = std::make_shared<ArtifactRuntimeEntry>();
+            entry->descriptor = descriptor;
+            impl_->entries.emplace(descriptor.id, std::move(entry));
+        }
+        return foundation::Result::success();
+    }
+
+    foundation::Result ArtifactRegistry::unregister_artifact(ArtifactId id) {
+        if (impl_ == nullptr) {
+            return invalid_state("artifact registry is not initialized");
+        }
+        if (!id.is_valid()) {
+            return invalid_argument("artifact id is invalid");
+        }
+        std::unique_lock lock(impl_->mutex);
+        const auto iterator = impl_->entries.find(id);
+        if (iterator == impl_->entries.end()) {
+            return not_found("artifact contract is not installed");
+        }
+        if (iterator->second.use_count() > 1) {
+            return invalid_state("artifact is still referenced by a runtime lease");
+        }
+        impl_->entries.erase(iterator);
+        return foundation::Result::success();
+    }
+
+    foundation::ResultValue<ArtifactDescriptor> ArtifactRegistry::find_descriptor(ArtifactId id) const {
+        if (impl_ == nullptr) {
+            return {invalid_state("artifact registry is not initialized"), {}};
+        }
+        if (!id.is_valid()) {
+            return {invalid_argument("artifact id is invalid"), {}};
+        }
+        std::shared_lock lock(impl_->mutex);
+        const auto iterator = impl_->entries.find(id);
+        if (iterator == impl_->entries.end()) {
+            return {not_found("artifact contract is not installed"), {}};
+        }
+        return {foundation::Result::success(), iterator->second->descriptor};
+    }
+
+    foundation::ResultValue<ArtifactView> ArtifactRegistry::read(ArtifactId id,
+                                                                   ArtifactTypeId expected_type,
+                                                                   uint32_t required_version) const {
+        if (impl_ == nullptr) {
+            return {invalid_state("artifact registry is not initialized"), {}};
+        }
+        if (!id.is_valid()) {
+            return {invalid_argument("artifact id is invalid"), {}};
+        }
+
+        std::shared_ptr<ArtifactRuntimeEntry> entry;
+        {
+            std::shared_lock registry_lock(impl_->mutex);
+            const auto iterator = impl_->entries.find(id);
+            if (iterator == impl_->entries.end()) {
+                return {not_found("artifact contract is not installed"), {}};
+            }
+            entry = iterator->second;
+        }
+
+        std::shared_lock lock(entry->mutex);
+        if (expected_type.is_valid() && expected_type != entry->descriptor.type) {
+            return {invalid_argument("artifact type does not match its contract"), {}};
+        }
+        if (required_version != 0 && required_version != entry->descriptor.version) {
+            return {invalid_argument("artifact version does not match its contract"), {}};
+        }
+        if (!entry->has_value) {
+            return {foundation::Result::failure(foundation::ResultCode::kNotReady,
+                                                 "artifact has no published runtime value"),
+                    {}};
+        }
+        return {foundation::Result::success(),
+                ArtifactView(entry->descriptor.id,
+                             entry->descriptor.type,
+                             entry->descriptor.owner_scope,
+                             entry->descriptor.storage,
+                             entry->descriptor.version,
+                             entry->revision,
+                             entry->data,
+                             entry->size,
+                             entry->alignment,
+                             entry->owner)};
+    }
+
+    foundation::ResultValue<ArtifactWriter> ArtifactRegistry::write(ArtifactId id,
+                                                                      ArtifactTypeId expected_type,
+                                                                      uint32_t required_version) {
+        if (impl_ == nullptr) {
+            return {invalid_state("artifact registry is not initialized"), {}};
+        }
+        if (!id.is_valid()) {
+            return {invalid_argument("artifact id is invalid"), {}};
+        }
+
+        std::shared_ptr<ArtifactRuntimeEntry> entry;
+        {
+            std::shared_lock registry_lock(impl_->mutex);
+            const auto iterator = impl_->entries.find(id);
+            if (iterator == impl_->entries.end()) {
+                return {not_found("artifact contract is not installed"), {}};
+            }
+            entry = iterator->second;
+        }
+
+        if (entry->descriptor.owner_scope != impl_->scope) {
+            return {unsupported("only the artifact owner scope may write the artifact"), {}};
+        }
+        if (entry->descriptor.storage == ArtifactStorage::kImmutableSnapshot ||
+            entry->descriptor.ownership == OwnershipPolicy::kSharedImmutable) {
+            return {unsupported("immutable artifact cannot be written through a writer lease"), {}};
+        }
+
+        std::unique_lock lock(entry->mutex);
+        if (expected_type.is_valid() && expected_type != entry->descriptor.type) {
+            return {invalid_argument("artifact type does not match its contract"), {}};
+        }
+        if (required_version != 0 && required_version != entry->descriptor.version) {
+            return {invalid_argument("artifact version does not match its contract"), {}};
+        }
+        if (!entry->has_value) {
+            return {foundation::Result::failure(foundation::ResultCode::kNotReady,
+                                                 "artifact has no writable runtime value"),
+                    {}};
+        }
+        if (!entry->writable) {
+            return {unsupported("artifact payload is immutable"), {}};
+        }
+
+        auto writer = std::make_unique<ArtifactWriter::Impl>();
+        writer->entry = std::move(entry);
+        writer->lock = std::move(lock);
+        writer->data = const_cast<void*>(writer->entry->data);
+        writer->size = writer->entry->size;
+        writer->alignment = writer->entry->alignment;
+        return {foundation::Result::success(), ArtifactWriter(std::move(writer))};
+    }
+
+    foundation::Result ArtifactRegistry::publish(ArtifactId id, ArtifactPayload payload) {
+        if (impl_ == nullptr) {
+            return invalid_state("artifact registry is not initialized");
+        }
+        if (!id.is_valid()) {
+            return invalid_argument("artifact id is invalid");
+        }
+        if (!payload.type.is_valid()) {
+            return invalid_argument("artifact payload type is invalid");
+        }
+        if (payload.size != 0 && payload.data == nullptr) {
+            return invalid_argument("artifact payload data is null");
+        }
+        if (payload.alignment == 0) {
+            return invalid_argument("artifact payload alignment is zero");
+        }
+
+        std::shared_ptr<ArtifactRuntimeEntry> entry;
+        {
+            std::shared_lock registry_lock(impl_->mutex);
+            const auto iterator = impl_->entries.find(id);
+            if (iterator == impl_->entries.end()) {
+                return not_found("artifact contract is not installed");
+            }
+            entry = iterator->second;
+        }
+        if (entry->descriptor.owner_scope != impl_->scope) {
+            return unsupported("only the artifact owner scope may publish the artifact");
+        }
+        if (payload.type != entry->descriptor.type) {
+            return invalid_argument("artifact payload type does not match its contract");
+        }
+        if ((entry->descriptor.storage == ArtifactStorage::kImmutableSnapshot ||
+             entry->descriptor.ownership == OwnershipPolicy::kSharedImmutable) &&
+            payload.writable) {
+            return unsupported("immutable artifact payload cannot be published as writable");
+        }
+
+        std::unique_lock lock(entry->mutex);
+        entry->owner = std::move(payload.owner);
+        entry->data = payload.data;
+        entry->size = payload.size;
+        entry->alignment = payload.alignment;
+        entry->writable = payload.writable;
+        entry->has_value = true;
+        ++entry->revision;
+        return foundation::Result::success();
+    }
+
+    foundation::Result ArtifactRegistry::release_lifetime(ArtifactLifetime lifetime) {
+        if (impl_ == nullptr) {
+            return invalid_state("artifact registry is not initialized");
+        }
+        if (!is_valid_artifact_lifetime(lifetime)) {
+            return invalid_argument("artifact lifetime is invalid");
+        }
+
+        std::vector<std::shared_ptr<ArtifactRuntimeEntry>> entries;
+        {
+            std::shared_lock registry_lock(impl_->mutex);
+            entries.reserve(impl_->entries.size());
+            for (const auto& [id, entry] : impl_->entries) {
+                static_cast<void>(id);
+                if (static_cast<uint8_t>(entry->descriptor.lifetime) <= static_cast<uint8_t>(lifetime)) {
+                    entries.push_back(entry);
+                }
+            }
+        }
+        for (const std::shared_ptr<ArtifactRuntimeEntry>& entry : entries) {
+            std::unique_lock lock(entry->mutex);
+            if (!entry->has_value) {
+                continue;
+            }
+            entry->owner.reset();
+            entry->data = nullptr;
+            entry->size = 0;
+            entry->alignment = alignof(std::max_align_t);
+            entry->writable = false;
+            entry->has_value = false;
+            ++entry->revision;
+        }
+        return foundation::Result::success();
+    }
+
+    ArtifactScopeBridge::ArtifactScopeBridge(PipelineScope source_scope,
+                                             PipelineScope target_scope,
+                                             const ArtifactRegistry& source_registry)
+        : impl_(std::make_unique<Impl>(source_scope, target_scope, source_registry)) {
+    }
+
+    ArtifactScopeBridge::~ArtifactScopeBridge() = default;
+
+    PipelineScope ArtifactScopeBridge::source_scope() const noexcept {
+        return impl_ == nullptr ? PipelineScope::kEngine : impl_->source_scope;
+    }
+
+    PipelineScope ArtifactScopeBridge::target_scope() const noexcept {
+        return impl_ == nullptr ? PipelineScope::kFrame : impl_->target_scope;
+    }
+
+    foundation::Result ArtifactScopeBridge::expose(ArtifactId id) {
+        if (impl_ == nullptr || impl_->source_registry == nullptr) {
+            return invalid_state("artifact scope bridge is not initialized");
+        }
+        if (!is_valid_scope(impl_->source_scope) || !is_valid_scope(impl_->target_scope) ||
+            impl_->source_registry->scope() != impl_->source_scope ||
+            !can_scope_read(impl_->target_scope, impl_->source_scope) ||
+            impl_->target_scope == impl_->source_scope) {
+            return invalid_argument("artifact scope bridge direction is invalid");
+        }
+
+        const foundation::ResultValue<ArtifactDescriptor> descriptor =
+            impl_->source_registry->find_descriptor(id);
+        if (!descriptor) {
+            return descriptor.result;
+        }
+        if (descriptor.value.owner_scope != impl_->source_scope) {
+            return unsupported("scope bridge can only expose source-owned artifacts");
+        }
+        if (descriptor.value.storage != ArtifactStorage::kImmutableSnapshot) {
+            return unsupported("scope bridge requires immutable snapshot artifacts");
+        }
+
+        std::unique_lock lock(impl_->mutex);
+        if (std::find(impl_->exposed_artifacts.begin(), impl_->exposed_artifacts.end(), id) ==
+            impl_->exposed_artifacts.end()) {
+            impl_->exposed_artifacts.push_back(id);
+        }
+        return foundation::Result::success();
+    }
+
+    foundation::Result ArtifactScopeBridge::capture() {
+        if (impl_ == nullptr || impl_->source_registry == nullptr) {
+            return invalid_state("artifact scope bridge is not initialized");
+        }
+
+        std::vector<ArtifactId> exposed_artifacts;
+        {
+            std::shared_lock lock(impl_->mutex);
+            exposed_artifacts = impl_->exposed_artifacts;
+        }
+
+        std::unordered_map<ArtifactId, ArtifactView, StableIdHash<ArtifactIdTag>> snapshots;
+        snapshots.reserve(exposed_artifacts.size());
+        for (const ArtifactId id : exposed_artifacts) {
+            const foundation::ResultValue<ArtifactView> value = impl_->source_registry->read(id);
+            if (!value) {
+                return foundation::Result::failure(
+                    value.result.code,
+                    append_message("scope bridge snapshot capture failed", value.result));
+            }
+            if (value.value.owner_scope() != impl_->source_scope ||
+                value.value.storage() != ArtifactStorage::kImmutableSnapshot) {
+                return unsupported("scope bridge captured a non-source immutable artifact");
+            }
+            snapshots.emplace(id, value.value);
+        }
+
+        {
+            std::unique_lock lock(impl_->mutex);
+            impl_->snapshots = std::move(snapshots);
+        }
+        return foundation::Result::success();
+    }
+
+    foundation::ResultValue<ArtifactView> ArtifactScopeBridge::read(ArtifactId id,
+                                                                      ArtifactTypeId expected_type,
+                                                                      uint32_t required_version) const {
+        if (impl_ == nullptr) {
+            return {invalid_state("artifact scope bridge is not initialized"), {}};
+        }
+        if (!id.is_valid()) {
+            return {invalid_argument("artifact id is invalid"), {}};
+        }
+
+        std::shared_lock lock(impl_->mutex);
+        const auto iterator = impl_->snapshots.find(id);
+        if (iterator == impl_->snapshots.end()) {
+            return {foundation::Result::failure(foundation::ResultCode::kNotReady,
+                                                 "scope bridge has no captured value for the artifact"),
+                    {}};
+        }
+        const ArtifactView& value = iterator->second;
+        if (expected_type.is_valid() && expected_type != value.type()) {
+            return {invalid_argument("bridged artifact type does not match its contract"), {}};
+        }
+        if (required_version != 0 && required_version != value.version()) {
+            return {invalid_argument("bridged artifact version does not match its contract"), {}};
+        }
+        return {foundation::Result::success(), value};
+    }
+
+    foundation::Result PipelineExecutionContext::begin_plan(const PipelinePlan& plan) noexcept {
+        if (active_plan_ != nullptr) {
+            return invalid_state("pipeline execution context is already executing a plan");
+        }
+        if (plan.revision == 0 || !plan.pipeline.is_valid()) {
+            return invalid_state("pipeline plan is invalid");
+        }
+        if (plan.scope != scope_) {
+            return invalid_state("pipeline plan scope does not match execution context scope");
+        }
+        active_plan_ = &plan;
+        return foundation::Result::success();
+    }
+
+    void PipelineExecutionContext::end_plan() noexcept {
+        active_plan_ = nullptr;
+    }
+
+    foundation::ResultValue<ArtifactView> PipelineExecutionContext::read_artifact(
+        const PipelineNode& node,
+        ArtifactId id,
+        ArtifactTypeId expected_type,
+        uint32_t required_version) const {
+        if (active_plan_ == nullptr) {
+            return {invalid_state("artifact access is outside pipeline execution"), {}};
+        }
+        const ArtifactDescriptor* artifact = find_plan_artifact(*active_plan_, id);
+        if (artifact == nullptr) {
+            return {not_found("task references an undeclared artifact"), {}};
+        }
+        const ArtifactBinding* binding = find_node_binding(node, id);
+        if (binding == nullptr || !is_reader(binding->access)) {
+            return {unsupported("task has no declared read access to the artifact"), {}};
+        }
+        if (!can_scope_read(scope_, artifact->owner_scope) ||
+            !artifact_is_visible(*active_plan_, *artifact, scope_)) {
+            return {unsupported("artifact is not visible from the execution scope"), {}};
+        }
+        if (expected_type.is_valid() && expected_type != artifact->type) {
+            return {invalid_argument("artifact type does not match its contract"), {}};
+        }
+        if (required_version == 0) {
+            required_version = binding->required_version;
+        }
+        if (required_version != artifact->version) {
+            return {invalid_argument("artifact version does not match its contract"), {}};
+        }
+        if (!expected_type.is_valid()) {
+            expected_type = artifact->type;
+        }
+
+        if (artifact_registry_ != nullptr) {
+            const foundation::ResultValue<ArtifactView> value =
+                artifact_registry_->read(id, expected_type, required_version);
+            if (value || (value.result.code != foundation::ResultCode::kNotFound &&
+                          value.result.code != foundation::ResultCode::kNotReady)) {
+                return value;
+            }
+        }
+        if (scope_bridge_ != nullptr) {
+            if (scope_bridge_->target_scope() != scope_ ||
+                scope_bridge_->source_scope() != artifact->owner_scope) {
+                return {invalid_state("artifact scope bridge does not match the artifact contract"), {}};
+            }
+            return scope_bridge_->read(id, expected_type, required_version);
+        }
+        return {foundation::Result::failure(foundation::ResultCode::kNotReady,
+                                             "artifact has no runtime value or scope bridge"),
+                {}};
+    }
+
+    foundation::ResultValue<ArtifactWriter> PipelineExecutionContext::write_artifact(
+        const PipelineNode& node,
+        ArtifactId id,
+        ArtifactTypeId expected_type,
+        uint32_t required_version) {
+        if (active_plan_ == nullptr) {
+            return {invalid_state("artifact access is outside pipeline execution"), {}};
+        }
+        const ArtifactDescriptor* artifact = find_plan_artifact(*active_plan_, id);
+        if (artifact == nullptr) {
+            return {not_found("task references an undeclared artifact"), {}};
+        }
+        const ArtifactBinding* binding = find_node_binding(node, id);
+        if (binding == nullptr || !is_writer(binding->access)) {
+            return {unsupported("task has no declared write access to the artifact"), {}};
+        }
+        if (artifact->owner_scope != scope_) {
+            return {unsupported("only the artifact owner scope may write the artifact"), {}};
+        }
+        if (expected_type.is_valid() && expected_type != artifact->type) {
+            return {invalid_argument("artifact type does not match its contract"), {}};
+        }
+        if (required_version == 0) {
+            required_version = binding->required_version;
+        }
+        if (required_version != artifact->version) {
+            return {invalid_argument("artifact version does not match its contract"), {}};
+        }
+        if (artifact->storage == ArtifactStorage::kImmutableSnapshot ||
+            artifact->ownership == OwnershipPolicy::kSharedImmutable) {
+            return {unsupported("immutable artifact cannot be written through a writer lease"), {}};
+        }
+        if (artifact_registry_ == nullptr) {
+            return {invalid_state("pipeline execution has no artifact registry"), {}};
+        }
+        return artifact_registry_->write(id, expected_type.is_valid() ? expected_type : artifact->type,
+                                         required_version);
+    }
+
+    foundation::Result PipelineExecutionContext::publish_artifact(const PipelineNode& node,
+                                                                    ArtifactId id,
+                                                                    ArtifactPayload payload) {
+        if (active_plan_ == nullptr) {
+            return invalid_state("artifact access is outside pipeline execution");
+        }
+        const ArtifactDescriptor* artifact = find_plan_artifact(*active_plan_, id);
+        if (artifact == nullptr) {
+            return not_found("task references an undeclared artifact");
+        }
+        const ArtifactBinding* binding = find_node_binding(node, id);
+        if (binding == nullptr || binding->access != ArtifactAccess::kPublishSnapshot) {
+            return unsupported("task has no declared snapshot publication access to the artifact");
+        }
+        if (artifact->storage != ArtifactStorage::kImmutableSnapshot) {
+            return unsupported("snapshot publication requires immutable snapshot storage");
+        }
+        if (artifact->owner_scope != scope_) {
+            return unsupported("only the artifact owner scope may publish the artifact");
+        }
+        if (artifact_registry_ == nullptr) {
+            return invalid_state("pipeline execution has no artifact registry");
+        }
+        return artifact_registry_->publish(id, std::move(payload));
+    }
+
+    foundation::ResultValue<ArtifactView> PipelineTaskContext::read_artifact(
+        ArtifactId id,
+        ArtifactTypeId expected_type,
+        uint32_t required_version) const {
+        return execution_context_.read_artifact(node_, id, expected_type, required_version);
+    }
+
+    foundation::ResultValue<ArtifactWriter> PipelineTaskContext::write_artifact(
+        ArtifactId id,
+        ArtifactTypeId expected_type,
+        uint32_t required_version) const {
+        return execution_context_.write_artifact(node_, id, expected_type, required_version);
+    }
+
+    foundation::Result PipelineTaskContext::publish_artifact(ArtifactId id,
+                                                               ArtifactPayload payload) const {
+        return execution_context_.publish_artifact(node_, id, std::move(payload));
+    }
+
     PipelineBuilder::PipelineBuilder(const PipelineDescriptor& descriptor) : descriptor_(descriptor) {
     }
 
@@ -429,8 +1221,20 @@ namespace aeg::pipeline {
             set_failure(foundation::ResultCode::kInvalidArgument, "artifact owner scope is invalid");
             return {};
         }
+        if (!is_valid_artifact_storage(descriptor.storage) ||
+            !is_valid_artifact_lifetime(descriptor.lifetime) ||
+            !is_valid_ownership_policy(descriptor.ownership)) {
+            set_failure(foundation::ResultCode::kInvalidArgument,
+                        "artifact storage, lifetime, or ownership policy is invalid");
+            return {};
+        }
         if ((descriptor.visible_to & ~kAllPipelineScopes) != 0) {
             set_failure(foundation::ResultCode::kInvalidArgument, "artifact visibility contains unknown scopes");
+            return {};
+        }
+        if ((descriptor.visible_to & ((1u << static_cast<uint8_t>(descriptor.owner_scope)) - 1u)) != 0) {
+            set_failure(foundation::ResultCode::kInvalidArgument,
+                        "artifact visibility cannot include a lower pipeline scope");
             return {};
         }
         if (find_artifact(descriptor.id) != kInvalidPipelineHandleIndex) {
@@ -675,6 +1479,11 @@ namespace aeg::pipeline {
         return add_binding(stage, binding, ArtifactAccess::kReadWrite);
     }
 
+    foundation::Result PipelineBuilder::publish_snapshot(PipelineStageHandle stage,
+                                                          const ArtifactBinding& binding) {
+        return add_binding(stage, binding, ArtifactAccess::kPublishSnapshot);
+    }
+
     foundation::Result PipelineBuilder::runs_before(PipelineStageHandle stage, StageId other) {
         if (!status_) {
             return status_;
@@ -717,6 +1526,13 @@ namespace aeg::pipeline {
         }
         if (!is_valid_scope(target_scope)) {
             set_failure(foundation::ResultCode::kInvalidArgument, "exposure target scope is invalid");
+            return status_;
+        }
+        const ArtifactDescriptor& descriptor = artifacts_[find_artifact(artifact)].descriptor;
+        if (!can_scope_read(target_scope, descriptor.owner_scope) ||
+            target_scope == descriptor.owner_scope) {
+            set_failure(foundation::ResultCode::kInvalidArgument,
+                        "artifact exposure must point to a higher pipeline scope");
             return status_;
         }
         for (const PipelineExposureRecord& existing : exposures_) {
@@ -776,6 +1592,39 @@ namespace aeg::pipeline {
                 find_feature_point(binding.descriptor.point) == kInvalidPipelineHandleIndex ||
                 !binding.descriptor.instance.is_valid()) {
                 return {invalid_state("feature binding contains an invalid reference"), {}};
+            }
+        }
+        for (const PipelineArtifactRecord& artifact : artifacts_) {
+            const ArtifactDescriptor& descriptor = artifact.descriptor;
+            if (descriptor.visible_to != 0 &&
+                (descriptor.visible_to & ((1u << static_cast<uint8_t>(descriptor.owner_scope)) - 1u)) != 0) {
+                return {invalid_argument("artifact visibility includes a lower pipeline scope"), {}};
+            }
+        }
+        for (const PipelineBindingRecord& binding : bindings_) {
+            if (binding.stage_index >= stages_.size()) {
+                return {invalid_state("artifact binding references an invalid stage"), {}};
+            }
+            const uint32_t artifact_index = find_artifact(binding.binding.artifact);
+            if (artifact_index == kInvalidPipelineHandleIndex ||
+                !is_valid_artifact_access(binding.binding.access)) {
+                return {invalid_state("artifact binding contains an invalid artifact reference"), {}};
+            }
+            const ArtifactDescriptor& descriptor = artifacts_[artifact_index].descriptor;
+            if (binding.binding.access == ArtifactAccess::kPublishSnapshot &&
+                descriptor.storage != ArtifactStorage::kImmutableSnapshot) {
+                return {invalid_argument("publish-snapshot access requires immutable snapshot storage"), {}};
+            }
+        }
+        for (const PipelineExposureRecord& exposure : exposures_) {
+            const uint32_t artifact_index = find_artifact(exposure.artifact);
+            if (artifact_index == kInvalidPipelineHandleIndex || !is_valid_scope(exposure.target_scope)) {
+                return {invalid_state("artifact exposure contains an invalid reference"), {}};
+            }
+            const ArtifactDescriptor& descriptor = artifacts_[artifact_index].descriptor;
+            if (!can_scope_read(exposure.target_scope, descriptor.owner_scope) ||
+                exposure.target_scope == descriptor.owner_scope) {
+                return {invalid_argument("artifact exposure must point to a higher pipeline scope"), {}};
             }
         }
 
@@ -1469,6 +2318,45 @@ namespace aeg::pipeline {
         }
         const PipelineDefinition& definition = expanded_definition.value;
 
+        const auto definition_artifact_exposed_to = [&](ArtifactId artifact,
+                                                         PipelineScope target_scope) {
+            return std::any_of(definition.exposures.begin(), definition.exposures.end(),
+                               [&](const PipelineExposureRecord& exposure) {
+                                   return exposure.artifact == artifact &&
+                                          exposure.target_scope == target_scope;
+                               });
+        };
+        for (const PipelineBindingRecord& binding : definition.bindings) {
+            const ArtifactDescriptor* artifact = nullptr;
+            for (const PipelineArtifactRecord& candidate : definition.artifacts) {
+                if (candidate.descriptor.id == binding.binding.artifact) {
+                    artifact = &candidate.descriptor;
+                    break;
+                }
+            }
+            if (artifact == nullptr) {
+                return {not_found("pipeline binding references an undeclared artifact"), {}};
+            }
+            if (!can_scope_read(input.scope, artifact->owner_scope)) {
+                return {unsupported("pipeline scope cannot read an artifact owned by a higher scope"), {}};
+            }
+            if (is_writer(binding.binding.access) && artifact->owner_scope != input.scope) {
+                return {unsupported("only the artifact owner scope may declare a write access"), {}};
+            }
+            if (is_reader(binding.binding.access) && input.scope != artifact->owner_scope &&
+                (artifact->visible_to & to_mask(input.scope)) == 0 &&
+                !definition_artifact_exposed_to(artifact->id, input.scope)) {
+                return {unsupported("artifact is not exposed to the requested pipeline scope"), {}};
+            }
+            if (binding.binding.required_version != artifact->version) {
+                return {invalid_argument("pipeline binding version does not match the artifact contract"), {}};
+            }
+            if (binding.binding.access == ArtifactAccess::kPublishSnapshot &&
+                artifact->storage != ArtifactStorage::kImmutableSnapshot) {
+                return {invalid_argument("publish-snapshot access requires immutable snapshot storage"), {}};
+            }
+        }
+
         PipelinePlan plan;
         plan.pipeline = definition.descriptor.id;
         plan.instance = input.instance;
@@ -1477,6 +2365,11 @@ namespace aeg::pipeline {
         plan.definition_owner = std::shared_ptr<const void>(registration.value.implementation);
         plan.feature_contributions = std::move(feature_contributions);
         plan.feature_owners = std::move(feature_owners);
+        plan.artifacts.reserve(definition.artifacts.size());
+        for (const PipelineArtifactRecord& artifact : definition.artifacts) {
+            plan.artifacts.push_back(artifact.descriptor);
+        }
+        plan.exposures = definition.exposures;
 
         std::vector<uint32_t> stage_order(definition.stages.size());
         std::iota(stage_order.begin(), stage_order.end(), 0);
@@ -1485,6 +2378,13 @@ namespace aeg::pipeline {
         });
 
         std::vector<std::vector<uint32_t>> stage_nodes(definition.stages.size());
+        std::vector<std::vector<ArtifactBinding>> stage_bindings(definition.stages.size());
+        for (const PipelineBindingRecord& binding : definition.bindings) {
+            if (binding.stage_index >= stage_bindings.size()) {
+                return {invalid_state("pipeline binding references an invalid stage"), {}};
+            }
+            stage_bindings[binding.stage_index].push_back(binding.binding);
+        }
         for (const uint32_t original_stage_index : stage_order) {
             const StageDescriptor& stage = definition.stages[original_stage_index].descriptor;
             std::vector<uint32_t> task_order;
@@ -1510,6 +2410,7 @@ namespace aeg::pipeline {
                     nullptr,
                     true,
                     stage.parallelizable,
+                    stage_bindings[original_stage_index],
                 });
                 continue;
             }
@@ -1528,6 +2429,7 @@ namespace aeg::pipeline {
                     task.user_data,
                     false,
                     stage.parallelizable,
+                    stage_bindings[original_stage_index],
                 });
             }
         }
@@ -1791,6 +2693,17 @@ namespace aeg::pipeline {
         }
 
         std::lock_guard execute_lock(impl_->execute_mutex);
+        if (const foundation::Result result = context.begin_plan(plan); !result) {
+            return result;
+        }
+        struct PlanExecutionGuard final {
+            PipelineExecutionContext& context;
+
+            ~PlanExecutionGuard() {
+                context.end_plan();
+            }
+        } plan_guard{context};
+
         for (const PipelineExecutionBatch& batch : plan.batches) {
             std::vector<uint32_t> cpu_worker_nodes;
             std::vector<uint32_t> main_thread_nodes;
@@ -1867,6 +2780,9 @@ namespace aeg::pipeline {
         if (!compiled) {
             return compiled.result;
         }
+        if (const foundation::Result result = artifacts_.install_plan(compiled.value); !result) {
+            return result;
+        }
         active_plan_.emplace(std::move(compiled.value));
         return foundation::Result::success();
     }
@@ -1898,6 +2814,15 @@ namespace aeg::pipeline {
         if (context.scope() != scope_) {
             return invalid_state("pipeline execution context scope does not match the host scope");
         }
+        ArtifactRegistry* artifact_registry = context.artifact_registry();
+        const ArtifactScopeBridge* scope_bridge = context.scope_bridge();
+        if (artifact_registry == nullptr) {
+            artifact_registry = &artifacts_;
+        }
+        if (scope_bridge == nullptr) {
+            scope_bridge = scope_bridge_;
+        }
+        context.set_artifact_runtime(artifact_registry, scope_bridge);
         return scheduler.execute(*active_plan_, context);
     }
 }  // namespace aeg::pipeline
