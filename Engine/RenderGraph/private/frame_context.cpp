@@ -90,8 +90,27 @@ namespace aeg::render_graph {
                     (void) device_.destroy_buffer(chunk.buffer);
                 }
             }
+            slot.retained_owners.clear();
         }
         (void) device_.collect_garbage();
+    }
+
+    foundation::Result FrameContext::retain_until_complete(std::shared_ptr<const void> owner) {
+        if (!frame_active_) {
+            return foundation::Result::failure(foundation::ResultCode::kInvalidState,
+                                                "Cannot retain ownership without an active frame");
+        }
+        if (owner.use_count() == 0) {
+            return foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
+                                                "Frame retention requires shared ownership");
+        }
+        try {
+            slots_[current_slot_].retained_owners.push_back(std::move(owner));
+        } catch (const std::bad_alloc&) {
+            return foundation::Result::failure(foundation::ResultCode::kOutOfMemory,
+                                                "Frame ownership retention allocation failed");
+        }
+        return foundation::Result::success();
     }
 
     foundation::Result FrameContext::validate_desc() const noexcept {
@@ -237,6 +256,13 @@ namespace aeg::render_graph {
             }
         }
 
+        if (const foundation::Result result = reset_command_lists(slot); !result) {
+            return result;
+        }
+        if (const foundation::Result result = release_deferred(slot.deferred); !result) {
+            return result;
+        }
+        slot.retained_owners.clear();
         slots_[current_slot_].completions.clear();
         for (UploadChunk& chunk: slots_[current_slot_].upload_chunks) {
             chunk.offset = 0;
@@ -267,6 +293,7 @@ namespace aeg::render_graph {
         if (!release_result) {
             return release_result;
         }
+        slot.retained_owners.clear();
 
         for (UploadChunk& chunk: slot.upload_chunks) {
             chunk.offset = 0;

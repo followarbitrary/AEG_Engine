@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -103,6 +104,9 @@ namespace aeg::render_graph {
         /** @brief Aborts the active frame and releases its unsubmitted work. */
         [[nodiscard]] foundation::Result abort_frame();
 
+        /** @brief Retains shared ownership until the active slot is safely recycled. */
+        [[nodiscard]] foundation::Result retain_until_complete(std::shared_ptr<const void> owner);
+
         /** @brief Acquires the next swapchain image for the active frame. */
         [[nodiscard]] foundation::ResultValue<rhi::FrameAcquireResult> acquire_next_image(
             rhi::SwapchainHandle swapchain);
@@ -190,6 +194,7 @@ namespace aeg::render_graph {
             std::vector<UploadChunk> upload_chunks{};
             std::vector<UploadChunk> readback_chunks{};
             DeferredResources deferred{};
+            std::vector<std::shared_ptr<const void>> retained_owners{};
         };
 
         [[nodiscard]] foundation::Result validate_desc() const noexcept;

@@ -2506,13 +2506,13 @@ Registry change -> rebuild -> Pending Plan
 Old Active Plan -> Retired Plans -> collect_retired_plans
 ```
 
-| 状态或操作 | 当前行为 |
-|------------|----------|
-| 没有 Pending Plan | `apply_pending_plan()` 返回 `kNotReady`；execute 将此视为无待应用变更 |
-| 旧 Plan 仍有外部快照且新契约不兼容 | 拒绝切换，返回 `kInvalidState`，保留 Pending Plan |
-| Artifact 契约替换受活动 Writer 等约束阻止 | 返回错误，不将 Pending Plan 发布为 Active |
-| 成功切换 | 替换 Artifact 契约并更新计划引用，将旧计划放入退休列表 |
-| `collect_retired_plans()` | 仅尝试清理无外部 Plan 引用的退休项，同时调用 Artifact 退休逻辑 |
+| 状态或操作                                | 当前行为                                                              |
+|-------------------------------------------|-----------------------------------------------------------------------|
+| 没有 Pending Plan                         | `apply_pending_plan()` 返回 `kNotReady`；execute 将此视为无待应用变更 |
+| 旧 Plan 仍有外部快照且新契约不兼容        | 拒绝切换，返回 `kInvalidState`，保留 Pending Plan                     |
+| Artifact 契约替换受活动 Writer 等约束阻止 | 返回错误，不将 Pending Plan 发布为 Active                             |
+| 成功切换                                  | 替换 Artifact 契约并更新计划引用，将旧计划放入退休列表                |
+| `collect_retired_plans()`                 | 仅尝试清理无外部 Plan 引用的退休项，同时调用 Artifact 退休逻辑        |
 
 Plan 锁协调 Host 的计划切换与 CPU 执行，引用计数负责对象生命周期；两者均不表示 GPU
 完成。当前 Host 不轮询或等待 GPU Completion。调用方必须单独管理仍在执行的
@@ -2520,6 +2520,48 @@ RenderGraph、资源、模块代码和完成点，再释放相关持有者。`re
 通用 CPU/GPU 完成门控与动态库卸载管理仍属于架构约定。
 
 ### 20.2 卸载模块
+
+#### 帧槽关联的共享所有权
+
+当前 `FrameContext::retain_until_complete(std::shared_ptr<const void> owner)` 将共享对象
+登记到活跃帧槽。它可直接接收 `PipelinePlanHandle`，也可用于资源集合或模块生命周期
+对象，不引入 Pipeline 到 RHI 的反向依赖。调用方必须在相关提交之前登记并检查 Result：
+
+```cpp
+auto snapshot = host.active_plan_snapshot();
+if (!snapshot) {
+    return aeg::foundation::Result::failure(
+            aeg::foundation::ResultCode::kInvalidState, "No active pipeline plan");
+}
+if (auto result = frame.retain_until_complete(snapshot); !result) {
+    return result;
+}
+// Build and execute the graph using this same snapshot.
+```
+
+`frame` 必须已经成功 begin_frame。必须使用保活的同一个快照构图，不能在登记后重新获取
+可能已经切换的 Active Plan。帧槽持有的引用阻止旧 Plan 被 `collect_retired_plans()` 提前
+清理；槽位释放引用后，调用方仍需再次调用 collect 完成 Host 退休列表清理。
+
+| 场景            | 语义                                                                   |
+|-----------------|------------------------------------------------------------------------|
+| 无活跃帧        | 返回 `kInvalidState`，不登记对象                                       |
+| 没有共享控制块  | 返回 `kInvalidArgument`；具有控制块的空 alias 指针可正常保活           |
+| 登记分配失败    | 返回 `kOutOfMemory`；调用方不得继续提交依赖该对象的工作                |
+| `end_frame()`   | 不释放登记对象，也不等待 GPU                                           |
+| 帧槽复用        | 等待该槽全部已记录队列完成点，重置命令列表并处理延迟销毁后释放引用     |
+| `abort_frame()` | 等待已提交工作并清理命令和延迟资源后释放引用；中途失败则保留引用       |
+| 正常析构        | 在设备等待及资源清理之后释放剩余引用；设备必须比 FrameContext 存活更久 |
+
+登记采用追加容器，不进行逐项去重；重复登记会增加共享引用计数，但不会重复销毁对象。
+容器在槽位回收后保留容量，减少重复分配。该接口与其他 FrameContext 修改操作一样，必须
+由调用方串行使用，不提供并发登记保证。对象析构在回收调用线程执行，析构函数不得抛出
+异常或重入当前 FrameContext。
+
+本机制只覆盖经当前 FrameContext 提交并记录的工作，不覆盖直接调用 Device 提交、其他
+FrameContext 的工作或未纳入持有对象的裸指针。Plan 保活不自动保活 RenderGraph 对象、
+外部资源和 DLL；需要分别持有实际所有者。发生设备丢失时不能将析构路径解释为 GPU
+成功执行证明；调用方应按设备故障恢复策略处理。
 
 模块卸载前必须满足：
 
