@@ -136,6 +136,7 @@ namespace aeg::pipeline {
 
     using PipelineScopeMask = uint32_t;
     using FeatureDomainMask = uint32_t;
+    using FeaturePriority = int32_t;
 
     /** @brief Converts one pipeline scope into its mask representation. */
     [[nodiscard]] constexpr PipelineScopeMask to_mask(PipelineScope scope) noexcept {
@@ -156,6 +157,36 @@ namespace aeg::pipeline {
                                                             to_mask(FeatureDomain::kRender) |
                                                             to_mask(FeatureDomain::kAudio) |
                                                             to_mask(FeatureDomain::kStream);
+
+    /** @brief Position of a feature extension relative to its anchor stage. */
+    enum class FeaturePointPosition : uint8_t {
+        kBefore = 0,
+        kInside = 1,
+        kAfter = 2,
+    };
+
+    /** @brief Permissions granted by a pipeline feature point. */
+    enum class FeaturePointFlags : uint32_t {
+        kNone = 0,
+        kMayCreateArtifacts = 1u << 0,
+        kMayCreateGraphicsPass = 1u << 1,
+        kMayCreateComputePass = 1u << 2,
+        kMayCreateCopyPass = 1u << 3,
+        kMayUseDedicatedQueue = 1u << 4,
+        kMayWriteFinalOutput = 1u << 5,
+    };
+
+    constexpr FeaturePointFlags operator|(FeaturePointFlags left, FeaturePointFlags right) noexcept {
+        return static_cast<FeaturePointFlags>(static_cast<uint32_t>(left) | static_cast<uint32_t>(right));
+    }
+
+    constexpr FeaturePointFlags operator&(FeaturePointFlags left, FeaturePointFlags right) noexcept {
+        return static_cast<FeaturePointFlags>(static_cast<uint32_t>(left) & static_cast<uint32_t>(right));
+    }
+
+    [[nodiscard]] constexpr bool has_flag(FeaturePointFlags value, FeaturePointFlags flag) noexcept {
+        return (value & flag) != FeaturePointFlags::kNone;
+    }
 
     /** @brief Classification used for registration and tooling. */
     enum class PipelineCategory : uint8_t {
@@ -294,6 +325,65 @@ namespace aeg::pipeline {
         CapabilityMask required_capabilities{0};
     };
 
+    /** @brief Static metadata for one feature type. */
+    struct FeatureDescriptor {
+        FeatureId id{};
+        std::string_view name{};
+        FeatureDomain domain{FeatureDomain::kLogic};
+        FeatureDomainMask domain_mask{0};
+        PipelineScopeMask supported_scopes{kAllPipelineScopes};
+        Version version{1, 0, 0};
+        ModuleId owner_module{};
+    };
+
+    /** @brief Public extension anchor exposed by a pipeline definition. */
+    struct FeaturePointDescriptor {
+        FeaturePointId id{};
+        std::string_view name{};
+        PipelineId pipeline{};
+        StageId anchor_stage{};
+        FeaturePointPosition position{FeaturePointPosition::kBefore};
+        FeatureDomainMask allowed_domains{0};
+        PipelineScopeMask allowed_scopes{kAllPipelineScopes};
+        FeaturePointFlags flags{FeaturePointFlags::kNone};
+    };
+
+    /** @brief Binding of one feature type to one pipeline extension point. */
+    struct FeatureBindingDescriptor {
+        FeatureId feature{};
+        PipelineId pipeline{};
+        PipelineScope scope{PipelineScope::kEngine};
+        FeaturePointId point{};
+        FeaturePriority priority{0};
+        bool enabled{true};
+        FeatureInstanceId instance{};
+    };
+
+    /** @brief Derives a deterministic identity for a feature binding. */
+    [[nodiscard]] inline FeatureInstanceId make_feature_instance_id(FeatureId feature,
+                                                                    PipelineId pipeline,
+                                                                    PipelineScope scope,
+                                                                    FeaturePointId point) noexcept {
+        uint64_t hash = 14695981039346656037ull;
+        const auto mix = [&hash](uint64_t value) constexpr {
+            hash ^= value;
+            hash *= 1099511628211ull;
+        };
+        mix(feature.value());
+        mix(pipeline.value());
+        mix(static_cast<uint8_t>(scope));
+        mix(point.value());
+        return FeatureInstanceId(hash == 0 ? 1 : hash);
+    }
+
+    /** @brief Derives a deterministic identity for a Composite feature part. */
+    [[nodiscard]] inline FeaturePartId make_feature_part_id(FeatureInstanceId instance,
+                                                             uint32_t part_index) noexcept {
+        uint64_t hash = instance.value() ^ 0x9e3779b97f4a7c15ull;
+        hash ^= static_cast<uint64_t>(part_index) + 0x9e3779b97f4a7c15ull + (hash << 6u) + (hash >> 2u);
+        return FeaturePartId(hash == 0 ? 1 : hash);
+    }
+
     /** @brief Static metadata for one stage in a pipeline definition. */
     struct StageDescriptor {
         StageId id{};
@@ -351,10 +441,12 @@ namespace aeg::pipeline {
     struct PipelineStageHandleTag;
     struct PipelineTaskHandleTag;
     struct PipelineArtifactHandleTag;
+    struct PipelineFeaturePointHandleTag;
 
     using PipelineStageHandle = DefinitionHandle<PipelineStageHandleTag>;
     using PipelineTaskHandle = DefinitionHandle<PipelineTaskHandleTag>;
     using PipelineArtifactHandle = DefinitionHandle<PipelineArtifactHandleTag>;
+    using PipelineFeaturePointHandle = DefinitionHandle<PipelineFeaturePointHandleTag>;
 
     /** @brief Internal definition record for a stage. */
     struct PipelineStageRecord {
@@ -370,6 +462,17 @@ namespace aeg::pipeline {
     /** @brief Internal definition record for an artifact. */
     struct PipelineArtifactRecord {
         ArtifactDescriptor descriptor{};
+    };
+
+    /** @brief Internal record for one public feature extension point. */
+    struct PipelineFeaturePointRecord {
+        FeaturePointDescriptor descriptor{};
+        uint32_t anchor_stage_index{kInvalidPipelineHandleIndex};
+    };
+
+    /** @brief Internal record for a feature binding declared by a pipeline definition. */
+    struct PipelineFeatureBindingRecord {
+        FeatureBindingDescriptor descriptor{};
     };
 
     /** @brief Internal definition record for one artifact access. */
@@ -391,12 +494,25 @@ namespace aeg::pipeline {
         PipelineScope target_scope{PipelineScope::kEngine};
     };
 
+    /** @brief Provenance record for one feature contribution in a compiled plan. */
+    struct PipelineFeatureContributionRecord {
+        FeatureInstanceId feature_instance{};
+        FeatureId feature{};
+        FeaturePartId part{};
+        FeaturePointId point{};
+        FeatureDomain domain{FeatureDomain::kLogic};
+        uint32_t first_stage_index{kInvalidPipelineHandleIndex};
+        uint32_t stage_count{0};
+    };
+
     /** @brief Immutable result of PipelineBuilder definition collection. */
     struct PipelineDefinition {
         PipelineDescriptor descriptor{};
         std::vector<PipelineStageRecord> stages{};
         std::vector<PipelineTaskRecord> tasks{};
         std::vector<PipelineArtifactRecord> artifacts{};
+        std::vector<PipelineFeaturePointRecord> feature_points{};
+        std::vector<PipelineFeatureBindingRecord> feature_bindings{};
         std::vector<PipelineBindingRecord> bindings{};
         std::vector<PipelineOrderingRecord> orderings{};
         std::vector<PipelineExposureRecord> exposures{};
@@ -440,14 +556,17 @@ namespace aeg::pipeline {
     struct PipelinePlan {
         PlanRevision revision{0};
         PipelineId pipeline{};
+        PipelineInstanceId instance{};
         Version definition_version{};
         PipelineScope scope{PipelineScope::kEngine};
         std::vector<PipelineNode> nodes{};
         std::vector<PipelineDependency> dependencies{};
         std::vector<uint32_t> topological_order{};
         std::vector<PipelineExecutionBatch> batches{};
+        std::vector<PipelineFeatureContributionRecord> feature_contributions{};
 
         // Keeps definition callbacks and their owner object alive after registry removal.
         std::shared_ptr<const void> definition_owner{};
+        std::vector<std::shared_ptr<const void>> feature_owners{};
     };
 }  // namespace aeg::pipeline
