@@ -200,6 +200,30 @@ if (WIN32)
     target_compile_definitions(aeg_result_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
+add_library(aeg_pipeline STATIC
+    Engine/Pipeline/private/pipeline.cpp
+)
+target_compile_features(aeg_pipeline PUBLIC cxx_std_20)
+target_include_directories(aeg_pipeline
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Pipeline/public
+)
+target_link_libraries(aeg_pipeline PUBLIC aeg_foundation Threads::Threads)
+
+if (MSVC)
+    target_compile_options(aeg_pipeline PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(aeg_pipeline PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+add_executable(aeg_pipeline_smoke
+    tests/pipeline_smoke.cpp
+)
+target_link_libraries(aeg_pipeline_smoke PRIVATE aeg_pipeline)
+if (WIN32)
+    target_compile_definitions(aeg_pipeline_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
 include(CTest)
 
 set(AEG_VMA_INCLUDE_DIR
@@ -455,12 +479,13 @@ endif()
 if (BUILD_TESTING)
     add_test(NAME aeg_math_smoke COMMAND aeg_math_smoke)
     add_test(NAME aeg_result_smoke COMMAND aeg_result_smoke)
+    add_test(NAME aeg_pipeline_smoke COMMAND aeg_pipeline_smoke)
     add_test(NAME aeg_rhi_smoke COMMAND aeg_rhi_smoke)
     add_test(NAME aeg_logging_smoke COMMAND aeg_logging_smoke)
     add_test(NAME aeg_triangle COMMAND aeg_triangle --frames 1)
     if (MINGW)
         get_filename_component(AEG_MINGW_RUNTIME_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
-        set_tests_properties(aeg_math_smoke aeg_result_smoke aeg_rhi_smoke aeg_logging_smoke aeg_triangle PROPERTIES
+        set_tests_properties(aeg_math_smoke aeg_result_smoke aeg_pipeline_smoke aeg_rhi_smoke aeg_logging_smoke aeg_triangle PROPERTIES
             ENVIRONMENT "PATH=${AEG_MINGW_RUNTIME_DIR};$ENV{PATH}"
         )
     endif()

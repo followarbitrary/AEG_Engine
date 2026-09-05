@@ -1085,7 +1085,7 @@ enum class TaskFlags : uint32_t {
 
 struct StageDescriptor {
     StageId id;
-    PhaseId phase;
+    EnginePhase phase;
     ExecutionDomain execution_domain;
     TimePolicy time_policy;
     bool parallelizable;
@@ -2092,7 +2092,7 @@ public:
             aeg::pipeline::PipelineBuilder& builder) const override {
         const auto stage = builder.add_stage({
                 .id = aeg::pipeline::StageId("WeatherUpdate"),
-                .phase = aeg::pipeline::PhaseId("VariableUpdate"),
+                .phase = aeg::pipeline::EnginePhase::kVariableUpdate,
                 .execution_domain = aeg::pipeline::ExecutionDomain::kCpuWorker,
                 .time_policy = aeg::pipeline::TimePolicy::kFrame,
                 .parallelizable = true,

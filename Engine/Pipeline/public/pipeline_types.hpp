@@ -1,0 +1,453 @@
+/**
+ * @file pipeline_types.hpp
+ * @brief Public data types for the domain-oriented pipeline graph.
+ */
+#pragma once
+
+#include <compare>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <memory>
+#include <string_view>
+#include <type_traits>
+#include <vector>
+
+#include "result.hpp"
+
+namespace aeg::pipeline {
+    inline constexpr uint32_t kInvalidPipelineHandleIndex = std::numeric_limits<uint32_t>::max();
+
+    /** @brief Hash-backed stable identity used by pipeline contracts. */
+    template <typename Tag>
+    class StableId final {
+    public:
+        constexpr StableId() noexcept = default;
+        explicit constexpr StableId(uint64_t value) noexcept : value_(value) {
+        }
+        explicit constexpr StableId(std::string_view name) noexcept : value_(hash_name(name)) {
+        }
+
+        [[nodiscard]] constexpr bool is_valid() const noexcept { return value_ != 0; }
+        [[nodiscard]] constexpr uint64_t value() const noexcept { return value_; }
+
+        friend constexpr bool operator==(StableId, StableId) = default;
+        friend constexpr auto operator<=>(StableId, StableId) = default;
+
+    private:
+        static constexpr uint64_t hash_name(std::string_view name) noexcept {
+            uint64_t hash = 14695981039346656037ull;
+            for (const char character : name) {
+                hash ^= static_cast<uint8_t>(character);
+                hash *= 1099511628211ull;
+            }
+            return hash == 0 ? 1 : hash;
+        }
+
+        uint64_t value_{0};
+    };
+
+    /** @brief Hash function for StableId values used in unordered containers. */
+    template <typename Tag>
+    struct StableIdHash final {
+        [[nodiscard]] std::size_t operator()(StableId<Tag> id) const noexcept {
+            return static_cast<std::size_t>(id.value());
+        }
+    };
+
+    struct ModuleIdTag;
+    struct PipelineIdTag;
+    struct PipelineInstanceIdTag;
+    struct StageIdTag;
+    struct TaskIdTag;
+    struct FeatureIdTag;
+    struct FeatureInstanceIdTag;
+    struct FeaturePartIdTag;
+    struct FeaturePointIdTag;
+    struct ArtifactIdTag;
+    struct ArtifactTypeIdTag;
+
+    using ModuleId = StableId<ModuleIdTag>;
+    using PipelineId = StableId<PipelineIdTag>;
+    using PipelineInstanceId = StableId<PipelineInstanceIdTag>;
+    using StageId = StableId<StageIdTag>;
+    using TaskId = StableId<TaskIdTag>;
+    using FeatureId = StableId<FeatureIdTag>;
+    using FeatureInstanceId = StableId<FeatureInstanceIdTag>;
+    using FeaturePartId = StableId<FeaturePartIdTag>;
+    using FeaturePointId = StableId<FeaturePointIdTag>;
+    using ArtifactId = StableId<ArtifactIdTag>;
+    using ArtifactTypeId = StableId<ArtifactTypeIdTag>;
+
+    using PlanRevision = uint64_t;
+
+    /** @brief Scope that owns a pipeline instance or artifact. */
+    enum class PipelineScope : uint8_t {
+        kEngine = 0,
+        kWorld = 1,
+        kFrame = 2,
+        kEditor = 3,
+    };
+
+    /** @brief Domain that defines the semantic meaning of a pipeline contribution. */
+    enum class FeatureDomain : uint8_t {
+        kLogic = 0,
+        kPhysics = 1,
+        kRender = 2,
+        kAudio = 3,
+        kStream = 4,
+        kComposite = 5,
+    };
+
+    /** @brief Execution resource used by a pipeline node. */
+    enum class ExecutionDomain : uint8_t {
+        kMainThread = 0,
+        kCpuWorker = 1,
+        kIoWorker = 2,
+        kRenderThread = 3,
+        kGpu = 4,
+    };
+
+    /** @brief Time mechanism that activates a pipeline node. */
+    enum class TimePolicy : uint8_t {
+        kStartup = 0,
+        kFrame = 1,
+        kFixedTick = 2,
+        kEvent = 3,
+        kShutdown = 4,
+    };
+
+    /** @brief Global lifecycle anchor shared by all pipeline definitions. */
+    enum class EnginePhase : uint8_t {
+        kStartup = 0,
+        kFrameBegin = 1,
+        kInput = 2,
+        kPreUpdate = 3,
+        kFixedUpdate = 4,
+        kVariableUpdate = 5,
+        kWorldCommit = 6,
+        kRenderExtract = 7,
+        kRenderBuild = 8,
+        kRenderExecute = 9,
+        kPresent = 10,
+        kFrameEnd = 11,
+        kShutdown = 12,
+    };
+
+    using PipelineScopeMask = uint32_t;
+    using FeatureDomainMask = uint32_t;
+
+    /** @brief Converts one pipeline scope into its mask representation. */
+    [[nodiscard]] constexpr PipelineScopeMask to_mask(PipelineScope scope) noexcept {
+        return 1u << static_cast<uint8_t>(scope);
+    }
+
+    /** @brief Converts one feature domain into its mask representation. */
+    [[nodiscard]] constexpr FeatureDomainMask to_mask(FeatureDomain domain) noexcept {
+        return domain == FeatureDomain::kComposite ? 0u : 1u << static_cast<uint8_t>(domain);
+    }
+
+    inline constexpr PipelineScopeMask kAllPipelineScopes = to_mask(PipelineScope::kEngine) |
+                                                            to_mask(PipelineScope::kWorld) |
+                                                            to_mask(PipelineScope::kFrame) |
+                                                            to_mask(PipelineScope::kEditor);
+    inline constexpr FeatureDomainMask kAllFeatureDomains = to_mask(FeatureDomain::kLogic) |
+                                                            to_mask(FeatureDomain::kPhysics) |
+                                                            to_mask(FeatureDomain::kRender) |
+                                                            to_mask(FeatureDomain::kAudio) |
+                                                            to_mask(FeatureDomain::kStream);
+
+    /** @brief Classification used for registration and tooling. */
+    enum class PipelineCategory : uint8_t {
+        kCore = 0,
+        kGameplay = 1,
+        kSimulation = 2,
+        kRendering = 3,
+        kAudio = 4,
+        kStreaming = 5,
+        kTooling = 6,
+        kCustom = 7,
+    };
+
+    /** @brief Backend-neutral capability required by a pipeline definition. */
+    enum class Capability : uint8_t {
+        kParallelCpuExecution = 0,
+        kGpuExecution = 1,
+        kGraphicsQueue = 2,
+        kComputeQueue = 3,
+        kCopyQueue = 4,
+        kRayTracing = 5,
+        kBindlessResources = 6,
+        kShaderReflection = 7,
+        kAsyncPipelineCompilation = 8,
+    };
+
+    using CapabilityMask = uint64_t;
+
+    /** @brief Semantic storage class of an artifact. */
+    enum class ArtifactStorage : uint8_t {
+        kValue = 0,
+        kMutableState = 1,
+        kImmutableSnapshot = 2,
+        kCommandBuffer = 3,
+        kCpuResource = 4,
+        kGpuLogicalResource = 5,
+        kCompletionToken = 6,
+    };
+
+    /** @brief Minimum execution lifetime of an artifact. */
+    enum class ArtifactLifetime : uint8_t {
+        kTask = 0,
+        kStage = 1,
+        kFrame = 2,
+        kFixedTick = 3,
+        kWorld = 4,
+        kEngine = 5,
+    };
+
+    /** @brief Object responsible for retaining and destroying an artifact. */
+    enum class OwnershipPolicy : uint8_t {
+        kScopeOwned = 0,
+        kGraphOwned = 1,
+        kProducerOwned = 2,
+        kSharedImmutable = 3,
+        kExternalBorrowed = 4,
+    };
+
+    /** @brief Operation a stage performs on an artifact. */
+    enum class ArtifactAccess : uint8_t {
+        kRead = 0,
+        kWrite = 1,
+        kReadWrite = 2,
+        kAppend = 3,
+        kConsume = 4,
+        kPublishSnapshot = 5,
+    };
+
+    /** @brief Additional constraints attached to an artifact access. */
+    enum class AccessFlags : uint32_t {
+        kNone = 0,
+        kOptional = 1u << 0,
+        kPreserveContents = 1u << 1,
+        kDiscardContents = 1u << 2,
+        kExclusive = 1u << 3,
+        kDeterministicAppend = 1u << 4,
+    };
+
+    constexpr AccessFlags operator|(AccessFlags left, AccessFlags right) noexcept {
+        return static_cast<AccessFlags>(static_cast<uint32_t>(left) | static_cast<uint32_t>(right));
+    }
+
+    constexpr AccessFlags operator&(AccessFlags left, AccessFlags right) noexcept {
+        return static_cast<AccessFlags>(static_cast<uint32_t>(left) & static_cast<uint32_t>(right));
+    }
+
+    [[nodiscard]] constexpr bool has_flag(AccessFlags value, AccessFlags flag) noexcept {
+        return (value & flag) != AccessFlags::kNone;
+    }
+
+    /** @brief Scheduling and retention properties of a task. */
+    enum class TaskFlags : uint32_t {
+        kNone = 0,
+        kParallelSafe = 1u << 0,
+        kOptional = 1u << 1,
+        kSideEffect = 1u << 2,
+        kMustRun = 1u << 3,
+        kMayBlock = 1u << 4,
+        kExportsCompletion = 1u << 5,
+    };
+
+    constexpr TaskFlags operator|(TaskFlags left, TaskFlags right) noexcept {
+        return static_cast<TaskFlags>(static_cast<uint32_t>(left) | static_cast<uint32_t>(right));
+    }
+
+    constexpr TaskFlags operator&(TaskFlags left, TaskFlags right) noexcept {
+        return static_cast<TaskFlags>(static_cast<uint32_t>(left) & static_cast<uint32_t>(right));
+    }
+
+    [[nodiscard]] constexpr bool has_flag(TaskFlags value, TaskFlags flag) noexcept {
+        return (value & flag) != TaskFlags::kNone;
+    }
+
+    /** @brief Version attached to a public pipeline contract. */
+    struct Version {
+        uint32_t major{0};
+        uint32_t minor{0};
+        uint32_t patch{0};
+
+        [[nodiscard]] constexpr bool is_valid() const noexcept { return major != 0 || minor != 0 || patch != 0; }
+        friend constexpr bool operator==(Version, Version) = default;
+        friend constexpr auto operator<=>(Version, Version) = default;
+    };
+
+    /** @brief Static metadata for one pipeline definition. */
+    struct PipelineDescriptor {
+        PipelineId id{};
+        std::string_view name{};
+        Version version{1, 0, 0};
+        PipelineCategory category{PipelineCategory::kCustom};
+        PipelineScopeMask supported_scopes{kAllPipelineScopes};
+        FeatureDomainMask domains{0};
+        ExecutionDomain default_execution_domain{ExecutionDomain::kMainThread};
+        TimePolicy default_time_policy{TimePolicy::kFrame};
+        ModuleId owner_module{};
+        CapabilityMask required_capabilities{0};
+    };
+
+    /** @brief Static metadata for one stage in a pipeline definition. */
+    struct StageDescriptor {
+        StageId id{};
+        EnginePhase phase{EnginePhase::kFrameBegin};
+        ExecutionDomain execution_domain{ExecutionDomain::kMainThread};
+        TimePolicy time_policy{TimePolicy::kFrame};
+        bool parallelizable{false};
+    };
+
+    class PipelineTaskContext;
+    using TaskExecutionFunction = foundation::Result (*)(PipelineTaskContext& context);
+
+    /** @brief Static metadata for one executable task. */
+    struct TaskDescriptor {
+        TaskId id{};
+        TaskFlags flags{TaskFlags::kNone};
+        TaskExecutionFunction execute{nullptr};
+        void* user_data{nullptr};
+    };
+
+    /** @brief Static metadata for one artifact contract. */
+    struct ArtifactDescriptor {
+        ArtifactId id{};
+        ArtifactTypeId type{};
+        PipelineScope owner_scope{PipelineScope::kEngine};
+        ArtifactStorage storage{ArtifactStorage::kValue};
+        ArtifactLifetime lifetime{ArtifactLifetime::kTask};
+        OwnershipPolicy ownership{OwnershipPolicy::kProducerOwned};
+        uint32_t version{1};
+        PipelineScopeMask visible_to{0};
+        bool external_input{false};
+    };
+
+    /** @brief One stage-to-artifact access declaration. */
+    struct ArtifactBinding {
+        ArtifactId artifact{};
+        ArtifactAccess access{ArtifactAccess::kRead};
+        uint32_t required_version{0};
+        AccessFlags flags{AccessFlags::kNone};
+    };
+
+    template <typename Tag>
+    struct DefinitionHandle final {
+        uint32_t index{kInvalidPipelineHandleIndex};
+        uint32_t generation{0};
+
+        [[nodiscard]] constexpr bool is_valid() const noexcept {
+            return index != kInvalidPipelineHandleIndex && generation != 0;
+        }
+
+        constexpr explicit operator bool() const noexcept { return is_valid(); }
+        friend constexpr bool operator==(DefinitionHandle, DefinitionHandle) = default;
+    };
+
+    struct PipelineStageHandleTag;
+    struct PipelineTaskHandleTag;
+    struct PipelineArtifactHandleTag;
+
+    using PipelineStageHandle = DefinitionHandle<PipelineStageHandleTag>;
+    using PipelineTaskHandle = DefinitionHandle<PipelineTaskHandleTag>;
+    using PipelineArtifactHandle = DefinitionHandle<PipelineArtifactHandleTag>;
+
+    /** @brief Internal definition record for a stage. */
+    struct PipelineStageRecord {
+        StageDescriptor descriptor{};
+    };
+
+    /** @brief Internal definition record for a task and its owning stage. */
+    struct PipelineTaskRecord {
+        TaskDescriptor descriptor{};
+        uint32_t stage_index{kInvalidPipelineHandleIndex};
+    };
+
+    /** @brief Internal definition record for an artifact. */
+    struct PipelineArtifactRecord {
+        ArtifactDescriptor descriptor{};
+    };
+
+    /** @brief Internal definition record for one artifact access. */
+    struct PipelineBindingRecord {
+        uint32_t stage_index{kInvalidPipelineHandleIndex};
+        ArtifactBinding binding{};
+    };
+
+    /** @brief Explicit ordering relation between two stages. */
+    struct PipelineOrderingRecord {
+        uint32_t source_stage_index{kInvalidPipelineHandleIndex};
+        StageId target_stage{};
+        bool source_runs_before{true};
+    };
+
+    /** @brief Cross-scope exposure declaration for an artifact. */
+    struct PipelineExposureRecord {
+        ArtifactId artifact{};
+        PipelineScope target_scope{PipelineScope::kEngine};
+    };
+
+    /** @brief Immutable result of PipelineBuilder definition collection. */
+    struct PipelineDefinition {
+        PipelineDescriptor descriptor{};
+        std::vector<PipelineStageRecord> stages{};
+        std::vector<PipelineTaskRecord> tasks{};
+        std::vector<PipelineArtifactRecord> artifacts{};
+        std::vector<PipelineBindingRecord> bindings{};
+        std::vector<PipelineOrderingRecord> orderings{};
+        std::vector<PipelineExposureRecord> exposures{};
+    };
+
+    /** @brief Reason for a dependency edge in a compiled plan. */
+    enum class PipelineDependencyKind : uint8_t {
+        kArtifact = 0,
+        kOrdering = 1,
+    };
+
+    /** @brief One executable node in a compiled pipeline plan. */
+    struct PipelineNode {
+        TaskId task{};
+        StageId stage{};
+        EnginePhase phase{EnginePhase::kFrameBegin};
+        ExecutionDomain execution_domain{ExecutionDomain::kMainThread};
+        TimePolicy time_policy{TimePolicy::kFrame};
+        TaskFlags flags{TaskFlags::kNone};
+        TaskExecutionFunction execute{nullptr};
+        void* user_data{nullptr};
+        bool synthetic{false};
+        bool stage_parallelizable{false};
+    };
+
+    /** @brief One directed dependency edge between compiled nodes. */
+    struct PipelineDependency {
+        uint32_t source_node{kInvalidPipelineHandleIndex};
+        uint32_t destination_node{kInvalidPipelineHandleIndex};
+        PipelineDependencyKind kind{PipelineDependencyKind::kArtifact};
+        ArtifactId artifact{};
+    };
+
+    /** @brief A set of nodes that can be scheduled after earlier batches complete. */
+    struct PipelineExecutionBatch {
+        std::vector<uint32_t> node_indices{};
+        bool parallelizable{false};
+    };
+
+    /** @brief Immutable executable plan emitted by PipelineCompiler. */
+    struct PipelinePlan {
+        PlanRevision revision{0};
+        PipelineId pipeline{};
+        Version definition_version{};
+        PipelineScope scope{PipelineScope::kEngine};
+        std::vector<PipelineNode> nodes{};
+        std::vector<PipelineDependency> dependencies{};
+        std::vector<uint32_t> topological_order{};
+        std::vector<PipelineExecutionBatch> batches{};
+
+        // Keeps definition callbacks and their owner object alive after registry removal.
+        std::shared_ptr<const void> definition_owner{};
+    };
+}  // namespace aeg::pipeline
