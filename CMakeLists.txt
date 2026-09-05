@@ -207,6 +207,7 @@ target_compile_features(aeg_pipeline PUBLIC cxx_std_20)
 target_include_directories(aeg_pipeline
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Pipeline/public
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RHI/public
 )
 target_link_libraries(aeg_pipeline PUBLIC aeg_foundation Threads::Threads)
 
@@ -238,6 +239,14 @@ add_executable(aeg_pipeline_runtime_smoke
 target_link_libraries(aeg_pipeline_runtime_smoke PRIVATE aeg_pipeline)
 if (WIN32)
     target_compile_definitions(aeg_pipeline_runtime_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
+add_executable(aeg_pipeline_hot_swap_smoke
+    tests/pipeline_hot_swap_smoke.cpp
+)
+target_link_libraries(aeg_pipeline_hot_swap_smoke PRIVATE aeg_pipeline)
+if (WIN32)
+    target_compile_definitions(aeg_pipeline_hot_swap_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
 include(CTest)
@@ -353,18 +362,27 @@ endif()
 add_library(aeg_render_graph STATIC
     Engine/RenderGraph/private/frame_context.cpp
     Engine/RenderGraph/private/render_graph.cpp
+    Engine/RenderGraph/private/render_feature_runtime.cpp
 )
 target_compile_features(aeg_render_graph PUBLIC cxx_std_20)
 target_include_directories(aeg_render_graph
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RenderGraph/public
 )
-target_link_libraries(aeg_render_graph PUBLIC aeg_foundation aeg_rhi_core)
+target_link_libraries(aeg_render_graph PUBLIC aeg_foundation aeg_rhi_core aeg_pipeline)
 
 if (MSVC)
     target_compile_options(aeg_render_graph PRIVATE /W4 /permissive-)
 else()
     target_compile_options(aeg_render_graph PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+add_executable(aeg_render_feature_runtime_smoke
+    tests/render_feature_runtime_smoke.cpp
+)
+target_link_libraries(aeg_render_feature_runtime_smoke PRIVATE aeg_render_graph aeg_rhi)
+if (WIN32)
+    target_compile_definitions(aeg_render_feature_runtime_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
 set(AEG_RESOURCE_PUBLIC_DIR
@@ -498,12 +516,14 @@ if (BUILD_TESTING)
     add_test(NAME aeg_pipeline_smoke COMMAND aeg_pipeline_smoke)
     add_test(NAME aeg_pipeline_extension_smoke COMMAND aeg_pipeline_extension_smoke)
     add_test(NAME aeg_pipeline_runtime_smoke COMMAND aeg_pipeline_runtime_smoke)
+    add_test(NAME aeg_pipeline_hot_swap_smoke COMMAND aeg_pipeline_hot_swap_smoke)
+    add_test(NAME aeg_render_feature_runtime_smoke COMMAND aeg_render_feature_runtime_smoke)
     add_test(NAME aeg_rhi_smoke COMMAND aeg_rhi_smoke)
     add_test(NAME aeg_logging_smoke COMMAND aeg_logging_smoke)
     add_test(NAME aeg_triangle COMMAND aeg_triangle --frames 1)
     if (MINGW)
         get_filename_component(AEG_MINGW_RUNTIME_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
-        set_tests_properties(aeg_math_smoke aeg_result_smoke aeg_pipeline_smoke aeg_pipeline_extension_smoke aeg_pipeline_runtime_smoke aeg_rhi_smoke aeg_logging_smoke aeg_triangle PROPERTIES
+        set_tests_properties(aeg_math_smoke aeg_result_smoke aeg_pipeline_smoke aeg_pipeline_extension_smoke aeg_pipeline_runtime_smoke aeg_pipeline_hot_swap_smoke aeg_render_feature_runtime_smoke aeg_rhi_smoke aeg_logging_smoke aeg_triangle PROPERTIES
             ENVIRONMENT "PATH=${AEG_MINGW_RUNTIME_DIR};$ENV{PATH}"
         )
     endif()

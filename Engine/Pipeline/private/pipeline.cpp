@@ -18,6 +18,7 @@
 #include <shared_mutex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -147,6 +148,16 @@ namespace aeg::pipeline {
             return nullptr;
         }
 
+        [[nodiscard]] bool plan_contracts_preserved(const PipelinePlan& previous,
+                                                     const PipelinePlan& next) noexcept {
+            return std::all_of(previous.artifacts.begin(), previous.artifacts.end(),
+                               [&](const ArtifactDescriptor& descriptor) {
+                                   const ArtifactDescriptor* replacement =
+                                       find_plan_artifact(next, descriptor.id);
+                                   return replacement != nullptr && descriptors_match(descriptor, *replacement);
+                               });
+        }
+
         [[nodiscard]] const ArtifactBinding* find_node_binding(const PipelineNode& node,
                                                                ArtifactId id) noexcept {
             for (const ArtifactBinding& binding : node.artifact_bindings) {
@@ -192,6 +203,44 @@ namespace aeg::pipeline {
 
         [[nodiscard]] foundation::Result unsupported(std::string message) {
             return foundation::Result::failure(foundation::ResultCode::kUnsupported, std::move(message));
+        }
+
+        [[nodiscard]] foundation::Result validate_artifact_descriptor(const ArtifactDescriptor& descriptor) {
+            if (!descriptor.id.is_valid() || !descriptor.type.is_valid() || descriptor.version == 0 ||
+                !is_valid_scope(descriptor.owner_scope) || !is_valid_artifact_storage(descriptor.storage) ||
+                !is_valid_artifact_lifetime(descriptor.lifetime) ||
+                !is_valid_ownership_policy(descriptor.ownership) ||
+                (descriptor.visible_to & ~kAllPipelineScopes) != 0 ||
+                (descriptor.visible_to & lower_scope_mask(descriptor.owner_scope)) != 0) {
+                return invalid_argument("artifact contract is invalid");
+            }
+            return foundation::Result::success();
+        }
+
+        using PlanArtifactIndex = std::unordered_map<ArtifactId,
+                                                     const ArtifactDescriptor*,
+                                                     StableIdHash<ArtifactIdTag>>;
+
+        [[nodiscard]] foundation::Result build_plan_artifact_index(const PipelinePlan& plan,
+                                                                    PlanArtifactIndex& index) {
+            index.reserve(plan.artifacts.size());
+            for (const ArtifactDescriptor& descriptor : plan.artifacts) {
+                if (const foundation::Result result = validate_artifact_descriptor(descriptor); !result) {
+                    return result;
+                }
+                if (!index.emplace(descriptor.id, &descriptor).second) {
+                    return invalid_argument("pipeline plan contains duplicate artifact ids");
+                }
+            }
+            for (const PipelineExposureRecord& exposure : plan.exposures) {
+                const auto artifact = index.find(exposure.artifact);
+                if (artifact == index.end() || !is_valid_scope(exposure.target_scope) ||
+                    !can_scope_read(exposure.target_scope, artifact->second->owner_scope) ||
+                    exposure.target_scope == artifact->second->owner_scope) {
+                    return invalid_argument("pipeline plan contains an invalid artifact exposure");
+                }
+            }
+            return foundation::Result::success();
         }
 
         [[nodiscard]] foundation::Result execute_node(const PipelineNode& node,
@@ -367,6 +416,9 @@ namespace aeg::pipeline {
     struct ArtifactRuntimeEntry final {
         ArtifactDescriptor descriptor{};
         mutable std::shared_mutex mutex;
+        std::atomic<uint32_t> active_writer_count{0};
+        std::unordered_set<PlanRevision> plan_revisions{};
+        bool has_manual_contract{false};
         std::shared_ptr<const void> owner{};
         const void* data{nullptr};
         std::size_t size{0};
@@ -492,6 +544,7 @@ namespace aeg::pipeline {
         ++impl_->entry->revision;
         impl_->committed = true;
         impl_->lock.unlock();
+        impl_->entry->active_writer_count.fetch_sub(1, std::memory_order_release);
         return foundation::Result::success();
     }
 
@@ -517,26 +570,8 @@ namespace aeg::pipeline {
         if (impl_ == nullptr) {
             return invalid_state("artifact registry is not initialized");
         }
-        if (!descriptor.id.is_valid() || !descriptor.type.is_valid()) {
-            return invalid_argument("artifact id or type is invalid");
-        }
-        if (descriptor.version == 0) {
-            return invalid_argument("artifact version must be non-zero");
-        }
-        if (!is_valid_scope(descriptor.owner_scope) ||
-            !is_valid_artifact_storage(descriptor.storage) ||
-            !is_valid_artifact_lifetime(descriptor.lifetime) ||
-            !is_valid_ownership_policy(descriptor.ownership)) {
-            return invalid_argument("artifact contract contains an invalid enum value");
-        }
-        if ((descriptor.visible_to & ~kAllPipelineScopes) != 0) {
-            return invalid_argument("artifact visibility mask is invalid");
-        }
-        if ((descriptor.visible_to & lower_scope_mask(descriptor.owner_scope)) != 0) {
-            return invalid_argument("artifact visibility cannot include a lower pipeline scope");
-        }
-        if (!is_valid_scope(descriptor.owner_scope)) {
-            return invalid_argument("artifact owner scope is invalid");
+        if (const foundation::Result result = validate_artifact_descriptor(descriptor); !result) {
+            return result;
         }
 
         std::unique_lock lock(impl_->mutex);
@@ -545,11 +580,13 @@ namespace aeg::pipeline {
             if (!descriptors_match(iterator->second->descriptor, descriptor)) {
                 return invalid_state("artifact contract conflicts with an installed contract");
             }
+            iterator->second->has_manual_contract = true;
             return foundation::Result::success();
         }
 
         auto entry = std::make_shared<ArtifactRuntimeEntry>();
         entry->descriptor = descriptor;
+        entry->has_manual_contract = true;
         impl_->entries.emplace(descriptor.id, std::move(entry));
         return foundation::Result::success();
     }
@@ -564,23 +601,9 @@ namespace aeg::pipeline {
         if (plan.scope != impl_->scope) {
             return invalid_state("artifact registry scope does not match pipeline plan scope");
         }
-        for (const ArtifactDescriptor& descriptor : plan.artifacts) {
-            if (!descriptor.id.is_valid() || !descriptor.type.is_valid() || descriptor.version == 0 ||
-                !is_valid_scope(descriptor.owner_scope) || !is_valid_artifact_storage(descriptor.storage) ||
-                !is_valid_artifact_lifetime(descriptor.lifetime) ||
-                !is_valid_ownership_policy(descriptor.ownership) ||
-                (descriptor.visible_to & ~kAllPipelineScopes) != 0 ||
-                (descriptor.visible_to & lower_scope_mask(descriptor.owner_scope)) != 0) {
-                return invalid_argument("pipeline plan contains an invalid artifact contract");
-            }
-        }
-        for (const PipelineExposureRecord& exposure : plan.exposures) {
-            const ArtifactDescriptor* artifact = find_plan_artifact(plan, exposure.artifact);
-            if (artifact == nullptr || !is_valid_scope(exposure.target_scope) ||
-                !can_scope_read(exposure.target_scope, artifact->owner_scope) ||
-                exposure.target_scope == artifact->owner_scope) {
-                return invalid_argument("pipeline plan contains an invalid artifact exposure");
-            }
+        PlanArtifactIndex artifact_index;
+        if (const foundation::Result result = build_plan_artifact_index(plan, artifact_index); !result) {
+            return result;
         }
 
         std::unique_lock lock(impl_->mutex);
@@ -592,12 +615,201 @@ namespace aeg::pipeline {
             }
         }
         for (const ArtifactDescriptor& descriptor : plan.artifacts) {
-            if (impl_->entries.find(descriptor.id) != impl_->entries.end()) {
+            const auto iterator = impl_->entries.find(descriptor.id);
+            if (iterator == impl_->entries.end()) {
+                auto entry = std::make_shared<ArtifactRuntimeEntry>();
+                entry->descriptor = descriptor;
+                entry->plan_revisions.insert(plan.revision);
+                impl_->entries.emplace(descriptor.id, std::move(entry));
                 continue;
             }
-            auto entry = std::make_shared<ArtifactRuntimeEntry>();
-            entry->descriptor = descriptor;
-            impl_->entries.emplace(descriptor.id, std::move(entry));
+            iterator->second->plan_revisions.insert(plan.revision);
+        }
+        return foundation::Result::success();
+    }
+
+    foundation::Result ArtifactRegistry::replace_plan(const PipelinePlan& previous,
+                                                       const PipelinePlan& next) {
+        if (impl_ == nullptr) {
+            return invalid_state("artifact registry is not initialized");
+        }
+        if (previous.revision == 0 || next.revision == 0 || !previous.pipeline.is_valid() ||
+            !next.pipeline.is_valid()) {
+            return invalid_argument("pipeline plan is invalid");
+        }
+        if (previous.scope != impl_->scope || next.scope != impl_->scope) {
+            return invalid_state("artifact registry scope does not match pipeline plan scope");
+        }
+        if (previous.pipeline != next.pipeline) {
+            return invalid_argument("pipeline plan replacement must keep the same pipeline");
+        }
+        if (previous.revision == next.revision) {
+            return foundation::Result::success();
+        }
+
+        PlanArtifactIndex previous_artifacts;
+        if (const foundation::Result result = build_plan_artifact_index(previous, previous_artifacts); !result) {
+            return result;
+        }
+        PlanArtifactIndex next_artifacts;
+        if (const foundation::Result result = build_plan_artifact_index(next, next_artifacts); !result) {
+            return result;
+        }
+
+        struct StagedEntry final {
+            ArtifactId id{};
+            std::shared_ptr<ArtifactRuntimeEntry> entry{};
+        };
+        std::vector<StagedEntry> staged_entries;
+
+        std::unique_lock lock(impl_->mutex);
+        for (const auto& [id, descriptor] : previous_artifacts) {
+            const auto iterator = impl_->entries.find(id);
+            if (iterator == impl_->entries.end() ||
+                iterator->second->plan_revisions.find(previous.revision) ==
+                    iterator->second->plan_revisions.end() ||
+                !descriptors_match(iterator->second->descriptor, *descriptor)) {
+                return invalid_state("previous pipeline plan is not installed in the artifact registry");
+            }
+        }
+
+        for (const auto& [id, descriptor] : next_artifacts) {
+            const auto iterator = impl_->entries.find(id);
+            if (iterator == impl_->entries.end()) {
+                continue;
+            }
+            ArtifactRuntimeEntry& entry = *iterator->second;
+            if (descriptors_match(entry.descriptor, *descriptor)) {
+                if (entry.plan_revisions.find(next.revision) == entry.plan_revisions.end()) {
+                    entry.plan_revisions.reserve(entry.plan_revisions.size() + 1);
+                }
+                continue;
+            }
+
+            const auto previous_iterator = previous_artifacts.find(id);
+            if (previous_iterator == previous_artifacts.end() ||
+                !descriptors_match(entry.descriptor, *previous_iterator->second) ||
+                entry.plan_revisions.size() != 1 ||
+                entry.plan_revisions.find(previous.revision) == entry.plan_revisions.end() ||
+                entry.has_manual_contract) {
+                return invalid_state("next pipeline plan artifact conflicts with an installed contract");
+            }
+            if (iterator->second->active_writer_count.load(std::memory_order_acquire) != 0) {
+                return invalid_state("pipeline plan replacement is blocked by an artifact runtime lease");
+            }
+
+            auto replacement = std::make_shared<ArtifactRuntimeEntry>();
+            replacement->descriptor = *descriptor;
+            replacement->plan_revisions.reserve(1);
+            replacement->plan_revisions.insert(next.revision);
+            staged_entries.push_back(StagedEntry{id, std::move(replacement)});
+        }
+
+        for (const auto& [id, descriptor] : previous_artifacts) {
+            const auto next_iterator = next_artifacts.find(id);
+            if (next_iterator != next_artifacts.end() &&
+                descriptors_match(*descriptor, *next_iterator->second)) {
+                continue;
+            }
+            const auto iterator = impl_->entries.find(id);
+            if (iterator == impl_->entries.end()) {
+                continue;
+            }
+            ArtifactRuntimeEntry& entry = *iterator->second;
+            if (entry.plan_revisions.size() == 1 && !entry.has_manual_contract &&
+                entry.active_writer_count.load(std::memory_order_acquire) != 0) {
+                return invalid_state("pipeline plan retirement is blocked by an artifact runtime lease");
+            }
+        }
+
+        try {
+            impl_->entries.reserve(impl_->entries.size() + staged_entries.size());
+        } catch (const std::bad_alloc&) {
+            return foundation::Result::failure(foundation::ResultCode::kOutOfMemory,
+                                                "artifact plan replacement allocation failed");
+        }
+
+        for (const auto& [id, descriptor] : previous_artifacts) {
+            const auto iterator = impl_->entries.find(id);
+            if (iterator == impl_->entries.end()) {
+                continue;
+            }
+            ArtifactRuntimeEntry& entry = *iterator->second;
+            entry.plan_revisions.erase(previous.revision);
+            const auto next_iterator = next_artifacts.find(id);
+            const bool descriptor_preserved = next_iterator != next_artifacts.end() &&
+                                              descriptors_match(*descriptor, *next_iterator->second);
+            if (entry.plan_revisions.empty() && !entry.has_manual_contract && !descriptor_preserved) {
+                impl_->entries.erase(iterator);
+            }
+        }
+
+        for (const auto& [id, descriptor] : next_artifacts) {
+            const auto staged = std::find_if(staged_entries.begin(), staged_entries.end(),
+                                             [id](const StagedEntry& candidate) { return candidate.id == id; });
+            if (staged != staged_entries.end()) {
+                impl_->entries.emplace(id, staged->entry);
+                continue;
+            }
+            const auto iterator = impl_->entries.find(id);
+            if (iterator == impl_->entries.end()) {
+                auto entry = std::make_shared<ArtifactRuntimeEntry>();
+                entry->descriptor = *descriptor;
+                entry->plan_revisions.insert(next.revision);
+                impl_->entries.emplace(id, std::move(entry));
+                continue;
+            }
+            iterator->second->plan_revisions.insert(next.revision);
+        }
+        return foundation::Result::success();
+    }
+
+    foundation::Result ArtifactRegistry::retire_plan(const PipelinePlan& plan) {
+        if (impl_ == nullptr) {
+            return invalid_state("artifact registry is not initialized");
+        }
+        if (plan.revision == 0 || !plan.pipeline.is_valid()) {
+            return invalid_argument("pipeline plan is invalid");
+        }
+        if (plan.scope != impl_->scope) {
+            return invalid_state("artifact registry scope does not match pipeline plan scope");
+        }
+        PlanArtifactIndex artifact_index;
+        if (const foundation::Result result = build_plan_artifact_index(plan, artifact_index); !result) {
+            return result;
+        }
+
+        std::unique_lock lock(impl_->mutex);
+        for (const auto& [id, descriptor] : artifact_index) {
+            const auto iterator = impl_->entries.find(id);
+            if (iterator == impl_->entries.end() ||
+                iterator->second->plan_revisions.find(plan.revision) == iterator->second->plan_revisions.end()) {
+                continue;
+            }
+            ArtifactRuntimeEntry& entry = *iterator->second;
+            if (!descriptors_match(entry.descriptor, *descriptor)) {
+                return invalid_state("retired pipeline plan artifact conflicts with its installed contract");
+            }
+            if (entry.plan_revisions.size() == 1 && !entry.has_manual_contract &&
+                entry.active_writer_count.load(std::memory_order_acquire) != 0) {
+                return invalid_state("pipeline plan retirement is blocked by an artifact runtime lease");
+            }
+        }
+
+        for (const auto& [id, descriptor] : artifact_index) {
+            static_cast<void>(descriptor);
+            const auto iterator = impl_->entries.find(id);
+            if (iterator == impl_->entries.end()) {
+                continue;
+            }
+            ArtifactRuntimeEntry& entry = *iterator->second;
+            if (entry.plan_revisions.erase(plan.revision) == 0) {
+                continue;
+            }
+            if (entry.plan_revisions.empty() && !entry.has_manual_contract &&
+                entry.active_writer_count.load(std::memory_order_acquire) == 0) {
+                impl_->entries.erase(iterator);
+            }
         }
         return foundation::Result::success();
     }
@@ -614,7 +826,10 @@ namespace aeg::pipeline {
         if (iterator == impl_->entries.end()) {
             return not_found("artifact contract is not installed");
         }
-        if (iterator->second.use_count() > 1) {
+        if (!iterator->second->plan_revisions.empty()) {
+            return invalid_state("artifact contract is still referenced by an installed pipeline plan");
+        }
+        if (iterator->second->active_writer_count.load(std::memory_order_acquire) != 0) {
             return invalid_state("artifact is still referenced by a runtime lease");
         }
         impl_->entries.erase(iterator);
@@ -731,6 +946,7 @@ namespace aeg::pipeline {
         writer->data = const_cast<void*>(writer->entry->data);
         writer->size = writer->entry->size;
         writer->alignment = writer->entry->alignment;
+        writer->entry->active_writer_count.fetch_add(1, std::memory_order_relaxed);
         return {foundation::Result::success(), ArtifactWriter(std::move(writer))};
     }
 
@@ -1717,6 +1933,8 @@ namespace aeg::pipeline {
             domain,
             first_stage_index,
             static_cast<uint32_t>(builder_->stages_.size()) - first_stage_index,
+            feature_point_.position,
+            feature_point_.flags,
         });
     }
 
@@ -2006,6 +2224,15 @@ namespace aeg::pipeline {
         return {foundation::Result::success(), registration.value.descriptor};
     }
 
+    foundation::ResultValue<std::shared_ptr<const PipelineFeature>> PipelineRegistry::find_feature(FeatureId id) const {
+        const foundation::ResultValue<FeatureRegistration> registration = acquire_feature_registration(id);
+        if (!registration) {
+            return {registration.result, {}};
+        }
+        return {foundation::Result::success(),
+                std::shared_ptr<const PipelineFeature>(registration.value.implementation)};
+    }
+
     foundation::Result PipelineRegistry::bind_feature(const FeatureBindingDescriptor& binding) {
         if (!binding.feature.is_valid() || !binding.pipeline.is_valid() || !binding.point.is_valid()) {
             return invalid_argument("feature binding identity is invalid");
@@ -2168,6 +2395,7 @@ namespace aeg::pipeline {
 
         PipelineBuilder contribution_builder(base_definition);
         std::vector<PipelineFeatureContributionRecord> feature_contributions;
+        std::vector<PipelineFeatureImplementationRecord> feature_implementations;
         std::vector<std::shared_ptr<const void>> feature_owners;
         std::vector<FeatureBindingDescriptor> feature_bindings;
         feature_bindings.reserve(base_definition.feature_bindings.size());
@@ -2251,6 +2479,7 @@ namespace aeg::pipeline {
             }
 
             const uint32_t first_stage_index = static_cast<uint32_t>(contribution_builder.stages_.size());
+            const size_t first_contribution_index = feature_contributions.size();
             FeatureBuildContext context(contribution_builder,
                                         input.scope,
                                         input.pipeline,
@@ -2279,6 +2508,20 @@ namespace aeg::pipeline {
             }
             if (!contribution_builder.status()) {
                 return {contribution_builder.status(), {}};
+            }
+
+            const std::shared_ptr<const PipelineFeature> feature_implementation =
+                feature_registration.value.implementation;
+            for (size_t contribution_index = first_contribution_index;
+                 contribution_index < feature_contributions.size(); ++contribution_index) {
+                const PipelineFeatureContributionRecord& contribution =
+                    feature_contributions[contribution_index];
+                feature_implementations.push_back(PipelineFeatureImplementationRecord{
+                    contribution.feature_instance,
+                    contribution.feature,
+                    contribution.part,
+                    feature_implementation,
+                });
             }
 
             FeatureExpansion expansion;
@@ -2364,6 +2607,7 @@ namespace aeg::pipeline {
         plan.scope = input.scope;
         plan.definition_owner = std::shared_ptr<const void>(registration.value.implementation);
         plan.feature_contributions = std::move(feature_contributions);
+        plan.feature_implementations = std::move(feature_implementations);
         plan.feature_owners = std::move(feature_owners);
         plan.artifacts.reserve(definition.artifacts.size());
         for (const PipelineArtifactRecord& artifact : definition.artifacts) {
@@ -2748,6 +2992,7 @@ namespace aeg::pipeline {
     }
 
     foundation::Result PipelineScopeHost::bind_pipeline(PipelineId pipeline) {
+        std::unique_lock plan_lock(plan_mutex_);
         if (!is_valid_scope(scope_)) {
             return invalid_state("pipeline scope host was created with an invalid scope");
         }
@@ -2758,20 +3003,27 @@ namespace aeg::pipeline {
             return invalid_argument("pipeline id is invalid");
         }
         pipeline_ = pipeline;
+        if (active_plan_ != nullptr) {
+            retired_plans_.push_back(std::move(active_plan_));
+        }
+        pending_plan_.reset();
         active_plan_.reset();
-        return foundation::Result::success();
+        plan_lock.unlock();
+        return collect_retired_plans();
     }
 
     foundation::Result PipelineScopeHost::rebuild(const PipelineRegistry& registry,
                                                    CapabilityMask available_capabilities) {
-        if (active_) {
-            return invalid_state("cannot rebuild an active scope host");
+        PipelineId pipeline;
+        {
+            std::shared_lock plan_lock(plan_mutex_);
+            pipeline = pipeline_;
         }
-        if (!pipeline_.is_valid()) {
+        if (!pipeline.is_valid()) {
             return invalid_state("scope host has no bound pipeline");
         }
         foundation::ResultValue<PipelinePlan> compiled = PipelineCompiler{}.compile({
-            .pipeline = pipeline_,
+            .pipeline = pipeline,
             .scope = scope_,
             .available_capabilities = available_capabilities,
             .registry = &registry,
@@ -2780,18 +3032,120 @@ namespace aeg::pipeline {
         if (!compiled) {
             return compiled.result;
         }
-        if (const foundation::Result result = artifacts_.install_plan(compiled.value); !result) {
+
+        PipelinePlanHandle plan;
+        try {
+            plan = std::make_shared<const PipelinePlan>(std::move(compiled.value));
+        } catch (const std::bad_alloc&) {
+            return foundation::Result::failure(foundation::ResultCode::kOutOfMemory,
+                                                "pipeline plan allocation failed");
+        }
+
+        std::unique_lock plan_lock(plan_mutex_);
+        if (pipeline_ != pipeline) {
+            return invalid_state("bound pipeline changed during pipeline rebuild");
+        }
+        if (active_) {
+            pending_plan_ = std::move(plan);
+            return foundation::Result::success();
+        }
+        if (active_plan_ != nullptr) {
+            if (active_plan_.use_count() > 1 && !plan_contracts_preserved(*active_plan_, *plan)) {
+                return invalid_state("pipeline rebuild is blocked by an externally referenced active plan");
+            }
+            if (const foundation::Result result = artifacts_.replace_plan(*active_plan_, *plan); !result) {
+                return result;
+            }
+        } else if (const foundation::Result result = artifacts_.install_plan(*plan); !result) {
             return result;
         }
-        active_plan_.emplace(std::move(compiled.value));
+        if (active_plan_ != nullptr) {
+            retired_plans_.push_back(std::move(active_plan_));
+        }
+        pending_plan_.reset();
+        active_plan_ = std::move(plan);
         return foundation::Result::success();
     }
 
+    bool PipelineScopeHost::is_active() const noexcept {
+        std::shared_lock plan_lock(plan_mutex_);
+        return active_;
+    }
+
+    const PipelinePlan* PipelineScopeHost::active_plan() const noexcept {
+        std::shared_lock plan_lock(plan_mutex_);
+        return active_plan_.get();
+    }
+
+    PipelinePlanHandle PipelineScopeHost::active_plan_snapshot() const noexcept {
+        std::shared_lock plan_lock(plan_mutex_);
+        return active_plan_;
+    }
+
+    bool PipelineScopeHost::has_pending_plan() const noexcept {
+        std::shared_lock plan_lock(plan_mutex_);
+        return pending_plan_ != nullptr;
+    }
+
+    std::size_t PipelineScopeHost::retired_plan_count() const noexcept {
+        std::shared_lock plan_lock(plan_mutex_);
+        return retired_plans_.size();
+    }
+
+    foundation::Result PipelineScopeHost::apply_pending_plan_internal() const {
+        std::unique_lock plan_lock(plan_mutex_);
+        if (pending_plan_ == nullptr) {
+            return foundation::Result::failure(foundation::ResultCode::kNotReady,
+                                                "scope host has no pending pipeline plan");
+        }
+        if (active_plan_ != nullptr) {
+            if (active_plan_.use_count() > 1 && !plan_contracts_preserved(*active_plan_, *pending_plan_)) {
+                return invalid_state("pending pipeline plan is blocked by an externally referenced active plan");
+            }
+            if (const foundation::Result result = artifacts_.replace_plan(*active_plan_, *pending_plan_); !result) {
+                return result;
+            }
+        } else if (const foundation::Result result = artifacts_.install_plan(*pending_plan_); !result) {
+            return result;
+        }
+        if (active_plan_ != nullptr) {
+            retired_plans_.push_back(std::move(active_plan_));
+        }
+        active_plan_ = std::move(pending_plan_);
+        return foundation::Result::success();
+    }
+
+    foundation::Result PipelineScopeHost::apply_pending_plan() {
+        return apply_pending_plan_internal();
+    }
+
+    foundation::Result PipelineScopeHost::collect_retired_plans() {
+        std::unique_lock plan_lock(plan_mutex_);
+        foundation::Result first_error = foundation::Result::success();
+        for (auto iterator = retired_plans_.begin(); iterator != retired_plans_.end();) {
+            if (iterator->use_count() != 1) {
+                ++iterator;
+                continue;
+            }
+            const foundation::Result result = artifacts_.retire_plan(**iterator);
+            if (!result) {
+                if (first_error) {
+                    first_error = result;
+                }
+                ++iterator;
+                continue;
+            }
+            iterator = retired_plans_.erase(iterator);
+        }
+        return first_error;
+    }
+
     foundation::Result PipelineScopeHost::activate(const PipelineActivationContext&) {
+        std::unique_lock plan_lock(plan_mutex_);
         if (active_) {
             return invalid_state("pipeline scope host is already active");
         }
-        if (!pipeline_.is_valid() || !active_plan_.has_value()) {
+        if (!pipeline_.is_valid() || active_plan_ == nullptr) {
             return invalid_state("scope host must have a bound and compiled pipeline");
         }
         active_ = true;
@@ -2799,6 +3153,7 @@ namespace aeg::pipeline {
     }
 
     foundation::Result PipelineScopeHost::deactivate(const PipelineDeactivationContext&) {
+        std::unique_lock plan_lock(plan_mutex_);
         if (!active_) {
             return invalid_state("pipeline scope host is not active");
         }
@@ -2808,7 +3163,13 @@ namespace aeg::pipeline {
 
     foundation::Result PipelineScopeHost::execute(PipelineScheduler& scheduler,
                                                    PipelineExecutionContext& context) const {
-        if (!active_ || !active_plan_.has_value()) {
+        const foundation::Result pending_result = apply_pending_plan_internal();
+        if (!pending_result && pending_result.code != foundation::ResultCode::kNotReady) {
+            return pending_result;
+        }
+
+        std::shared_lock plan_lock(plan_mutex_);
+        if (!active_ || active_plan_ == nullptr) {
             return invalid_state("pipeline scope host is not active or has no compiled plan");
         }
         if (context.scope() != scope_) {
@@ -2823,6 +3184,8 @@ namespace aeg::pipeline {
             scope_bridge = scope_bridge_;
         }
         context.set_artifact_runtime(artifact_registry, scope_bridge);
-        return scheduler.execute(*active_plan_, context);
+        const PipelinePlanHandle plan = active_plan_;
+        const foundation::Result result = scheduler.execute(*plan, context);
+        return result;
     }
 }  // namespace aeg::pipeline

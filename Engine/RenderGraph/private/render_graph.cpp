@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -21,6 +22,16 @@
 
 namespace aeg::render_graph {
     namespace {
+        std::atomic<uint64_t> g_next_graph_id{1};
+
+        [[nodiscard]] uint64_t allocate_graph_id() noexcept {
+            uint64_t graph_id = g_next_graph_id.fetch_add(1, std::memory_order_relaxed);
+            while (graph_id == 0) {
+                graph_id = g_next_graph_id.fetch_add(1, std::memory_order_relaxed);
+            }
+            return graph_id;
+        }
+
         constexpr uint32_t kAspectPlaneCount = 3;
 
         enum class ResourceKind : uint8_t { kBuffer, kTexture };
@@ -486,6 +497,7 @@ namespace aeg::render_graph {
         }
 
         rhi::Device& device;
+        uint64_t graph_id{allocate_graph_id()};
         uint32_t next_generation{1};
         uint64_t revision{1};
         uint64_t compiled_revision{0};
@@ -504,6 +516,26 @@ namespace aeg::render_graph {
         std::vector<TransientTextureSlotPlan> transient_texture_slots{};
         std::vector<uint32_t> pass_to_batch{};
         RenderGraphPlan plan{};
+
+        struct FeatureBuildTransaction {
+            bool active{false};
+            size_t buffer_count{0};
+            size_t texture_count{0};
+            size_t pass_count{0};
+            uint32_t next_generation{1};
+            uint64_t revision{0};
+            uint64_t compiled_revision{0};
+            bool compiled{false};
+            RenderGraphPlan plan{};
+            RenderGraphCompileInfo compile_info{};
+            std::vector<uint8_t> buffer_exports{};
+            std::vector<uint8_t> texture_exports{};
+        } feature_build_transaction{};
+
+        [[nodiscard]] foundation::Result begin_feature_build_transaction(
+                const RenderGraphCompileInfo& compile_info);
+        void commit_feature_build_transaction() noexcept;
+        void rollback_feature_build_transaction(RenderGraphCompileInfo& compile_info) noexcept;
 
         [[nodiscard]] uint32_t allocate_generation() noexcept {
             const uint32_t generation = next_generation++;
@@ -527,7 +559,7 @@ namespace aeg::render_graph {
                 return nullptr;
             }
             BufferRecord& record = buffers[handle.index];
-            return record.generation == handle.generation ? &record : nullptr;
+            return record.generation == handle.generation && handle.graph_id == graph_id ? &record : nullptr;
         }
 
         [[nodiscard]] const BufferRecord* get_buffer(RenderGraphBuffer handle) const noexcept {
@@ -535,7 +567,7 @@ namespace aeg::render_graph {
                 return nullptr;
             }
             const BufferRecord& record = buffers[handle.index];
-            return record.generation == handle.generation ? &record : nullptr;
+            return record.generation == handle.generation && handle.graph_id == graph_id ? &record : nullptr;
         }
 
         [[nodiscard]] TextureRecord* get_texture(RenderGraphTexture handle) noexcept {
@@ -543,7 +575,7 @@ namespace aeg::render_graph {
                 return nullptr;
             }
             TextureRecord& record = textures[handle.index];
-            return record.generation == handle.generation ? &record : nullptr;
+            return record.generation == handle.generation && handle.graph_id == graph_id ? &record : nullptr;
         }
 
         [[nodiscard]] const TextureRecord* get_texture(RenderGraphTexture handle) const noexcept {
@@ -551,7 +583,7 @@ namespace aeg::render_graph {
                 return nullptr;
             }
             const TextureRecord& record = textures[handle.index];
-            return record.generation == handle.generation ? &record : nullptr;
+            return record.generation == handle.generation && handle.graph_id == graph_id ? &record : nullptr;
         }
 
         [[nodiscard]] PassRecord* get_pass(RenderGraphPass handle) noexcept {
@@ -559,7 +591,7 @@ namespace aeg::render_graph {
                 return nullptr;
             }
             PassRecord& record = passes[handle.index];
-            return record.generation == handle.generation ? &record : nullptr;
+            return record.generation == handle.generation && handle.graph_id == graph_id ? &record : nullptr;
         }
 
         [[nodiscard]] const PassRecord* get_pass(RenderGraphPass handle) const noexcept {
@@ -567,7 +599,7 @@ namespace aeg::render_graph {
                 return nullptr;
             }
             const PassRecord& record = passes[handle.index];
-            return record.generation == handle.generation ? &record : nullptr;
+            return record.generation == handle.generation && handle.graph_id == graph_id ? &record : nullptr;
         }
 
         [[nodiscard]] foundation::Result add_use(uint32_t pass_index, ResourceUse use);
@@ -610,7 +642,7 @@ namespace aeg::render_graph {
                                                              uint32_t frame_slot) const noexcept;
         [[nodiscard]] PhysicalTexture* physical_texture(TextureRecord& record, uint32_t frame_slot) noexcept;
         [[nodiscard]] const PhysicalTexture* physical_texture(const TextureRecord& record,
-                                                               uint32_t frame_slot) const noexcept;
+                                                              uint32_t frame_slot) const noexcept;
         [[nodiscard]] foundation::Result initialize_runtime_states(uint32_t frame_slot,
                                                              std::vector<RuntimeBufferState>& buffer_states,
                                                              std::vector<RuntimeTextureState>& texture_states);
@@ -625,6 +657,108 @@ namespace aeg::render_graph {
     RenderGraph::~RenderGraph() {
         if (impl_ != nullptr) {
             (void) impl_->release_all();
+        }
+    }
+
+    foundation::Result RenderGraph::Impl::begin_feature_build_transaction(
+            const RenderGraphCompileInfo& compile_info) {
+        if (feature_build_transaction.active) {
+            return foundation::Result::failure(
+                    foundation::ResultCode::kInvalidState,
+                    "Render graph feature build transaction is already active");
+        }
+
+        FeatureBuildTransaction checkpoint{};
+        checkpoint.buffer_count = buffers.size();
+        checkpoint.texture_count = textures.size();
+        checkpoint.pass_count = passes.size();
+        checkpoint.next_generation = next_generation;
+        checkpoint.revision = revision;
+        checkpoint.compiled_revision = compiled_revision;
+        checkpoint.compiled = compiled;
+        checkpoint.compile_info = compile_info;
+        checkpoint.plan = std::move(plan);
+        try {
+            checkpoint.buffer_exports.resize(checkpoint.buffer_count);
+            checkpoint.texture_exports.resize(checkpoint.texture_count);
+            for (size_t index = 0; index < checkpoint.buffer_count; ++index) {
+                checkpoint.buffer_exports[index] = buffers[index].exported ? 1 : 0;
+            }
+            for (size_t index = 0; index < checkpoint.texture_count; ++index) {
+                checkpoint.texture_exports[index] = textures[index].exported ? 1 : 0;
+            }
+        } catch (const std::bad_alloc&) {
+            plan = std::move(checkpoint.plan);
+            return foundation::Result::failure(
+                    foundation::ResultCode::kOutOfMemory,
+                    "Render graph feature transaction allocation failed");
+        }
+
+        checkpoint.active = true;
+        feature_build_transaction = std::move(checkpoint);
+        return foundation::Result::success();
+    }
+
+    void RenderGraph::Impl::commit_feature_build_transaction() noexcept {
+        if (feature_build_transaction.active &&
+            revision == feature_build_transaction.revision &&
+            compiled == feature_build_transaction.compiled) {
+            plan = std::move(feature_build_transaction.plan);
+        }
+        feature_build_transaction = {};
+    }
+
+    void RenderGraph::Impl::rollback_feature_build_transaction(
+            RenderGraphCompileInfo& compile_info) noexcept {
+        if (!feature_build_transaction.active) {
+            return;
+        }
+
+        for (size_t index = feature_build_transaction.buffer_count; index < buffers.size(); ++index) {
+            (void) release_physical_buffer(buffers[index].physical);
+        }
+        for (size_t index = feature_build_transaction.texture_count; index < textures.size(); ++index) {
+            (void) release_physical_texture(textures[index].physical);
+        }
+
+        buffers.resize(feature_build_transaction.buffer_count);
+        textures.resize(feature_build_transaction.texture_count);
+        passes.resize(feature_build_transaction.pass_count);
+        for (size_t index = 0;
+             index < feature_build_transaction.buffer_exports.size() && index < buffers.size(); ++index) {
+            buffers[index].exported = feature_build_transaction.buffer_exports[index] != 0;
+        }
+        for (size_t index = 0;
+             index < feature_build_transaction.texture_exports.size() && index < textures.size(); ++index) {
+            textures[index].exported = feature_build_transaction.texture_exports[index] != 0;
+        }
+
+        next_generation = feature_build_transaction.next_generation;
+        revision = feature_build_transaction.revision;
+        compiled_revision = feature_build_transaction.compiled_revision;
+        compiled = feature_build_transaction.compiled;
+        plan = std::move(feature_build_transaction.plan);
+        compile_info = feature_build_transaction.compile_info;
+        feature_build_transaction = {};
+    }
+
+    foundation::Result RenderGraph::begin_feature_build_transaction() {
+        if (impl_ == nullptr) {
+            return foundation::Result::failure(foundation::ResultCode::kInvalidState,
+                                                "Render graph implementation is not initialized");
+        }
+        return impl_->begin_feature_build_transaction(compile_info_);
+    }
+
+    void RenderGraph::commit_feature_build_transaction() noexcept {
+        if (impl_ != nullptr) {
+            impl_->commit_feature_build_transaction();
+        }
+    }
+
+    void RenderGraph::rollback_feature_build_transaction() noexcept {
+        if (impl_ != nullptr) {
+            impl_->rollback_feature_build_transaction(compile_info_);
         }
     }
 
@@ -727,7 +861,8 @@ namespace aeg::render_graph {
             const uint32_t index = static_cast<uint32_t>(impl_->buffers.size());
             impl_->buffers.push_back(std::move(record));
             impl_->mark_dirty();
-            return {foundation::Result::success(), RenderGraphBuffer{index, impl_->buffers.back().generation}};
+            return {foundation::Result::success(),
+                    RenderGraphBuffer{index, impl_->buffers.back().generation, impl_->graph_id}};
         } catch (const std::bad_alloc&) {
             return {foundation::Result::failure(foundation::ResultCode::kOutOfMemory,
                                          "Render graph buffer resource allocation failed"), {}};
@@ -772,11 +907,20 @@ namespace aeg::render_graph {
             const uint32_t index = static_cast<uint32_t>(impl_->textures.size());
             impl_->textures.push_back(std::move(record));
             impl_->mark_dirty();
-            return {foundation::Result::success(), RenderGraphTexture{index, impl_->textures.back().generation}};
+            return {foundation::Result::success(),
+                    RenderGraphTexture{index, impl_->textures.back().generation, impl_->graph_id}};
         } catch (const std::bad_alloc&) {
             return {foundation::Result::failure(foundation::ResultCode::kOutOfMemory,
                                          "Render graph texture resource allocation failed"), {}};
         }
+    }
+
+    bool RenderGraph::contains_buffer(RenderGraphBuffer resource) const noexcept {
+        return impl_ != nullptr && impl_->get_buffer(resource) != nullptr;
+    }
+
+    bool RenderGraph::contains_texture(RenderGraphTexture resource) const noexcept {
+        return impl_ != nullptr && impl_->get_texture(resource) != nullptr;
     }
 
     foundation::ResultValue<RenderGraphBuffer> RenderGraph::import_buffer(rhi::BufferHandle buffer,
@@ -990,7 +1134,8 @@ namespace aeg::render_graph {
                 }
             }
             impl_->mark_dirty();
-            return {foundation::Result::success(), RenderGraphPass{index, stored_pass.generation}};
+            return {foundation::Result::success(),
+                    RenderGraphPass{index, stored_pass.generation, impl_->graph_id}};
         } catch (const std::bad_alloc&) {
             if (!impl_->passes.empty() && impl_->passes.back().generation == generation) {
                 impl_->passes.pop_back();
@@ -1026,8 +1171,8 @@ namespace aeg::render_graph {
             return foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                         "Pass builder is no longer attached to a pass");
         }
-        const PassRecord* pass = graph_.impl_->get_pass(RenderGraphPass{pass_index_,
-                                                                          graph_.impl_->passes[pass_index_].generation});
+        const PassRecord* pass = graph_.impl_->get_pass(RenderGraphPass{
+                pass_index_, graph_.impl_->passes[pass_index_].generation, graph_.impl_->graph_id});
         if (pass == nullptr) {
             return foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                         "Pass builder is no longer attached to a pass");
@@ -1051,8 +1196,8 @@ namespace aeg::render_graph {
             return foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                         "Pass builder is no longer attached to a pass");
         }
-        const PassRecord* pass = graph_.impl_->get_pass(RenderGraphPass{pass_index_,
-                                                                          graph_.impl_->passes[pass_index_].generation});
+        const PassRecord* pass = graph_.impl_->get_pass(RenderGraphPass{
+                pass_index_, graph_.impl_->passes[pass_index_].generation, graph_.impl_->graph_id});
         if (pass == nullptr) {
             return foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                         "Pass builder is no longer attached to a pass");
@@ -1077,8 +1222,8 @@ namespace aeg::render_graph {
             return foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                         "Pass builder is no longer attached to a pass");
         }
-        const PassRecord* pass = graph_.impl_->get_pass(RenderGraphPass{pass_index_,
-                                                                          graph_.impl_->passes[pass_index_].generation});
+        const PassRecord* pass = graph_.impl_->get_pass(RenderGraphPass{
+                pass_index_, graph_.impl_->passes[pass_index_].generation, graph_.impl_->graph_id});
         if (pass == nullptr) {
             return foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                         "Pass builder is no longer attached to a pass");
@@ -1102,8 +1247,8 @@ namespace aeg::render_graph {
             return foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                         "Pass builder is no longer attached to a pass");
         }
-        const PassRecord* pass = graph_.impl_->get_pass(RenderGraphPass{pass_index_,
-                                                                          graph_.impl_->passes[pass_index_].generation});
+        const PassRecord* pass = graph_.impl_->get_pass(RenderGraphPass{
+                pass_index_, graph_.impl_->passes[pass_index_].generation, graph_.impl_->graph_id});
         if (pass == nullptr) {
             return foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                         "Pass builder is no longer attached to a pass");
@@ -1136,8 +1281,8 @@ namespace aeg::render_graph {
             return foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                         "Pass builder is no longer attached to a pass");
         }
-        const PassRecord* pass = graph_.impl_->get_pass(RenderGraphPass{pass_index_,
-                                                                          graph_.impl_->passes[pass_index_].generation});
+        const PassRecord* pass = graph_.impl_->get_pass(RenderGraphPass{
+                pass_index_, graph_.impl_->passes[pass_index_].generation, graph_.impl_->graph_id});
         if (pass == nullptr) {
             return foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                         "Pass builder is no longer attached to a pass");
@@ -1171,8 +1316,8 @@ namespace aeg::render_graph {
             return foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                         "Pass builder is no longer attached to a pass");
         }
-        const PassRecord* pass = graph_.impl_->get_pass(RenderGraphPass{pass_index_,
-                                                                          graph_.impl_->passes[pass_index_].generation});
+        const PassRecord* pass = graph_.impl_->get_pass(RenderGraphPass{
+                pass_index_, graph_.impl_->passes[pass_index_].generation, graph_.impl_->graph_id});
         if (pass == nullptr) {
             return foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                         "Pass builder is no longer attached to a pass");
@@ -2116,7 +2261,7 @@ namespace aeg::render_graph {
             for (uint32_t pass_index = 0; pass_index < passes.size(); ++pass_index) {
                 RenderGraphPassPlan& pass_plan = built_plan.pass_plans[pass_index];
                 const PassRecord& pass = passes[pass_index];
-                pass_plan.pass = RenderGraphPass{pass_index, pass.generation};
+                pass_plan.pass = RenderGraphPass{pass_index, pass.generation, graph_id};
                 pass_plan.live = live_passes[pass_index] != 0;
                 pass_plan.topological_index = topological_positions[pass_index];
                 pass_plan.batch_index = pass_plan.live ? pass_to_batch[pass_index] : kInvalidHandleIndex;
@@ -3662,8 +3807,9 @@ namespace aeg::render_graph {
                         return fail_execution(before_barrier_result);
                     }
 
-                    PassExecutionContext context(*this, device_, RenderGraphPass{pass_index, pass.generation},
-                                                 command_list, pass_index, frame_slot);
+                    PassExecutionContext context(
+                            *this, device_, RenderGraphPass{pass_index, pass.generation, impl_->graph_id},
+                            command_list, pass_index, frame_slot);
                     try {
                         if (pass.execute) {
                             const foundation::Result execute_result = pass.execute(context);

@@ -2,7 +2,7 @@
 
 > 文档性质：架构说明、公共 API 和 ABI 使用手册
 >
-> 更新时间：2026-09-04
+> 更新时间：2026-09-05
 >
 > 适用范围：Pipeline、PipelineFeature、Scope、Artifact、Domain Graph、RenderGraph、RHI
 
@@ -21,6 +21,23 @@
 
 本文档不是实现排期、任务列表或模块开发顺序。文档中的代码是接口级示例，用于说明
 调用方式和契约；某些类型在当前仓库中仍属于设计目标，不代表已经全部实现。
+
+### 1.1 实现边界与文档维护
+
+公共接口发生变化时，必须同步修订对应的签名、示例、枚举语义、生命周期和错误处理说明。
+已实现 API 的描述以仓库公共头文件及可验证的实现行为为依据；尚未实现的架构约定必须明确
+标识，不得将概念接口作为可以直接调用的现有 API。
+
+当前已实现的 Pipeline 基建包括 `PipelineRegistry`、`PipelineCompiler`、
+`PipelineScheduler`、`PipelineScopeHost`、`ArtifactRegistry`、`ArtifactScopeBridge`、
+五个领域 Feature 基类、`CompositeFeature<Parts...>`，以及 RenderFeature 到 RenderGraph
+的运行期适配。通用 Host 通过 Scope、实例 ID 和非拥有的 `owner` 指针关联宿主对象。
+
+下文的 `WorldHandle`、`WorldFrameKey`、专用 Engine/World/Frame/Editor Host、
+`FeatureExecutionContext`、通用 Completion 契约、动态模块 C ABI，以及 Simulation/Render
+参考 Stage 编排属于架构约定，不表示当前已有同名公共实现。`RebuildReason` 和
+`PipelineRegistry::request_rebuild()` 也属于设计接口；当前由调用方显式执行
+`PipelineScopeHost::rebuild(registry)`。这些约定说明目标语义，不构成实现排期。
 
 本文档采用以下规范性措辞：
 
@@ -438,14 +455,21 @@ Plan 不保存业务对象裸指针，也不保存 Vulkan、D3D12 等后端原�
 
 ### 7.2 运行时句柄
 
-运行时句柄适合使用 `index + generation`，典型对象包括 World、Frame、资源实例和
-临时 Graph 资源。句柄应满足：
+句柄必须同时满足对象归属与代际有效性约束。当前 RenderGraph 的 Buffer、Texture、Pass
+句柄使用 `index + generation + graph_id`：`index` 定位对应类型的记录，`generation`
+标识记录代际，`graph_id` 标识创建它的图实例。不同图即使 index 和 generation 相同，
+也不得互相解析句柄。Pipeline 侧的 `RenderGraphHandle<Tag>` 镜像保留这三个字段。
+句柄应满足：
 
 - 可复制、可比较。
 - 不隐式拥有对象。
 - 不隐式转换为裸指针。
 - 只能由创建它的 Host 或 Device 解析。
 - generation 失效后所有操作返回错误。
+
+`is_valid()` 只验证字段非空，不访问对象表；必须通过所属图的 `contains_buffer()`、
+`contains_texture()` 或资源操作验证实际有效性。`reset()` 使原资源句柄失效；
+`clear_passes()` 保留资源句柄，但移除原 Pass。`graph_id == 0` 表示没有有效的图身份。
 
 ## 8. EnginePhase、Stage 和 FeaturePoint
 
@@ -1247,14 +1271,24 @@ public:
 
     [[nodiscard]] virtual const FeatureDescriptor& descriptor()
             const noexcept = 0;
+    [[nodiscard]] virtual FeatureDomain feature_domain() const noexcept;
+    [[nodiscard]] virtual FeatureDomainMask feature_domain_mask() const noexcept;
     [[nodiscard]] virtual foundation::Result collect_contributions(
             FeatureBuildContext& context) const = 0;
+    [[nodiscard]] virtual foundation::Result build_render_graph(
+            RenderGraphBuilder&) const {
+        return foundation::Result::success();
+    }
 };
 ```
 
 `collect_contributions()` 必须是非模板虚入口，因为 Registry 只持有类型擦除后的
 `PipelineFeature`。领域 Builder 的静态匹配只在内部实现中进行，不能让模板函数成为
 Registry 的唯一入口。
+
+`build_render_graph()` 是运行期渲染图声明入口，默认不产生渲染贡献。RenderFeature 在此
+创建逻辑资源和 Pass；`collect_contributions()` 则用于 Pipeline 编译时收集 Stage、Task
+和 Artifact 契约。两者不是同一次调用，也不得混用各自的 Builder 能力。
 
 ### 11.3 五个领域基类
 
@@ -1605,7 +1639,27 @@ Registry 操作分为两类：
 
 ### 13.2 Scope Host
 
-Host 管理某个 Scope 的实例、Artifact namespace、当前 Plan 和完成点：
+当前使用 `PipelineScopeHost : public PipelineInstance` 管理一个独立实例的绑定、
+ArtifactRegistry、Active/Pending Plan 和退休列表。其主要调用接口为：
+
+```cpp
+PipelineScopeHost(PipelineScope scope, PipelineInstanceId instance = {},
+                  void* owner = nullptr);
+foundation::Result bind_pipeline(PipelineId pipeline);
+foundation::Result rebuild(const PipelineRegistry& registry,
+                           CapabilityMask available_capabilities = 0);
+PipelinePlanHandle active_plan_snapshot() const noexcept;
+foundation::Result apply_pending_plan();
+foundation::Result collect_retired_plans();
+foundation::Result execute(PipelineScheduler& scheduler,
+                           PipelineExecutionContext& context) const;
+```
+
+上述为签名摘录。宿主负责 `owner` 的有效期；World 必须分别创建 Host，不能共用可变
+ArtifactRegistry。`active_plan()` 返回借用指针，不适合跨重配置长期保存；需要保留
+Plan 时应使用 `active_plan_snapshot()`。具体热切换语义见第 20 节。
+
+以下专用 Host 是架构层封装示意，尚不是当前可直接实例化的公共类：
 
 ```cpp
 class WorldPipelineHost {
@@ -1656,24 +1710,24 @@ Compiler 负责：
 5. 建立 Data、Ordering、Resource 和 Completion 依赖。
 6. 检查循环、多写者和跨 Scope 非法访问。
 7. 生成稳定拓扑、并行批次和生命周期范围。
-8. 把领域子图交给对应的 Domain Compiler。
+8. 保存领域贡献及其实现引用；当前 RenderGraph 展开由独立运行期适配器显式调用，
+   `PipelineCompiler::compile()` 不自动编译或提交 RenderGraph。
 9. 输出完整诊断；失败时不发布部分 Plan。
 
 ### 13.4 PipelinePlan
 
-```cpp
-struct PipelinePlan {
-    PlanRevision revision;
-    PipelinePlanKey key;
-    std::vector<PipelineNode> nodes;
-    std::vector<PipelineDependency> dependencies;
-    std::vector<ExecutionBatch> batches;
-    std::vector<ArtifactLifetimeRange> artifact_lifetimes;
-    std::vector<ScopeBridgeBinding> bridges;
-    std::vector<CompletionRequirement> completions;
-    std::vector<PipelineDiagnostic> diagnostics;
-};
-```
+当前 Plan 保存 `revision`、Pipeline/Scope 身份、定义版本、`nodes`、`dependencies`、
+`topological_order`、`batches`、`artifacts` 和 `exposures`。完整字段定义位于
+`Engine/Pipeline/public/pipeline_types.hpp`。
+
+| 字段或类型 | 使用语义 |
+|------------|----------|
+| `feature_contributions` | 记录 Feature 实例、Composite Part、领域、挂载点、Stage 范围及挂载点权限 |
+| `feature_implementations` | 将每项贡献关联到 `shared_ptr<const PipelineFeature>`，使已编译贡献不受后续 Registry 撤销影响 |
+| `definition_owner` / `feature_owners` | 延长编译时定义对象与 Feature 对象的生命周期 |
+| `PipelinePlanHandle` | `shared_ptr<const PipelinePlan>`；用于获取和持有不可变计划快照 |
+
+通用 Completion 列表、结构化诊断列表及 `PipelinePlanKey` 不属于当前 Plan 的字段。
 
 Plan 是只读对象。执行线程只读取紧凑的索引数组和函数绑定，不在普通帧中修改图结构。
 
@@ -1825,34 +1879,49 @@ RenderFeature 身份。
 
 ### 15.2 RenderGraphBuilder
 
-架构层的 `RenderGraphBuilder` 是 Feature 看到的受限适配器：
+当前 `aeg::pipeline::RenderGraphBuilder` 是 Feature 使用的受限适配器，声明于
+`Engine/Pipeline/public/pipeline.hpp`。它有两种模式：Pipeline 编译时使用 Stage/Task/Artifact
+接口；`build_render_graph()` 调用期间使用资源和 Pass 接口。`is_runtime()` 区分这两种模式。
 
-```cpp
-class RenderGraphBuilder {
-public:
-    [[nodiscard]] RenderGraphTextureHandle create_texture(
-            const RenderTextureDescriptor& descriptor);
-    [[nodiscard]] RenderGraphBufferHandle create_buffer(
-            const RenderBufferDescriptor& descriptor);
-    [[nodiscard]] foundation::Result import_texture(
-            ArtifactId artifact, RenderGraphTextureHandle* handle);
-    [[nodiscard]] foundation::Result read(
-            RenderGraphPassHandle pass, RenderGraphResourceHandle resource,
-            const ResourceUsageDescriptor& usage);
-    [[nodiscard]] foundation::Result write(
-            RenderGraphPassHandle pass, RenderGraphResourceHandle resource,
-            const ResourceUsageDescriptor& usage);
-    [[nodiscard]] foundation::Result add_graphics_pass(
-            std::string_view name, PassSetup setup,
-            PassExecute execute);
-    [[nodiscard]] foundation::Result add_compute_pass(
-            std::string_view name, PassSetup setup,
-            PassExecute execute);
-};
-```
+| API | 作用与调用要求 |
+|-----|----------------|
+| `create_buffer(id, desc, lifetime)` / `create_texture(id, desc, lifetime)` | 使用 RHI 描述符声明资源，返回 `ResultValue<RenderGraphBuffer/Texture>`；可省略 ID 创建匿名资源 |
+| `import_buffer()` / `import_texture()` | 将外部 RHI 资源及初始状态导入图，不转移底层资源所有权 |
+| `import_swapchain_image()` | 导入已获取的交换链图像，使用 `FrameAcquireResult`、纹理描述符和初始状态 |
+| `find_buffer(id)` / `find_texture(id)` | 按 `RenderResourceId` 查询已登记资源；不声明任何 Pass 读写关系 |
+| `export_buffer(handle)` / `export_texture(handle)` | 将逻辑资源标记为外部可观察输出，参与存活分析；不返回物理资源 |
+| `add_graphics_pass()` / `add_compute_pass()` / `add_copy_pass()` | 接收名称、Setup、Execute 和 Queue，返回 `ResultValue<RenderGraphPass>` |
+| `feature_point_flags()` / `allows()` | 查询当前挂载点授予的能力 |
+| `user_data()` | 取得宿主借用的数据指针；不自动提供 Artifact 访问或类型检查 |
+
+`RenderResourceId` 是渲染资源命名空间中的 ID，不等同于 `ArtifactId`。同一次 Runtime
+构建中，命名 Buffer 与 Texture 共用 ID 唯一性约束；重复 ID 返回 `kInvalidState`，
+查询未登记 ID 返回 `kNotFound`。读写声明应置于 Setup 回调，通过
+`RenderPassBuilder::read()`、`write()`、`read_write()` 或附件接口完成。
+
+`RenderGraphResourceLifetime` 的值定义如下：
+
+| 值 | 语义 |
+|----|------|
+| `kTransient` | 图管理的临时逻辑资源，参与瞬态分配；默认值 |
+| `kPersistent` | 图管理的持久资源，不按临时资源生命周期复用 |
+| `kImported` | 外部拥有的资源，必须通过 import 接口登记，不能传给 create 接口 |
+
+`RenderGraphPassType::kGraphics`、`kCompute`、`kCopy` 分别表示绘制、计算和复制声明类别。
+当前类别用于选择挂载点权限，不能视为命令录制的完整隔离机制。三个专用 add 接口的默认
+Queue 分别为 `kGraphics`、`kCompute`、`kCopy`；后两者请求独立队列时还需要
+`kMayUseDedicatedQueue`，否则必须显式选择获准的 Queue。
+
+创建和导入资源需要 `kMayCreateArtifacts`；创建 Pass 需要对应的
+`kMayCreateGraphicsPass`、`kMayCreateComputePass` 或 `kMayCreateCopyPass`；导出资源及
+声明 Present 使用需要 `kMayWriteFinalOutput`。权限不足返回 `kUnsupported`。
+该权限目前不等同于对某个指定最终输出纹理的所有写操作进行对象级授权。
 
 这些接口只声明逻辑资源和访问关系，不返回 `VkImage`、`VkBuffer` 或
-`ID3D12Resource*`。物理资源解析和命令录制发生在 RenderGraph/RHI 内部。
+`ID3D12Resource*`。Execute 回调使用 `RenderPassExecutionContext` 解析 RHI Buffer、Texture
+及 View，通过 `device()` 和 `command_list()` 录制后端无关命令。该 Context 不提供
+`bind_shader(path)` 或直接的 `dispatch()` 便利接口；Shader/布局须由 Shader Contract
+及 RHI Pipeline 绑定流程提供。
 
 当前仓库的 `RenderGraph`、`PassBuilder`、`PassExecutionContext`、`FrameContext` 和
 `RenderGraphPlan` 已经提供了这类适配器所需的底层能力：
@@ -1862,6 +1931,36 @@ public:
 - Transient 生命周期分析。
 - `RenderGraphBarrierPlan` 和 `RenderGraphQueueDependency`。
 - Frame Slot、Command List、提交、呈现和 GPU Completion。
+
+### 15.2.1 RenderGraphFeatureRuntime
+
+`aeg::render_graph::RenderGraphFeatureRuntime` 定义于
+`Engine/RenderGraph/public/render_feature_runtime.hpp`，连接 Pipeline Plan 与具体图。
+依赖方向为 `aeg_render_graph -> aeg_pipeline`，Pipeline 不反向依赖 RenderGraph 实现。
+
+宿主创建 Runtime 时提供 `RenderGraph&`、`const PipelinePlan&`、
+`const PipelineRegistry&` 和可选 `RenderGraphFeatureRuntimeDesc`，随后调用 `build()`。
+一次性调用可使用 `build_render_graph_features(graph, plan, registry, desc)`。
+
+| 输入 | 生命周期与含义 |
+|------|----------------|
+| `buffers` / `textures` | 借用的绑定 span，将公开 `RenderResourceId` 关联到当前图已有句柄；绑定数组须保持有效直到 build 返回 |
+| `user_data` | 非拥有指针；构图期间必须有效，若被 Execute 回调捕获则须持续到相关执行完成 |
+| Graph / Plan / Registry | 借用引用，必须覆盖 Runtime 构建调用；不要直接解引用临时 Plan 快照后立即丢弃其持有者 |
+
+Runtime 优先使用 Plan 保存的 Feature 实现；记录缺失时才尝试 Registry 查询。
+Pass 回调持有 Feature 实现引用，因此 Registry 撤销不会立即销毁仍被图引用的对象。
+这并不自动保证动态库代码或捕获的外部资源存活。
+
+`build()` 只展开逻辑声明，不调用 `RenderGraph::compile()` 或 `execute()`。成功后不得
+在同一个 Runtime 上再次 build，重复调用返回 `kInvalidState`。失败时回滚本次新增的资源、
+Pass、导出标记及编译计划状态，可以重试；没有图变更时保留原编译计划。
+该事务不撤销 Feature 对外部对象的修改，也不涵盖直接访问图进行 reset、compile、execute
+或并发修改；调用方必须在构图期间排除这些操作。失败构建返回过的临时句柄必须全部丢弃，
+不得跨重试保留或使用。
+
+跨图或不再存在的资源绑定返回 `kNotFound`；字段不完整的绑定返回 `kInvalidArgument`。
+回滚不销毁导入的外部 RHI 资源。成功构建后，由宿主显式编译并使用 FrameContext 执行。
 
 ### 15.3 RenderGraph 的职责
 
@@ -2286,14 +2385,16 @@ public:
 
 ### 18.3 Feature 的构建时和运行时
 
-Feature 的 `setup()` 是构建时回调，适合声明：
+当前 Feature 调用分为三层：
 
-- Pass、Task 和 Artifact。
-- 资源访问和依赖。
-- FeaturePoint 关联。
-- 执行域和时间策略。
+1. `setup()` 在 Pipeline 编译期间声明 Stage、Task、Artifact、访问依赖与执行策略；
+   此时不能使用运行期 RenderGraph 资源接口。
+2. `build_render_graph()` 在宿主显式执行 Runtime 构图时创建渲染资源和 Pass；
+   Pass Setup 同步声明资源访问，不能在此保存局部对象的引用供后续 Execute 使用。
+3. Task Execute 使用 `PipelineTaskContext` 访问 Artifact，Pass Execute 使用
+   `RenderPassExecutionContext` 解析资源并录制 RHI 命令。逻辑句柄应按值捕获。
 
-运行时数据应通过 `FeatureExecutionContext` 取得：
+下列 `FeatureExecutionContext` 是尚未实现的统一上下文设计，不应替代当前两个执行接口：
 
 ```cpp
 class FeatureExecutionContext {
@@ -2334,72 +2435,89 @@ engine.end_frame();
 
 ### 19.2 RenderGraph 执行顺序
 
-RenderFeature 的典型使用方式：
+以下为宿主端的实际调用方式。示例函数接收已创建的图、已编译 Pipeline Plan、Registry、
+FrameContext 及宿主纹理；FrameContext 必须已进入可执行帧状态，纹理必须属于该图：
 
 ```cpp
-foundation::Result WeatherRenderFeature::setup(
-        aeg::pipeline::RenderGraphBuilder& builder) const {
-    const auto scene_color = builder.read_texture(
-            aeg::pipeline::ArtifactId("SceneColor"));
-    const auto scene_depth = builder.read_texture(
-            aeg::pipeline::ArtifactId("SceneDepth"));
-    const auto weather_buffer = builder.create_texture({
-            .name = "WeatherBuffer",
-            .format = aeg::rhi::Format::kRgba16Float,
-    });
-
-    return builder.add_compute_pass(
-            "WeatherComposite",
-            [&](auto& pass) {
-                pass.read(scene_color);
-                pass.read(scene_depth);
-                pass.write(weather_buffer);
-                pass.bind_shader("weather/composite");
-                return aeg::foundation::Result::success();
-            },
-            [&](auto& pass_context) {
-                pass_context.dispatch(/* group counts */);
-                return aeg::foundation::Result::success();
-            });
+aeg::foundation::Result build_and_execute(
+        aeg::render_graph::RenderGraph& graph,
+        const aeg::pipeline::PipelinePlan& plan,
+        const aeg::pipeline::PipelineRegistry& registry,
+        aeg::render_graph::FrameContext& frame,
+        aeg::render_graph::RenderGraphTexture scene_color) {
+    const aeg::render_graph::RenderGraphFeatureTextureBinding binding{
+        aeg::pipeline::RenderResourceId("SceneColor"), scene_color};
+    aeg::render_graph::RenderGraphFeatureRuntimeDesc desc{};
+    desc.textures = {&binding, 1};
+    if (auto result = aeg::render_graph::build_render_graph_features(
+                graph, plan, registry, desc); !result) {
+        return result;
+    }
+    if (auto result = graph.compile(); !result) {
+        return result;
+    }
+    return graph.execute(frame).result;
 }
 ```
 
 Feature 只声明资源使用和绘制行为；资源状态转换、Barrier、跨队列等待和物理句柄解析
-由 RenderGraph/RHI 完成。
+由 RenderGraph/RHI 完成。本例不自动呈现，也不等待 GPU 完成。生产调用方应保留
+`execute()` 返回的完成点，按 FrameContext 规则退休资源。该函数用于一次构图执行；
+重复构图前须由宿主管理既有声明，不能逐帧向同一图无限追加 Feature 资源和 Pass。
 
 ### 19.3 当前底层 RenderGraph 的对应关系
 
 架构层概念与当前仓库 API 的对应关系：
 
-| Pipeline 层概念      | 当前底层对象                        |
-|----------------------|-------------------------------------|
-| `RenderGraphBuilder` | `RenderGraph` + Pass setup 适配器   |
-| Render Pass          | `RenderGraph::add_pass()`           |
-| 资源读取/写入        | `PassBuilder::read()` / `write()`   |
-| 帧执行上下文         | `render_graph::FrameContext`        |
-| 编译后渲染计划       | `RenderGraphPlan`                   |
-| GPU 完成点           | `GpuSyncPoint` / `GpuCompletionSet` |
-| 后端设备             | `rhi::Device`                       |
+| Pipeline 层概念                | 当前底层对象                                 |
+|--------------------------------|----------------------------------------------|
+| `pipeline::RenderGraphBuilder` | `RenderGraphFeatureRuntime` 提供的后端适配器 |
+| Render Pass                    | `RenderGraph::add_pass()`                    |
+| 资源读取/写入                  | `PassBuilder::read()` / `write()`            |
+| 帧执行上下文                   | `render_graph::FrameContext`                 |
+| 编译后渲染计划                 | `RenderGraphPlan`                            |
+| GPU 完成点                     | `GpuSyncPoint` / `GpuCompletionSet`          |
+| 后端设备                       | `rhi::Device`                                |
 
 ## 20. 动态重配置和卸载
 
 ### 20.1 启停 Feature
 
-Feature 的启用和禁用通过 Registry/Host 完成：
+当前 Feature 的绑定变更与 Plan 重建必须显式衔接。下例中 Host 已完成绑定、初始编译和激活，
+调用方负责选择不与该实例执行冲突的重配置边界，并检查每项 Result：
 
 ```cpp
-registry.bind_feature(binding);
-registry.request_rebuild(
-        aeg::pipeline::PipelineScope::kFrame,
-        aeg::pipeline::RebuildReason::kFeatureBindingChanged);
+if (auto result = registry.bind_feature(binding); !result) {
+    return result;
+}
+if (auto result = host.rebuild(registry); !result) {
+    return result;
+}
+return host.apply_pending_plan();
 ```
 
-请求不会立即修改正在执行的 Plan。Host 会在安全点创建 PendingPlan，等待旧 Plan 的
-CPU/GPU Completion，然后一次性切换：
+禁用使用 `unbind_feature(instance)` 后重建。Registry 变更本身不会更新已编译 Plan。
+Host 未激活时，`rebuild()` 安装 Active Plan；已激活时只暂存 Pending Plan。
+`execute()` 在执行前也会尝试应用 Pending Plan，应用失败则返回错误，不继续执行旧计划。
 
 ```text
-ActivePlan -> PendingPlan compile -> wait completions -> atomic install
+Registry change -> rebuild -> Pending Plan
+                            -> apply_pending_plan -> Active Plan
+Old Active Plan -> Retired Plans -> collect_retired_plans
 ```
+
+| 状态或操作 | 当前行为 |
+|------------|----------|
+| 没有 Pending Plan | `apply_pending_plan()` 返回 `kNotReady`；execute 将此视为无待应用变更 |
+| 旧 Plan 仍有外部快照且新契约不兼容 | 拒绝切换，返回 `kInvalidState`，保留 Pending Plan |
+| Artifact 契约替换受活动 Writer 等约束阻止 | 返回错误，不将 Pending Plan 发布为 Active |
+| 成功切换 | 替换 Artifact 契约并更新计划引用，将旧计划放入退休列表 |
+| `collect_retired_plans()` | 仅尝试清理无外部 Plan 引用的退休项，同时调用 Artifact 退休逻辑 |
+
+Plan 锁协调 Host 的计划切换与 CPU 执行，引用计数负责对象生命周期；两者均不表示 GPU
+完成。当前 Host 不轮询或等待 GPU Completion。调用方必须单独管理仍在执行的
+RenderGraph、资源、模块代码和完成点，再释放相关持有者。`request_rebuild()` 自动通知、
+通用 CPU/GPU 完成门控与动态库卸载管理仍属于架构约定。
 
 ### 20.2 卸载模块
 
@@ -2515,8 +2633,9 @@ Plan 采用只读和版本化策略：
 
 - Active Plan 可以被多个只读执行者使用。
 - Pending Plan 可以在后台编译。
-- 安全点只切换 Plan 指针，不修改旧 Plan 内容。
-- 旧 Plan 需要等 CPU Task、Render Command 和 GPU Completion 全部结束后退休。
+- 安全点替换 Artifact 契约并切换 Plan 引用，不修改旧 Plan 内容。
+- 当前 `collect_retired_plans()` 根据外部引用与 Artifact 状态清理计划，不自动等待 GPU。
+  涉及 Render Command、GPU 资源和模块代码的生命周期仍须由调用方关联完成点管理。
 
 ### 22.4 线程模型
 
@@ -3543,8 +3662,10 @@ Transfer 可能同时包含 Usage Transition 和 Memory Dependency；这时 `kin
 | `kBuffer`  | Barrier 指向逻辑 Buffer  | `buffer_range`                            | `resource_index/generation` 必须指向 Buffer 表；`subresources` 不参与匹配   |
 | `kTexture` | Barrier 指向逻辑 Texture | `subresources`                            | Aspect、mip 和 layer 必须落在 Texture 描述范围内；`buffer_range` 不参与匹配 |
 
-`resource_kind`、`resource_index` 和 `resource_generation` 共同构成逻辑资源身份，不能
-只比较 index。Graph `reset()` 或重新创建后 generation 变化，旧 Barrier/Handle 即使
+`resource_kind`、`resource_index` 和 `resource_generation` 在所属图的 Plan 内共同标识
+逻辑资源，不能只比较 index。Barrier 记录不携带跨图身份，不得复制到其他图执行；
+公开 Buffer/Texture/Pass 句柄另外携带 `graph_id`。Graph `reset()` 后资源代际变化，
+新建图则由不同 `graph_id` 区分，旧 Barrier/Handle 即使
 index 相同也必须视为过期并返回 `kInvalidState`。
 
 ### 28.10 非枚举哨兵、容量常量和“空值”语义

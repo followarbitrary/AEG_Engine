@@ -24,15 +24,16 @@ namespace aeg::render_graph {
     /**
      * @brief Opaque handle for a logical render-graph texture.
      *
-     * Handles are valid only for the graph generation that created them and are
-     * invalidated by reset().
+     * Handles are valid only for the graph instance and resource generation
+     * that created them. They are invalidated by reset().
      */
     struct RenderGraphTexture {
         uint32_t index{kInvalidHandleIndex};
         uint32_t generation{0};
+        uint64_t graph_id{0};
 
         [[nodiscard]] constexpr bool is_valid() const noexcept {
-            return index != kInvalidHandleIndex && generation != 0;
+            return index != kInvalidHandleIndex && generation != 0 && graph_id != 0;
         }
 
         constexpr explicit operator bool() const noexcept { return is_valid(); }
@@ -43,9 +44,10 @@ namespace aeg::render_graph {
     struct RenderGraphBuffer {
         uint32_t index{kInvalidHandleIndex};
         uint32_t generation{0};
+        uint64_t graph_id{0};
 
         [[nodiscard]] constexpr bool is_valid() const noexcept {
-            return index != kInvalidHandleIndex && generation != 0;
+            return index != kInvalidHandleIndex && generation != 0 && graph_id != 0;
         }
 
         constexpr explicit operator bool() const noexcept { return is_valid(); }
@@ -56,9 +58,10 @@ namespace aeg::render_graph {
     struct RenderGraphPass {
         uint32_t index{kInvalidHandleIndex};
         uint32_t generation{0};
+        uint64_t graph_id{0};
 
         [[nodiscard]] constexpr bool is_valid() const noexcept {
-            return index != kInvalidHandleIndex && generation != 0;
+            return index != kInvalidHandleIndex && generation != 0 && graph_id != 0;
         }
 
         constexpr explicit operator bool() const noexcept { return is_valid(); }
@@ -192,6 +195,7 @@ namespace aeg::render_graph {
     class RenderGraph;
     class PassBuilder;
     class PassExecutionContext;
+    class RenderGraphFeatureRuntime;
 
     /** @brief Callback that declares resource usage for a pass. */
     using PassSetupCallback = std::function<foundation::Result(PassBuilder&)>;
@@ -392,6 +396,11 @@ namespace aeg::render_graph {
                 const rhi::TextureDesc& desc,
                 ResourceLifetime lifetime = ResourceLifetime::kTransient);
 
+        /** @brief Tests whether a buffer handle belongs to this graph instance. */
+        [[nodiscard]] bool contains_buffer(RenderGraphBuffer resource) const noexcept;
+        /** @brief Tests whether a texture handle belongs to this graph instance. */
+        [[nodiscard]] bool contains_texture(RenderGraphTexture resource) const noexcept;
+
         /** @brief Imports an externally owned buffer into the graph. */
         [[nodiscard]] foundation::ResultValue<RenderGraphBuffer> import_buffer(
                 rhi::BufferHandle buffer, const rhi::BufferDesc& desc,
@@ -435,6 +444,11 @@ namespace aeg::render_graph {
     private:
         friend class PassBuilder;
         friend class PassExecutionContext;
+        friend class RenderGraphFeatureRuntime;
+
+        [[nodiscard]] foundation::Result begin_feature_build_transaction();
+        void commit_feature_build_transaction() noexcept;
+        void rollback_feature_build_transaction() noexcept;
 
         /** @brief Opaque implementation containing graph compiler and runtime state. */
         struct Impl;

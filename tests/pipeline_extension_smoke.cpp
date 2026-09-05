@@ -263,7 +263,8 @@ int main() {
         return 8;
     }
     if (compiled.value.nodes.size() != 4 || compiled.value.feature_contributions.size() != 3 ||
-        compiled.value.feature_owners.size() != 2 || compiled.value.instance !=
+        compiled.value.feature_implementations.size() != 3 || compiled.value.feature_owners.size() != 2 ||
+        compiled.value.instance !=
                                                        aeg::pipeline::PipelineInstanceId("ExtensionInstance")) {
         return 9;
     }

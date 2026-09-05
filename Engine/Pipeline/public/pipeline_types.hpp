@@ -16,6 +16,8 @@
 #include "result.hpp"
 
 namespace aeg::pipeline {
+    class PipelineFeature;
+
     inline constexpr uint32_t kInvalidPipelineHandleIndex = std::numeric_limits<uint32_t>::max();
 
     /** @brief Hash-backed stable identity used by pipeline contracts. */
@@ -440,15 +442,58 @@ namespace aeg::pipeline {
         friend constexpr bool operator==(DefinitionHandle, DefinitionHandle) = default;
     };
 
+    /** @brief Opaque handle shared between Pipeline and RenderGraph runtime APIs. */
+    template <typename Tag>
+    struct RenderGraphHandle final {
+        uint32_t index{kInvalidPipelineHandleIndex};
+        uint32_t generation{0};
+        uint64_t graph_id{0};
+
+        [[nodiscard]] constexpr bool is_valid() const noexcept {
+            return index != kInvalidPipelineHandleIndex && generation != 0 && graph_id != 0;
+        }
+
+        constexpr explicit operator bool() const noexcept { return is_valid(); }
+        friend constexpr bool operator==(RenderGraphHandle, RenderGraphHandle) = default;
+    };
+
     struct PipelineStageHandleTag;
     struct PipelineTaskHandleTag;
     struct PipelineArtifactHandleTag;
     struct PipelineFeaturePointHandleTag;
+    struct RenderGraphResourceIdTag;
+    struct RenderGraphBufferHandleTag;
+    struct RenderGraphTextureHandleTag;
+    struct RenderGraphPassHandleTag;
 
     using PipelineStageHandle = DefinitionHandle<PipelineStageHandleTag>;
     using PipelineTaskHandle = DefinitionHandle<PipelineTaskHandleTag>;
     using PipelineArtifactHandle = DefinitionHandle<PipelineArtifactHandleTag>;
     using PipelineFeaturePointHandle = DefinitionHandle<PipelineFeaturePointHandleTag>;
+    using RenderResourceId = StableId<RenderGraphResourceIdTag>;
+    using RenderGraphBuffer = RenderGraphHandle<RenderGraphBufferHandleTag>;
+    using RenderGraphTexture = RenderGraphHandle<RenderGraphTextureHandleTag>;
+    using RenderGraphPass = RenderGraphHandle<RenderGraphPassHandleTag>;
+
+    /** @brief Lifetime policy for a logical render-graph resource. */
+    enum class RenderGraphResourceLifetime : uint8_t {
+        kTransient = 0,
+        kPersistent = 1,
+        kImported = 2,
+    };
+
+    /** @brief Execution category of a render-graph pass. */
+    enum class RenderGraphPassType : uint8_t {
+        kGraphics = 0,
+        kCompute = 1,
+        kCopy = 2,
+    };
+
+    /** @brief Byte range of a logical render-graph buffer. */
+    struct RenderGraphBufferRange {
+        uint64_t offset{0};
+        uint64_t size{std::numeric_limits<uint64_t>::max()};
+    };
 
     /** @brief Internal definition record for a stage. */
     struct PipelineStageRecord {
@@ -505,6 +550,16 @@ namespace aeg::pipeline {
         FeatureDomain domain{FeatureDomain::kLogic};
         uint32_t first_stage_index{kInvalidPipelineHandleIndex};
         uint32_t stage_count{0};
+        FeaturePointPosition point_position{FeaturePointPosition::kBefore};
+        FeaturePointFlags point_flags{FeaturePointFlags::kNone};
+    };
+
+    /** @brief Keeps one compiled feature contribution implementation alive. */
+    struct PipelineFeatureImplementationRecord {
+        FeatureInstanceId feature_instance{};
+        FeatureId feature{};
+        FeaturePartId part{};
+        std::shared_ptr<const PipelineFeature> implementation{};
     };
 
     /** @brief Immutable result of PipelineBuilder definition collection. */
@@ -567,6 +622,7 @@ namespace aeg::pipeline {
         std::vector<uint32_t> topological_order{};
         std::vector<PipelineExecutionBatch> batches{};
         std::vector<PipelineFeatureContributionRecord> feature_contributions{};
+        std::vector<PipelineFeatureImplementationRecord> feature_implementations{};
         std::vector<ArtifactDescriptor> artifacts{};
         std::vector<PipelineExposureRecord> exposures{};
 
@@ -574,4 +630,6 @@ namespace aeg::pipeline {
         std::shared_ptr<const void> definition_owner{};
         std::vector<std::shared_ptr<const void>> feature_owners{};
     };
+
+    using PipelinePlanHandle = std::shared_ptr<const PipelinePlan>;
 }  // namespace aeg::pipeline

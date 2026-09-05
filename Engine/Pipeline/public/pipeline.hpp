@@ -9,7 +9,6 @@
 #include <exception>
 #include <functional>
 #include <memory>
-#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <string_view>
@@ -20,20 +19,359 @@
 #include <vector>
 
 #include "pipeline_types.hpp"
+#include "rhi_struct.hpp"
+
+namespace aeg::rhi {
+    class Device;
+}
 
 namespace aeg::pipeline {
     class FeatureBuildContext;
     class ArtifactRegistry;
     class ArtifactScopeBridge;
+    class PipelineFeature;
+    class RenderGraphBuilder;
+    class RenderGraphBuilderBackend;
+    class RenderPassBuilder;
+    class RenderPassBuilderBackend;
+    class RenderPassExecutionContext;
+    class RenderPassExecutionContextBackend;
+
+    using RenderPassSetupFunction = std::function<foundation::Result(RenderPassBuilder&)>;
+    using RenderPassExecuteFunction = std::function<foundation::Result(RenderPassExecutionContext&)>;
 
     template <FeatureDomain Domain>
     class DomainGraphBuilder;
 
     using LogicGraphBuilder = DomainGraphBuilder<FeatureDomain::kLogic>;
     using PhysicsGraphBuilder = DomainGraphBuilder<FeatureDomain::kPhysics>;
-    using RenderGraphBuilder = DomainGraphBuilder<FeatureDomain::kRender>;
     using AudioGraphBuilder = DomainGraphBuilder<FeatureDomain::kAudio>;
     using StreamGraphBuilder = DomainGraphBuilder<FeatureDomain::kStream>;
+
+    /** @brief Runtime metadata associated with one render-feature contribution. */
+    struct RenderGraphFeatureContext {
+        PipelineScope scope{PipelineScope::kFrame};
+        PipelineId pipeline{};
+        FeatureId feature{};
+        FeatureInstanceId feature_instance{};
+        FeaturePartId part{};
+        FeaturePointId feature_point{};
+        FeaturePointPosition point_position{FeaturePointPosition::kBefore};
+        FeaturePointFlags point_flags{FeaturePointFlags::kNone};
+        void* user_data{nullptr};
+
+        [[nodiscard]] bool allows(FeaturePointFlags flag) const noexcept {
+            return has_flag(point_flags, flag);
+        }
+    };
+
+    /** @brief Backend adapter for render-pass resource declarations. */
+    class RenderPassBuilderBackend {
+    public:
+        virtual ~RenderPassBuilderBackend() = default;
+
+        [[nodiscard]] virtual foundation::Result read_buffer(
+            RenderGraphBuffer buffer, rhi::ResourceUsage usage,
+            rhi::PipelineStageMask pipeline_stages, rhi::ShaderStageMask shader_stages,
+            RenderGraphBufferRange range) = 0;
+        [[nodiscard]] virtual foundation::Result write_buffer(
+            RenderGraphBuffer buffer, rhi::ResourceUsage usage,
+            rhi::PipelineStageMask pipeline_stages, rhi::ShaderStageMask shader_stages,
+            RenderGraphBufferRange range, bool discard_contents) = 0;
+        [[nodiscard]] virtual foundation::Result read_write_buffer(
+            RenderGraphBuffer buffer, rhi::ResourceUsage usage,
+            rhi::PipelineStageMask pipeline_stages, rhi::ShaderStageMask shader_stages,
+            RenderGraphBufferRange range) = 0;
+        [[nodiscard]] virtual foundation::Result read_texture(
+            RenderGraphTexture texture, rhi::ResourceUsage usage,
+            rhi::PipelineStageMask pipeline_stages, rhi::ShaderStageMask shader_stages,
+            rhi::SubresourceRange subresources) = 0;
+        [[nodiscard]] virtual foundation::Result write_texture(
+            RenderGraphTexture texture, rhi::ResourceUsage usage,
+            rhi::PipelineStageMask pipeline_stages, rhi::ShaderStageMask shader_stages,
+            rhi::SubresourceRange subresources, bool discard_contents) = 0;
+        [[nodiscard]] virtual foundation::Result read_write_texture(
+            RenderGraphTexture texture, rhi::ResourceUsage usage,
+            rhi::PipelineStageMask pipeline_stages, rhi::ShaderStageMask shader_stages,
+            rhi::SubresourceRange subresources) = 0;
+        [[nodiscard]] virtual foundation::Result use_color_attachment(
+            RenderGraphTexture texture, rhi::LoadOp load_op, rhi::StoreOp store_op,
+            rhi::ClearColorValue clear_color, rhi::ResourceUsage final_usage,
+            rhi::SubresourceRange subresources) = 0;
+        [[nodiscard]] virtual foundation::Result use_depth_stencil_attachment(
+            RenderGraphTexture texture, rhi::LoadOp depth_load_op, rhi::StoreOp depth_store_op,
+            float clear_depth, uint32_t clear_stencil, rhi::ResourceUsage final_usage,
+            rhi::SubresourceRange subresources) = 0;
+        virtual void set_side_effects(bool enabled) noexcept = 0;
+    };
+
+    /** @brief Backend adapter for render-pass command recording. */
+    class RenderPassExecutionContextBackend {
+    public:
+        virtual ~RenderPassExecutionContextBackend() = default;
+
+        [[nodiscard]] virtual rhi::Device& device() const noexcept = 0;
+        [[nodiscard]] virtual rhi::CommandListHandle command_list() const noexcept = 0;
+        [[nodiscard]] virtual RenderGraphPass pass() const noexcept = 0;
+        [[nodiscard]] virtual foundation::ResultValue<rhi::BufferHandle> buffer(
+            RenderGraphBuffer buffer) const = 0;
+        [[nodiscard]] virtual foundation::ResultValue<rhi::TextureHandle> texture(
+            RenderGraphTexture texture) const = 0;
+        [[nodiscard]] virtual foundation::ResultValue<rhi::BufferViewHandle> buffer_view(
+            RenderGraphBuffer buffer, rhi::BufferViewKind kind, uint64_t offset, uint64_t size,
+            rhi::Format format, uint32_t structure_stride) = 0;
+        [[nodiscard]] virtual foundation::ResultValue<rhi::TextureViewHandle> texture_view(
+            RenderGraphTexture texture, rhi::TextureViewKind kind, rhi::SubresourceRange subresources,
+            rhi::Format format, rhi::TextureViewDimension dimension) = 0;
+        [[nodiscard]] virtual foundation::Result begin_rendering() = 0;
+        [[nodiscard]] virtual foundation::Result end_rendering() = 0;
+        [[nodiscard]] virtual bool rendering_active() const noexcept = 0;
+        [[nodiscard]] virtual bool rendering_started() const noexcept = 0;
+        [[nodiscard]] virtual foundation::Result copy_buffer(
+            RenderGraphBuffer source, RenderGraphBuffer destination,
+            uint64_t source_offset, uint64_t destination_offset, uint64_t size) = 0;
+        [[nodiscard]] virtual foundation::Result copy_buffer_to_texture(
+            RenderGraphBuffer source, uint64_t source_offset, uint32_t source_row_length,
+            uint32_t source_image_height, RenderGraphTexture destination,
+            rhi::TextureSubresourceLayers destination_subresources, rhi::Offset3D destination_offset,
+            rhi::Extent3D extent) = 0;
+        [[nodiscard]] virtual foundation::Result copy_texture_to_buffer(
+            RenderGraphTexture source, rhi::TextureSubresourceLayers source_subresources,
+            rhi::Offset3D source_offset, rhi::Extent3D extent, RenderGraphBuffer destination,
+            uint64_t destination_offset, uint32_t destination_row_length,
+            uint32_t destination_image_height) = 0;
+        [[nodiscard]] virtual foundation::Result copy_texture(
+            RenderGraphTexture source, rhi::TextureSubresourceLayers source_subresources,
+            rhi::Offset3D source_offset, RenderGraphTexture destination,
+            rhi::TextureSubresourceLayers destination_subresources, rhi::Offset3D destination_offset,
+            rhi::Extent3D extent) = 0;
+        [[nodiscard]] virtual foundation::Result clear_texture(
+            RenderGraphTexture texture, rhi::SubresourceRange subresources,
+            rhi::ClearColorValue color, float depth, uint32_t stencil) = 0;
+    };
+
+    /** @brief Backend adapter for logical resources and render-pass creation. */
+    class RenderGraphBuilderBackend {
+    public:
+        virtual ~RenderGraphBuilderBackend() = default;
+
+        [[nodiscard]] virtual foundation::ResultValue<RenderGraphBuffer> create_buffer(
+            RenderResourceId id, const rhi::BufferDesc& desc,
+            RenderGraphResourceLifetime lifetime) = 0;
+        [[nodiscard]] virtual foundation::ResultValue<RenderGraphTexture> create_texture(
+            RenderResourceId id, const rhi::TextureDesc& desc,
+            RenderGraphResourceLifetime lifetime) = 0;
+        [[nodiscard]] virtual foundation::ResultValue<RenderGraphBuffer> import_buffer(
+            RenderResourceId id, rhi::BufferHandle buffer, const rhi::BufferDesc& desc,
+            const rhi::ResourceState& initial_state) = 0;
+        [[nodiscard]] virtual foundation::ResultValue<RenderGraphTexture> import_texture(
+            RenderResourceId id, rhi::TextureHandle texture, rhi::TextureViewHandle default_view,
+            const rhi::TextureDesc& desc, const rhi::ResourceState& initial_state) = 0;
+        [[nodiscard]] virtual foundation::ResultValue<RenderGraphTexture> import_swapchain_image(
+            RenderResourceId id, const rhi::FrameAcquireResult& acquired,
+            const rhi::TextureDesc& desc, const rhi::ResourceState& initial_state) = 0;
+        [[nodiscard]] virtual foundation::ResultValue<RenderGraphBuffer> find_buffer(
+            RenderResourceId id) const = 0;
+        [[nodiscard]] virtual foundation::ResultValue<RenderGraphTexture> find_texture(
+            RenderResourceId id) const = 0;
+        [[nodiscard]] virtual foundation::Result export_buffer(RenderGraphBuffer buffer) = 0;
+        [[nodiscard]] virtual foundation::Result export_texture(RenderGraphTexture texture) = 0;
+        virtual void set_feature_owner(std::shared_ptr<const PipelineFeature> owner) = 0;
+        [[nodiscard]] virtual foundation::ResultValue<RenderGraphPass> add_pass(
+            std::string_view name, RenderGraphPassType type, rhi::QueueClass queue,
+            RenderPassSetupFunction setup, RenderPassExecuteFunction execute) = 0;
+    };
+
+    /** @brief Public facade used by RenderFeature declaration and graph build callbacks. */
+    class RenderGraphBuilder final {
+    public:
+        static constexpr FeatureDomain kDomain = FeatureDomain::kRender;
+
+        [[nodiscard]] PipelineStageHandle add_stage(const StageDescriptor& descriptor);
+        [[nodiscard]] PipelineTaskHandle add_task(const TaskDescriptor& descriptor);
+        [[nodiscard]] PipelineArtifactHandle declare_artifact(const ArtifactDescriptor& descriptor);
+        [[nodiscard]] foundation::Result bind_task(PipelineTaskHandle task, PipelineStageHandle stage);
+        [[nodiscard]] foundation::Result reads(PipelineStageHandle stage, const ArtifactBinding& binding);
+        [[nodiscard]] foundation::Result writes(PipelineStageHandle stage, const ArtifactBinding& binding);
+        [[nodiscard]] foundation::Result reads_writes(PipelineStageHandle stage,
+                                                       const ArtifactBinding& binding);
+        [[nodiscard]] foundation::Result publish_snapshot(PipelineStageHandle stage,
+                                                           const ArtifactBinding& binding);
+        [[nodiscard]] foundation::Result runs_before(PipelineStageHandle stage, StageId other);
+        [[nodiscard]] foundation::Result runs_after(PipelineStageHandle stage, StageId other);
+        [[nodiscard]] foundation::Result expose_artifact(ArtifactId artifact,
+                                                          PipelineScope target_scope);
+
+        [[nodiscard]] PipelineScope scope() const noexcept;
+        [[nodiscard]] PipelineId pipeline_id() const noexcept;
+        [[nodiscard]] FeatureId feature_id() const noexcept;
+        [[nodiscard]] FeatureInstanceId feature_instance_id() const noexcept;
+        [[nodiscard]] FeaturePartId part_id() const noexcept;
+        [[nodiscard]] FeaturePointId feature_point() const noexcept;
+        [[nodiscard]] FeaturePointPosition feature_point_position() const noexcept;
+        [[nodiscard]] FeaturePointFlags feature_point_flags() const noexcept;
+        [[nodiscard]] void* user_data() const noexcept;
+        [[nodiscard]] bool allows(FeaturePointFlags flag) const noexcept;
+        [[nodiscard]] bool is_runtime() const noexcept;
+
+        [[nodiscard]] foundation::ResultValue<RenderGraphBuffer> create_buffer(
+            const rhi::BufferDesc& desc,
+            RenderGraphResourceLifetime lifetime = RenderGraphResourceLifetime::kTransient);
+        [[nodiscard]] foundation::ResultValue<RenderGraphBuffer> create_buffer(
+            RenderResourceId id, const rhi::BufferDesc& desc,
+            RenderGraphResourceLifetime lifetime = RenderGraphResourceLifetime::kTransient);
+        [[nodiscard]] foundation::ResultValue<RenderGraphTexture> create_texture(
+            const rhi::TextureDesc& desc,
+            RenderGraphResourceLifetime lifetime = RenderGraphResourceLifetime::kTransient);
+        [[nodiscard]] foundation::ResultValue<RenderGraphTexture> create_texture(
+            RenderResourceId id, const rhi::TextureDesc& desc,
+            RenderGraphResourceLifetime lifetime = RenderGraphResourceLifetime::kTransient);
+        [[nodiscard]] foundation::ResultValue<RenderGraphBuffer> import_buffer(
+            RenderResourceId id, rhi::BufferHandle buffer, const rhi::BufferDesc& desc,
+            const rhi::ResourceState& initial_state = {});
+        [[nodiscard]] foundation::ResultValue<RenderGraphTexture> import_texture(
+            RenderResourceId id, rhi::TextureHandle texture, rhi::TextureViewHandle default_view,
+            const rhi::TextureDesc& desc, const rhi::ResourceState& initial_state = {});
+        [[nodiscard]] foundation::ResultValue<RenderGraphTexture> import_swapchain_image(
+            RenderResourceId id, const rhi::FrameAcquireResult& acquired,
+            const rhi::TextureDesc& desc, const rhi::ResourceState& initial_state = {});
+        [[nodiscard]] foundation::ResultValue<RenderGraphBuffer> find_buffer(RenderResourceId id) const;
+        [[nodiscard]] foundation::ResultValue<RenderGraphTexture> find_texture(RenderResourceId id) const;
+        [[nodiscard]] foundation::Result export_buffer(RenderGraphBuffer buffer);
+        [[nodiscard]] foundation::Result export_texture(RenderGraphTexture texture);
+
+        [[nodiscard]] foundation::ResultValue<RenderGraphPass> add_pass(
+            std::string_view name, RenderGraphPassType type, rhi::QueueClass queue,
+            RenderPassSetupFunction setup, RenderPassExecuteFunction execute);
+        [[nodiscard]] foundation::ResultValue<RenderGraphPass> add_graphics_pass(
+            std::string_view name, RenderPassSetupFunction setup,
+            RenderPassExecuteFunction execute, rhi::QueueClass queue = rhi::QueueClass::kGraphics);
+        [[nodiscard]] foundation::ResultValue<RenderGraphPass> add_compute_pass(
+            std::string_view name, RenderPassSetupFunction setup,
+            RenderPassExecuteFunction execute, rhi::QueueClass queue = rhi::QueueClass::kCompute);
+        [[nodiscard]] foundation::ResultValue<RenderGraphPass> add_copy_pass(
+            std::string_view name, RenderPassSetupFunction setup,
+            RenderPassExecuteFunction execute, rhi::QueueClass queue = rhi::QueueClass::kCopy);
+
+        /** @brief Creates a runtime facade backed by a RenderGraph adapter. */
+        RenderGraphBuilder(RenderGraphBuilderBackend& backend,
+                           const RenderGraphFeatureContext& context) noexcept;
+
+    private:
+        explicit RenderGraphBuilder(FeatureBuildContext& context) noexcept;
+
+        FeatureBuildContext* declaration_context_{nullptr};
+        RenderGraphBuilderBackend* runtime_backend_{nullptr};
+        RenderGraphFeatureContext runtime_context_{};
+
+        friend class FeatureBuildContext;
+    };
+
+    /** @brief Facade used by one render-pass setup callback. */
+    class RenderPassBuilder final {
+    public:
+        explicit RenderPassBuilder(
+            RenderPassBuilderBackend& backend,
+            FeaturePointFlags point_flags = FeaturePointFlags::kNone) noexcept
+            : backend_(&backend), point_flags_(point_flags) {
+        }
+
+        [[nodiscard]] foundation::Result read(
+            RenderGraphBuffer buffer, rhi::ResourceUsage usage,
+            rhi::PipelineStageMask pipeline_stages = rhi::PipelineStage::kAllCommands,
+            rhi::ShaderStageMask shader_stages = rhi::ShaderStage::kAll,
+            RenderGraphBufferRange range = {});
+        [[nodiscard]] foundation::Result write(
+            RenderGraphBuffer buffer, rhi::ResourceUsage usage,
+            rhi::PipelineStageMask pipeline_stages = rhi::PipelineStage::kAllCommands,
+            rhi::ShaderStageMask shader_stages = rhi::ShaderStage::kAll,
+            RenderGraphBufferRange range = {}, bool discard_contents = true);
+        [[nodiscard]] foundation::Result read_write(
+            RenderGraphBuffer buffer, rhi::ResourceUsage usage,
+            rhi::PipelineStageMask pipeline_stages = rhi::PipelineStage::kAllCommands,
+            rhi::ShaderStageMask shader_stages = rhi::ShaderStage::kAll,
+            RenderGraphBufferRange range = {});
+        [[nodiscard]] foundation::Result read(
+            RenderGraphTexture texture, rhi::ResourceUsage usage,
+            rhi::PipelineStageMask pipeline_stages = rhi::PipelineStage::kAllCommands,
+            rhi::ShaderStageMask shader_stages = rhi::ShaderStage::kAll,
+            rhi::SubresourceRange subresources = {});
+        [[nodiscard]] foundation::Result write(
+            RenderGraphTexture texture, rhi::ResourceUsage usage,
+            rhi::PipelineStageMask pipeline_stages = rhi::PipelineStage::kAllCommands,
+            rhi::ShaderStageMask shader_stages = rhi::ShaderStage::kAll,
+            rhi::SubresourceRange subresources = {}, bool discard_contents = true);
+        [[nodiscard]] foundation::Result read_write(
+            RenderGraphTexture texture, rhi::ResourceUsage usage,
+            rhi::PipelineStageMask pipeline_stages = rhi::PipelineStage::kAllCommands,
+            rhi::ShaderStageMask shader_stages = rhi::ShaderStage::kAll,
+            rhi::SubresourceRange subresources = {});
+        [[nodiscard]] foundation::Result use_color_attachment(
+            RenderGraphTexture texture, rhi::LoadOp load_op, rhi::StoreOp store_op,
+            rhi::ClearColorValue clear_color = {},
+            rhi::ResourceUsage final_usage = rhi::ResourceUsage::kColorAttachmentWrite,
+            rhi::SubresourceRange subresources = {});
+        [[nodiscard]] foundation::Result use_depth_stencil_attachment(
+            RenderGraphTexture texture, rhi::LoadOp depth_load_op, rhi::StoreOp depth_store_op,
+            float clear_depth = 1.0f, uint32_t clear_stencil = 0,
+            rhi::ResourceUsage final_usage = rhi::ResourceUsage::kDepthStencilWrite,
+            rhi::SubresourceRange subresources = {});
+        void set_side_effects(bool enabled = true) noexcept;
+
+    private:
+        RenderPassBuilderBackend* backend_{nullptr};
+        FeaturePointFlags point_flags_{FeaturePointFlags::kNone};
+    };
+
+    /** @brief Facade used by one render-pass command callback. */
+    class RenderPassExecutionContext final {
+    public:
+        explicit RenderPassExecutionContext(RenderPassExecutionContextBackend& backend) noexcept
+            : backend_(&backend) {
+        }
+
+        [[nodiscard]] rhi::Device& device() const noexcept;
+        [[nodiscard]] rhi::CommandListHandle command_list() const noexcept;
+        [[nodiscard]] RenderGraphPass pass() const noexcept;
+        [[nodiscard]] foundation::ResultValue<rhi::BufferHandle> buffer(RenderGraphBuffer buffer) const;
+        [[nodiscard]] foundation::ResultValue<rhi::TextureHandle> texture(RenderGraphTexture texture) const;
+        [[nodiscard]] foundation::ResultValue<rhi::BufferViewHandle> buffer_view(
+            RenderGraphBuffer buffer, rhi::BufferViewKind kind, uint64_t offset = 0,
+            uint64_t size = std::numeric_limits<uint64_t>::max(),
+            rhi::Format format = rhi::Format::kUnknown, uint32_t structure_stride = 0);
+        [[nodiscard]] foundation::ResultValue<rhi::TextureViewHandle> texture_view(
+            RenderGraphTexture texture, rhi::TextureViewKind kind = rhi::TextureViewKind::kSampled,
+            rhi::SubresourceRange subresources = {}, rhi::Format format = rhi::Format::kUnknown,
+            rhi::TextureViewDimension dimension = rhi::TextureViewDimension::kAuto);
+        [[nodiscard]] foundation::Result begin_rendering();
+        [[nodiscard]] foundation::Result end_rendering();
+        [[nodiscard]] bool rendering_active() const noexcept;
+        [[nodiscard]] bool rendering_started() const noexcept;
+        [[nodiscard]] foundation::Result copy_buffer(
+            RenderGraphBuffer source, RenderGraphBuffer destination,
+            uint64_t source_offset, uint64_t destination_offset, uint64_t size);
+        [[nodiscard]] foundation::Result copy_buffer_to_texture(
+            RenderGraphBuffer source, uint64_t source_offset, uint32_t source_row_length,
+            uint32_t source_image_height, RenderGraphTexture destination,
+            rhi::TextureSubresourceLayers destination_subresources, rhi::Offset3D destination_offset,
+            rhi::Extent3D extent);
+        [[nodiscard]] foundation::Result copy_texture_to_buffer(
+            RenderGraphTexture source, rhi::TextureSubresourceLayers source_subresources,
+            rhi::Offset3D source_offset, rhi::Extent3D extent, RenderGraphBuffer destination,
+            uint64_t destination_offset, uint32_t destination_row_length,
+            uint32_t destination_image_height);
+        [[nodiscard]] foundation::Result copy_texture(
+            RenderGraphTexture source, rhi::TextureSubresourceLayers source_subresources,
+            rhi::Offset3D source_offset, RenderGraphTexture destination,
+            rhi::TextureSubresourceLayers destination_subresources, rhi::Offset3D destination_offset,
+            rhi::Extent3D extent);
+        [[nodiscard]] foundation::Result clear_texture(
+            RenderGraphTexture texture, rhi::SubresourceRange subresources = {},
+            rhi::ClearColorValue color = {}, float depth = 1.0f, uint32_t stencil = 0);
+
+    private:
+        RenderPassExecutionContextBackend* backend_{nullptr};
+    };
 
     /** @brief Type-erased payload installed into an ArtifactRegistry. */
     struct ArtifactPayload {
@@ -200,6 +538,11 @@ namespace aeg::pipeline {
         [[nodiscard]] foundation::Result install_contract(const ArtifactDescriptor& descriptor);
         /** @brief Installs all contracts carried by a compiled plan. */
         [[nodiscard]] foundation::Result install_plan(const PipelinePlan& plan);
+        /** @brief Atomically replaces the contracts owned by one installed plan. */
+        [[nodiscard]] foundation::Result replace_plan(const PipelinePlan& previous,
+                                                       const PipelinePlan& next);
+        /** @brief Releases the contract references owned by one installed plan. */
+        [[nodiscard]] foundation::Result retire_plan(const PipelinePlan& plan);
         /** @brief Removes a contract and any value owned by this registry. */
         [[nodiscard]] foundation::Result unregister_artifact(ArtifactId id);
         /** @brief Returns the installed immutable contract for an artifact. */
@@ -463,6 +806,9 @@ namespace aeg::pipeline {
         [[nodiscard]] virtual FeatureDomain feature_domain() const noexcept;
         [[nodiscard]] virtual FeatureDomainMask feature_domain_mask() const noexcept;
         [[nodiscard]] virtual foundation::Result collect_contributions(FeatureBuildContext& context) const = 0;
+        [[nodiscard]] virtual foundation::Result build_render_graph(RenderGraphBuilder&) const {
+            return foundation::Result::success();
+        }
     };
 
     /** @brief Construction-time context that restricts a feature to one pipeline extension point. */
@@ -477,6 +823,9 @@ namespace aeg::pipeline {
         [[nodiscard]] FeatureDomain domain() const noexcept { return active_domain_; }
         [[nodiscard]] const FeaturePointDescriptor& feature_point_descriptor() const noexcept {
             return feature_point_;
+        }
+        [[nodiscard]] FeaturePointFlags feature_point_flags() const noexcept {
+            return feature_point_.flags;
         }
         [[nodiscard]] bool domain_is_active(FeatureDomain domain) const noexcept {
             return active_domain_ == domain && domain != FeatureDomain::kComposite &&
@@ -549,6 +898,7 @@ namespace aeg::pipeline {
         friend class RenderFeature;
         friend class AudioFeature;
         friend class StreamFeature;
+        friend class RenderGraphBuilder;
         template <FeatureDomain Domain>
         friend class DomainGraphBuilder;
     };
@@ -707,6 +1057,24 @@ namespace aeg::pipeline {
             return result;
         }
 
+        [[nodiscard]] foundation::Result build_render_graph(RenderGraphBuilder& builder) const final {
+            foundation::Result result = foundation::Result::success();
+            uint32_t part_index = 0;
+            const auto visit_part = [&](const auto& part) {
+                using PartType = std::remove_cvref_t<decltype(part)>;
+                const FeaturePartId part_id = make_feature_part_id(
+                    builder.feature_instance_id(), part_index++);
+                if (!result || builder.part_id() != part_id) {
+                    return;
+                }
+                if constexpr (PartType::kDomain == FeatureDomain::kRender) {
+                    result = static_cast<const PipelineFeature&>(part).build_render_graph(builder);
+                }
+            };
+            std::apply([&](const auto&... part) { (visit_part(part), ...); }, parts_);
+            return result;
+        }
+
         template <typename Part>
         [[nodiscard]] Part& part() noexcept {
             return std::get<Part>(parts_);
@@ -771,6 +1139,9 @@ namespace aeg::pipeline {
         [[nodiscard]] foundation::Result unregister_feature(FeatureId id);
         /** @brief Returns immutable metadata for one registered feature. */
         [[nodiscard]] foundation::ResultValue<FeatureDescriptor> find_feature_descriptor(FeatureId id) const;
+        /** @brief Returns the live immutable implementation of one registered feature. */
+        [[nodiscard]] foundation::ResultValue<std::shared_ptr<const PipelineFeature>> find_feature(
+            FeatureId id) const;
         /** @brief Binds a registered feature to a pipeline feature point. */
         [[nodiscard]] foundation::Result bind_feature(const FeatureBindingDescriptor& binding);
         /** @brief Removes one feature binding by its stable instance identity. */
@@ -860,16 +1231,21 @@ namespace aeg::pipeline {
         [[nodiscard]] PipelineInstanceId instance_id() const noexcept { return instance_; }
         [[nodiscard]] PipelineId pipeline_id() const noexcept override { return pipeline_; }
         [[nodiscard]] void* owner() const noexcept override { return owner_; }
-        [[nodiscard]] bool is_active() const noexcept { return active_; }
+        [[nodiscard]] bool is_active() const noexcept;
         [[nodiscard]] ArtifactRegistry& artifacts() noexcept { return artifacts_; }
         [[nodiscard]] const ArtifactRegistry& artifacts() const noexcept { return artifacts_; }
-        [[nodiscard]] const PipelinePlan* active_plan() const noexcept {
-            return active_plan_.has_value() ? &*active_plan_ : nullptr;
-        }
+        [[nodiscard]] const PipelinePlan* active_plan() const noexcept;
+        [[nodiscard]] PipelinePlanHandle active_plan_snapshot() const noexcept;
+        [[nodiscard]] bool has_pending_plan() const noexcept;
+        [[nodiscard]] std::size_t retired_plan_count() const noexcept;
 
         [[nodiscard]] foundation::Result bind_pipeline(PipelineId pipeline);
         [[nodiscard]] foundation::Result rebuild(const PipelineRegistry& registry,
                                                   CapabilityMask available_capabilities = 0);
+        /** @brief Applies a plan staged by rebuild at a safe execution boundary. */
+        [[nodiscard]] foundation::Result apply_pending_plan();
+        /** @brief Releases retired plans that have no remaining external references. */
+        [[nodiscard]] foundation::Result collect_retired_plans();
         void set_scope_bridge(const ArtifactScopeBridge* scope_bridge) noexcept {
             scope_bridge_ = scope_bridge;
         }
@@ -885,9 +1261,512 @@ namespace aeg::pipeline {
         PipelineId pipeline_{};
         mutable ArtifactRegistry artifacts_;
         const ArtifactScopeBridge* scope_bridge_{nullptr};
-        std::optional<PipelinePlan> active_plan_{};
-        bool active_{false};
+        mutable std::shared_mutex plan_mutex_;
+        mutable PipelinePlanHandle active_plan_{};
+        mutable PipelinePlanHandle pending_plan_{};
+        mutable std::vector<PipelinePlanHandle> retired_plans_{};
+        mutable bool active_{false};
+
+        [[nodiscard]] foundation::Result apply_pending_plan_internal() const;
     };
+
+    inline foundation::Result render_graph_builder_invalid_state() {
+        return foundation::Result::failure(foundation::ResultCode::kInvalidState,
+                                            "render graph builder is not attached to a runtime backend");
+    }
+
+    inline foundation::Result render_graph_builder_permission_denied(FeaturePointFlags flag) {
+        static_cast<void>(flag);
+        return foundation::Result::failure(foundation::ResultCode::kUnsupported,
+                                            "feature point does not grant the requested render graph permission");
+    }
+
+    inline RenderGraphBuilder::RenderGraphBuilder(FeatureBuildContext& context) noexcept
+        : declaration_context_(&context) {
+    }
+
+    inline RenderGraphBuilder::RenderGraphBuilder(
+        RenderGraphBuilderBackend& backend, const RenderGraphFeatureContext& context) noexcept
+        : runtime_backend_(&backend), runtime_context_(context) {
+    }
+
+    inline PipelineStageHandle RenderGraphBuilder::add_stage(const StageDescriptor& descriptor) {
+        if (declaration_context_ == nullptr || !declaration_context_->domain_is_active(kDomain)) {
+            return {};
+        }
+        const PipelineStageHandle stage = declaration_context_->builder_->add_stage(descriptor);
+        if (stage) {
+            declaration_context_->on_stage_added(stage);
+        }
+        return stage;
+    }
+
+    inline PipelineTaskHandle RenderGraphBuilder::add_task(const TaskDescriptor& descriptor) {
+        return declaration_context_ != nullptr && declaration_context_->domain_is_active(kDomain)
+                   ? declaration_context_->builder_->add_task(descriptor)
+                   : PipelineTaskHandle{};
+    }
+
+    inline PipelineArtifactHandle RenderGraphBuilder::declare_artifact(const ArtifactDescriptor& descriptor) {
+        if (declaration_context_ == nullptr || !declaration_context_->domain_is_active(kDomain)) {
+            return {};
+        }
+        if (!declaration_context_->allows(FeaturePointFlags::kMayCreateArtifacts)) {
+            static_cast<void>(declaration_context_->reject(
+                foundation::ResultCode::kUnsupported,
+                "feature point does not allow artifact creation"));
+            return {};
+        }
+        return declaration_context_->builder_->declare_artifact(descriptor);
+    }
+
+    inline foundation::Result RenderGraphBuilder::bind_task(PipelineTaskHandle task,
+                                                              PipelineStageHandle stage) {
+        if (declaration_context_ == nullptr || !declaration_context_->domain_is_active(kDomain)) {
+            return render_graph_builder_invalid_state();
+        }
+        return declaration_context_->builder_->bind_task(task, stage);
+    }
+
+    inline foundation::Result RenderGraphBuilder::reads(PipelineStageHandle stage,
+                                                          const ArtifactBinding& binding) {
+        if (declaration_context_ == nullptr || !declaration_context_->domain_is_active(kDomain)) {
+            return render_graph_builder_invalid_state();
+        }
+        return declaration_context_->builder_->reads(stage, binding);
+    }
+
+    inline foundation::Result RenderGraphBuilder::writes(PipelineStageHandle stage,
+                                                           const ArtifactBinding& binding) {
+        if (declaration_context_ == nullptr || !declaration_context_->domain_is_active(kDomain)) {
+            return render_graph_builder_invalid_state();
+        }
+        return declaration_context_->builder_->writes(stage, binding);
+    }
+
+    inline foundation::Result RenderGraphBuilder::reads_writes(PipelineStageHandle stage,
+                                                                 const ArtifactBinding& binding) {
+        if (declaration_context_ == nullptr || !declaration_context_->domain_is_active(kDomain)) {
+            return render_graph_builder_invalid_state();
+        }
+        return declaration_context_->builder_->reads_writes(stage, binding);
+    }
+
+    inline foundation::Result RenderGraphBuilder::publish_snapshot(
+        PipelineStageHandle stage, const ArtifactBinding& binding) {
+        if (declaration_context_ == nullptr || !declaration_context_->domain_is_active(kDomain)) {
+            return render_graph_builder_invalid_state();
+        }
+        if (!declaration_context_->allows(FeaturePointFlags::kMayPublishSnapshot)) {
+            return declaration_context_->reject(
+                foundation::ResultCode::kUnsupported,
+                "feature point does not allow snapshot publication");
+        }
+        return declaration_context_->builder_->publish_snapshot(stage, binding);
+    }
+
+    inline foundation::Result RenderGraphBuilder::runs_before(PipelineStageHandle stage, StageId other) {
+        if (declaration_context_ == nullptr || !declaration_context_->domain_is_active(kDomain)) {
+            return render_graph_builder_invalid_state();
+        }
+        return declaration_context_->builder_->runs_before(stage, other);
+    }
+
+    inline foundation::Result RenderGraphBuilder::runs_after(PipelineStageHandle stage, StageId other) {
+        if (declaration_context_ == nullptr || !declaration_context_->domain_is_active(kDomain)) {
+            return render_graph_builder_invalid_state();
+        }
+        return declaration_context_->builder_->runs_after(stage, other);
+    }
+
+    inline foundation::Result RenderGraphBuilder::expose_artifact(ArtifactId artifact,
+                                                                    PipelineScope target_scope) {
+        if (declaration_context_ == nullptr || !declaration_context_->domain_is_active(kDomain)) {
+            return render_graph_builder_invalid_state();
+        }
+        return declaration_context_->builder_->expose_artifact(artifact, target_scope);
+    }
+
+    inline PipelineScope RenderGraphBuilder::scope() const noexcept {
+        return declaration_context_ != nullptr ? declaration_context_->scope() : runtime_context_.scope;
+    }
+
+    inline PipelineId RenderGraphBuilder::pipeline_id() const noexcept {
+        return declaration_context_ != nullptr ? declaration_context_->pipeline_id() : runtime_context_.pipeline;
+    }
+
+    inline FeatureId RenderGraphBuilder::feature_id() const noexcept {
+        return declaration_context_ != nullptr ? declaration_context_->feature_id() : runtime_context_.feature;
+    }
+
+    inline FeatureInstanceId RenderGraphBuilder::feature_instance_id() const noexcept {
+        return declaration_context_ != nullptr ? declaration_context_->feature_instance_id()
+                                                : runtime_context_.feature_instance;
+    }
+
+    inline FeaturePartId RenderGraphBuilder::part_id() const noexcept {
+        return declaration_context_ != nullptr ? declaration_context_->part_id() : runtime_context_.part;
+    }
+
+    inline FeaturePointId RenderGraphBuilder::feature_point() const noexcept {
+        return declaration_context_ != nullptr ? declaration_context_->feature_point()
+                                                : runtime_context_.feature_point;
+    }
+
+    inline FeaturePointPosition RenderGraphBuilder::feature_point_position() const noexcept {
+        return declaration_context_ != nullptr ? declaration_context_->feature_point_descriptor().position
+                                                : runtime_context_.point_position;
+    }
+
+    inline FeaturePointFlags RenderGraphBuilder::feature_point_flags() const noexcept {
+        return declaration_context_ != nullptr ? declaration_context_->feature_point_flags()
+                                                : runtime_context_.point_flags;
+    }
+
+    inline void* RenderGraphBuilder::user_data() const noexcept {
+        return declaration_context_ != nullptr ? nullptr : runtime_context_.user_data;
+    }
+
+    inline bool RenderGraphBuilder::allows(FeaturePointFlags flag) const noexcept {
+        return declaration_context_ != nullptr ? declaration_context_->allows(flag)
+                                                : runtime_context_.allows(flag);
+    }
+
+    inline bool RenderGraphBuilder::is_runtime() const noexcept {
+        return runtime_backend_ != nullptr;
+    }
+
+    inline foundation::ResultValue<RenderGraphBuffer> RenderGraphBuilder::create_buffer(
+        const rhi::BufferDesc& desc, RenderGraphResourceLifetime lifetime) {
+        return create_buffer({}, desc, lifetime);
+    }
+
+    inline foundation::ResultValue<RenderGraphBuffer> RenderGraphBuilder::create_buffer(
+        RenderResourceId id, const rhi::BufferDesc& desc, RenderGraphResourceLifetime lifetime) {
+        if (runtime_backend_ == nullptr) {
+            return {render_graph_builder_invalid_state(), {}};
+        }
+        if (!allows(FeaturePointFlags::kMayCreateArtifacts)) {
+            return {render_graph_builder_permission_denied(FeaturePointFlags::kMayCreateArtifacts), {}};
+        }
+        return runtime_backend_->create_buffer(id, desc, lifetime);
+    }
+
+    inline foundation::ResultValue<RenderGraphTexture> RenderGraphBuilder::create_texture(
+        const rhi::TextureDesc& desc, RenderGraphResourceLifetime lifetime) {
+        return create_texture({}, desc, lifetime);
+    }
+
+    inline foundation::ResultValue<RenderGraphTexture> RenderGraphBuilder::create_texture(
+        RenderResourceId id, const rhi::TextureDesc& desc, RenderGraphResourceLifetime lifetime) {
+        if (runtime_backend_ == nullptr) {
+            return {render_graph_builder_invalid_state(), {}};
+        }
+        if (!allows(FeaturePointFlags::kMayCreateArtifacts)) {
+            return {render_graph_builder_permission_denied(FeaturePointFlags::kMayCreateArtifacts), {}};
+        }
+        return runtime_backend_->create_texture(id, desc, lifetime);
+    }
+
+    inline foundation::ResultValue<RenderGraphBuffer> RenderGraphBuilder::import_buffer(
+        RenderResourceId id, rhi::BufferHandle buffer, const rhi::BufferDesc& desc,
+        const rhi::ResourceState& initial_state) {
+        if (runtime_backend_ == nullptr) {
+            return {render_graph_builder_invalid_state(), {}};
+        }
+        if (!allows(FeaturePointFlags::kMayCreateArtifacts)) {
+            return {render_graph_builder_permission_denied(FeaturePointFlags::kMayCreateArtifacts), {}};
+        }
+        return runtime_backend_->import_buffer(id, buffer, desc, initial_state);
+    }
+
+    inline foundation::ResultValue<RenderGraphTexture> RenderGraphBuilder::import_texture(
+        RenderResourceId id, rhi::TextureHandle texture, rhi::TextureViewHandle default_view,
+        const rhi::TextureDesc& desc, const rhi::ResourceState& initial_state) {
+        if (runtime_backend_ == nullptr) {
+            return {render_graph_builder_invalid_state(), {}};
+        }
+        if (!allows(FeaturePointFlags::kMayCreateArtifacts)) {
+            return {render_graph_builder_permission_denied(FeaturePointFlags::kMayCreateArtifacts), {}};
+        }
+        return runtime_backend_->import_texture(id, texture, default_view, desc, initial_state);
+    }
+
+    inline foundation::ResultValue<RenderGraphTexture> RenderGraphBuilder::import_swapchain_image(
+        RenderResourceId id, const rhi::FrameAcquireResult& acquired,
+        const rhi::TextureDesc& desc, const rhi::ResourceState& initial_state) {
+        if (runtime_backend_ == nullptr) {
+            return {render_graph_builder_invalid_state(), {}};
+        }
+        if (!allows(FeaturePointFlags::kMayCreateArtifacts)) {
+            return {render_graph_builder_permission_denied(FeaturePointFlags::kMayCreateArtifacts), {}};
+        }
+        return runtime_backend_->import_swapchain_image(id, acquired, desc, initial_state);
+    }
+
+    inline foundation::ResultValue<RenderGraphBuffer> RenderGraphBuilder::find_buffer(RenderResourceId id) const {
+        if (runtime_backend_ == nullptr) {
+            return {render_graph_builder_invalid_state(), {}};
+        }
+        return runtime_backend_->find_buffer(id);
+    }
+
+    inline foundation::ResultValue<RenderGraphTexture> RenderGraphBuilder::find_texture(RenderResourceId id) const {
+        if (runtime_backend_ == nullptr) {
+            return {render_graph_builder_invalid_state(), {}};
+        }
+        return runtime_backend_->find_texture(id);
+    }
+
+    inline foundation::Result RenderGraphBuilder::export_buffer(RenderGraphBuffer buffer) {
+        if (runtime_backend_ == nullptr) {
+            return render_graph_builder_invalid_state();
+        }
+        if (!allows(FeaturePointFlags::kMayWriteFinalOutput)) {
+            return render_graph_builder_permission_denied(FeaturePointFlags::kMayWriteFinalOutput);
+        }
+        return runtime_backend_->export_buffer(buffer);
+    }
+
+    inline foundation::Result RenderGraphBuilder::export_texture(RenderGraphTexture texture) {
+        if (runtime_backend_ == nullptr) {
+            return render_graph_builder_invalid_state();
+        }
+        if (!allows(FeaturePointFlags::kMayWriteFinalOutput)) {
+            return render_graph_builder_permission_denied(FeaturePointFlags::kMayWriteFinalOutput);
+        }
+        return runtime_backend_->export_texture(texture);
+    }
+
+    inline foundation::ResultValue<RenderGraphPass> RenderGraphBuilder::add_pass(
+        std::string_view name, RenderGraphPassType type, rhi::QueueClass queue,
+        RenderPassSetupFunction setup, RenderPassExecuteFunction execute) {
+        if (runtime_backend_ == nullptr) {
+            return {render_graph_builder_invalid_state(), {}};
+        }
+        FeaturePointFlags required_flag = FeaturePointFlags::kNone;
+        switch (type) {
+            case RenderGraphPassType::kGraphics:
+                required_flag = FeaturePointFlags::kMayCreateGraphicsPass;
+                break;
+            case RenderGraphPassType::kCompute:
+                required_flag = FeaturePointFlags::kMayCreateComputePass;
+                break;
+            case RenderGraphPassType::kCopy:
+                required_flag = FeaturePointFlags::kMayCreateCopyPass;
+                break;
+        }
+        if (!allows(required_flag)) {
+            return {render_graph_builder_permission_denied(required_flag), {}};
+        }
+        if ((queue == rhi::QueueClass::kCompute || queue == rhi::QueueClass::kCopy) &&
+            !allows(FeaturePointFlags::kMayUseDedicatedQueue)) {
+            return {render_graph_builder_permission_denied(FeaturePointFlags::kMayUseDedicatedQueue), {}};
+        }
+        return runtime_backend_->add_pass(name, type, queue, std::move(setup), std::move(execute));
+    }
+
+    inline foundation::ResultValue<RenderGraphPass> RenderGraphBuilder::add_graphics_pass(
+        std::string_view name, RenderPassSetupFunction setup,
+        RenderPassExecuteFunction execute, rhi::QueueClass queue) {
+        return add_pass(name, RenderGraphPassType::kGraphics, queue, std::move(setup), std::move(execute));
+    }
+
+    inline foundation::ResultValue<RenderGraphPass> RenderGraphBuilder::add_compute_pass(
+        std::string_view name, RenderPassSetupFunction setup,
+        RenderPassExecuteFunction execute, rhi::QueueClass queue) {
+        return add_pass(name, RenderGraphPassType::kCompute, queue, std::move(setup), std::move(execute));
+    }
+
+    inline foundation::ResultValue<RenderGraphPass> RenderGraphBuilder::add_copy_pass(
+        std::string_view name, RenderPassSetupFunction setup,
+        RenderPassExecuteFunction execute, rhi::QueueClass queue) {
+        return add_pass(name, RenderGraphPassType::kCopy, queue, std::move(setup), std::move(execute));
+    }
+
+    inline foundation::Result RenderPassBuilder::read(
+        RenderGraphBuffer buffer, rhi::ResourceUsage usage, rhi::PipelineStageMask pipeline_stages,
+        rhi::ShaderStageMask shader_stages, RenderGraphBufferRange range) {
+        return backend_ == nullptr ? render_graph_builder_invalid_state()
+                                    : backend_->read_buffer(buffer, usage, pipeline_stages, shader_stages, range);
+    }
+
+    inline foundation::Result RenderPassBuilder::write(
+        RenderGraphBuffer buffer, rhi::ResourceUsage usage, rhi::PipelineStageMask pipeline_stages,
+        rhi::ShaderStageMask shader_stages, RenderGraphBufferRange range, bool discard_contents) {
+        return backend_ == nullptr ? render_graph_builder_invalid_state()
+                                    : backend_->write_buffer(buffer, usage, pipeline_stages, shader_stages,
+                                                              range, discard_contents);
+    }
+
+    inline foundation::Result RenderPassBuilder::read_write(
+        RenderGraphBuffer buffer, rhi::ResourceUsage usage, rhi::PipelineStageMask pipeline_stages,
+        rhi::ShaderStageMask shader_stages, RenderGraphBufferRange range) {
+        return backend_ == nullptr ? render_graph_builder_invalid_state()
+                                    : backend_->read_write_buffer(buffer, usage, pipeline_stages, shader_stages,
+                                                                   range);
+    }
+
+    inline foundation::Result RenderPassBuilder::read(
+        RenderGraphTexture texture, rhi::ResourceUsage usage, rhi::PipelineStageMask pipeline_stages,
+        rhi::ShaderStageMask shader_stages, rhi::SubresourceRange subresources) {
+        if (usage == rhi::ResourceUsage::kPresent &&
+            !has_flag(point_flags_, FeaturePointFlags::kMayWriteFinalOutput)) {
+            return render_graph_builder_permission_denied(FeaturePointFlags::kMayWriteFinalOutput);
+        }
+        return backend_ == nullptr ? render_graph_builder_invalid_state()
+                                    : backend_->read_texture(texture, usage, pipeline_stages, shader_stages,
+                                                              subresources);
+    }
+
+    inline foundation::Result RenderPassBuilder::write(
+        RenderGraphTexture texture, rhi::ResourceUsage usage, rhi::PipelineStageMask pipeline_stages,
+        rhi::ShaderStageMask shader_stages, rhi::SubresourceRange subresources, bool discard_contents) {
+        if (usage == rhi::ResourceUsage::kPresent &&
+            !has_flag(point_flags_, FeaturePointFlags::kMayWriteFinalOutput)) {
+            return render_graph_builder_permission_denied(FeaturePointFlags::kMayWriteFinalOutput);
+        }
+        return backend_ == nullptr ? render_graph_builder_invalid_state()
+                                    : backend_->write_texture(texture, usage, pipeline_stages, shader_stages,
+                                                               subresources, discard_contents);
+    }
+
+    inline foundation::Result RenderPassBuilder::read_write(
+        RenderGraphTexture texture, rhi::ResourceUsage usage, rhi::PipelineStageMask pipeline_stages,
+        rhi::ShaderStageMask shader_stages, rhi::SubresourceRange subresources) {
+        if (usage == rhi::ResourceUsage::kPresent &&
+            !has_flag(point_flags_, FeaturePointFlags::kMayWriteFinalOutput)) {
+            return render_graph_builder_permission_denied(FeaturePointFlags::kMayWriteFinalOutput);
+        }
+        return backend_ == nullptr ? render_graph_builder_invalid_state()
+                                    : backend_->read_write_texture(texture, usage, pipeline_stages, shader_stages,
+                                                                    subresources);
+    }
+
+    inline foundation::Result RenderPassBuilder::use_color_attachment(
+        RenderGraphTexture texture, rhi::LoadOp load_op, rhi::StoreOp store_op,
+        rhi::ClearColorValue clear_color, rhi::ResourceUsage final_usage,
+        rhi::SubresourceRange subresources) {
+        if (final_usage == rhi::ResourceUsage::kPresent &&
+            !has_flag(point_flags_, FeaturePointFlags::kMayWriteFinalOutput)) {
+            return render_graph_builder_permission_denied(FeaturePointFlags::kMayWriteFinalOutput);
+        }
+        return backend_ == nullptr
+                   ? render_graph_builder_invalid_state()
+                   : backend_->use_color_attachment(texture, load_op, store_op, clear_color,
+                                                     final_usage, subresources);
+    }
+
+    inline foundation::Result RenderPassBuilder::use_depth_stencil_attachment(
+        RenderGraphTexture texture, rhi::LoadOp depth_load_op, rhi::StoreOp depth_store_op,
+        float clear_depth, uint32_t clear_stencil, rhi::ResourceUsage final_usage,
+        rhi::SubresourceRange subresources) {
+        if (final_usage == rhi::ResourceUsage::kPresent &&
+            !has_flag(point_flags_, FeaturePointFlags::kMayWriteFinalOutput)) {
+            return render_graph_builder_permission_denied(FeaturePointFlags::kMayWriteFinalOutput);
+        }
+        return backend_ == nullptr
+                   ? render_graph_builder_invalid_state()
+                   : backend_->use_depth_stencil_attachment(texture, depth_load_op, depth_store_op,
+                                                             clear_depth, clear_stencil, final_usage,
+                                                             subresources);
+    }
+
+    inline void RenderPassBuilder::set_side_effects(bool enabled) noexcept {
+        if (backend_ != nullptr) {
+            backend_->set_side_effects(enabled);
+        }
+    }
+
+    inline rhi::Device& RenderPassExecutionContext::device() const noexcept {
+        return backend_->device();
+    }
+
+    inline rhi::CommandListHandle RenderPassExecutionContext::command_list() const noexcept {
+        return backend_->command_list();
+    }
+
+    inline RenderGraphPass RenderPassExecutionContext::pass() const noexcept {
+        return backend_->pass();
+    }
+
+    inline foundation::ResultValue<rhi::BufferHandle> RenderPassExecutionContext::buffer(
+        RenderGraphBuffer buffer) const {
+        return backend_->buffer(buffer);
+    }
+
+    inline foundation::ResultValue<rhi::TextureHandle> RenderPassExecutionContext::texture(
+        RenderGraphTexture texture) const {
+        return backend_->texture(texture);
+    }
+
+    inline foundation::ResultValue<rhi::BufferViewHandle> RenderPassExecutionContext::buffer_view(
+        RenderGraphBuffer buffer, rhi::BufferViewKind kind, uint64_t offset, uint64_t size,
+        rhi::Format format, uint32_t structure_stride) {
+        return backend_->buffer_view(buffer, kind, offset, size, format, structure_stride);
+    }
+
+    inline foundation::ResultValue<rhi::TextureViewHandle> RenderPassExecutionContext::texture_view(
+        RenderGraphTexture texture, rhi::TextureViewKind kind, rhi::SubresourceRange subresources,
+        rhi::Format format, rhi::TextureViewDimension dimension) {
+        return backend_->texture_view(texture, kind, subresources, format, dimension);
+    }
+
+    inline foundation::Result RenderPassExecutionContext::begin_rendering() {
+        return backend_->begin_rendering();
+    }
+
+    inline foundation::Result RenderPassExecutionContext::end_rendering() {
+        return backend_->end_rendering();
+    }
+
+    inline bool RenderPassExecutionContext::rendering_active() const noexcept {
+        return backend_->rendering_active();
+    }
+
+    inline bool RenderPassExecutionContext::rendering_started() const noexcept {
+        return backend_->rendering_started();
+    }
+
+    inline foundation::Result RenderPassExecutionContext::copy_buffer(
+        RenderGraphBuffer source, RenderGraphBuffer destination,
+        uint64_t source_offset, uint64_t destination_offset, uint64_t size) {
+        return backend_->copy_buffer(source, destination, source_offset, destination_offset, size);
+    }
+
+    inline foundation::Result RenderPassExecutionContext::copy_buffer_to_texture(
+        RenderGraphBuffer source, uint64_t source_offset, uint32_t source_row_length,
+        uint32_t source_image_height, RenderGraphTexture destination,
+        rhi::TextureSubresourceLayers destination_subresources, rhi::Offset3D destination_offset,
+        rhi::Extent3D extent) {
+        return backend_->copy_buffer_to_texture(source, source_offset, source_row_length,
+                                                 source_image_height, destination,
+                                                 destination_subresources, destination_offset, extent);
+    }
+
+    inline foundation::Result RenderPassExecutionContext::copy_texture_to_buffer(
+        RenderGraphTexture source, rhi::TextureSubresourceLayers source_subresources,
+        rhi::Offset3D source_offset, rhi::Extent3D extent, RenderGraphBuffer destination,
+        uint64_t destination_offset, uint32_t destination_row_length, uint32_t destination_image_height) {
+        return backend_->copy_texture_to_buffer(source, source_subresources, source_offset, extent,
+                                                destination, destination_offset, destination_row_length,
+                                                destination_image_height);
+    }
+
+    inline foundation::Result RenderPassExecutionContext::copy_texture(
+        RenderGraphTexture source, rhi::TextureSubresourceLayers source_subresources,
+        rhi::Offset3D source_offset, RenderGraphTexture destination,
+        rhi::TextureSubresourceLayers destination_subresources, rhi::Offset3D destination_offset,
+        rhi::Extent3D extent) {
+        return backend_->copy_texture(source, source_subresources, source_offset, destination,
+                                      destination_subresources, destination_offset, extent);
+    }
+
+    inline foundation::Result RenderPassExecutionContext::clear_texture(
+        RenderGraphTexture texture, rhi::SubresourceRange subresources,
+        rhi::ClearColorValue color, float depth, uint32_t stencil) {
+        return backend_->clear_texture(texture, subresources, color, depth, stencil);
+    }
 
     template <FeatureDomain Domain>
     PipelineStageHandle DomainGraphBuilder<Domain>::add_stage(const StageDescriptor& descriptor) {
