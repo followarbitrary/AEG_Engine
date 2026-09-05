@@ -38,11 +38,20 @@ namespace aeg::render_graph {
         void* user_data{nullptr};
     };
 
-    /** @brief Builds the RenderGraph contribution of a compiled pipeline plan. */
+    /**
+     * @brief Builds the RenderGraph contribution of a compiled pipeline plan.
+     *
+     * The PipelinePlanHandle overload transfers plan ownership to the graph
+     * until the graph is submitted through a FrameContext.
+     */
     class RenderGraphFeatureRuntime final {
     public:
         explicit RenderGraphFeatureRuntime(
             RenderGraph& graph, const pipeline::PipelinePlan& plan,
+            const pipeline::PipelineRegistry& registry,
+            const RenderGraphFeatureRuntimeDesc& desc = {});
+        explicit RenderGraphFeatureRuntime(
+            RenderGraph& graph, pipeline::PipelinePlanHandle plan,
             const pipeline::PipelineRegistry& registry,
             const RenderGraphFeatureRuntimeDesc& desc = {});
         ~RenderGraphFeatureRuntime();
@@ -63,6 +72,12 @@ namespace aeg::render_graph {
     /** @brief Builds render-feature contributions with one short-lived runtime object. */
     [[nodiscard]] foundation::Result build_render_graph_features(
         RenderGraph& graph, const pipeline::PipelinePlan& plan,
+        const pipeline::PipelineRegistry& registry,
+        const RenderGraphFeatureRuntimeDesc& desc = {});
+
+    /** @brief Builds contributions while retaining the plan through frame completion. */
+    [[nodiscard]] foundation::Result build_render_graph_features(
+        RenderGraph& graph, pipeline::PipelinePlanHandle plan,
         const pipeline::PipelineRegistry& registry,
         const RenderGraphFeatureRuntimeDesc& desc = {});
 }  // namespace aeg::render_graph

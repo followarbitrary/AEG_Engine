@@ -354,5 +354,74 @@ int main() {
         no_op_graph.compile_info().resource_count != 1) {
         return 25;
     }
+
+    auto retained_plan = std::make_shared<const aeg::pipeline::PipelinePlan>(plan);
+    std::weak_ptr<const aeg::pipeline::PipelinePlan> weak_retained_plan = retained_plan;
+    aeg::render_graph::RenderGraph retained_graph(*device);
+    const auto retained_input_result = retained_graph.create_texture(
+        input_desc, aeg::render_graph::ResourceLifetime::kPersistent);
+    if (!retained_input_result) {
+        return 26;
+    }
+    const std::array<aeg::render_graph::RenderGraphFeatureTextureBinding, 1> retained_bindings{{
+        {aeg::pipeline::RenderResourceId("RuntimeHostInput"), retained_input_result.value},
+    }};
+    const aeg::render_graph::RenderGraphFeatureRuntimeDesc retained_runtime_desc{
+        {}, retained_bindings, nullptr,
+    };
+    aeg::render_graph::RenderGraphFeatureRuntime retained_runtime(
+        retained_graph, retained_plan, registry, retained_runtime_desc);
+    if (const Result result = retained_runtime.build(); !result ||
+        !retained_graph.compile()) {
+        return 27;
+    }
+
+    aeg::render_graph::FrameContext frame(*device, {.frames_in_flight = 2});
+    if (const Result result = frame.begin_frame(); !result) {
+        return 28;
+    }
+    retained_plan.reset();
+    const auto execution = retained_graph.execute(frame);
+    if (!execution || !frame.end_frame() || weak_retained_plan.expired()) {
+        return 29;
+    }
+    if (!frame.begin_frame() || weak_retained_plan.expired() || !frame.end_frame()) {
+        return 30;
+    }
+    if (!frame.begin_frame() || !weak_retained_plan.expired() || !frame.end_frame()) {
+        return 31;
+    }
+
+    aeg::render_graph::RenderGraphExecutionLease empty_lease;
+    if (!frame.begin_frame()) {
+        return 32;
+    }
+    aeg::render_graph::RenderGraphExecuteDesc invalid_execute_desc{};
+    invalid_execute_desc.execution_leases = {&empty_lease, 1};
+    const auto invalid_execution = retained_graph.execute(frame, invalid_execute_desc);
+    if (invalid_execution || invalid_execution.result.code != ResultCode::kInvalidArgument) {
+        return 33;
+    }
+
+    auto leased_plan = std::make_shared<const aeg::pipeline::PipelinePlan>(plan);
+    std::weak_ptr<const aeg::pipeline::PipelinePlan> weak_leased_plan = leased_plan;
+    aeg::render_graph::RenderGraphExecutionLease plan_lease(leased_plan);
+    leased_plan.reset();
+    if (!frame.begin_frame()) {
+        return 34;
+    }
+    aeg::render_graph::RenderGraphExecuteDesc execute_desc{};
+    execute_desc.execution_leases = {&plan_lease, 1};
+    const auto leased_execution = retained_graph.execute(frame, execute_desc);
+    if (!leased_execution || !frame.end_frame() || weak_leased_plan.expired()) {
+        return 35;
+    }
+    plan_lease = {};
+    if (!frame.begin_frame() || weak_leased_plan.expired() || !frame.end_frame()) {
+        return 36;
+    }
+    if (!frame.begin_frame() || !weak_leased_plan.expired() || !frame.end_frame()) {
+        return 37;
+    }
     return 0;
 }

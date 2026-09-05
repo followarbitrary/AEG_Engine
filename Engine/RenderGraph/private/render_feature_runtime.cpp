@@ -863,11 +863,19 @@ namespace aeg::render_graph {
         Impl(RenderGraph& graph_reference, const pipeline::PipelinePlan& plan_reference,
              const pipeline::PipelineRegistry& registry_reference,
              const RenderGraphFeatureRuntimeDesc& desc_reference)
-            : graph(graph_reference), plan(plan_reference), registry(registry_reference), desc(desc_reference) {
+            : graph(graph_reference), plan(&plan_reference), registry(registry_reference), desc(desc_reference) {
+        }
+
+        Impl(RenderGraph& graph_reference, pipeline::PipelinePlanHandle plan_reference,
+             const pipeline::PipelineRegistry& registry_reference,
+             const RenderGraphFeatureRuntimeDesc& desc_reference)
+            : graph(graph_reference), plan(plan_reference.get()), plan_owner(std::move(plan_reference)),
+              registry(registry_reference), desc(desc_reference) {
         }
 
         RenderGraph& graph;
-        const pipeline::PipelinePlan& plan;
+        const pipeline::PipelinePlan* plan{nullptr};
+        pipeline::PipelinePlanHandle plan_owner{};
         const pipeline::PipelineRegistry& registry;
         RenderGraphFeatureRuntimeDesc desc{};
         bool built{false};
@@ -881,6 +889,12 @@ namespace aeg::render_graph {
 
     RenderGraphFeatureRuntime::~RenderGraphFeatureRuntime() = default;
 
+    RenderGraphFeatureRuntime::RenderGraphFeatureRuntime(
+        RenderGraph& graph, pipeline::PipelinePlanHandle plan,
+        const pipeline::PipelineRegistry& registry, const RenderGraphFeatureRuntimeDesc& desc)
+        : impl_(std::make_unique<Impl>(graph, std::move(plan), registry, desc)) {
+    }
+
     foundation::Result RenderGraphFeatureRuntime::build() {
         if (impl_ == nullptr) {
             return invalid_state("render feature runtime is not initialized");
@@ -888,7 +902,10 @@ namespace aeg::render_graph {
         if (impl_->built) {
             return invalid_state("render feature runtime has already built its contributions");
         }
-        if (const foundation::Result plan_result = validate_render_feature_plan(impl_->plan);
+        if (impl_->plan == nullptr) {
+            return invalid_argument("render feature runtime received a null pipeline plan");
+        }
+        if (const foundation::Result plan_result = validate_render_feature_plan(*impl_->plan);
             !plan_result) {
             return plan_result;
         }
@@ -902,6 +919,14 @@ namespace aeg::render_graph {
             impl_->graph.rollback_feature_build_transaction();
             return result;
         };
+
+        if (impl_->plan_owner != nullptr) {
+            const std::shared_ptr<const void> plan_owner = impl_->plan_owner;
+            if (const foundation::Result result = impl_->graph.retain_execution_owner(plan_owner);
+                !result) {
+                return rollback(result);
+            }
+        }
 
         std::shared_ptr<RenderGraphBuilderBackendImpl> backend;
         try {
@@ -918,13 +943,13 @@ namespace aeg::render_graph {
         }
 
         for (const pipeline::PipelineFeatureContributionRecord& contribution :
-             impl_->plan.feature_contributions) {
+             impl_->plan->feature_contributions) {
             if (contribution.domain != pipeline::FeatureDomain::kRender) {
                 continue;
             }
 
             std::shared_ptr<const pipeline::PipelineFeature> feature_implementation =
-                find_plan_feature_implementation(impl_->plan, contribution);
+                find_plan_feature_implementation(*impl_->plan, contribution);
             if (feature_implementation == nullptr) {
                 const auto feature_result = impl_->registry.find_feature(contribution.feature);
                 if (!feature_result) {
@@ -942,8 +967,8 @@ namespace aeg::render_graph {
             backend->set_feature_owner(feature_implementation);
             backend->set_feature_point_flags(contribution.point_flags);
             const pipeline::RenderGraphFeatureContext feature_context{
-                impl_->plan.scope,
-                impl_->plan.pipeline,
+                impl_->plan->scope,
+                impl_->plan->pipeline,
                 contribution.feature,
                 contribution.feature_instance,
                 contribution.part,
@@ -978,6 +1003,8 @@ namespace aeg::render_graph {
         }
 
         impl_->graph.commit_feature_build_transaction();
+        impl_->plan_owner.reset();
+        impl_->plan = nullptr;
         impl_->built = true;
         return foundation::Result::success();
     }
@@ -986,6 +1013,16 @@ namespace aeg::render_graph {
         RenderGraph& graph, const pipeline::PipelinePlan& plan,
         const pipeline::PipelineRegistry& registry, const RenderGraphFeatureRuntimeDesc& desc) {
         RenderGraphFeatureRuntime runtime(graph, plan, registry, desc);
+        return runtime.build();
+    }
+
+    foundation::Result build_render_graph_features(
+        RenderGraph& graph, pipeline::PipelinePlanHandle plan,
+        const pipeline::PipelineRegistry& registry, const RenderGraphFeatureRuntimeDesc& desc) {
+        if (plan == nullptr) {
+            return invalid_argument("render feature runtime received a null pipeline plan");
+        }
+        RenderGraphFeatureRuntime runtime(graph, std::move(plan), registry, desc);
         return runtime.build();
     }
 }  // namespace aeg::render_graph

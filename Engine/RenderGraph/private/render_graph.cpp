@@ -516,12 +516,14 @@ namespace aeg::render_graph {
         std::vector<TransientTextureSlotPlan> transient_texture_slots{};
         std::vector<uint32_t> pass_to_batch{};
         RenderGraphPlan plan{};
+        std::vector<std::shared_ptr<const void>> execution_owners{};
 
         struct FeatureBuildTransaction {
             bool active{false};
             size_t buffer_count{0};
             size_t texture_count{0};
             size_t pass_count{0};
+            size_t execution_owner_count{0};
             uint32_t next_generation{1};
             uint64_t revision{0};
             uint64_t compiled_revision{0};
@@ -672,6 +674,7 @@ namespace aeg::render_graph {
         checkpoint.buffer_count = buffers.size();
         checkpoint.texture_count = textures.size();
         checkpoint.pass_count = passes.size();
+        checkpoint.execution_owner_count = execution_owners.size();
         checkpoint.next_generation = next_generation;
         checkpoint.revision = revision;
         checkpoint.compiled_revision = compiled_revision;
@@ -724,6 +727,7 @@ namespace aeg::render_graph {
         buffers.resize(feature_build_transaction.buffer_count);
         textures.resize(feature_build_transaction.texture_count);
         passes.resize(feature_build_transaction.pass_count);
+        execution_owners.resize(feature_build_transaction.execution_owner_count);
         for (size_t index = 0;
              index < feature_build_transaction.buffer_exports.size() && index < buffers.size(); ++index) {
             buffers[index].exported = feature_build_transaction.buffer_exports[index] != 0;
@@ -748,6 +752,29 @@ namespace aeg::render_graph {
                                                 "Render graph implementation is not initialized");
         }
         return impl_->begin_feature_build_transaction(compile_info_);
+    }
+
+    foundation::Result RenderGraph::retain_execution_owner(std::shared_ptr<const void> owner) {
+        if (impl_ == nullptr) {
+            return foundation::Result::failure(foundation::ResultCode::kInvalidState,
+                                                "Render graph implementation is not initialized");
+        }
+        if (!impl_->feature_build_transaction.active) {
+            return foundation::Result::failure(
+                    foundation::ResultCode::kInvalidState,
+                    "Render graph execution ownership requires an active feature build transaction");
+        }
+        if (owner.use_count() == 0) {
+            return foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
+                                                "Render graph execution owner is empty");
+        }
+        try {
+            impl_->execution_owners.push_back(std::move(owner));
+        } catch (const std::bad_alloc&) {
+            return foundation::Result::failure(foundation::ResultCode::kOutOfMemory,
+                                                "Render graph execution ownership allocation failed");
+        }
+        return foundation::Result::success();
     }
 
     void RenderGraph::commit_feature_build_transaction() noexcept {
@@ -780,6 +807,7 @@ namespace aeg::render_graph {
         }
         impl_->transient_pools.clear();
         impl_->passes.clear();
+        impl_->execution_owners.clear();
         impl_->live_passes.clear();
         impl_->topological_order.clear();
         impl_->edges.clear();
@@ -812,6 +840,7 @@ namespace aeg::render_graph {
         impl_->buffers.clear();
         impl_->textures.clear();
         impl_->passes.clear();
+        impl_->execution_owners.clear();
         impl_->transient_pools.clear();
         impl_->live_passes.clear();
         impl_->topological_order.clear();
@@ -3550,6 +3579,26 @@ namespace aeg::render_graph {
         if (!compile_result) {
             return fail_execution(compile_result);
         }
+
+        for (const RenderGraphExecutionLease& lease: desc.execution_leases) {
+            if (!lease.is_valid()) {
+                return fail_execution(foundation::Result::failure(
+                        foundation::ResultCode::kInvalidArgument,
+                        "Render graph execution lease is empty"));
+            }
+        }
+        for (const RenderGraphExecutionLease& lease: desc.execution_leases) {
+            if (const foundation::Result result = frame_context.retain_until_complete(lease.owner());
+                !result) {
+                return fail_execution(result);
+            }
+        }
+        for (const std::shared_ptr<const void>& owner: impl_->execution_owners) {
+            if (const foundation::Result result = frame_context.retain_until_complete(owner); !result) {
+                return fail_execution(result);
+            }
+        }
+        impl_->execution_owners.clear();
 
         const uint32_t frame_slot = frame_context.frame_slot_index();
         const foundation::Result pool_result = impl_->ensure_transient_pool(frame_context.frames_in_flight());

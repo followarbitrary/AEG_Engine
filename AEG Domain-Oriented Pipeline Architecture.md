@@ -2465,6 +2465,50 @@ Feature 只声明资源使用和绘制行为；资源状态转换、Barrier、�
 `execute()` 返回的完成点，按 FrameContext 规则退休资源。该函数用于一次构图执行；
 重复构图前须由宿主管理既有声明，不能逐帧向同一图无限追加 Feature 资源和 Pass。
 
+当 RenderGraph 的构图来源是 `PipelineScopeHost::active_plan_snapshot()` 时，应优先使用
+`PipelinePlanHandle` 重载，使 Pipeline Plan 的所有权与本次图执行建立明确关联：
+
+```cpp
+auto plan_snapshot = host.active_plan_snapshot();
+if (!plan_snapshot) {
+    return aeg::foundation::Result::failure(
+            aeg::foundation::ResultCode::kInvalidState, "No active pipeline plan");
+}
+if (auto result = aeg::render_graph::build_render_graph_features(
+        graph, plan_snapshot, registry, desc); !result) {
+    return result;
+}
+if (auto result = graph.compile(); !result) {
+    return result;
+}
+return graph.execute(frame).result;
+```
+
+该重载在构图事务成功时将 `PipelinePlanHandle` 转移为 RenderGraph 的待执行所有权；
+`execute()` 开始时把该所有权登记到当前 `FrameContext` 的活动帧槽，随后 RenderGraph
+释放自身的待执行引用。帧槽只有在其全部 GPU Completion 满足后才释放该引用，因此
+`PipelineScopeHost` 可以在后续安全边界生成并切换新 Plan，而旧 Plan 不会在当前帧的
+GPU 工作完成前退休。构图失败时，事务回滚同时撤销待执行所有权。
+
+`const PipelinePlan&` 重载仍然是借用语义，不会替调用方建立上述所有权链；如果该 Plan
+可能在执行期间被 Host 退休，可以通过显式 `RenderGraphExecutionLease` 将共享所有权
+附加到本次执行：
+
+```cpp
+const aeg::render_graph::RenderGraphExecutionLease plan_lease(plan_snapshot);
+aeg::render_graph::RenderGraphExecuteDesc execute_desc{};
+execute_desc.execution_leases = {&plan_lease, 1};
+return graph.execute(frame, execute_desc).result;
+```
+
+Lease 只在 `execute()` 调用期间借用其 `span`，RenderGraph 会将其中的共享所有权
+复制到活动 `FrameContext` 帧槽；帧槽回收前，调用方无需继续持有 Lease 对象。对于不
+属于 RenderGraph 执行的其他 CPU/GPU 对象，仍可直接使用
+`FrameContext::retain_until_complete()`。RenderGraph 本体、Pass 回调捕获的 Feature
+实现、Imported 资源以及动态库模块的生命周期仍须分别管理；Plan 保活不等价于这些对象
+的自动保活。同一 RenderGraph 若跨多个 Frame 重复执行，宿主必须为每个 Frame 重新建立
+计划保活关系，不能假定一次构图的待执行所有权会自动覆盖后续 Frame。
+
 ### 19.3 当前底层 RenderGraph 的对应关系
 
 架构层概念与当前仓库 API 的对应关系：
@@ -2477,6 +2521,7 @@ Feature 只声明资源使用和绘制行为；资源状态转换、Barrier、�
 | 帧执行上下文                   | `render_graph::FrameContext`                 |
 | 编译后渲染计划                 | `RenderGraphPlan`                            |
 | GPU 完成点                     | `GpuSyncPoint` / `GpuCompletionSet`          |
+| 执行期所有权 Lease             | `RenderGraphExecutionLease`                  |
 | 后端设备                       | `rhi::Device`                                |
 
 ## 20. 动态重配置和卸载

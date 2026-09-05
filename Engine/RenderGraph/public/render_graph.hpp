@@ -12,6 +12,7 @@
 #include <memory>
 #include <span>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "result.hpp"
@@ -177,9 +178,38 @@ namespace aeg::render_graph {
         uint32_t queue_dependency_count{0};
     };
 
-    /** @brief Options controlling execution of a compiled graph. */
+    /**
+     * @brief Shared ownership retained until the frame consuming a graph completes.
+     *
+     * The lease is borrowed while RenderGraph::execute() runs. The shared
+     * ownership is copied into the active FrameContext slot before submission.
+     */
+    class RenderGraphExecutionLease final {
+    public:
+        RenderGraphExecutionLease() noexcept = default;
+        explicit RenderGraphExecutionLease(std::shared_ptr<const void> owner) noexcept
+            : owner_(std::move(owner)) {
+        }
+
+        [[nodiscard]] bool is_valid() const noexcept { return owner_.use_count() != 0; }
+
+    private:
+        friend class RenderGraph;
+
+        [[nodiscard]] const std::shared_ptr<const void>& owner() const noexcept { return owner_; }
+
+        std::shared_ptr<const void> owner_{};
+    };
+
+    /**
+     * @brief Options controlling execution of a compiled graph.
+     *
+     * execution_leases must remain valid until execute() returns. They are
+     * not retained by the descriptor after the call.
+     */
     struct RenderGraphExecuteDesc {
         bool present_acquired_frame{false};
+        std::span<const RenderGraphExecutionLease> execution_leases{};
     };
 
     /** @brief Submission and presentation results from execute(). */
@@ -447,6 +477,7 @@ namespace aeg::render_graph {
         friend class RenderGraphFeatureRuntime;
 
         [[nodiscard]] foundation::Result begin_feature_build_transaction();
+        [[nodiscard]] foundation::Result retain_execution_owner(std::shared_ptr<const void> owner);
         void commit_feature_build_transaction() noexcept;
         void rollback_feature_build_transaction() noexcept;
 
