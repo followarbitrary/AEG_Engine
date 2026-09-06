@@ -10,6 +10,7 @@
 #include <functional>
 #include <memory>
 #include <shared_mutex>
+#include <span>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -1115,11 +1116,44 @@ namespace aeg::pipeline {
     using PipelineFactory = std::function<std::unique_ptr<Pipeline>()>;
     using FeatureFactory = std::function<std::unique_ptr<PipelineFeature>()>;
 
+    /** @brief Thread-safe registry of built-in and extension-defined global Phases. */
+    class PhaseRegistry final {
+    public:
+        PhaseRegistry();
+        ~PhaseRegistry();
+
+        PhaseRegistry(const PhaseRegistry&) = delete;
+        PhaseRegistry& operator=(const PhaseRegistry&) = delete;
+        PhaseRegistry(PhaseRegistry&&) = delete;
+        PhaseRegistry& operator=(PhaseRegistry&&) = delete;
+
+        /** @brief Registers a custom Phase relative to an existing Phase. */
+        [[nodiscard]] foundation::Result register_phase(const PhaseDescriptor& descriptor);
+        /** @brief Removes a custom Phase that is not used as another Phase's anchor. */
+        [[nodiscard]] foundation::Result unregister_phase(PhaseId id);
+        /** @brief Tests whether a Phase is present in the registry. */
+        [[nodiscard]] bool contains(PhaseId id) const noexcept;
+        /** @brief Returns one Phase declaration; its name is borrowed from this registry. */
+        [[nodiscard]] foundation::ResultValue<PhaseDescriptor> find_phase(PhaseId id) const;
+        /** @brief Captures the ordered Phase list and revision under one registry read lock. */
+        [[nodiscard]] foundation::ResultValue<PhaseRegistrySnapshot> snapshot() const;
+        /** @brief Returns the deterministic global execution order of all Phases. */
+        [[nodiscard]] foundation::ResultValue<std::vector<PhaseId>> ordered_phases() const;
+        /** @brief Returns the revision changed by every successful registration or removal. */
+        [[nodiscard]] uint64_t revision() const noexcept;
+
+    private:
+        [[nodiscard]] foundation::ResultValue<std::vector<PhaseId>> ordered_phases_locked() const;
+
+        struct Impl;
+        std::unique_ptr<Impl> impl_{};
+    };
+
     /** @brief Thread-safe registry of immutable pipeline definitions. */
     class PipelineRegistry final {
     public:
-        PipelineRegistry() = default;
-        ~PipelineRegistry() = default;
+        PipelineRegistry();
+        ~PipelineRegistry();
 
         PipelineRegistry(const PipelineRegistry&) = delete;
         PipelineRegistry& operator=(const PipelineRegistry&) = delete;
@@ -1147,6 +1181,11 @@ namespace aeg::pipeline {
         /** @brief Removes one feature binding by its stable instance identity. */
         [[nodiscard]] foundation::Result unbind_feature(FeatureInstanceId instance);
 
+        /** @brief Returns the global Phase registry shared by pipeline compilation. */
+        [[nodiscard]] PhaseRegistry& phase_registry() noexcept { return phase_registry_; }
+        /** @brief Returns the read-only global Phase registry. */
+        [[nodiscard]] const PhaseRegistry& phase_registry() const noexcept { return phase_registry_; }
+
     private:
         struct Registration {
             std::shared_ptr<Pipeline> implementation{};
@@ -1164,6 +1203,7 @@ namespace aeg::pipeline {
             PipelineId pipeline,
             PipelineScope scope) const;
 
+        PhaseRegistry phase_registry_{};
         mutable std::shared_mutex mutex_;
         std::unordered_map<PipelineId, Registration, StableIdHash<PipelineIdTag>> registrations_{};
         std::unordered_map<FeatureId, FeatureRegistration, StableIdHash<FeatureIdTag>> features_{};
@@ -1182,6 +1222,7 @@ namespace aeg::pipeline {
         CapabilityMask available_capabilities{0};
         const PipelineRegistry* registry{nullptr};
         PipelineInstanceId instance{};
+        const PhaseRegistry* phase_registry{nullptr};
     };
 
     /** @brief Converts one registered definition into an immutable execution plan. */
@@ -1190,10 +1231,19 @@ namespace aeg::pipeline {
         [[nodiscard]] foundation::ResultValue<PipelinePlan> compile(const PipelineCompileInput& input) const;
     };
 
-    /** @brief Executes compiled CPU-capable pipeline batches. */
+    /** @brief Configures worker lanes used by PipelineScheduler. */
+    struct PipelineSchedulerDesc {
+        uint32_t cpu_worker_count{0};
+        uint32_t io_worker_count{0};
+        uint32_t render_thread_worker_count{1};
+        uint32_t gpu_worker_count{1};
+    };
+
+    /** @brief Executes compiled pipeline batches on their declared execution domains. */
     class PipelineScheduler final {
     public:
         explicit PipelineScheduler(uint32_t worker_count = 0);
+        explicit PipelineScheduler(const PipelineSchedulerDesc& desc);
         ~PipelineScheduler();
 
         PipelineScheduler(const PipelineScheduler&) = delete;
@@ -1204,10 +1254,20 @@ namespace aeg::pipeline {
         /** @brief Executes batches in dependency order and parallelizes safe batches. */
         [[nodiscard]] foundation::Result execute(const PipelinePlan& plan,
                                                   PipelineExecutionContext& context) const;
+        /** @brief Executes only nodes assigned to one global Phase. */
+        [[nodiscard]] foundation::Result execute_phase(const PipelinePlan& plan,
+                                                        PipelineExecutionContext& context,
+                                                        PhaseId phase) const;
         /** @brief Returns the number of worker threads owned by this scheduler. */
         [[nodiscard]] uint32_t worker_count() const noexcept;
+        /** @brief Returns the worker count for a concrete execution domain. */
+        [[nodiscard]] uint32_t worker_count(ExecutionDomain domain) const noexcept;
 
     private:
+        [[nodiscard]] foundation::Result execute_internal(const PipelinePlan& plan,
+                                                           PipelineExecutionContext& context,
+                                                           const PhaseId* phase) const;
+
         struct Impl;
         std::unique_ptr<Impl> impl_{};
     };
@@ -1253,6 +1313,11 @@ namespace aeg::pipeline {
         [[nodiscard]] foundation::Result deactivate(const PipelineDeactivationContext& context) override;
         [[nodiscard]] foundation::Result execute(PipelineScheduler& scheduler,
                                                   PipelineExecutionContext& context) const;
+        /** @brief Executes one Phase using an optional frame-pinned Plan. */
+        [[nodiscard]] foundation::Result execute_phase(PipelineScheduler& scheduler,
+                                                        PipelineExecutionContext& context,
+                                                        PhaseId phase,
+                                                        PipelinePlanHandle pinned_plan = {}) const;
 
     private:
         PipelineScope scope_{PipelineScope::kEngine};
@@ -1791,8 +1856,9 @@ namespace aeg::pipeline {
             return {};
         }
         if (!context_->allows(FeaturePointFlags::kMayCreateArtifacts)) {
-            context_->reject(foundation::ResultCode::kUnsupported,
-                             "feature point does not allow artifact creation");
+            static_cast<void>(context_->reject(
+                foundation::ResultCode::kUnsupported,
+                "feature point does not allow artifact creation"));
             return {};
         }
         return context_->builder_->declare_artifact(descriptor);

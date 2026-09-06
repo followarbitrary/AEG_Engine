@@ -446,6 +446,10 @@ namespace aeg::render_graph {
         [[nodiscard]] foundation::Result update_imported_texture(
             RenderGraphTexture resource, rhi::TextureHandle texture, rhi::TextureViewHandle default_view,
                                                           const rhi::ResourceState& initial_state = {});
+        /** @brief Replaces an imported texture and refreshes its logical description. */
+        [[nodiscard]] foundation::Result update_imported_texture(
+            RenderGraphTexture resource, rhi::TextureHandle texture, rhi::TextureViewHandle default_view,
+            const rhi::TextureDesc& desc, const rhi::ResourceState& initial_state = {});
         /** @brief Imports an acquired swapchain image as a graph texture. */
         [[nodiscard]] foundation::ResultValue<RenderGraphTexture> import_swapchain_image(
                 const rhi::FrameAcquireResult& acquired, const rhi::TextureDesc& desc,

@@ -5,6 +5,7 @@
 #include "../public/pipeline.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
@@ -83,6 +84,10 @@ namespace aeg::pipeline {
 
         [[nodiscard]] bool is_valid_engine_phase(EnginePhase phase) noexcept {
             return static_cast<uint8_t>(phase) <= static_cast<uint8_t>(EnginePhase::kShutdown);
+        }
+
+        [[nodiscard]] bool is_valid_phase_order_relation(PhaseOrderRelation relation) noexcept {
+            return static_cast<uint8_t>(relation) <= static_cast<uint8_t>(PhaseOrderRelation::kAfter);
         }
 
         [[nodiscard]] bool is_valid_artifact_storage(ArtifactStorage storage) noexcept {
@@ -183,10 +188,12 @@ namespace aeg::pipeline {
         }
 
         [[nodiscard]] bool is_parallel_safe(const PipelineNode& node) noexcept {
-            return !node.synthetic && node.stage_parallelizable &&
-                   node.execution_domain == ExecutionDomain::kCpuWorker &&
-                   has_flag(node.flags, TaskFlags::kParallelSafe) &&
-                   !has_flag(node.flags, TaskFlags::kSideEffect);
+            if (node.synthetic || !node.stage_parallelizable ||
+                !has_flag(node.flags, TaskFlags::kParallelSafe) ||
+                has_flag(node.flags, TaskFlags::kSideEffect)) {
+                return false;
+            }
+            return node.execution_domain != ExecutionDomain::kMainThread;
         }
 
         [[nodiscard]] foundation::Result invalid_argument(std::string message) {
@@ -412,6 +419,333 @@ namespace aeg::pipeline {
             bool stopping_{false};
         };
     }  // namespace
+
+    struct PhaseRegistry::Impl final {
+        struct Record final {
+            PhaseDescriptor descriptor{};
+            std::string name_storage{};
+            bool builtin{false};
+            uint32_t builtin_order{kInvalidPipelineHandleIndex};
+            uint32_t lower_builtin_order{kInvalidPipelineHandleIndex};
+            uint32_t upper_builtin_order{kInvalidPipelineHandleIndex};
+        };
+
+        mutable std::shared_mutex mutex;
+        std::unordered_map<PhaseId, Record, StableIdHash<PhaseIdTag>> phases{};
+        uint64_t revision{1};
+    };
+
+    namespace {
+        struct BuiltinPhaseInfo final {
+            EnginePhase phase;
+            const char* name;
+        };
+
+        inline constexpr std::array kBuiltinPhaseInfos{
+            BuiltinPhaseInfo{EnginePhase::kStartup, "Startup"},
+            BuiltinPhaseInfo{EnginePhase::kFrameBegin, "FrameBegin"},
+            BuiltinPhaseInfo{EnginePhase::kInput, "Input"},
+            BuiltinPhaseInfo{EnginePhase::kPreUpdate, "PreUpdate"},
+            BuiltinPhaseInfo{EnginePhase::kFixedUpdate, "FixedUpdate"},
+            BuiltinPhaseInfo{EnginePhase::kVariableUpdate, "VariableUpdate"},
+            BuiltinPhaseInfo{EnginePhase::kWorldCommit, "WorldCommit"},
+            BuiltinPhaseInfo{EnginePhase::kRenderExtract, "RenderExtract"},
+            BuiltinPhaseInfo{EnginePhase::kRenderBuild, "RenderBuild"},
+            BuiltinPhaseInfo{EnginePhase::kRenderExecute, "RenderExecute"},
+            BuiltinPhaseInfo{EnginePhase::kPresent, "Present"},
+            BuiltinPhaseInfo{EnginePhase::kFrameEnd, "FrameEnd"},
+            BuiltinPhaseInfo{EnginePhase::kShutdown, "Shutdown"},
+        };
+
+        [[nodiscard]] uint64_t next_phase_revision(uint64_t revision) noexcept {
+            return revision == std::numeric_limits<uint64_t>::max() ? 1 : revision + 1;
+        }
+    }  // namespace
+
+    PhaseRegistry::PhaseRegistry() : impl_(std::make_unique<Impl>()) {
+        for (uint32_t index = 0; index < kBuiltinPhaseInfos.size(); ++index) {
+            const BuiltinPhaseInfo& info = kBuiltinPhaseInfos[index];
+            Impl::Record record{};
+            record.name_storage = info.name;
+            record.descriptor.id = PhaseId(info.name);
+            record.descriptor.name = record.name_storage;
+            record.descriptor.anchor_phase = {};
+            record.descriptor.relation = PhaseOrderRelation::kAfter;
+            record.builtin = true;
+            record.builtin_order = index;
+            const auto [iterator, inserted] = impl_->phases.emplace(record.descriptor.id, std::move(record));
+            if (inserted) {
+                iterator->second.descriptor.name = iterator->second.name_storage;
+            }
+        }
+    }
+
+    PhaseRegistry::~PhaseRegistry() = default;
+
+    PipelineRegistry::PipelineRegistry() = default;
+
+    PipelineRegistry::~PipelineRegistry() = default;
+
+    foundation::ResultValue<std::vector<PhaseId>> PhaseRegistry::ordered_phases_locked() const {
+        if (impl_ == nullptr) {
+            return {invalid_state("phase registry is not initialized"), {}};
+        }
+
+        try {
+            std::vector<PhaseId> ids;
+            ids.reserve(impl_->phases.size());
+            for (const auto& [id, record] : impl_->phases) {
+                static_cast<void>(record);
+                ids.push_back(id);
+            }
+
+            const auto phase_less = [&](PhaseId left, PhaseId right) {
+                const auto left_record = impl_->phases.find(left);
+                const auto right_record = impl_->phases.find(right);
+                if (left_record->second.builtin != right_record->second.builtin) {
+                    return left_record->second.builtin;
+                }
+                if (left_record->second.builtin &&
+                    left_record->second.builtin_order != right_record->second.builtin_order) {
+                    return left_record->second.builtin_order < right_record->second.builtin_order;
+                }
+                return left < right;
+            };
+            std::sort(ids.begin(), ids.end(), phase_less);
+
+            std::unordered_map<PhaseId, uint32_t, StableIdHash<PhaseIdTag>> indices;
+            indices.reserve(ids.size());
+            for (uint32_t index = 0; index < ids.size(); ++index) {
+                indices.emplace(ids[index], index);
+            }
+
+            std::vector<std::vector<uint32_t>> outgoing(ids.size());
+            std::vector<uint32_t> indegree(ids.size(), 0);
+            std::unordered_set<uint64_t> edge_set;
+            edge_set.reserve(ids.size() * 2);
+            const auto add_edge = [&](PhaseId source, PhaseId destination) {
+                const auto source_iterator = indices.find(source);
+                const auto destination_iterator = indices.find(destination);
+                if (source_iterator == indices.end() || destination_iterator == indices.end() ||
+                    source == destination) {
+                    return;
+                }
+                const uint64_t key = (static_cast<uint64_t>(source_iterator->second) << 32u) |
+                                     destination_iterator->second;
+                if (edge_set.insert(key).second) {
+                    outgoing[source_iterator->second].push_back(destination_iterator->second);
+                    ++indegree[destination_iterator->second];
+                }
+            };
+
+            for (size_t index = 1; index < kBuiltinPhaseInfos.size(); ++index) {
+                add_edge(PhaseId(kBuiltinPhaseInfos[index - 1].name),
+                         PhaseId(kBuiltinPhaseInfos[index].name));
+            }
+
+            for (const PhaseId id : ids) {
+                const Impl::Record& record = impl_->phases.find(id)->second;
+                if (record.builtin) {
+                    continue;
+                }
+                const PhaseId anchor = record.descriptor.anchor_phase;
+                const auto anchor_iterator = impl_->phases.find(anchor);
+                if (anchor_iterator == impl_->phases.end()) {
+                    return {not_found("phase anchor is no longer registered"), {}};
+                }
+                if (record.descriptor.relation == PhaseOrderRelation::kBefore) {
+                    add_edge(id, anchor);
+                } else if (record.descriptor.relation == PhaseOrderRelation::kAfter) {
+                    add_edge(anchor, id);
+                } else {
+                    return {invalid_argument("phase ordering relation is invalid"), {}};
+                }
+
+                if (record.lower_builtin_order != kInvalidPipelineHandleIndex) {
+                    add_edge(PhaseId(kBuiltinPhaseInfos[record.lower_builtin_order].name), id);
+                }
+                if (record.upper_builtin_order != kInvalidPipelineHandleIndex) {
+                    add_edge(id, PhaseId(kBuiltinPhaseInfos[record.upper_builtin_order].name));
+                }
+            }
+
+            const auto ready_compare = [&](uint32_t left, uint32_t right) {
+                return phase_less(ids[right], ids[left]);
+            };
+            std::priority_queue<uint32_t, std::vector<uint32_t>, decltype(ready_compare)> ready(ready_compare);
+            for (uint32_t index = 0; index < indegree.size(); ++index) {
+                if (indegree[index] == 0) {
+                    ready.push(index);
+                }
+            }
+
+            std::vector<PhaseId> ordered;
+            ordered.reserve(ids.size());
+            while (!ready.empty()) {
+                const uint32_t source = ready.top();
+                ready.pop();
+                ordered.push_back(ids[source]);
+                for (const uint32_t destination : outgoing[source]) {
+                    if (--indegree[destination] == 0) {
+                        ready.push(destination);
+                    }
+                }
+            }
+
+            if (ordered.size() != ids.size()) {
+                return {invalid_argument("phase registry contains a cyclic ordering"), {}};
+            }
+            return {foundation::Result::success(), std::move(ordered)};
+        } catch (const std::bad_alloc&) {
+            return {foundation::Result::failure(foundation::ResultCode::kOutOfMemory,
+                                                 "phase ordering allocation failed"), {}};
+        }
+    }
+
+    foundation::Result PhaseRegistry::register_phase(const PhaseDescriptor& descriptor) {
+        if (impl_ == nullptr) {
+            return invalid_state("phase registry is not initialized");
+        }
+        if (!descriptor.id.is_valid() || descriptor.name.empty() || !descriptor.anchor_phase.is_valid() ||
+            !is_valid_phase_order_relation(descriptor.relation)) {
+            return invalid_argument("phase descriptor is invalid");
+        }
+        if (descriptor.id == descriptor.anchor_phase) {
+            return invalid_argument("phase cannot be anchored to itself");
+        }
+
+        std::unique_lock lock(impl_->mutex);
+        if (impl_->phases.find(descriptor.id) != impl_->phases.end()) {
+            return invalid_state("phase is already registered");
+        }
+        if (impl_->phases.find(descriptor.anchor_phase) == impl_->phases.end()) {
+            return not_found("phase anchor is not registered");
+        }
+
+        try {
+            const Impl::Record& anchor = impl_->phases.find(descriptor.anchor_phase)->second;
+            Impl::Record record{};
+            record.descriptor = descriptor;
+            record.name_storage.assign(descriptor.name.begin(), descriptor.name.end());
+            record.descriptor.name = record.name_storage;
+            if (anchor.builtin) {
+                if (descriptor.relation == PhaseOrderRelation::kBefore) {
+                    record.upper_builtin_order = anchor.builtin_order;
+                    if (anchor.builtin_order > 0) {
+                        record.lower_builtin_order = anchor.builtin_order - 1;
+                    }
+                } else {
+                    record.lower_builtin_order = anchor.builtin_order;
+                    if (anchor.builtin_order + 1 < kBuiltinPhaseInfos.size()) {
+                        record.upper_builtin_order = anchor.builtin_order + 1;
+                    }
+                }
+            } else {
+                record.lower_builtin_order = anchor.lower_builtin_order;
+                record.upper_builtin_order = anchor.upper_builtin_order;
+            }
+            const auto [iterator, inserted] = impl_->phases.emplace(descriptor.id, std::move(record));
+            if (!inserted) {
+                return invalid_state("phase is already registered");
+            }
+            iterator->second.descriptor.name = iterator->second.name_storage;
+
+            const foundation::ResultValue<std::vector<PhaseId>> ordered = ordered_phases_locked();
+            if (!ordered) {
+                impl_->phases.erase(iterator);
+                return ordered.result;
+            }
+            impl_->revision = next_phase_revision(impl_->revision);
+            return foundation::Result::success();
+        } catch (const std::bad_alloc&) {
+            return foundation::Result::failure(foundation::ResultCode::kOutOfMemory,
+                                                "phase registration allocation failed");
+        }
+    }
+
+    foundation::Result PhaseRegistry::unregister_phase(PhaseId id) {
+        if (impl_ == nullptr) {
+            return invalid_state("phase registry is not initialized");
+        }
+        if (!id.is_valid()) {
+            return invalid_argument("phase id is invalid");
+        }
+
+        std::unique_lock lock(impl_->mutex);
+        const auto iterator = impl_->phases.find(id);
+        if (iterator == impl_->phases.end()) {
+            return not_found("phase is not registered");
+        }
+        if (iterator->second.builtin) {
+            return unsupported("built-in phases cannot be unregistered");
+        }
+        for (const auto& [candidate_id, candidate] : impl_->phases) {
+            static_cast<void>(candidate_id);
+            if (!candidate.builtin && candidate.descriptor.anchor_phase == id) {
+                return invalid_state("phase is used as another phase anchor");
+            }
+        }
+        impl_->phases.erase(iterator);
+        impl_->revision = next_phase_revision(impl_->revision);
+        return foundation::Result::success();
+    }
+
+    bool PhaseRegistry::contains(PhaseId id) const noexcept {
+        if (impl_ == nullptr || !id.is_valid()) {
+            return false;
+        }
+        std::shared_lock lock(impl_->mutex);
+        return impl_->phases.find(id) != impl_->phases.end();
+    }
+
+    foundation::ResultValue<PhaseDescriptor> PhaseRegistry::find_phase(PhaseId id) const {
+        if (impl_ == nullptr) {
+            return {invalid_state("phase registry is not initialized"), {}};
+        }
+        if (!id.is_valid()) {
+            return {invalid_argument("phase id is invalid"), {}};
+        }
+        std::shared_lock lock(impl_->mutex);
+        const auto iterator = impl_->phases.find(id);
+        if (iterator == impl_->phases.end()) {
+            return {not_found("phase is not registered"), {}};
+        }
+        PhaseDescriptor descriptor = iterator->second.descriptor;
+        descriptor.name = iterator->second.name_storage;
+        return {foundation::Result::success(), descriptor};
+    }
+
+    foundation::ResultValue<std::vector<PhaseId>> PhaseRegistry::ordered_phases() const {
+        foundation::ResultValue<PhaseRegistrySnapshot> snapshot_result = snapshot();
+        if (!snapshot_result) {
+            return {snapshot_result.result, {}};
+        }
+        return {foundation::Result::success(), std::move(snapshot_result.value.ordered_phases)};
+    }
+
+    foundation::ResultValue<PhaseRegistrySnapshot> PhaseRegistry::snapshot() const {
+        if (impl_ == nullptr) {
+            return {invalid_state("phase registry is not initialized"), {}};
+        }
+        std::shared_lock lock(impl_->mutex);
+        const foundation::ResultValue<std::vector<PhaseId>> ordered = ordered_phases_locked();
+        if (!ordered) {
+            return {ordered.result, {}};
+        }
+
+        PhaseRegistrySnapshot result{};
+        result.revision = impl_->revision;
+        result.ordered_phases = std::move(ordered.value);
+        return {foundation::Result::success(), std::move(result)};
+    }
+
+    uint64_t PhaseRegistry::revision() const noexcept {
+        if (impl_ == nullptr) {
+            return 0;
+        }
+        std::shared_lock lock(impl_->mutex);
+        return impl_->revision;
+    }
 
     struct ArtifactRuntimeEntry final {
         ArtifactDescriptor descriptor{};
@@ -1370,7 +1704,7 @@ namespace aeg::pipeline {
             return {};
         }
         if (!is_valid_engine_phase(descriptor.phase)) {
-            set_failure(foundation::ResultCode::kInvalidArgument, "stage engine phase is invalid");
+            set_failure(foundation::ResultCode::kInvalidArgument, "stage compatibility phase is invalid");
             return {};
         }
         if (!is_valid_execution_domain(descriptor.execution_domain)) {
@@ -1388,7 +1722,11 @@ namespace aeg::pipeline {
         }
 
         const uint32_t index = static_cast<uint32_t>(stages_.size());
-        stages_.push_back(PipelineStageRecord{descriptor});
+        StageDescriptor normalized = descriptor;
+        if (!normalized.phase_id.is_valid()) {
+            normalized.phase_id = to_phase_id(normalized.phase);
+        }
+        stages_.push_back(PipelineStageRecord{normalized});
         return PipelineStageHandle{index, kBuilderGeneration};
     }
 
@@ -2379,6 +2717,13 @@ namespace aeg::pipeline {
             return {invalid_argument("pipeline compile scope is invalid"), {}};
         }
 
+        const PhaseRegistry* phase_registry = input.phase_registry != nullptr
+                                                   ? input.phase_registry
+                                                   : &input.registry->phase_registry();
+        if (phase_registry == nullptr) {
+            return {invalid_state("pipeline compile phase registry is null"), {}};
+        }
+
         const foundation::ResultValue<PipelineRegistry::Registration> registration =
             input.registry->acquire_registration(input.pipeline);
         if (!registration) {
@@ -2561,6 +2906,26 @@ namespace aeg::pipeline {
         }
         const PipelineDefinition& definition = expanded_definition.value;
 
+        const foundation::ResultValue<PhaseRegistrySnapshot> phase_snapshot = phase_registry->snapshot();
+        if (!phase_snapshot) {
+            return {phase_snapshot.result, {}};
+        }
+        std::unordered_map<PhaseId, uint32_t, StableIdHash<PhaseIdTag>> phase_ranks;
+        phase_ranks.reserve(phase_snapshot.value.ordered_phases.size());
+        for (uint32_t rank = 0; rank < phase_snapshot.value.ordered_phases.size(); ++rank) {
+            phase_ranks.emplace(phase_snapshot.value.ordered_phases[rank], rank);
+        }
+        std::vector<PhaseId> resolved_stage_phases;
+        resolved_stage_phases.reserve(definition.stages.size());
+        for (const PipelineStageRecord& stage_record : definition.stages) {
+            const StageDescriptor& stage = stage_record.descriptor;
+            const PhaseId phase = stage.phase_id.is_valid() ? stage.phase_id : to_phase_id(stage.phase);
+            if (!phase.is_valid() || phase_ranks.find(phase) == phase_ranks.end()) {
+                return {not_found("pipeline stage references an unregistered phase"), {}};
+            }
+            resolved_stage_phases.push_back(phase);
+        }
+
         const auto definition_artifact_exposed_to = [&](ArtifactId artifact,
                                                          PipelineScope target_scope) {
             return std::any_of(definition.exposures.begin(), definition.exposures.end(),
@@ -2605,6 +2970,7 @@ namespace aeg::pipeline {
         plan.instance = input.instance;
         plan.definition_version = definition.descriptor.version;
         plan.scope = input.scope;
+        plan.phase_revision = phase_snapshot.value.revision;
         plan.definition_owner = std::shared_ptr<const void>(registration.value.implementation);
         plan.feature_contributions = std::move(feature_contributions);
         plan.feature_implementations = std::move(feature_implementations);
@@ -2655,6 +3021,7 @@ namespace aeg::pipeline {
                     true,
                     stage.parallelizable,
                     stage_bindings[original_stage_index],
+                    resolved_stage_phases[original_stage_index],
                 });
                 continue;
             }
@@ -2674,6 +3041,7 @@ namespace aeg::pipeline {
                     false,
                     stage.parallelizable,
                     stage_bindings[original_stage_index],
+                    resolved_stage_phases[original_stage_index],
                 });
             }
         }
@@ -2709,11 +3077,13 @@ namespace aeg::pipeline {
             }
         };
 
-        const size_t engine_phase_count = static_cast<size_t>(EnginePhase::kShutdown) + 1;
-        std::vector<std::vector<uint32_t>> stages_by_phase(engine_phase_count);
+        std::vector<std::vector<uint32_t>> stages_by_phase(phase_snapshot.value.ordered_phases.size());
         for (uint32_t stage_index = 0; stage_index < definition.stages.size(); ++stage_index) {
-            const size_t phase_index = static_cast<size_t>(definition.stages[stage_index].descriptor.phase);
-            stages_by_phase[phase_index].push_back(stage_index);
+            const auto phase_iterator = phase_ranks.find(resolved_stage_phases[stage_index]);
+            if (phase_iterator == phase_ranks.end()) {
+                return {not_found("pipeline stage references an unregistered phase"), {}};
+            }
+            stages_by_phase[phase_iterator->second].push_back(stage_index);
         }
 
         uint32_t previous_phase = kInvalidPipelineHandleIndex;
@@ -2894,24 +3264,44 @@ namespace aeg::pipeline {
             return {invalid_argument("pipeline dependency graph contains a cycle"), {}};
         }
 
+        if (phase_registry->revision() != plan.phase_revision) {
+            return {foundation::Result::failure(
+                        foundation::ResultCode::kOutOfDate,
+                        "phase registry changed while compiling the pipeline"),
+                    {}};
+        }
+
         static std::atomic<PlanRevision> next_revision{1};
         plan.revision = next_revision.fetch_add(1, std::memory_order_relaxed);
         return {foundation::Result::success(), std::move(plan)};
     }
 
     struct PipelineScheduler::Impl final {
-        explicit Impl(uint32_t requested_worker_count)
-            : worker_pool([&] {
+        explicit Impl(const PipelineSchedulerDesc& scheduler_desc)
+            : cpu_worker_pool([&] {
                   const uint32_t hardware_count = std::max(1u, std::thread::hardware_concurrency());
-                  return std::max(1u, requested_worker_count == 0 ? hardware_count : requested_worker_count);
-              }()) {
+                  return std::max(1u, scheduler_desc.cpu_worker_count == 0
+                                           ? hardware_count
+                                           : scheduler_desc.cpu_worker_count);
+              }()),
+              io_worker_pool(std::max(1u, scheduler_desc.io_worker_count)),
+              render_thread_worker_pool(std::max(1u, scheduler_desc.render_thread_worker_count)),
+              gpu_worker_pool(std::max(1u, scheduler_desc.gpu_worker_count)) {
         }
 
-        WorkerPool worker_pool;
+        WorkerPool cpu_worker_pool;
+        WorkerPool io_worker_pool;
+        WorkerPool render_thread_worker_pool;
+        WorkerPool gpu_worker_pool;
         mutable std::mutex execute_mutex;
     };
 
-    PipelineScheduler::PipelineScheduler(uint32_t worker_count) : impl_(std::make_unique<Impl>(worker_count)) {
+    PipelineScheduler::PipelineScheduler(uint32_t worker_count)
+        : PipelineScheduler(PipelineSchedulerDesc{worker_count, 1, 1, 1}) {
+    }
+
+    PipelineScheduler::PipelineScheduler(const PipelineSchedulerDesc& desc)
+        : impl_(std::make_unique<Impl>(desc)) {
     }
 
     PipelineScheduler::~PipelineScheduler() = default;
@@ -2921,11 +3311,45 @@ namespace aeg::pipeline {
     PipelineScheduler& PipelineScheduler::operator=(PipelineScheduler&&) noexcept = default;
 
     uint32_t PipelineScheduler::worker_count() const noexcept {
-        return impl_ == nullptr ? 0 : impl_->worker_pool.worker_count();
+        return worker_count(ExecutionDomain::kCpuWorker);
+    }
+
+    uint32_t PipelineScheduler::worker_count(ExecutionDomain domain) const noexcept {
+        if (impl_ == nullptr) {
+            return 0;
+        }
+        switch (domain) {
+            case ExecutionDomain::kMainThread:
+                return 0;
+            case ExecutionDomain::kCpuWorker:
+                return impl_->cpu_worker_pool.worker_count();
+            case ExecutionDomain::kIoWorker:
+                return impl_->io_worker_pool.worker_count();
+            case ExecutionDomain::kRenderThread:
+                return impl_->render_thread_worker_pool.worker_count();
+            case ExecutionDomain::kGpu:
+                return impl_->gpu_worker_pool.worker_count();
+        }
+        return 0;
     }
 
     foundation::Result PipelineScheduler::execute(const PipelinePlan& plan,
                                                    PipelineExecutionContext& context) const {
+        return execute_internal(plan, context, nullptr);
+    }
+
+    foundation::Result PipelineScheduler::execute_phase(const PipelinePlan& plan,
+                                                         PipelineExecutionContext& context,
+                                                         PhaseId phase) const {
+        if (!phase.is_valid()) {
+            return invalid_argument("pipeline execution phase id is invalid");
+        }
+        return execute_internal(plan, context, &phase);
+    }
+
+    foundation::Result PipelineScheduler::execute_internal(const PipelinePlan& plan,
+                                                            PipelineExecutionContext& context,
+                                                            const PhaseId* phase) const {
         if (impl_ == nullptr) {
             return invalid_state("pipeline scheduler is not initialized");
         }
@@ -2949,38 +3373,94 @@ namespace aeg::pipeline {
         } plan_guard{context};
 
         for (const PipelineExecutionBatch& batch : plan.batches) {
-            std::vector<uint32_t> cpu_worker_nodes;
-            std::vector<uint32_t> main_thread_nodes;
-            cpu_worker_nodes.reserve(batch.node_indices.size());
-            main_thread_nodes.reserve(batch.node_indices.size());
+            std::array<std::vector<uint32_t>, 5> domain_nodes;
+            for (std::vector<uint32_t>& nodes : domain_nodes) {
+                nodes.reserve(batch.node_indices.size());
+            }
 
             for (const uint32_t node_index : batch.node_indices) {
                 if (node_index >= plan.nodes.size()) {
                     return invalid_state("pipeline batch references an invalid node");
                 }
                 const PipelineNode& node = plan.nodes[node_index];
+                const PhaseId node_phase = node.phase_id.is_valid() ? node.phase_id : to_phase_id(node.phase);
+                if (phase != nullptr && node_phase != *phase) {
+                    continue;
+                }
                 switch (node.execution_domain) {
                     case ExecutionDomain::kMainThread:
-                        main_thread_nodes.push_back(node_index);
+                        domain_nodes[static_cast<size_t>(ExecutionDomain::kMainThread)].push_back(node_index);
                         break;
                     case ExecutionDomain::kCpuWorker:
-                        cpu_worker_nodes.push_back(node_index);
+                        domain_nodes[static_cast<size_t>(ExecutionDomain::kCpuWorker)].push_back(node_index);
                         break;
                     case ExecutionDomain::kIoWorker:
+                        domain_nodes[static_cast<size_t>(ExecutionDomain::kIoWorker)].push_back(node_index);
+                        break;
                     case ExecutionDomain::kRenderThread:
+                        domain_nodes[static_cast<size_t>(ExecutionDomain::kRenderThread)].push_back(node_index);
+                        break;
                     case ExecutionDomain::kGpu:
-                        return unsupported("pipeline scheduler only executes MainThread and CpuWorker nodes");
+                        domain_nodes[static_cast<size_t>(ExecutionDomain::kGpu)].push_back(node_index);
+                        break;
+                    default:
+                        return invalid_argument("pipeline node execution domain is invalid");
                 }
             }
 
-            if (!cpu_worker_nodes.empty()) {
-                const foundation::Result result = impl_->worker_pool.run(
-                    plan.nodes, cpu_worker_nodes, context, batch.parallelizable);
-                if (!result) {
-                    return result;
+            const auto run_domain = [&](ExecutionDomain domain,
+                                        std::span<const uint32_t> node_indices) -> foundation::Result {
+                if (node_indices.empty()) {
+                    return foundation::Result::success();
                 }
+                WorkerPool* worker_pool = nullptr;
+                switch (domain) {
+                    case ExecutionDomain::kCpuWorker:
+                        worker_pool = &impl_->cpu_worker_pool;
+                        break;
+                    case ExecutionDomain::kIoWorker:
+                        worker_pool = &impl_->io_worker_pool;
+                        break;
+                    case ExecutionDomain::kRenderThread:
+                        worker_pool = &impl_->render_thread_worker_pool;
+                        break;
+                    case ExecutionDomain::kGpu:
+                        worker_pool = &impl_->gpu_worker_pool;
+                        break;
+                    case ExecutionDomain::kMainThread:
+                    default:
+                        return invalid_argument("pipeline worker lane is invalid");
+                }
+                return worker_pool->run(plan.nodes, node_indices, context, batch.parallelizable);
+            };
+
+            const foundation::Result cpu_result = run_domain(
+                ExecutionDomain::kCpuWorker,
+                domain_nodes[static_cast<size_t>(ExecutionDomain::kCpuWorker)]);
+            if (!cpu_result) {
+                return cpu_result;
+            }
+            const foundation::Result io_result = run_domain(
+                ExecutionDomain::kIoWorker,
+                domain_nodes[static_cast<size_t>(ExecutionDomain::kIoWorker)]);
+            if (!io_result) {
+                return io_result;
+            }
+            const foundation::Result render_thread_result = run_domain(
+                ExecutionDomain::kRenderThread,
+                domain_nodes[static_cast<size_t>(ExecutionDomain::kRenderThread)]);
+            if (!render_thread_result) {
+                return render_thread_result;
+            }
+            const foundation::Result gpu_result = run_domain(
+                ExecutionDomain::kGpu,
+                domain_nodes[static_cast<size_t>(ExecutionDomain::kGpu)]);
+            if (!gpu_result) {
+                return gpu_result;
             }
 
+            const std::vector<uint32_t>& main_thread_nodes =
+                domain_nodes[static_cast<size_t>(ExecutionDomain::kMainThread)];
             for (const uint32_t node_index : main_thread_nodes) {
                 foundation::Result result = execute_node(plan.nodes[node_index], context);
                 if (!result) {
@@ -3187,5 +3667,48 @@ namespace aeg::pipeline {
         const PipelinePlanHandle plan = active_plan_;
         const foundation::Result result = scheduler.execute(*plan, context);
         return result;
+    }
+
+    foundation::Result PipelineScopeHost::execute_phase(PipelineScheduler& scheduler,
+                                                        PipelineExecutionContext& context,
+                                                        PhaseId phase,
+                                                        PipelinePlanHandle pinned_plan) const {
+        if (!phase.is_valid()) {
+            return invalid_argument("pipeline execution phase id is invalid");
+        }
+
+        if (pinned_plan == nullptr) {
+            const foundation::Result pending_result = apply_pending_plan_internal();
+            if (!pending_result && pending_result.code != foundation::ResultCode::kNotReady) {
+                return pending_result;
+            }
+        }
+
+        std::shared_lock plan_lock(plan_mutex_);
+        if (!active_) {
+            return invalid_state("pipeline scope host is not active");
+        }
+        if (context.scope() != scope_) {
+            return invalid_state("pipeline execution context scope does not match the host scope");
+        }
+
+        const PipelinePlanHandle plan = pinned_plan != nullptr ? std::move(pinned_plan) : active_plan_;
+        if (plan == nullptr || plan->revision == 0 || !plan->pipeline.is_valid()) {
+            return invalid_state("pipeline scope host has no valid execution plan");
+        }
+        if (plan->scope != scope_ || plan->instance != instance_ || plan->pipeline != pipeline_) {
+            return invalid_state("pinned pipeline plan does not belong to the scope host");
+        }
+
+        ArtifactRegistry* artifact_registry = context.artifact_registry();
+        const ArtifactScopeBridge* scope_bridge = context.scope_bridge();
+        if (artifact_registry == nullptr) {
+            artifact_registry = &artifacts_;
+        }
+        if (scope_bridge == nullptr) {
+            scope_bridge = scope_bridge_;
+        }
+        context.set_artifact_runtime(artifact_registry, scope_bridge);
+        return scheduler.execute_phase(*plan, context, phase);
     }
 }  // namespace aeg::pipeline

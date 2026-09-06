@@ -28,16 +28,18 @@
 已实现 API 的描述以仓库公共头文件及可验证的实现行为为依据；尚未实现的架构约定必须明确
 标识，不得将概念接口作为可以直接调用的现有 API。
 
-当前已实现的 Pipeline 基建包括 `PipelineRegistry`、`PipelineCompiler`、
+当前已实现的 Pipeline 基建包括 `PhaseRegistry`、`PipelineRegistry`、`PipelineCompiler`、
 `PipelineScheduler`、`PipelineScopeHost`、`ArtifactRegistry`、`ArtifactScopeBridge`、
-五个领域 Feature 基类、`CompositeFeature<Parts...>`，以及 RenderFeature 到 RenderGraph
-的运行期适配。通用 Host 通过 Scope、实例 ID 和非拥有的 `owner` 指针关联宿主对象。
+五个领域 Feature 基类、`CompositeFeature<Parts...>`、RenderFeature 到 RenderGraph 的
+运行期适配，以及 `EngineFrameOrchestrator`。通用 Host 通过 Scope、实例 ID 和非拥有的
+`owner` 指针关联宿主对象；Orchestrator 通过非拥有的 Host 注册表统一驱动这些实例。
 
 下文的 `WorldHandle`、`WorldFrameKey`、专用 Engine/World/Frame/Editor Host、
 `FeatureExecutionContext`、通用 Completion 契约、动态模块 C ABI，以及 Simulation/Render
 参考 Stage 编排属于架构约定，不表示当前已有同名公共实现。`RebuildReason` 和
-`PipelineRegistry::request_rebuild()` 也属于设计接口；当前由调用方显式执行
-`PipelineScopeHost::rebuild(registry)`。这些约定说明目标语义，不构成实现排期。
+`PipelineRegistry::request_rebuild()` 仍属于设计接口；当前重建由调用方显式执行
+`PipelineScopeHost::rebuild(registry)`，Orchestrator 会在帧边界检测 Phase revision 并
+自动执行必要的重建和 Plan 切换。这些约定说明目标语义，不构成实现排期。
 
 本文档采用以下规范性措辞：
 
@@ -238,10 +240,11 @@ Pipeline 的 `category`。
 | `kCpuWorker`    | 引擎 CPU Worker Pool 中可调度的任务 | 可并行的 CPU 计算、数据转换、图编译         | 不保证固定 Worker 线程；任务必须满足线程安全要求         |
 | `kIoWorker`     | IO 或资源流送专用执行资源           | 文件、网络、解码和阻塞式外部 IO             | 不得直接录制 RHI Command List，完成后必须发布 Artifact |
 | `kRenderThread` | Render Build/Command 录制执行资源   | RenderGraph 构建、Pass setup、RHI 命令录制  | 不表示工作已经在 GPU 执行                                |
-| `kGpu`          | 由图形队列提交并在 GPU 上执行的工作 | Graphics、Compute、Copy 等 GPU 命令         | 不是 CPU 线程；不得在其中执行 C++ 回调或访问 World 状态  |
+| `kGpu`          | 由 GPU 编排通道准备并提交、最终在 GPU 上执行的工作 | Graphics、Compute、Copy 等 GPU 命令         | 当前 Scheduler 在 CPU 侧执行编排回调；真实 GPU 指令由 RHI Queue Submission 执行，不得把该域误认为 GPU 线程  |
 
 `kRenderThread` 和 `kGpu` 可以同时出现在一个 Render Pass 的不同节点上：前者负责在
-CPU 侧准备和录制命令，后者负责执行已提交的命令。
+CPU 侧准备和录制命令，后者负责在 CPU 侧编排 GPU 工作并提交 Queue；提交完成后，真实
+的 Shader 和 GPU 指令由 RHI 后端及设备执行。二者都不是“在 GPU 上运行的 C++ 函数”。
 
 ### 4.4 `TimePolicy` 枚举值
 
@@ -473,11 +476,17 @@ Plan 不保存业务对象裸指针，也不保存 Vulkan、D3D12 等后端原�
 
 ## 8. EnginePhase、Stage 和 FeaturePoint
 
-### 8.1 EnginePhase 的作用
+### 8.1 EnginePhase 与可扩展全局 Phase
 
 `EnginePhase` 是跨 Pipeline 共享的全局生命周期锚点，用于建立不同 Pipeline 之间的
 宏观时序偏序关系。它不是功能实现类，也不是线程、队列或 GPU Shader Stage 的别名。
-公共枚举定义及逐值语义如下：
+这些枚举值是 ABI 稳定的内置 Phase 集合；内置枚举并不构成全局 Phase 命名空间的封闭
+边界。真正的全局 Phase 集合由 `PhaseRegistry` 管理，扩展 Phase 使用独立的 `PhaseId`
+标识，并通过相对于既有 Phase 的 `before/after` 关系插入全局偏序图。
+
+`StageDescriptor::phase_id` 非空时表示该 Stage 使用注册表中的自定义或内置 Phase；为空
+时才从兼容字段 `StageDescriptor::phase` 推导内置 Phase。这样既保持旧代码的 ABI/API
+兼容性，又允许模块注册真正参与跨 Pipeline 调度的新 Phase。公共枚举定义及逐值语义如下：
 
 ```cpp
 enum class EnginePhase : uint8_t {
@@ -536,6 +545,81 @@ Shutdown (outside the normal frame loop)
 内部对不存在数据冲突的 Stage/Task 进行并行化；`FixedUpdate` 是唯一允许在单个渲染帧
 内重复进入的标准阶段。服务器、离屏工具和编辑器模式可以省略不适用的阶段，但不得
 改变保留阶段的语义或将其重新解释为其他生命周期事件。
+
+自定义 Phase 通过锚定到既有 Phase 的相对关系进入上述生命周期，而不是替换或重编号
+内置枚举。对于 `EngineFrameOrchestrator`，自定义 Phase 按其拓扑位置落入以下五个执行
+区间：
+
+| 区间 | 拓扑范围 | Orchestrator 的执行时机 | 典型用途 |
+| --- | --- | --- | --- |
+| 启动前置区间 | `Phase < Startup` | `initialize()` 激活 Host 后、`Startup` 前 | 模块前置注册、静态服务准备、启动前诊断 |
+| 帧前置区间 | `Startup < Phase < FrameBegin` | `run_frame()` 开始帧后、`FrameBegin` 前 | 输入预处理、帧级调度准备、外部数据摄取 |
+| 活动帧区间 | `FrameBegin <= Phase <= FrameEnd` | 当前 FrameContext 处于活动状态时 | 业务更新、World 提交、RenderGraph 构建与执行 |
+| 帧后置区间 | `FrameEnd < Phase < Shutdown` | `FrameEnd` 完成并释放当前帧状态后 | 帧后统计、回收请求、异步结果归并 |
+| 关闭尾部区间 | `Phase >= Shutdown` | `shutdown()` 的有序关闭流程中 | 模块收尾、服务停机、关闭后诊断 |
+
+同一区间内的多个自定义 Phase 仍由 `PhaseRegistry` 的拓扑排序统一决定；稳定 ID 只用于
+无额外偏序约束时的确定性并列排序。`run_frame()` 自动执行帧前置、活动帧和帧后置区间，
+`initialize()` 与 `shutdown()` 分别负责启动前置和关闭尾部区间。
+
+### 8.1.1 PhaseRegistry、PhaseId 与注册约束
+
+`PhaseRegistry` 同时保存内置 Phase 和扩展 Phase。内置 Phase 在注册表构造时自动存在，
+不能被删除；扩展 Phase 必须提供唯一的 `PhaseId`、非空名称和一个已经存在的锚点 Phase：
+
+```cpp
+const aeg::pipeline::PhaseDescriptor weather_phase{
+    aeg::pipeline::PhaseId("WeatherUpdate"),
+    "WeatherUpdate",
+    aeg::pipeline::to_phase_id(aeg::pipeline::EnginePhase::kVariableUpdate),
+    aeg::pipeline::PhaseOrderRelation::kAfter,
+};
+
+registry.phase_registry().register_phase(weather_phase);
+
+const auto weather_stage = builder.add_stage({
+    aeg::pipeline::StageId("WeatherStage"),
+    aeg::pipeline::EnginePhase::kFrameBegin,
+    aeg::pipeline::ExecutionDomain::kCpuWorker,
+    aeg::pipeline::TimePolicy::kFrame,
+    true,
+    aeg::pipeline::PhaseId("WeatherUpdate"),
+});
+```
+
+其中 `PhaseId` 是稳定哈希身份，不是字符串指针，也不携带所有权；名称仅用于诊断和
+工具显示。`PhaseOrderRelation::kBefore` 表示新 Phase 必须先于锚点执行，`kAfter` 表示
+新 Phase 必须后于锚点执行。注册表仍保留内置 Phase 之间的标准顺序，因此扩展 Phase 不会
+破坏既有生命周期边界。
+
+| API/字段 | 精确定义 | 生命周期与失败条件 |
+| --- | --- | --- |
+| `PhaseRegistry::register_phase()` | 将一个扩展 Phase 加入全局偏序图，并执行环检测 | ID 重复、锚点不存在、关系非法或形成环时失败；成功后 revision 递增 |
+| `PhaseRegistry::unregister_phase()` | 删除一个未被其他扩展 Phase 作为锚点引用的扩展 Phase | 内置 Phase、被引用 Phase 或不存在的 ID 不能删除 |
+| `PhaseRegistry::find_phase()` | 查询一个 Phase 的声明元数据 | 返回的 `name` 是 Registry 内部存储的借用视图；Registry 销毁后或对应 Phase 删除后不得继续使用 |
+| `PhaseRegistry::snapshot()` | 在同一读锁内捕获有序 Phase 列表和 revision | 用于 Compiler、Orchestrator 等需要同时消费顺序和版本的调用方；返回值是独立拥有的快照 |
+| `PhaseRegistry::ordered_phases()` | 返回确定性的全局拓扑序；同等约束下按内置顺序和稳定 ID 排序 | 发现环或内部状态损坏时返回错误；调用方不得自行按注册顺序排序 |
+| `PhaseRegistry::revision()` | 反映 Phase 集合或顺序约束是否发生变化的单调版本 | 每次成功注册/删除递增；`PipelinePlan::phase_revision` 记录编译时版本 |
+| `PipelineCompileInput::phase_registry` | 可选的编译注册表；为空时使用 `PipelineRegistry::phase_registry()` | 编译结果必须记录所用 revision；Stage 引用未注册 Phase 时失败 |
+
+Phase 注册属于拓扑变更。`snapshot()` 将顺序和 revision 作为一个逻辑版本读取；Compiler
+在构建 Plan 时记录该 revision，并在已知的并发变更情况下返回 `kOutOfDate`，调用方应
+重新获取快照后重试。运行中的 Orchestrator 不在当前帧中替换 Phase 图；它会在下一
+个帧边界检测 revision，重编译并切换所有受影响的 Plan。若 Registry 在一帧执行期间被
+修改，当前帧必须在下一阶段边界检测到版本不一致并进入 Abort/恢复路径，不能让同一帧
+同时使用两个全局 Phase 图。
+
+自定义 Phase 的锚点可以是内置 Phase，也可以是已经注册的自定义 Phase。锚点被其他
+自定义 Phase 引用时不得删除；删除操作不会隐式修改其他 Phase 的锚点，也不会静默将
+受影响的 Pipeline Stage 改挂到其他 Phase。Registry 的生命周期不依赖某个具体 Pipeline，
+因此模块卸载前必须显式解除相关 Stage/Definition 的使用关系，并在安全边界完成 Plan
+重建或停用。
+
+当锚点是自定义 Phase 时，新 Phase 继承该锚点所在的相邻内置 Phase 区间。例如，若
+`WeatherUpdate` 位于 `VariableUpdate` 与 `WorldCommit` 之间，则锚定到
+`WeatherUpdate` 的前置或后置 Phase 仍必须留在同一区间；其相对边只决定区间内部顺序，
+不得越过 `WorldCommit` 或被稳定排序推迟到后续生命周期区间。位于 `Startup` 之前或
+`Shutdown` 之后的开放区间采用同一继承规则。
 
 阶段值只表示生命周期位置。Feature 仍必须声明自己的 Artifact 访问和执行域；不得因为
 绑定到 `kRenderBuild` 就自动获得 RenderGraph 的全部权限。不同运行模式可以省略阶段，
@@ -1109,10 +1193,11 @@ enum class TaskFlags : uint32_t {
 
 struct StageDescriptor {
     StageId id;
-    EnginePhase phase;
+    EnginePhase phase;       // 兼容字段：仅在 phase_id 为空时生效。
     ExecutionDomain execution_domain;
     TimePolicy time_policy;
     bool parallelizable;
+    PhaseId phase_id;        // 非空时引用 PhaseRegistry 中的内置或自定义 Phase。
 };
 
 struct TaskDescriptor {
@@ -1144,6 +1229,12 @@ struct TaskDescriptor {
 
 Stage 负责表达依赖和调度边界，Task 负责实际工作。Task 不应自行等待未声明的任务，
 也不应直接修改其他 Task 的数据。
+
+`StageDescriptor::phase_id` 是 Stage 的实际全局 Phase 引用。旧代码可以继续填写
+`phase`，Builder 会将其规范化为对应的内置 `PhaseId`；新代码若使用自定义 Phase，必须
+填写 `phase_id`，并确保该 ID 已存在于编译所使用的 `PhaseRegistry`。`phase` 与
+`phase_id` 同时填写时，以 `phase_id` 为准，但 `phase` 仍应填写一个合法的内置枚举值，
+以保持结构化诊断和旧 ABI 消费者的可解释性。
 
 ### 10.4 `PipelineBuilder`
 
@@ -1603,10 +1694,19 @@ public:
     [[nodiscard]] foundation::Result unbind_feature(
             FeatureInstanceId feature);
 
-    [[nodiscard]] foundation::Result request_rebuild(
-            PipelineScope scope, RebuildReason reason);
+    [[nodiscard]] PhaseRegistry& phase_registry() noexcept;
+    [[nodiscard]] const PhaseRegistry& phase_registry() const noexcept;
 };
 ```
+
+`PipelineRegistry::phase_registry()` 返回与该 Registry 绑定的全局 Phase 注册表。Pipeline
+定义、Feature 绑定和 Phase 集合分别受各自的注册操作管理；Registry 不会因为新的 Phase
+或绑定注册而隐式修改已发布的 `PipelinePlan`。需要把拓扑变更反映到运行时，必须通过
+`PipelineScopeHost::rebuild()`，或者交由 `EngineFrameOrchestrator` 在下一帧边界完成。
+
+当前 `PipelineRegistry` 不提供 `request_rebuild()` 公共方法。下表中的 `RebuildReason`
+是面向未来重配置系统的结构化原因约定，调用方可以在自己的重配置管理器中使用，但不得
+把它当作当前 Registry 已实现的调用接口。
 
 #### `RebuildReason` 的值语义
 
@@ -1653,6 +1753,10 @@ foundation::Result apply_pending_plan();
 foundation::Result collect_retired_plans();
 foundation::Result execute(PipelineScheduler& scheduler,
                            PipelineExecutionContext& context) const;
+foundation::Result execute_phase(PipelineScheduler& scheduler,
+                                 PipelineExecutionContext& context,
+                                 PhaseId phase,
+                                 PipelinePlanHandle pinned_plan = {}) const;
 ```
 
 上述为签名摘录。宿主负责 `owner` 的有效期；World 必须分别创建 Host，不能共用可变
@@ -1689,6 +1793,44 @@ public:
 Host 不把所有作用域合并成一个全局对象。这样可以让多个 World 并行运行，并让 Preview
 World 与 Game World 拥有完全独立的可变状态。
 
+`execute_phase()` 是 Orchestrator 使用的帧内入口。调用方传入的 `pinned_plan` 若非空，
+Host 会在本次调用中使用该不可变快照，而不会读取可能已经切换的 Active Plan；这保证同一
+帧的各个 Phase 使用同一个 Plan。未传入快照时，Host 使用当前 Active Plan，并在必要时
+尝试应用 Pending Plan。直接使用该接口时，调用方必须按照 `PhaseRegistry::snapshot()`
+返回的全局顺序驱动 Phase，并自行保证帧边界和跨作用域 Bridge 已就绪。
+
+### 13.2.1 EngineFrameOrchestrator
+
+`aeg::engine::EngineFrameOrchestrator` 是当前实现的统一帧编排入口，位于
+`Engine/Runtime/public/engine_frame_orchestrator.hpp`。它以非拥有方式登记多个
+`PipelineScopeHost`，负责初始化、Phase 同步、帧内 Plan 固定、Pipeline Runtime 执行、
+RenderFeature 构图、RenderGraph 执行、Present 和 Shutdown。
+
+```cpp
+aeg::engine::EngineFrameOrchestrator orchestrator(
+        registry, scheduler, frame_context, render_graph);
+orchestrator.register_pipeline(engine_host);
+orchestrator.register_pipeline(world_host);
+orchestrator.register_pipeline(frame_host);
+
+if (auto result = orchestrator.initialize(); !result) {
+    return result;
+}
+
+aeg::engine::EngineFrameDesc frame_desc{};
+frame_desc.user_data = frame_user_data;
+if (auto result = orchestrator.run_frame(frame_desc); !result) {
+    return result;
+}
+
+return orchestrator.shutdown();
+```
+
+Orchestrator 不拥有传入的 Registry、Scheduler、FrameContext、RenderGraph 或 Host；这些
+对象必须在 Orchestrator 整个生命周期内保持有效。Host 在 `begin_frame()` 时按 Scope、
+PipelineId 和 InstanceId 进行稳定排序，并固定每个 Active Plan；帧执行期间 Registry
+或 Host 的拓扑变化不会替换已固定的 Plan，而是在边界处被检测并要求重建。
+
 ### 13.3 PipelineCompiler
 
 Compiler 把静态定义和运行时绑定编译为不可变 Plan：
@@ -1710,14 +1852,19 @@ Compiler 负责：
 5. 建立 Data、Ordering、Resource 和 Completion 依赖。
 6. 检查循环、多写者和跨 Scope 非法访问。
 7. 生成稳定拓扑、并行批次和生命周期范围。
-8. 保存领域贡献及其实现引用；当前 RenderGraph 展开由独立运行期适配器显式调用，
-   `PipelineCompiler::compile()` 不自动编译或提交 RenderGraph。
-9. 输出完整诊断；失败时不发布部分 Plan。
+8. 保存领域贡献及其实现引用；`PipelineCompiler::compile()` 只生成 Pipeline Plan，
+   不直接编译或提交 RenderGraph。统一的 `EngineFrameOrchestrator` 在
+   `RenderBuild`/`RenderExecute` 边界调用运行期适配器完成连接。
+9. 从 `PhaseRegistry::snapshot()` 同时读取有序 Phase 列表和 revision；如果已知的
+   编译期间 Phase 版本发生变化，则返回 `kOutOfDate`，不发布与新旧版本都不一致的 Plan。
+10. 输出完整诊断；失败时不发布部分 Plan。
 
 ### 13.4 PipelinePlan
 
-当前 Plan 保存 `revision`、Pipeline/Scope 身份、定义版本、`nodes`、`dependencies`、
-`topological_order`、`batches`、`artifacts` 和 `exposures`。完整字段定义位于
+当前 Plan 保存 `revision`、Pipeline/Scope 身份、定义版本、编译时
+`phase_revision`、`nodes`、`dependencies`、`topological_order`、`batches`、`artifacts`
+和 `exposures`。`PipelineNode::phase_id` 是节点实际所属的全局 Phase；其旧的
+`EnginePhase phase` 字段仅保留用于兼容和诊断。完整字段定义位于
 `Engine/Pipeline/public/pipeline_types.hpp`。
 
 | 字段或类型 | 使用语义 |
@@ -1726,6 +1873,7 @@ Compiler 负责：
 | `feature_implementations` | 将每项贡献关联到 `shared_ptr<const PipelineFeature>`，使已编译贡献不受后续 Registry 撤销影响 |
 | `definition_owner` / `feature_owners` | 延长编译时定义对象与 Feature 对象的生命周期 |
 | `PipelinePlanHandle` | `shared_ptr<const PipelinePlan>`；用于获取和持有不可变计划快照 |
+| `phase_revision` | 记录该 Plan 所依据的 `PhaseRegistry::revision()`；不匹配时必须在帧边界重编译 |
 
 通用 Completion 列表、结构化诊断列表及 `PipelinePlanKey` 不属于当前 Plan 的字段。
 
@@ -1733,20 +1881,48 @@ Plan 是只读对象。执行线程只读取紧凑的索引数组和函数绑定
 
 ### 13.5 PipelineScheduler
 
-Scheduler 执行 Plan，不重新分析拓扑：
+Scheduler 执行 Plan，不重新分析拓扑。它为五种 `ExecutionDomain` 提供实际调度通道：
+`kMainThread` 在调用线程串行执行，`kCpuWorker`、`kIoWorker`、`kRenderThread` 和
+`kGpu` 分别进入独立的 Worker Pool。`kGpu` 的 Task 回调仍是 CPU 侧的 GPU 编排/提交
+工作；真正的 Shader 和 GPU 指令在 RHI 提交后由设备执行，不能把 C++ 回调误认为在 GPU
+线程上运行。
 
 ```cpp
+struct PipelineSchedulerDesc {
+    uint32_t cpu_worker_count;
+    uint32_t io_worker_count;
+    uint32_t render_thread_worker_count;
+    uint32_t gpu_worker_count;
+};
+
 class PipelineScheduler {
 public:
     [[nodiscard]] foundation::Result execute(
             const PipelinePlan& plan, PipelineExecutionContext& context);
-    [[nodiscard]] foundation::Result wait(
-            const CompletionSet& completions);
+    [[nodiscard]] foundation::Result execute_phase(
+            const PipelinePlan& plan, PipelineExecutionContext& context,
+            PhaseId phase);
+    [[nodiscard]] uint32_t worker_count(ExecutionDomain domain) const noexcept;
 };
 ```
 
 一个批次中的节点只有在不存在数据、资源或完成点冲突时才可以并行。Task 不应自行等待
-未声明的节点，也不应依赖当前实现偶然形成的执行顺序。
+未声明的节点，也不应依赖当前实现偶然形成的执行顺序。`execute_phase()` 只筛选指定
+全局 Phase 的节点，但仍按原 Plan 的批次和依赖顺序执行；因此它适合由 Orchestrator
+逐 Phase 驱动，而不是替代 Compiler。一个合法 Phase 可能没有任何属于当前 Plan 的
+节点，此时执行结果仍为成功；调用方不得把“本 Plan 没有节点”解释为“Phase 未注册”。
+
+调度器为每个非主线程执行域维护独立 Worker Pool。当前实现按一个已编译批次的域分组
+执行：`kCpuWorker`、`kIoWorker`、`kRenderThread`、`kGpu` 均通过各自 Pool 调用
+`TaskExecutionFunction`，随后在调用线程执行 `kMainThread` 节点。不同域在当前实现中
+按固定顺序完成，不构成跨域并行保证；同一域内只有同时满足 Batch、Stage 和 Task
+并行安全条件的节点才会并行。`kGpu` 的 C++ 回调是 GPU 工作的编排/提交入口，不是
+运行在 GPU 上的函数；真实 GPU 执行由 RenderGraph/RHI 的 Queue Submission 完成。
+
+`PipelineSchedulerDesc` 中计数为 `0` 时使用默认策略：CPU Worker 使用硬件并发度的
+至少一个线程，IO、RenderThread 和 GPU 编排域各保留至少一个 Worker。Scheduler 的
+执行接口不是可重入接口；Task 不得递归调用同一个 Scheduler 的执行方法，也不得依赖
+未声明的共享可变状态。
 
 ## 14. ScopeBridge、快照和命令通道
 
@@ -1960,7 +2136,15 @@ Pass、导出标记及编译计划状态，可以重试；没有图变更时保�
 不得跨重试保留或使用。
 
 跨图或不再存在的资源绑定返回 `kNotFound`；字段不完整的绑定返回 `kInvalidArgument`。
-回滚不销毁导入的外部 RHI 资源。成功构建后，由宿主显式编译并使用 FrameContext 执行。
+回滚不销毁导入的外部 RHI 资源。低层 API 的调用方在 `build()` 成功后仍必须显式调用
+`RenderGraph::compile()` 和 `RenderGraph::execute()`；这是便于工具、离屏渲染和特殊
+提交策略使用的原始控制路径。
+
+常规 Engine 帧应使用 `aeg::engine::EngineFrameOrchestrator`。Orchestrator 在
+`RenderBuild` 阶段自动以帧内固定的 `PipelinePlanHandle` 调用该 Runtime，在
+`RenderExecute` 阶段自动调用 `RenderGraph::execute()`；调用方不应在同一帧再次手动
+展开相同 Plan，否则会重复添加 Pass 或破坏图的单次构建事务。需要自定义提交、离屏
+多图或工具模式时，才直接使用本节的低层 Runtime 与 RenderGraph API。
 
 ### 15.3 RenderGraph 的职责
 
@@ -2412,31 +2596,98 @@ public:
 
 ### 19.1 顶层 Pipeline 调度
 
-典型客户端帧的调用顺序如下：
+常规 Engine 帧的推荐入口是 `EngineFrameOrchestrator`。它将 Pipeline Runtime 和
+RenderGraph 绑定到同一个帧状态机中，调用方不再需要分别驱动每个 Host、手动固定 Plan
+或在 RenderBuild/RenderExecute 之间传递临时所有权：
 
 ```cpp
-engine.begin_frame();
+// Registry、Scheduler、FrameContext、RenderGraph 和各 Host 的生命周期
+// 必须覆盖 Orchestrator 的整个生命周期。
+aeg::engine::EngineFrameOrchestrator orchestrator(
+        registry, scheduler, frame_context, render_graph);
+orchestrator.register_pipeline(engine_host);
+orchestrator.register_pipeline(world_host);
+orchestrator.register_pipeline(frame_host);
+orchestrator.register_pipeline(editor_overlay_host);
 
-input_pipeline.execute(frame_context);
-world.pipeline_host().execute_fixed_ticks(frame_context);
-world.pipeline_host().execute_variable_update(frame_context);
-world.pipeline_host().publish_snapshots(frame_context);
+if (auto result = orchestrator.initialize(); !result) {
+    return result;
+}
 
-frame_host.extract_world(world.snapshot(), frame_context);
-frame_host.build_render_graph(frame_context);
-frame_host.execute(frame_context);
+aeg::engine::EngineFrameDesc frame_desc{};
+frame_desc.user_data = frame_user_data;
+frame_desc.acquire_swapchain_image = true;
+frame_desc.swapchain = swapchain;
+frame_desc.present_acquired_frame = true;
+if (auto result = orchestrator.run_frame(frame_desc); !result) {
+    return result;
+}
 
-editor_overlay_host.execute(frame_context);
-engine.end_frame();
+return orchestrator.shutdown();
 ```
 
-这里的 API 是 Host 层的概念接口；底层 RenderGraph 的实际执行仍然通过现有的
-`FrameContext`、`RenderGraph::compile()` 和 `RenderGraph::execute()` 完成。
+`initialize()` 完成 Phase Registry 同步、所有已登记 Host 的必要重建和激活，并执行一次
+`Startup`。`run_frame()` 完成以下不可分割的帧内操作：
 
-### 19.2 RenderGraph 执行顺序
+1. 调用 `FrameContext::begin_frame()`，等待当前帧槽可复用。
+2. 复制调用方提供的绑定 span，并在帧边界固定每个 Active `PipelinePlan`。
+3. 按 `PhaseRegistry::snapshot()` 的全局顺序执行 `FrameBegin` 至 `FrameEnd` 之间的
+   所有 Phase；落在该区间内的自定义 Phase 会自动参与执行。
+4. 在 `RenderBuild` 后自动展开当前固定 Plan 中的 RenderFeature。
+5. 在 `RenderExecute` 后自动编译并执行 RenderGraph，提交 Queue Batch 和 GPU Completion。
+6. 在 `Present` 或 `FrameEnd` 处理 acquired frame，并结束 FrameContext 生命周期。
 
-以下为宿主端的实际调用方式。示例函数接收已创建的图、已编译 Pipeline Plan、Registry、
-FrameContext 及宿主纹理；FrameContext 必须已进入可执行帧状态，纹理必须属于该图：
+`present_acquired_frame == true` 时，Orchestrator 在 `Present` Phase 尝试呈现；为 `false`
+时则将呈现或取消处理延迟到 `FrameEnd`。如果图已经以 `submits_frame` Batch 提交了
+acquired frame，Orchestrator 会确保该帧最终被解析；没有 Present 输出时则允许取消未提交
+的 acquired frame。`reset_render_graph` 为真会重置逻辑资源和 Pass；为假只清除 Pass，
+适合保留 Persistent/Imported 资源记录并更新当前 Swapchain Image。
+
+需要逐阶段插入调试、工具或自定义控制时，可以使用活动帧区间的低层入口：
+
+```cpp
+if (auto result = orchestrator.begin_frame(frame_desc); !result) {
+    return result;
+}
+const auto phase_snapshot = registry.phase_registry().snapshot();
+if (!phase_snapshot) {
+    return phase_snapshot.result;
+}
+
+const auto& phases = phase_snapshot.value.ordered_phases;
+std::size_t frame_begin_rank = phases.size();
+std::size_t frame_end_rank = phases.size();
+for (std::size_t rank = 0; rank < phases.size(); ++rank) {
+    if (phases[rank] == aeg::pipeline::to_phase_id(aeg::pipeline::EnginePhase::kFrameBegin)) {
+        frame_begin_rank = rank;
+    }
+    if (phases[rank] == aeg::pipeline::to_phase_id(aeg::pipeline::EnginePhase::kFrameEnd)) {
+        frame_end_rank = rank;
+    }
+}
+if (frame_begin_rank > frame_end_rank || frame_end_rank == phases.size()) {
+    return aeg::foundation::Result::failure(
+            aeg::foundation::ResultCode::kInvalidState,
+            "invalid frame phase interval");
+}
+for (std::size_t rank = frame_begin_rank; rank <= frame_end_rank; ++rank) {
+    if (auto result = orchestrator.execute_phase(phases[rank]); !result) {
+        return result;
+    }
+}
+```
+
+该手动形式必须保留全局顺序，并且必须让 `FrameEnd` 作为最后一个普通帧 Phase 执行。
+帧前置和帧后置自定义 Phase、启动区间及关闭区间由 `run_frame()`、`initialize()` 和
+`shutdown()` 自动处理；正常业务不应同时调用 `run_frame()` 和逐 Phase 接口。任一阶段
+失败都会进入 Abort 路径；如果底层 GPU 等待或取消仍未完成，Orchestrator 会保留活动帧
+状态，调用方必须先完成恢复或再次执行 `shutdown()`，不得开始下一帧。
+
+### 19.2 RenderGraph 执行顺序（低层显式路径）
+
+以下为不使用 Orchestrator 时的低层调用方式。示例函数接收已创建的图、已编译 Pipeline
+Plan、Registry、FrameContext 及宿主纹理；FrameContext 必须已进入可执行帧状态，纹理
+必须属于该图：
 
 ```cpp
 aeg::foundation::Result build_and_execute(
@@ -2523,6 +2774,7 @@ Lease 只在 `execute()` 调用期间借用其 `span`，RenderGraph 会将其中
 | GPU 完成点                     | `GpuSyncPoint` / `GpuCompletionSet`          |
 | 执行期所有权 Lease             | `RenderGraphExecutionLease`                  |
 | 后端设备                       | `rhi::Device`                                |
+| 统一帧编排                     | `engine::EngineFrameOrchestrator`            |
 
 ## 20. 动态重配置和卸载
 
@@ -2544,6 +2796,13 @@ return host.apply_pending_plan();
 禁用使用 `unbind_feature(instance)` 后重建。Registry 变更本身不会更新已编译 Plan。
 Host 未激活时，`rebuild()` 安装 Active Plan；已激活时只暂存 Pending Plan。
 `execute()` 在执行前也会尝试应用 Pending Plan，应用失败则返回错误，不继续执行旧计划。
+
+使用 `EngineFrameOrchestrator` 时，调用方不需要在每个 Phase 手动调用
+`apply_pending_plan()`：Orchestrator 在初始化以及每个帧边界同步 Phase Registry 时，会
+为所有已登记 Host 检查 Active Plan 的 `phase_revision`，必要时调用 `rebuild()` 并应用
+Pending Plan。随后 `begin_frame()` 固定新的 Plan 快照，当前帧不会观察到中途切换。
+若 Registry 在帧执行过程中发生变化，Orchestrator 在下一阶段边界返回状态错误并中止
+当前帧；它不会把新 Phase 拓扑部分混入旧帧。
 
 ```text
 Registry change -> rebuild -> Pending Plan
@@ -2920,17 +3179,18 @@ Pipeline Cache。
 
 当前仓库中已经存在的模块与本架构的关系如下：
 
-| 模块                 | 架构角色                                                | 公共边界                      |
-|----------------------|---------------------------------------------------------|-------------------------------|
-| `Engine/Foundation`  | Result、通用基础类型和错误                              | 不依赖任何图形后端            |
-| `Engine/Logging`     | 统一日志和诊断输出                                      | 供 Runtime/模块使用           |
-| `Engine/Math`        | SIMD 数学、变换和图形基础计算                           | 不参与 Pipeline 拓扑          |
-| `Engine/RHI`         | Buffer、Texture、View、Binding、Pipeline、Command、Sync | 公共接口后端无关              |
-| `Engine/RenderGraph` | FrameContext、资源图、Barrier、Queue Sync               | 只管理 Render Domain 图       |
-| `Engine/Shader`      | HLSL 产物、Reflection、Shader Contract、Layout          | 不决定 EnginePhase            |
-| `Engine/Resource`    | Mesh、Texture、上传和 Render Target                     | 通过 RHI/RenderGraph 使用 GPU |
-| `Engine/Pipeline`    | Pipeline、Feature、Registry、Compiler、Scheduler        | 本文档描述的扩展层            |
-| `Engine/World`       | WorldHandle、World Host、ECS 快照和命令                 | World Scope 数据所有者        |
+| 模块                 | 架构角色                                                | 公共边界                             |
+|----------------------|---------------------------------------------------------|--------------------------------------|
+| `Engine/Foundation`  | Result、通用基础类型和错误                              | 不依赖任何图形后端                   |
+| `Engine/Logging`     | 统一日志和诊断输出                                      | 供 Runtime/模块使用                  |
+| `Engine/Math`        | SIMD 数学、变换和图形基础计算                           | 不参与 Pipeline 拓扑                 |
+| `Engine/RHI`         | Buffer、Texture、View、Binding、Pipeline、Command、Sync | 公共接口后端无关                     |
+| `Engine/RenderGraph` | FrameContext、资源图、Barrier、Queue Sync               | 只管理 Render Domain 图              |
+| `Engine/Shader`      | HLSL 产物、Reflection、Shader Contract、Layout          | 不决定 EnginePhase                   |
+| `Engine/Resource`    | Mesh、Texture、上传和 Render Target                     | 通过 RHI/RenderGraph 使用 GPU        |
+| `Engine/Pipeline`    | Pipeline、Feature、Registry、Compiler、Scheduler        | 本文档描述的扩展层                   |
+| `Engine/Runtime`     | EngineFrameOrchestrator 与统一 Engine 帧生命周期        | 连接 Pipeline Runtime 与 RenderGraph |
+| `Engine/World`       | WorldHandle、World Host、ECS 快照和命令                 | World Scope 数据所有者               |
 
 当前 Pipeline、World 和部分通用 Scheduler 类型属于架构目标。本文档不会把目标 API
 误写成当前已经存在的头文件；实现时应优先保持这里定义的调用方向和所有权规则。

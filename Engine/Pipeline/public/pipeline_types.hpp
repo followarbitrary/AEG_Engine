@@ -60,6 +60,7 @@ namespace aeg::pipeline {
     struct ModuleIdTag;
     struct PipelineIdTag;
     struct PipelineInstanceIdTag;
+    struct PhaseIdTag;
     struct StageIdTag;
     struct TaskIdTag;
     struct FeatureIdTag;
@@ -72,6 +73,7 @@ namespace aeg::pipeline {
     using ModuleId = StableId<ModuleIdTag>;
     using PipelineId = StableId<PipelineIdTag>;
     using PipelineInstanceId = StableId<PipelineInstanceIdTag>;
+    using PhaseId = StableId<PhaseIdTag>;
     using StageId = StableId<StageIdTag>;
     using TaskId = StableId<TaskIdTag>;
     using FeatureId = StableId<FeatureIdTag>;
@@ -135,6 +137,59 @@ namespace aeg::pipeline {
         kPresent = 10,
         kFrameEnd = 11,
         kShutdown = 12,
+    };
+
+    /** @brief Ordering relation used when registering a custom global Phase. */
+    enum class PhaseOrderRelation : uint8_t {
+        kBefore = 0,
+        kAfter = 1,
+    };
+
+    /** @brief Stable identity of one built-in EnginePhase. */
+    [[nodiscard]] constexpr PhaseId to_phase_id(EnginePhase phase) noexcept {
+        switch (phase) {
+            case EnginePhase::kStartup:
+                return PhaseId("Startup");
+            case EnginePhase::kFrameBegin:
+                return PhaseId("FrameBegin");
+            case EnginePhase::kInput:
+                return PhaseId("Input");
+            case EnginePhase::kPreUpdate:
+                return PhaseId("PreUpdate");
+            case EnginePhase::kFixedUpdate:
+                return PhaseId("FixedUpdate");
+            case EnginePhase::kVariableUpdate:
+                return PhaseId("VariableUpdate");
+            case EnginePhase::kWorldCommit:
+                return PhaseId("WorldCommit");
+            case EnginePhase::kRenderExtract:
+                return PhaseId("RenderExtract");
+            case EnginePhase::kRenderBuild:
+                return PhaseId("RenderBuild");
+            case EnginePhase::kRenderExecute:
+                return PhaseId("RenderExecute");
+            case EnginePhase::kPresent:
+                return PhaseId("Present");
+            case EnginePhase::kFrameEnd:
+                return PhaseId("FrameEnd");
+            case EnginePhase::kShutdown:
+                return PhaseId("Shutdown");
+        }
+        return {};
+    }
+
+    /** @brief Declaration of one global Phase and its relative ordering anchor. */
+    struct PhaseDescriptor {
+        PhaseId id{};
+        std::string_view name{};
+        PhaseId anchor_phase{};
+        PhaseOrderRelation relation{PhaseOrderRelation::kAfter};
+    };
+
+    /** @brief Consistent global Phase order and revision captured from one registry read. */
+    struct PhaseRegistrySnapshot {
+        uint64_t revision{0};
+        std::vector<PhaseId> ordered_phases{};
     };
 
     using PipelineScopeMask = uint32_t;
@@ -395,6 +450,7 @@ namespace aeg::pipeline {
         ExecutionDomain execution_domain{ExecutionDomain::kMainThread};
         TimePolicy time_policy{TimePolicy::kFrame};
         bool parallelizable{false};
+        PhaseId phase_id{};
     };
 
     class PipelineTaskContext;
@@ -594,6 +650,7 @@ namespace aeg::pipeline {
         bool synthetic{false};
         bool stage_parallelizable{false};
         std::vector<ArtifactBinding> artifact_bindings{};
+        PhaseId phase_id{};
     };
 
     /** @brief One directed dependency edge between compiled nodes. */
@@ -617,6 +674,7 @@ namespace aeg::pipeline {
         PipelineInstanceId instance{};
         Version definition_version{};
         PipelineScope scope{PipelineScope::kEngine};
+        uint64_t phase_revision{0};
         std::vector<PipelineNode> nodes{};
         std::vector<PipelineDependency> dependencies{};
         std::vector<uint32_t> topological_order{};

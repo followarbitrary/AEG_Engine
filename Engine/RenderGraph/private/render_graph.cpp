@@ -1059,23 +1059,47 @@ namespace aeg::render_graph {
             return foundation::Result::failure(foundation::ResultCode::kNotFound,
                                         "Invalid imported texture resource");
         }
+        const rhi::TextureDesc desc = record->desc.materialize();
+        return update_imported_texture(resource, texture, default_view, desc, initial_state);
+    }
+
+    foundation::Result RenderGraph::update_imported_texture(RenderGraphTexture resource, rhi::TextureHandle texture,
+                                                     rhi::TextureViewHandle default_view,
+                                                     const rhi::TextureDesc& desc,
+                                                     const rhi::ResourceState& initial_state) {
+        TextureRecord* record = impl_->get_texture(resource);
+        if (record == nullptr || record->lifetime != ResourceLifetime::kImported) {
+            return foundation::Result::failure(foundation::ResultCode::kNotFound,
+                                        "Invalid imported texture resource");
+        }
         if (!texture.is_valid()) {
             return foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                         "Imported texture handle must be valid");
         }
+        if (desc.format == rhi::Format::kUnknown || desc.extent.width == 0 || desc.extent.height == 0 ||
+            desc.extent.depth == 0 || desc.mip_levels == 0 || desc.array_layers == 0 ||
+            desc.capabilities == rhi::TextureCapability::kNone) {
+            return foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
+                                        "Imported texture description is incomplete");
+        }
+
+        OwnedTextureDesc next_desc{};
+        if (const foundation::Result copy_result = copy_texture_desc(desc, next_desc); !copy_result) {
+            return copy_result;
+        }
         const rhi::ResourceState resolved_state =
                 initial_state.usage == rhi::ResourceUsage::kUndefined &&
-                        record->desc.desc.initial_usage != rhi::ResourceUsage::kUndefined
-                    ? rhi::ResourceState{record->desc.desc.initial_usage,
+                        next_desc.desc.initial_usage != rhi::ResourceUsage::kUndefined
+                    ? rhi::ResourceState{next_desc.desc.initial_usage,
                                          rhi::ShaderStage::kAll,
-                                         record->desc.desc.initial_queue,
+                                         next_desc.desc.initial_queue,
                                          false,
-                                         record->desc.desc.initial_stages}
+                                         next_desc.desc.initial_stages}
                     : initial_state;
         std::vector<rhi::ResourceState> new_states;
         try {
-            new_states.assign(static_cast<size_t>(kAspectPlaneCount) * record->desc.desc.mip_levels *
-                                      record->desc.desc.array_layers,
+            new_states.assign(static_cast<size_t>(kAspectPlaneCount) * next_desc.desc.mip_levels *
+                                      next_desc.desc.array_layers,
                               resolved_state);
         } catch (const std::bad_alloc&) {
             return foundation::Result::failure(foundation::ResultCode::kOutOfMemory,
@@ -1091,6 +1115,8 @@ namespace aeg::render_graph {
         record->imported_default_view = default_view;
         record->physical.handle = texture;
         record->physical.owns_handle = false;
+        record->desc = std::move(next_desc);
+        record->physical.desc = record->desc;
         record->physical.states.swap(new_states);
         record->imported_state = resolved_state;
         record->last_completions.clear();
