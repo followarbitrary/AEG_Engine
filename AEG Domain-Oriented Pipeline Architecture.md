@@ -31,11 +31,14 @@
 当前已实现的 Pipeline 基建包括 `PhaseRegistry`、`PipelineRegistry`、`PipelineCompiler`、
 `PipelineScheduler`、`PipelineScopeHost`、`ArtifactRegistry`、`ArtifactScopeBridge`、
 五个领域 Feature 基类、`CompositeFeature<Parts...>`、RenderFeature 到 RenderGraph 的
-运行期适配，以及 `EngineFrameOrchestrator`。通用 Host 通过 Scope、实例 ID 和非拥有的
-`owner` 指针关联宿主对象；Orchestrator 通过非拥有的 Host 注册表统一驱动这些实例。
+运行期适配，以及 `EngineFrameOrchestrator`。`Concurrency` 已提供通用的
+`Executor`、`WorkerExecutor`、`InlineExecutor`、`ExecutorRegistry`、`Completion` 和
+`CancellationToken`、`TaskGroup` 和 `TaskGraph`；Pipeline Scheduler 通过执行器注册表
+驱动各执行域。通用 Host 通过 Scope、实例 ID 和非拥有的 `owner` 指针关联宿主对象；
+Orchestrator 通过非拥有的 Host 注册表统一驱动这些实例。
 
 下文的 `WorldHandle`、`WorldFrameKey`、专用 Engine/World/Frame/Editor Host、
-`FeatureExecutionContext`、通用 Completion 契约、动态模块 C ABI，以及 Simulation/Render
+`FeatureExecutionContext`、动态模块 C ABI，以及 Simulation/Render
 参考 Stage 编排属于架构约定，不表示当前已有同名公共实现。`RebuildReason` 和
 `PipelineRegistry::request_rebuild()` 仍属于设计接口；当前重建由调用方显式执行
 `PipelineScopeHost::rebuild(registry)`，Orchestrator 会在帧边界检测 Phase revision 并
@@ -550,13 +553,13 @@ Shutdown (outside the normal frame loop)
 内置枚举。对于 `EngineFrameOrchestrator`，自定义 Phase 按其拓扑位置落入以下五个执行
 区间：
 
-| 区间 | 拓扑范围 | Orchestrator 的执行时机 | 典型用途 |
-| --- | --- | --- | --- |
-| 启动前置区间 | `Phase < Startup` | `initialize()` 激活 Host 后、`Startup` 前 | 模块前置注册、静态服务准备、启动前诊断 |
-| 帧前置区间 | `Startup < Phase < FrameBegin` | `run_frame()` 开始帧后、`FrameBegin` 前 | 输入预处理、帧级调度准备、外部数据摄取 |
-| 活动帧区间 | `FrameBegin <= Phase <= FrameEnd` | 当前 FrameContext 处于活动状态时 | 业务更新、World 提交、RenderGraph 构建与执行 |
-| 帧后置区间 | `FrameEnd < Phase < Shutdown` | `FrameEnd` 完成并释放当前帧状态后 | 帧后统计、回收请求、异步结果归并 |
-| 关闭尾部区间 | `Phase >= Shutdown` | `shutdown()` 的有序关闭流程中 | 模块收尾、服务停机、关闭后诊断 |
+| 区间         | 拓扑范围                          | Orchestrator 的执行时机                   | 典型用途                                     |
+|--------------|-----------------------------------|-------------------------------------------|----------------------------------------------|
+| 启动前置区间 | `Phase < Startup`                 | `initialize()` 激活 Host 后、`Startup` 前 | 模块前置注册、静态服务准备、启动前诊断       |
+| 帧前置区间   | `Startup < Phase < FrameBegin`    | `run_frame()` 开始帧后、`FrameBegin` 前   | 输入预处理、帧级调度准备、外部数据摄取       |
+| 活动帧区间   | `FrameBegin <= Phase <= FrameEnd` | 当前 FrameContext 处于活动状态时          | 业务更新、World 提交、RenderGraph 构建与执行 |
+| 帧后置区间   | `FrameEnd < Phase < Shutdown`     | `FrameEnd` 完成并释放当前帧状态后         | 帧后统计、回收请求、异步结果归并             |
+| 关闭尾部区间 | `Phase >= Shutdown`               | `shutdown()` 的有序关闭流程中             | 模块收尾、服务停机、关闭后诊断               |
 
 同一区间内的多个自定义 Phase 仍由 `PhaseRegistry` 的拓扑排序统一决定；稳定 ID 只用于
 无额外偏序约束时的确定性并列排序。`run_frame()` 自动执行帧前置、活动帧和帧后置区间，
@@ -592,15 +595,15 @@ const auto weather_stage = builder.add_stage({
 新 Phase 必须后于锚点执行。注册表仍保留内置 Phase 之间的标准顺序，因此扩展 Phase 不会
 破坏既有生命周期边界。
 
-| API/字段 | 精确定义 | 生命周期与失败条件 |
-| --- | --- | --- |
-| `PhaseRegistry::register_phase()` | 将一个扩展 Phase 加入全局偏序图，并执行环检测 | ID 重复、锚点不存在、关系非法或形成环时失败；成功后 revision 递增 |
-| `PhaseRegistry::unregister_phase()` | 删除一个未被其他扩展 Phase 作为锚点引用的扩展 Phase | 内置 Phase、被引用 Phase 或不存在的 ID 不能删除 |
-| `PhaseRegistry::find_phase()` | 查询一个 Phase 的声明元数据 | 返回的 `name` 是 Registry 内部存储的借用视图；Registry 销毁后或对应 Phase 删除后不得继续使用 |
-| `PhaseRegistry::snapshot()` | 在同一读锁内捕获有序 Phase 列表和 revision | 用于 Compiler、Orchestrator 等需要同时消费顺序和版本的调用方；返回值是独立拥有的快照 |
-| `PhaseRegistry::ordered_phases()` | 返回确定性的全局拓扑序；同等约束下按内置顺序和稳定 ID 排序 | 发现环或内部状态损坏时返回错误；调用方不得自行按注册顺序排序 |
-| `PhaseRegistry::revision()` | 反映 Phase 集合或顺序约束是否发生变化的单调版本 | 每次成功注册/删除递增；`PipelinePlan::phase_revision` 记录编译时版本 |
-| `PipelineCompileInput::phase_registry` | 可选的编译注册表；为空时使用 `PipelineRegistry::phase_registry()` | 编译结果必须记录所用 revision；Stage 引用未注册 Phase 时失败 |
+| API/字段                               | 精确定义                                                          | 生命周期与失败条件                                                                           |
+|----------------------------------------|-------------------------------------------------------------------|----------------------------------------------------------------------------------------------|
+| `PhaseRegistry::register_phase()`      | 将一个扩展 Phase 加入全局偏序图，并执行环检测                     | ID 重复、锚点不存在、关系非法或形成环时失败；成功后 revision 递增                            |
+| `PhaseRegistry::unregister_phase()`    | 删除一个未被其他扩展 Phase 作为锚点引用的扩展 Phase               | 内置 Phase、被引用 Phase 或不存在的 ID 不能删除                                              |
+| `PhaseRegistry::find_phase()`          | 查询一个 Phase 的声明元数据                                       | 返回的 `name` 是 Registry 内部存储的借用视图；Registry 销毁后或对应 Phase 删除后不得继续使用 |
+| `PhaseRegistry::snapshot()`            | 在同一读锁内捕获有序 Phase 列表和 revision                        | 用于 Compiler、Orchestrator 等需要同时消费顺序和版本的调用方；返回值是独立拥有的快照         |
+| `PhaseRegistry::ordered_phases()`      | 返回确定性的全局拓扑序；同等约束下按内置顺序和稳定 ID 排序        | 发现环或内部状态损坏时返回错误；调用方不得自行按注册顺序排序                                 |
+| `PhaseRegistry::revision()`            | 反映 Phase 集合或顺序约束是否发生变化的单调版本                   | 每次成功注册/删除递增；`PipelinePlan::phase_revision` 记录编译时版本                         |
+| `PipelineCompileInput::phase_registry` | 可选的编译注册表；为空时使用 `PipelineRegistry::phase_registry()` | 编译结果必须记录所用 revision；Stage 引用未注册 Phase 时失败                                 |
 
 Phase 注册属于拓扑变更。`snapshot()` 将顺序和 revision 作为一个逻辑版本读取；Compiler
 在构建 Plan 时记录该 revision，并在已知的并发变更情况下返回 `kOutOfDate`，调用方应
@@ -680,16 +683,16 @@ Compiler 可以将单个 Stage 分解为多个分区子图，但不得改变输�
 编排和命令录制，也包含 GPU 侧的 Graphics/Compute 执行；`RenderThread` 与 `Gpu` 是
 正交的执行域，不可由 Stage 名称推导。下表定义各 Stage 的最小可观察契约：
 
-| Stage | 语义契约 | 典型输入 | 典型输出 | 不可违反的边界 |
-| --- | --- | --- | --- | --- |
-| `Visibility` | 根据 View、相机参数和场景加速结构确定本帧可见集合，并生成后续绘制所需的实例或间接参数 | `RenderScene`、Camera、Frustum、Occlusion/HZB、LOD 策略 | `VisibleSet`、Indirect Arguments、Draw Packet | 只能输出可见性结论，不得在未声明的情况下修改 World 状态；遮挡结果必须绑定对应深度历史版本 |
-| `Shadow` | 为光源 View 构建阴影投影并生成 Shadow Map、Atlas 或其他阴影表示 | `VisibleSet`、LightSet、Shadow Policy、场景几何 | Shadow Texture、Shadow Metadata | 阴影资源的分辨率、层级和生命周期必须由 RenderGraph 声明；不得把阴影图隐式视为主场景颜色 |
-| `Depth` | 建立主视图深度表示，可包含 Depth Prepass、深度金字塔或层级 Z 缓存 | `VisibleSet`、Camera、Depth Configuration | `SceneDepth`、HZB/Depth Pyramid | 深度格式、采样数和反向 Z 约定必须由 Pipeline/Shader Contract 固定；后续消费者必须声明读取版本 |
-| `Opaque` | 对不透明几何执行材质评估和基础光栅化，生成 GBuffer 或不透明颜色结果 | `VisibleSet`、`SceneDepth`、Material/Geometry、Shadow Metadata | GBuffer、`SceneColor` 或 Opaque Color | 不透明写入必须显式声明颜色/深度附件及 Load/Store 语义；不得将透明材质混入该 Stage 的隐式排序 |
-| `Lighting` | 将几何、材质、光源和阴影信息合成为光照结果 | GBuffer、LightSet、Shadow Texture、环境光数据 | Lit Scene Color、Lighting Auxiliary Buffers | 可以采用 Forward、Deferred 或 Compute 实现，但必须保持输入输出 Artifact 契约；光照结果不得绕过资源状态跟踪 |
-| `Transparent` | 对透明几何执行顺序相关或顺序无关的合成 | Transparent Visible Set、`SceneDepth`、当前 Scene Color、Material | Composited Scene Color、Transparency Accumulation | 需要严格排序时必须显式声明排序键和顺序约束；加权混合等近似算法必须在 Shader Contract 中标明 |
-| `PostProcess` | 对场景输出执行时域、空域和色彩空间处理，例如 TAA、Bloom、Tone Mapping、Upscaling | Scene Color、Depth、Motion、Exposure、History Resources | Post-Processed Color、History 更新、诊断输出 | History 属于跨帧持久资源，必须通过明确的导入和 Completion 管理；不得将临时中间结果暴露为长期资源 |
-| `BeforePresent` | 将最终 Frame 输出转换为 Presentation Surface 所需的格式、尺寸和资源状态，并完成必要的 Overlay/Resolve | Post-Processed Color、UI/Editor Overlay、Swapchain Image | Final Output、`ResourceUsage::kPresent` 状态 | 必须是 Present 前的最后一个可扩展语义锚点；转换完成后不得再写入呈现图像 |
+| Stage           | 语义契约                                                                                              | 典型输入                                                          | 典型输出                                          | 不可违反的边界                                                                                             |
+|-----------------|-------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------|---------------------------------------------------|------------------------------------------------------------------------------------------------------------|
+| `Visibility`    | 根据 View、相机参数和场景加速结构确定本帧可见集合，并生成后续绘制所需的实例或间接参数                 | `RenderScene`、Camera、Frustum、Occlusion/HZB、LOD 策略           | `VisibleSet`、Indirect Arguments、Draw Packet     | 只能输出可见性结论，不得在未声明的情况下修改 World 状态；遮挡结果必须绑定对应深度历史版本                  |
+| `Shadow`        | 为光源 View 构建阴影投影并生成 Shadow Map、Atlas 或其他阴影表示                                       | `VisibleSet`、LightSet、Shadow Policy、场景几何                   | Shadow Texture、Shadow Metadata                   | 阴影资源的分辨率、层级和生命周期必须由 RenderGraph 声明；不得把阴影图隐式视为主场景颜色                    |
+| `Depth`         | 建立主视图深度表示，可包含 Depth Prepass、深度金字塔或层级 Z 缓存                                     | `VisibleSet`、Camera、Depth Configuration                         | `SceneDepth`、HZB/Depth Pyramid                   | 深度格式、采样数和反向 Z 约定必须由 Pipeline/Shader Contract 固定；后续消费者必须声明读取版本              |
+| `Opaque`        | 对不透明几何执行材质评估和基础光栅化，生成 GBuffer 或不透明颜色结果                                   | `VisibleSet`、`SceneDepth`、Material/Geometry、Shadow Metadata    | GBuffer、`SceneColor` 或 Opaque Color             | 不透明写入必须显式声明颜色/深度附件及 Load/Store 语义；不得将透明材质混入该 Stage 的隐式排序               |
+| `Lighting`      | 将几何、材质、光源和阴影信息合成为光照结果                                                            | GBuffer、LightSet、Shadow Texture、环境光数据                     | Lit Scene Color、Lighting Auxiliary Buffers       | 可以采用 Forward、Deferred 或 Compute 实现，但必须保持输入输出 Artifact 契约；光照结果不得绕过资源状态跟踪 |
+| `Transparent`   | 对透明几何执行顺序相关或顺序无关的合成                                                                | Transparent Visible Set、`SceneDepth`、当前 Scene Color、Material | Composited Scene Color、Transparency Accumulation | 需要严格排序时必须显式声明排序键和顺序约束；加权混合等近似算法必须在 Shader Contract 中标明                |
+| `PostProcess`   | 对场景输出执行时域、空域和色彩空间处理，例如 TAA、Bloom、Tone Mapping、Upscaling                      | Scene Color、Depth、Motion、Exposure、History Resources           | Post-Processed Color、History 更新、诊断输出      | History 属于跨帧持久资源，必须通过明确的导入和 Completion 管理；不得将临时中间结果暴露为长期资源           |
+| `BeforePresent` | 将最终 Frame 输出转换为 Presentation Surface 所需的格式、尺寸和资源状态，并完成必要的 Overlay/Resolve | Post-Processed Color、UI/Editor Overlay、Swapchain Image          | Final Output、`ResourceUsage::kPresent` 状态      | 必须是 Present 前的最后一个可扩展语义锚点；转换完成后不得再写入呈现图像                                    |
 
 Render Stage 的默认顺序不构成不可分解的全序。例如 `Shadow` 与部分 `Depth` 工作在
 资源依赖独立时可以并行，多个 Light/Viewport 也可以形成分区子图。真正的执行顺序由
@@ -703,21 +706,21 @@ Shader Stage 或硬件流水线阶段。
 生命周期归属，不限制 Stage 内部同时使用多个执行域，也不表示每个 Stage 必须对应一个
 独立的函数或 Command List。
 
-| Pipeline | Stage | 默认 `EnginePhase` | 主要执行域 | 说明 |
-| --- | --- | --- | --- | --- |
-| `SimulationPipeline` | `PreSolve` | `kPreUpdate` | `kCpuWorker` | 将输入命令和上一 Tick 状态转换为本次求解输入 |
-| `SimulationPipeline` | `Broadphase` | `kFixedUpdate` | `kCpuWorker` 或 `kGpu` | 生成潜在相交候选对；可按空间分区并行 |
-| `SimulationPipeline` | `Narrowphase` | `kFixedUpdate` | `kCpuWorker` 或 `kGpu` | 计算精确接触和约束几何信息 |
-| `SimulationPipeline` | `Solve` | `kFixedUpdate` | `kCpuWorker` 或 `kGpu` | 推进约束系统和连续状态 |
-| `SimulationPipeline` | `PublishSnapshot` | `kWorldCommit` | `kCpuWorker` 或 `kMainThread` | 发布带版本的不可变 Simulation/Physics Snapshot |
-| `RenderPipeline` | `Visibility` | `kRenderExtract` | `kCpuWorker` 或 `kGpu` | 从 Render Scene 生成可见集合和绘制参数 |
-| `RenderPipeline` | `Shadow` | `kRenderBuild` / `kRenderExecute` | `kRenderThread` 和 `kGpu` | 构建并执行阴影资源生产图 |
-| `RenderPipeline` | `Depth` | `kRenderBuild` / `kRenderExecute` | `kRenderThread` 和 `kGpu` | 生产主视图深度及其派生层级表示 |
-| `RenderPipeline` | `Opaque` | `kRenderBuild` / `kRenderExecute` | `kRenderThread` 和 `kGpu` | 执行不透明几何的资源编排与光栅化 |
-| `RenderPipeline` | `Lighting` | `kRenderBuild` / `kRenderExecute` | `kRenderThread` 和 `kGpu` | 计算光照合成结果 |
-| `RenderPipeline` | `Transparent` | `kRenderBuild` / `kRenderExecute` | `kRenderThread` 和 `kGpu` | 执行透明材质的排序或顺序无关合成 |
-| `RenderPipeline` | `PostProcess` | `kRenderBuild` / `kRenderExecute` | `kRenderThread` 和 `kGpu` | 执行时域、空域和色彩空间处理 |
-| `RenderPipeline` | `BeforePresent` | `kPresent` | `kRenderThread` 和 `kGpu` | 生成最终输出并转换为可呈现状态 |
+| Pipeline             | Stage             | 默认 `EnginePhase`                | 主要执行域                    | 说明                                           |
+|----------------------|-------------------|-----------------------------------|-------------------------------|------------------------------------------------|
+| `SimulationPipeline` | `PreSolve`        | `kPreUpdate`                      | `kCpuWorker`                  | 将输入命令和上一 Tick 状态转换为本次求解输入   |
+| `SimulationPipeline` | `Broadphase`      | `kFixedUpdate`                    | `kCpuWorker` 或 `kGpu`        | 生成潜在相交候选对；可按空间分区并行           |
+| `SimulationPipeline` | `Narrowphase`     | `kFixedUpdate`                    | `kCpuWorker` 或 `kGpu`        | 计算精确接触和约束几何信息                     |
+| `SimulationPipeline` | `Solve`           | `kFixedUpdate`                    | `kCpuWorker` 或 `kGpu`        | 推进约束系统和连续状态                         |
+| `SimulationPipeline` | `PublishSnapshot` | `kWorldCommit`                    | `kCpuWorker` 或 `kMainThread` | 发布带版本的不可变 Simulation/Physics Snapshot |
+| `RenderPipeline`     | `Visibility`      | `kRenderExtract`                  | `kCpuWorker` 或 `kGpu`        | 从 Render Scene 生成可见集合和绘制参数         |
+| `RenderPipeline`     | `Shadow`          | `kRenderBuild` / `kRenderExecute` | `kRenderThread` 和 `kGpu`     | 构建并执行阴影资源生产图                       |
+| `RenderPipeline`     | `Depth`           | `kRenderBuild` / `kRenderExecute` | `kRenderThread` 和 `kGpu`     | 生产主视图深度及其派生层级表示                 |
+| `RenderPipeline`     | `Opaque`          | `kRenderBuild` / `kRenderExecute` | `kRenderThread` 和 `kGpu`     | 执行不透明几何的资源编排与光栅化               |
+| `RenderPipeline`     | `Lighting`        | `kRenderBuild` / `kRenderExecute` | `kRenderThread` 和 `kGpu`     | 计算光照合成结果                               |
+| `RenderPipeline`     | `Transparent`     | `kRenderBuild` / `kRenderExecute` | `kRenderThread` 和 `kGpu`     | 执行透明材质的排序或顺序无关合成               |
+| `RenderPipeline`     | `PostProcess`     | `kRenderBuild` / `kRenderExecute` | `kRenderThread` 和 `kGpu`     | 执行时域、空域和色彩空间处理                   |
+| `RenderPipeline`     | `BeforePresent`   | `kPresent`                        | `kRenderThread` 和 `kGpu`     | 生成最终输出并转换为可呈现状态                 |
 
 `kRenderBuild` 与 `kRenderExecute` 是 Render Pipeline 中必须区分的两个生命周期边界：
 前者负责声明式图构建、Shader Contract 校验和计划编译，后者负责命令录制、Queue 提交
@@ -1867,13 +1870,13 @@ Compiler 负责：
 `EnginePhase phase` 字段仅保留用于兼容和诊断。完整字段定义位于
 `Engine/Pipeline/public/pipeline_types.hpp`。
 
-| 字段或类型 | 使用语义 |
-|------------|----------|
-| `feature_contributions` | 记录 Feature 实例、Composite Part、领域、挂载点、Stage 范围及挂载点权限 |
-| `feature_implementations` | 将每项贡献关联到 `shared_ptr<const PipelineFeature>`，使已编译贡献不受后续 Registry 撤销影响 |
-| `definition_owner` / `feature_owners` | 延长编译时定义对象与 Feature 对象的生命周期 |
-| `PipelinePlanHandle` | `shared_ptr<const PipelinePlan>`；用于获取和持有不可变计划快照 |
-| `phase_revision` | 记录该 Plan 所依据的 `PhaseRegistry::revision()`；不匹配时必须在帧边界重编译 |
+| 字段或类型                            | 使用语义                                                                                     |
+|---------------------------------------|----------------------------------------------------------------------------------------------|
+| `feature_contributions`               | 记录 Feature 实例、Composite Part、领域、挂载点、Stage 范围及挂载点权限                      |
+| `feature_implementations`             | 将每项贡献关联到 `shared_ptr<const PipelineFeature>`，使已编译贡献不受后续 Registry 撤销影响 |
+| `definition_owner` / `feature_owners` | 延长编译时定义对象与 Feature 对象的生命周期                                                  |
+| `PipelinePlanHandle`                  | `shared_ptr<const PipelinePlan>`；用于获取和持有不可变计划快照                               |
+| `phase_revision`                      | 记录该 Plan 所依据的 `PhaseRegistry::revision()`；不匹配时必须在帧边界重编译                 |
 
 通用 Completion 列表、结构化诊断列表及 `PipelinePlanKey` 不属于当前 Plan 的字段。
 
@@ -1882,10 +1885,11 @@ Plan 是只读对象。执行线程只读取紧凑的索引数组和函数绑定
 ### 13.5 PipelineScheduler
 
 Scheduler 执行 Plan，不重新分析拓扑。它为五种 `ExecutionDomain` 提供实际调度通道：
-`kMainThread` 在调用线程串行执行，`kCpuWorker`、`kIoWorker`、`kRenderThread` 和
-`kGpu` 分别进入独立的 Worker Pool。`kGpu` 的 Task 回调仍是 CPU 侧的 GPU 编排/提交
-工作；真正的 Shader 和 GPU 指令在 RHI 提交后由设备执行，不能把 C++ 回调误认为在 GPU
-线程上运行。
+`kMainThread` 在调用线程串行执行，其余执行域通过 `Concurrency::ExecutorRegistry`
+解析到独立的 `Executor`。默认实现使用 `WorkerExecutor`，但 Render Thread 和 GPU
+提交域可以在后续由宿主替换为专用执行器。`kGpu` 的 Task 回调是 CPU 侧的 GPU
+编排/提交入口；真正的 Shader 和 GPU 指令在 RHI 提交后由设备执行，不能把 C++ 回调
+误认为在 GPU 线程上运行。
 
 ```cpp
 struct PipelineSchedulerDesc {
@@ -1903,6 +1907,11 @@ public:
             const PipelinePlan& plan, PipelineExecutionContext& context,
             PhaseId phase);
     [[nodiscard]] uint32_t worker_count(ExecutionDomain domain) const noexcept;
+    [[nodiscard]] foundation::Result set_executor(
+            ExecutionDomain domain,
+            std::shared_ptr<concurrency::Executor> executor);
+    [[nodiscard]] foundation::Result wait_idle(
+            uint64_t timeout_nanoseconds = concurrency::kWaitIndefinitely) const;
 };
 ```
 
@@ -1912,17 +1921,30 @@ public:
 逐 Phase 驱动，而不是替代 Compiler。一个合法 Phase 可能没有任何属于当前 Plan 的
 节点，此时执行结果仍为成功；调用方不得把“本 Plan 没有节点”解释为“Phase 未注册”。
 
-调度器为每个非主线程执行域维护独立 Worker Pool。当前实现按一个已编译批次的域分组
-执行：`kCpuWorker`、`kIoWorker`、`kRenderThread`、`kGpu` 均通过各自 Pool 调用
-`TaskExecutionFunction`，随后在调用线程执行 `kMainThread` 节点。不同域在当前实现中
-按固定顺序完成，不构成跨域并行保证；同一域内只有同时满足 Batch、Stage 和 Task
-并行安全条件的节点才会并行。`kGpu` 的 C++ 回调是 GPU 工作的编排/提交入口，不是
-运行在 GPU 上的函数；真实 GPU 执行由 RenderGraph/RHI 的 Queue Submission 完成。
+调度器通过 `ExecutorRegistry` 获取每个非主线程执行域的执行器，并按已编译批次的域
+分组提交：`kCpuWorker`、`kIoWorker`、`kRenderThread`、`kGpu` 均提交
+`TaskExecutionFunction`，随后在调用线程执行 `kMainThread` 节点。当前 Pipeline Plan
+仍按域的固定顺序收敛，不构成跨域并行保证；同一域内只有同时满足 Batch、Stage 和
+Task 并行安全条件的节点才会并行。`kGpu` 的 C++ 回调是 GPU 工作的编排/提交入口，
+不是运行在 GPU 上的函数；真实 GPU 执行由 RenderGraph/RHI 的 Queue Submission 完成。
+
+`Concurrency::Completion` 负责暴露异步任务的最终 `Result`，`TaskGroup` 负责批量等待、
+首个非取消失败传播和失败后的协作式取消。`Completion::result()` 在任务未结束时返回
+`kNotReady`，等待超时返回 `kTimeout`，取消返回 `kCancelled`。Scheduler 不以线程
+连接或隐式共享状态表示跨域依赖；节点之间的数据顺序仍必须由 Plan 的 Artifact 和
+拓扑约束表达。通用 `Concurrency::TaskGraph` 同样只通过显式前驱依赖推进任务；它
+适合 World、Streaming 和 Tooling 的通用任务图，不替代 Pipeline Compiler 对领域
+Artifact DAG 的编译与优化。
 
 `PipelineSchedulerDesc` 中计数为 `0` 时使用默认策略：CPU Worker 使用硬件并发度的
-至少一个线程，IO、RenderThread 和 GPU 编排域各保留至少一个 Worker。Scheduler 的
-执行接口不是可重入接口；Task 不得递归调用同一个 Scheduler 的执行方法，也不得依赖
-未声明的共享可变状态。
+至少一个线程，IO、RenderThread 和 GPU 编排域各保留至少一个 Worker。调用方可以在
+初始化或安全切换边界通过 `set_executor()` 注入专用执行器；替换不会改变已编译 Plan
+的拓扑，但新提交会使用新的执行器，旧执行器由其共享所有权保持到既有任务结束。
+Scheduler 的执行接口允许不同 Context 并发调用；同一个 `PipelineExecutionContext`
+不得被并发共享。Task 不得递归调用同一个 Scheduler 的执行方法，也不得依赖未声明的
+共享可变状态。`wait_idle()` 是生命周期边界操作，会以独占执行闸门阻止新的 Scheduler
+执行，等待已进入的执行退出，再等待当前执行器集合空闲；因此适用于模块卸载、执行器
+替换和 Runtime 关闭，不应从一个正在运行的 Task 回调中调用。
 
 ## 14. ScopeBridge、快照和命令通道
 
@@ -2059,16 +2081,16 @@ RenderFeature 身份。
 `Engine/Pipeline/public/pipeline.hpp`。它有两种模式：Pipeline 编译时使用 Stage/Task/Artifact
 接口；`build_render_graph()` 调用期间使用资源和 Pass 接口。`is_runtime()` 区分这两种模式。
 
-| API | 作用与调用要求 |
-|-----|----------------|
+| API                                                                        | 作用与调用要求                                                                                 |
+|----------------------------------------------------------------------------|------------------------------------------------------------------------------------------------|
 | `create_buffer(id, desc, lifetime)` / `create_texture(id, desc, lifetime)` | 使用 RHI 描述符声明资源，返回 `ResultValue<RenderGraphBuffer/Texture>`；可省略 ID 创建匿名资源 |
-| `import_buffer()` / `import_texture()` | 将外部 RHI 资源及初始状态导入图，不转移底层资源所有权 |
-| `import_swapchain_image()` | 导入已获取的交换链图像，使用 `FrameAcquireResult`、纹理描述符和初始状态 |
-| `find_buffer(id)` / `find_texture(id)` | 按 `RenderResourceId` 查询已登记资源；不声明任何 Pass 读写关系 |
-| `export_buffer(handle)` / `export_texture(handle)` | 将逻辑资源标记为外部可观察输出，参与存活分析；不返回物理资源 |
-| `add_graphics_pass()` / `add_compute_pass()` / `add_copy_pass()` | 接收名称、Setup、Execute 和 Queue，返回 `ResultValue<RenderGraphPass>` |
-| `feature_point_flags()` / `allows()` | 查询当前挂载点授予的能力 |
-| `user_data()` | 取得宿主借用的数据指针；不自动提供 Artifact 访问或类型检查 |
+| `import_buffer()` / `import_texture()`                                     | 将外部 RHI 资源及初始状态导入图，不转移底层资源所有权                                          |
+| `import_swapchain_image()`                                                 | 导入已获取的交换链图像，使用 `FrameAcquireResult`、纹理描述符和初始状态                        |
+| `find_buffer(id)` / `find_texture(id)`                                     | 按 `RenderResourceId` 查询已登记资源；不声明任何 Pass 读写关系                                 |
+| `export_buffer(handle)` / `export_texture(handle)`                         | 将逻辑资源标记为外部可观察输出，参与存活分析；不返回物理资源                                   |
+| `add_graphics_pass()` / `add_compute_pass()` / `add_copy_pass()`           | 接收名称、Setup、Execute 和 Queue，返回 `ResultValue<RenderGraphPass>`                         |
+| `feature_point_flags()` / `allows()`                                       | 查询当前挂载点授予的能力                                                                       |
+| `user_data()`                                                              | 取得宿主借用的数据指针；不自动提供 Artifact 访问或类型检查                                     |
 
 `RenderResourceId` 是渲染资源命名空间中的 ID，不等同于 `ArtifactId`。同一次 Runtime
 构建中，命名 Buffer 与 Texture 共用 ID 唯一性约束；重复 ID 返回 `kInvalidState`，
@@ -2077,11 +2099,11 @@ RenderFeature 身份。
 
 `RenderGraphResourceLifetime` 的值定义如下：
 
-| 值 | 语义 |
-|----|------|
-| `kTransient` | 图管理的临时逻辑资源，参与瞬态分配；默认值 |
-| `kPersistent` | 图管理的持久资源，不按临时资源生命周期复用 |
-| `kImported` | 外部拥有的资源，必须通过 import 接口登记，不能传给 create 接口 |
+| 值            | 语义                                                           |
+|---------------|----------------------------------------------------------------|
+| `kTransient`  | 图管理的临时逻辑资源，参与瞬态分配；默认值                     |
+| `kPersistent` | 图管理的持久资源，不按临时资源生命周期复用                     |
+| `kImported`   | 外部拥有的资源，必须通过 import 接口登记，不能传给 create 接口 |
 
 `RenderGraphPassType::kGraphics`、`kCompute`、`kCopy` 分别表示绘制、计算和复制声明类别。
 当前类别用于选择挂载点权限，不能视为命令录制的完整隔离机制。三个专用 add 接口的默认
@@ -2118,11 +2140,11 @@ Queue 分别为 `kGraphics`、`kCompute`、`kCopy`；后两者请求独立队列
 `const PipelineRegistry&` 和可选 `RenderGraphFeatureRuntimeDesc`，随后调用 `build()`。
 一次性调用可使用 `build_render_graph_features(graph, plan, registry, desc)`。
 
-| 输入 | 生命周期与含义 |
-|------|----------------|
-| `buffers` / `textures` | 借用的绑定 span，将公开 `RenderResourceId` 关联到当前图已有句柄；绑定数组须保持有效直到 build 返回 |
-| `user_data` | 非拥有指针；构图期间必须有效，若被 Execute 回调捕获则须持续到相关执行完成 |
-| Graph / Plan / Registry | 借用引用，必须覆盖 Runtime 构建调用；不要直接解引用临时 Plan 快照后立即丢弃其持有者 |
+| 输入                    | 生命周期与含义                                                                                     |
+|-------------------------|----------------------------------------------------------------------------------------------------|
+| `buffers` / `textures`  | 借用的绑定 span，将公开 `RenderResourceId` 关联到当前图已有句柄；绑定数组须保持有效直到 build 返回 |
+| `user_data`             | 非拥有指针；构图期间必须有效，若被 Execute 回调捕获则须持续到相关执行完成                          |
+| Graph / Plan / Registry | 借用引用，必须覆盖 Runtime 构建调用；不要直接解引用临时 Plan 快照后立即丢弃其持有者                |
 
 Runtime 优先使用 Plan 保存的 Feature 实现；记录缺失时才尝试 Registry 查询。
 Pass 回调持有 Feature 实现引用，因此 Registry 撤销不会立即销毁仍被图引用的对象。
@@ -2182,8 +2204,8 @@ rhi::Device
 
 渲染示例中的 `aeg::rhi::Format::kRgba16Float` 表示一个未压缩的 RGBA 纹理格式：
 
-| 枚举值               | 通道布局                    | 每通道类型                    | 每像素大小        | 数值解释                                             |
-|----------------------|-----------------------------|-------------------------------|-------------------|------------------------------------------------------|
+| 枚举值         | 通道布局                    | 每通道类型                    | 每像素大小        | 数值解释                                             |
+|----------------|-----------------------------|-------------------------------|-------------------|------------------------------------------------------|
 | `kRgba16Float` | `R`、`G`、`B`、`A` 四个通道 | 16 位浮点数（half precision） | 64 bit，即 8 byte | 线性浮点值，不是 UNORM/SNORM，也不自动执行 sRGB 转换 |
 
 该格式的名称只描述数据布局，不保证在当前设备上一定支持所有用途。创建资源前仍需
@@ -3052,25 +3074,27 @@ enum class ResultCode : uint8_t {
     kNotReady = 9,
     kOutOfDate = 10,
     kSurfaceLost = 11,
-    kUnknown = 12
+    kUnknown = 12,
+    kCancelled = 13
 };
 ```
 
-| 枚举值             | 精确定义                                    | 调用方通常如何处理                           |
-|--------------------|---------------------------------------------|----------------------------------------------|
-| `kSuccess`         | 操作已完成，返回值和输出参数有效            | 继续使用返回对象；不得把非空错误消息当作失败 |
-| `kInvalidArgument` | 参数为空、范围错误、格式错误或组合不合法    | 修正调用参数后重试；不得对完全相同的请求重复重试 |
-| `kInvalidState`    | 对象存在，但当前生命周期/状态不允许该操作   | 按正确顺序调用，或先激活/结束当前操作        |
-| `kOutOfMemory`     | CPU、GPU、Descriptor 或其他分配资源不足     | 释放/裁剪资源或降低配置；重试不保证成功      |
-| `kUnsupported`     | 当前实现或后端不提供该操作                  | 选择替代路径或裁剪功能                       |
-| `kNotFound`        | 请求的对象或稳定 ID 不存在                  | 检查注册、绑定和命名；不得将缺失对象当作空对象 |
-| `kTimeout`         | 在约定期限内未完成等待或外部操作            | 记录上下文并决定取消、重试或故障处理         |
-| `kDeviceLost`      | GPU Device 或其执行上下文不可继续使用       | 停止提交，进入设备恢复或引擎重启流程         |
-| `kBackendError`    | 无法进一步归类的后端执行错误                | 保留后端诊断，不依赖错误文本分类             |
-| `kNotReady`        | 对象存在，但异步结果尚未准备好              | 等待对应 Completion 或稍后重试               |
-| `kOutOfDate`       | 外部状态已变化，当前对象/配置需要刷新或重建 | 重建交换链、缓存或相关 Plan                  |
-| `kSurfaceLost`     | Presentation Surface 已失效                 | 停止获取/呈现并重建 Surface/Swapchain        |
-| `kUnknown`         | 无法映射到已知错误类别的外部或旧版本错误    | 只能作为兜底诊断，不能被调用方细分解释       |
+| 枚举值             | 精确定义                                    | 调用方通常如何处理                                 |
+|--------------------|---------------------------------------------|----------------------------------------------------|
+| `kSuccess`         | 操作已完成，返回值和输出参数有效            | 继续使用返回对象；不得把非空错误消息当作失败       |
+| `kInvalidArgument` | 参数为空、范围错误、格式错误或组合不合法    | 修正调用参数后重试；不得对完全相同的请求重复重试   |
+| `kInvalidState`    | 对象存在，但当前生命周期/状态不允许该操作   | 按正确顺序调用，或先激活/结束当前操作              |
+| `kOutOfMemory`     | CPU、GPU、Descriptor 或其他分配资源不足     | 释放/裁剪资源或降低配置；重试不保证成功            |
+| `kUnsupported`     | 当前实现或后端不提供该操作                  | 选择替代路径或裁剪功能                             |
+| `kNotFound`        | 请求的对象或稳定 ID 不存在                  | 检查注册、绑定和命名；不得将缺失对象当作空对象     |
+| `kTimeout`         | 在约定期限内未完成等待或外部操作            | 记录上下文并决定取消、重试或故障处理               |
+| `kDeviceLost`      | GPU Device 或其执行上下文不可继续使用       | 停止提交，进入设备恢复或引擎重启流程               |
+| `kBackendError`    | 无法进一步归类的后端执行错误                | 保留后端诊断，不依赖错误文本分类                   |
+| `kNotReady`        | 对象存在，但异步结果尚未准备好              | 等待对应 Completion 或稍后重试                     |
+| `kOutOfDate`       | 外部状态已变化，当前对象/配置需要刷新或重建 | 重建交换链、缓存或相关 Plan                        |
+| `kSurfaceLost`     | Presentation Surface 已失效                 | 停止获取/呈现并重建 Surface/Swapchain              |
+| `kUnknown`         | 无法映射到已知错误类别的外部或旧版本错误    | 只能作为兜底诊断，不能被调用方细分解释             |
+| `kCancelled`       | 操作被显式或级联取消，未表示参数或后端错误  | 停止消费结果；根据上游状态决定丢弃、重排或重新提交 |
 
 `Result` 的布尔转换只有 `kSuccess` 为真；所有其他值都必须视为失败。调用方可以根据
 `ResultCode` 决定恢复策略，但不能依赖 `message` 的具体文本。`ResultValue<T>` 只有在
@@ -3179,21 +3203,24 @@ Pipeline Cache。
 
 当前仓库中已经存在的模块与本架构的关系如下：
 
-| 模块                 | 架构角色                                                | 公共边界                             |
-|----------------------|---------------------------------------------------------|--------------------------------------|
-| `Engine/Foundation`  | Result、通用基础类型和错误                              | 不依赖任何图形后端                   |
-| `Engine/Logging`     | 统一日志和诊断输出                                      | 供 Runtime/模块使用                  |
-| `Engine/Math`        | SIMD 数学、变换和图形基础计算                           | 不参与 Pipeline 拓扑                 |
-| `Engine/RHI`         | Buffer、Texture、View、Binding、Pipeline、Command、Sync | 公共接口后端无关                     |
-| `Engine/RenderGraph` | FrameContext、资源图、Barrier、Queue Sync               | 只管理 Render Domain 图              |
-| `Engine/Shader`      | HLSL 产物、Reflection、Shader Contract、Layout          | 不决定 EnginePhase                   |
-| `Engine/Resource`    | Mesh、Texture、上传和 Render Target                     | 通过 RHI/RenderGraph 使用 GPU        |
-| `Engine/Pipeline`    | Pipeline、Feature、Registry、Compiler、Scheduler        | 本文档描述的扩展层                   |
-| `Engine/Runtime`     | EngineFrameOrchestrator 与统一 Engine 帧生命周期        | 连接 Pipeline Runtime 与 RenderGraph |
-| `Engine/World`       | WorldHandle、World Host、ECS 快照和命令                 | World Scope 数据所有者               |
+| 模块                 | 架构角色                                                | 公共边界                              |
+|----------------------|---------------------------------------------------------|---------------------------------------|
+| `Engine/Foundation`  | Result、通用基础类型和错误                              | 不依赖任何图形后端                    |
+| `Engine/Logging`     | 统一日志和诊断输出                                      | 供 Runtime/模块使用                   |
+| `Engine/Math`        | SIMD 数学、变换和图形基础计算                           | 不参与 Pipeline 拓扑                  |
+| `Engine/RHI`         | Buffer、Texture、View、Binding、Pipeline、Command、Sync | 公共接口后端无关                      |
+| `Engine/RenderGraph` | FrameContext、资源图、Barrier、Queue Sync               | 只管理 Render Domain 图               |
+| `Engine/Shader`      | HLSL 产物、Reflection、Shader Contract、Layout          | 不决定 EnginePhase                    |
+| `Engine/Resource`    | Mesh、Texture、上传和 Render Target                     | 通过 RHI/RenderGraph 使用 GPU         |
+| `Engine/Concurrency` | Executor、Worker、Completion、Cancellation 和任务批次   | 平台中立；不持有领域状态              |
+| `Engine/Pipeline`    | Pipeline、Feature、Registry、Compiler、Scheduler        | 本文档描述的扩展层                    |
+| `Engine/Runtime`     | EngineFrameOrchestrator 与统一 Engine 帧生命周期        | 连接 Pipeline Runtime 与 RenderGraph  |
+| `Engine/World`       | WorldHandle、World Host、ECS 快照和命令                 | World Scope 数据所有者                |
 
-当前 Pipeline、World 和部分通用 Scheduler 类型属于架构目标。本文档不会把目标 API
-误写成当前已经存在的头文件；实现时应优先保持这里定义的调用方向和所有权规则。
+当前 World、专用 Scope Host、Renderer 和部分模块化运行时仍属于架构目标。本文档不会
+把目标 API 误写成当前已经存在的头文件；实现时应优先保持这里定义的调用方向和所有权
+规则。通用 Concurrency 基建已经存在，但 GPU 队列提交适配器仍由 RHI/RenderGraph
+负责，不能将默认 WorkerExecutor 视为真实 GPU 执行线程。
 
 ## 26. API 快速参考
 
@@ -3305,6 +3332,7 @@ Pipeline 层枚举给出了完整语义；本节补充 Foundation、Logging、RH
 | `kOutOfDate`       | 外部状态变化，需要刷新或重建 |
 | `kSurfaceLost`     | Presentation Surface 已失效  |
 | `kUnknown`         | 兜底未知错误                 |
+| `kCancelled`       | 操作被显式或级联取消         |
 
 ### 28.3 Logging：`Level` 和 `Category`
 

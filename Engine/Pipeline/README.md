@@ -9,10 +9,11 @@ Task、Artifact 及其依赖，并负责在声明的 ExecutionDomain 上调度�
 
 - `public/pipeline_types.hpp`：公共 ID、枚举、描述符、Plan 和数据模型。
 - `public/pipeline.hpp`：Builder、Feature、Registry、Compiler、Scheduler 和 Scope Host。
-- `private/pipeline.cpp`：定义收集、拓扑编译、Artifact Runtime 和 Worker Pool 实现。
+- `private/pipeline.cpp`：定义收集、拓扑编译、Artifact Runtime 和执行器编排。
 
 ## 依赖边界
 
-Pipeline 可以使用 Foundation 和通用 RHI 数据模型，但不应依赖具体 Vulkan/D3D12
-类型。RenderGraph 通过受控的 Feature/Runtime 接口接入 Pipeline，不应让 Pipeline
+Pipeline 可以使用 Foundation、Concurrency 和通用 RHI 数据模型，但不应依赖具体
+Vulkan/D3D12 类型。`PipelineScheduler` 通过 Concurrency 的 `ExecutorRegistry` 映射
+执行域；RenderGraph 通过受控的 Feature/Runtime 接口接入 Pipeline，不应让 Pipeline
 直接持有 RenderGraph 的私有实现。

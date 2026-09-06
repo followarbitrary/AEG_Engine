@@ -200,6 +200,30 @@ if (WIN32)
     target_compile_definitions(aeg_result_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
+add_library(aeg_concurrency STATIC
+    Engine/Concurrency/private/concurrency.cpp
+)
+target_compile_features(aeg_concurrency PUBLIC cxx_std_20)
+target_include_directories(aeg_concurrency
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Concurrency/public
+)
+target_link_libraries(aeg_concurrency PUBLIC aeg_foundation Threads::Threads)
+
+if (MSVC)
+    target_compile_options(aeg_concurrency PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(aeg_concurrency PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+add_executable(aeg_concurrency_smoke
+    tests/concurrency_smoke.cpp
+)
+target_link_libraries(aeg_concurrency_smoke PRIVATE aeg_concurrency)
+if (WIN32)
+    target_compile_definitions(aeg_concurrency_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
 add_library(aeg_pipeline STATIC
     Engine/Pipeline/private/pipeline.cpp
 )
@@ -209,7 +233,7 @@ target_include_directories(aeg_pipeline
         ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Pipeline/public
         ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RHI/public
 )
-target_link_libraries(aeg_pipeline PUBLIC aeg_foundation Threads::Threads)
+target_link_libraries(aeg_pipeline PUBLIC aeg_foundation aeg_concurrency Threads::Threads)
 
 if (MSVC)
     target_compile_options(aeg_pipeline PRIVATE /W4 /permissive-)
@@ -547,6 +571,7 @@ endif()
 if (BUILD_TESTING)
     add_test(NAME aeg_math_smoke COMMAND aeg_math_smoke)
     add_test(NAME aeg_result_smoke COMMAND aeg_result_smoke)
+    add_test(NAME aeg_concurrency_smoke COMMAND aeg_concurrency_smoke)
     add_test(NAME aeg_pipeline_smoke COMMAND aeg_pipeline_smoke)
     add_test(NAME aeg_pipeline_extension_smoke COMMAND aeg_pipeline_extension_smoke)
     add_test(NAME aeg_pipeline_runtime_smoke COMMAND aeg_pipeline_runtime_smoke)

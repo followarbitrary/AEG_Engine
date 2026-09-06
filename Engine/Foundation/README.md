@@ -9,6 +9,7 @@
 
 - `public/result.hpp`：`Result` 与 `ResultValue`。
 - `private/result.cpp`：结果类型的非内联实现。
+- `ResultCode::kCancelled`：用于任务、批次和帧级协作式取消的稳定错误分类。
 
 ## 依赖边界
 
