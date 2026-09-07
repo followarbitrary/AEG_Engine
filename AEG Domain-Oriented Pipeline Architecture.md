@@ -31,7 +31,8 @@
 当前已实现的 Pipeline 基建包括 `PhaseRegistry`、`PipelineRegistry`、`PipelineCompiler`、
 `PipelineScheduler`、`PipelineScopeHost`、`ArtifactRegistry`、`ArtifactScopeBridge`、
 五个领域 Feature 基类、`CompositeFeature<Parts...>`、RenderFeature 到 RenderGraph 的
-运行期适配，以及 `EngineFrameOrchestrator`。`Concurrency` 已提供通用的
+运行期适配、Math 的 `Plane`/`Frustum` 几何 API、`Renderer`/`RenderPipeline`，以及
+`EngineFrameOrchestrator`。`Concurrency` 已提供通用的
 `Executor`、`WorkerExecutor`、`InlineExecutor`、`ExecutorRegistry`、`Completion` 和
 `CancellationToken`、`TaskGroup` 和 `TaskGraph`；Pipeline Scheduler 通过执行器注册表
 驱动各执行域。通用 Host 通过 Scope、实例 ID 和非拥有的 `owner` 指针关联宿主对象；
@@ -46,10 +47,12 @@ Orchestrator 通过非拥有的 Host 注册表统一驱动这些实例。
 `FeatureExecutionContext`、动态模块 C ABI，以及 Simulation/Render
 参考 Stage 编排属于架构约定，不表示当前已有同名公共实现。`WorldPipelineHost` 和
 `FramePipelineHost` 当前由通用 `PipelineScopeHost` 分别承担，专用类型仍属于文档层抽象。
-`RebuildReason` 和
-`PipelineRegistry::request_rebuild()` 仍属于设计接口；当前重建由调用方显式执行
-`PipelineScopeHost::rebuild(registry)`，Orchestrator 会在帧边界检测 Phase revision 并
-自动执行必要的重建和 Plan 切换。这些约定说明目标语义，不构成实现排期。
+`RebuildReason` 和 `PipelineRegistry::request_rebuild()` 仍属于设计接口；当前
+`PipelineRegistry` 不提供自动重建通知。Pipeline 或 Feature 注册/绑定发生变化时，调用方
+必须显式执行 `PipelineScopeHost::rebuild(registry)`；`EngineFrameOrchestrator` 只会在初始化
+和帧边界检测 `PhaseRegistry` revision 变化、缺少 Active Plan 或 Active Plan 的
+`phase_revision` 与当前 Phase revision 失配，并据此执行必要的重建和 Plan 切换。这些约定
+说明目标语义，不构成实现排期。
 
 本文档采用以下规范性措辞：
 
@@ -214,12 +217,12 @@ using FeatureDomainMask = uint32_t;
 
 `PipelineScope` 决定实例和 Artifact 的所有权边界，不决定线程，也不决定执行频率。
 
-| 枚举值    | 精确定义                                                                | 典型实例                                             | 约束                                                                    |
-|-----------|-------------------------------------------------------------------------|------------------------------------------------------|-------------------------------------------------------------------------|
-| `kEngine` | 引擎进程级或运行时级作用域，保存跨 World 共享的定义、服务和只读能力信息 | `EnginePipelineHost`、资源缓存、设备能力             | 不得读取 World、Frame 或 Editor 的业务数据；通常每个引擎进程只有一个    |
-| `kWorld`  | 一个独立世界的可变状态作用域，包含 ECS、Gameplay、Physics 等状态        | `WorldPipelineHost[WorldHandle]`                     | 必须绑定有效 `WorldHandle`；不得将状态发布为跨线程可变借用              |
-| `kFrame`  | 某个 World 的某个 View 在一次输出帧内的临时作用域                       | `FramePipelineHost[WorldFrameKey]`、RenderGraph 资源 | 只能读取已发布的 World Snapshot；Frame 结束并完成退休后，临时对象失效   |
-| `kEditor` | 编辑器会话或工具 View 的叠加作用域                                      | `EditorOverlayHost`                                  | 只能通过 Frame 输出和 Command Channel 参与；不得直接修改 World 可变状态 |
+| 枚举值    | 精确定义                                                                | 典型实例                                                                 | 约束                                                                    |
+|-----------|-------------------------------------------------------------------------|--------------------------------------------------------------------------|-------------------------------------------------------------------------|
+| `kEngine` | 引擎进程级或运行时级作用域，保存跨 World 共享的定义、服务和只读能力信息 | 当前为 `PipelineScopeHost(kEngine)`；目标封装为 `EnginePipelineHost`    | 不得读取 World、Frame 或 Editor 的业务数据；通常每个引擎进程只有一个    |
+| `kWorld`  | 一个独立世界的可变状态作用域，包含 ECS、Gameplay、Physics 等状态        | 当前为 `WorldScope::pipeline_host()`；目标封装为 `WorldPipelineHost`    | 必须绑定有效 `WorldHandle`；不得将状态发布为跨线程可变借用              |
+| `kFrame`  | 某个 World 的某个 View 在一次输出帧内的临时作用域                       | 当前为 `PipelineScopeHost(kFrame)`；目标封装为 `FramePipelineHost`      | 只能读取已发布的 World Snapshot；Frame 结束并完成退休后，临时对象失效   |
+| `kEditor` | 编辑器会话或工具 View 的叠加作用域                                      | 当前可使用 `PipelineScopeHost(kEditor)`；目标封装为 `EditorOverlayHost` | 只能通过 Frame 输出和 Command Channel 参与；不得直接修改 World 可变状态 |
 
 ### 4.2 `FeatureDomain` 枚举值
 
@@ -244,13 +247,13 @@ Pipeline 的 `category`。
 `ExecutionDomain` 描述工作由哪类执行资源承载。它是调度约束，不是线程句柄；实际线程
 和队列由 Scheduler 或领域 Host 管理。
 
-| 枚举值          | 精确定义                            | 允许的工作                                  | 不可推断的内容                                           |
-|-----------------|-------------------------------------|---------------------------------------------|----------------------------------------------------------|
-| `kMainThread`   | 引擎主控制线程上的串行工作          | 生命周期控制、输入分发、非线程安全 API 调用 | 不表示所有 Engine Scope 工作都必须在主线程               |
-| `kCpuWorker`    | 引擎 CPU Worker Pool 中可调度的任务 | 可并行的 CPU 计算、数据转换、图编译         | 不保证固定 Worker 线程；任务必须满足线程安全要求         |
-| `kIoWorker`     | IO 或资源流送专用执行资源           | 文件、网络、解码和阻塞式外部 IO             | 不得直接录制 RHI Command List，完成后必须发布 Artifact |
-| `kRenderThread` | Render Build/Command 录制执行资源   | RenderGraph 构建、Pass setup、RHI 命令录制  | 不表示工作已经在 GPU 执行                                |
-| `kGpu`          | 由 GPU 编排通道准备并提交、最终在 GPU 上执行的工作 | Graphics、Compute、Copy 等 GPU 命令         | 当前 Scheduler 在 CPU 侧执行编排回调；真实 GPU 指令由 RHI Queue Submission 执行，不得把该域误认为 GPU 线程  |
+| 枚举值          | 精确定义                                           | 允许的工作                                  | 不可推断的内容                                                                                             |
+|-----------------|----------------------------------------------------|---------------------------------------------|------------------------------------------------------------------------------------------------------------|
+| `kMainThread`   | 引擎主控制线程上的串行工作                         | 生命周期控制、输入分发、非线程安全 API 调用 | 不表示所有 Engine Scope 工作都必须在主线程                                                                 |
+| `kCpuWorker`    | 引擎 CPU Worker Pool 中可调度的任务                | 可并行的 CPU 计算、数据转换、图编译         | 不保证固定 Worker 线程；任务必须满足线程安全要求                                                           |
+| `kIoWorker`     | IO 或资源流送专用执行资源                          | 文件、网络、解码和阻塞式外部 IO             | 不得直接录制 RHI Command List，完成后必须发布 Artifact                                                     |
+| `kRenderThread` | Render Build/Command 录制执行资源                  | RenderGraph 构建、Pass setup、RHI 命令录制  | 不表示工作已经在 GPU 执行                                                                                  |
+| `kGpu`          | 由 GPU 编排通道准备并提交、最终在 GPU 上执行的工作 | Graphics、Compute、Copy 等 GPU 命令         | 当前 Scheduler 在 CPU 侧执行编排回调；真实 GPU 指令由 RHI Queue Submission 执行，不得把该域误认为 GPU 线程 |
 
 `kRenderThread` 和 `kGpu` 可以同时出现在一个 Render Pass 的不同节点上：前者负责在
 CPU 侧准备和录制命令，后者负责在 CPU 侧编排 GPU 工作并提交 Queue；提交完成后，真实
@@ -261,13 +264,13 @@ CPU 侧准备和录制命令，后者负责在 CPU 侧编排 GPU 工作并提交
 `TimePolicy` 描述节点何时被触发，不负责表达同一时间域内的先后关系；先后关系必须用
 Artifact 依赖或 `runs_before`/`runs_after` 声明。
 
-| 枚举值       | 精确定义                                  | 调用次数/触发条件              | 适用规则                                                        |
-|--------------|-------------------------------------------|--------------------------------|-----------------------------------------------------------------|
-| `kStartup`   | 引擎、模块或 Scope 激活时执行的一次性工作 | 对应对象激活后执行一次         | 适合初始化定义、缓存和初始 Artifact；不得假设每帧执行           |
-| `kFrame`     | 每个有效输出帧执行的可变步长工作          | 每帧最多一次，使用当前帧时间   | 适合 Render、Frame Extract、UI 和可变步长逻辑                   |
-| `kFixedTick` | 固定时间步长驱动的工作                    | 一帧内可能执行零次、一次或多次 | 适合 Physics 和确定性模拟；必须使用 Tick 上下文而不是渲染帧时间 |
-| `kEvent`     | 由显式事件或命令触发的工作                | 事件到达时执行，可同帧多次     | 必须声明事件来源和消费语义，不得依赖轮询顺序                    |
-| `kShutdown`  | Scope 或模块关闭时执行的收尾工作          | 关闭流程中执行一次             | 必须在相关 Task、IO 和 GPU Completion 满足后释放资源            |
+| 枚举值       | 精确定义                                  | 调用次数/触发条件                                                                            | 适用规则                                                        |
+|--------------|-------------------------------------------|----------------------------------------------------------------------------------------------|-----------------------------------------------------------------|
+| `kStartup`   | 引擎、模块或 Scope 激活时执行的一次性工作 | 对应对象激活后执行一次                                                                       | 适合初始化定义、缓存和初始 Artifact；不得假设每帧执行           |
+| `kFrame`     | 每个有效输出帧执行的可变步长工作          | 每帧最多一次，使用当前帧时间                                                                 | 适合 Render、Frame Extract、UI 和可变步长逻辑                   |
+| `kFixedTick` | 固定时间步长驱动的工作                    | 架构上可由固定 Tick 驱动器在一帧内执行零次、一次或多次；当前 Orchestrator 不自动展开多次迭代 | 适合 Physics 和确定性模拟；必须使用 Tick 上下文而不是渲染帧时间 |
+| `kEvent`     | 由显式事件或命令触发的工作                | 事件到达时执行，可同帧多次                                                                   | 必须声明事件来源和消费语义，不得依赖轮询顺序                    |
+| `kShutdown`  | Scope 或模块关闭时执行的收尾工作          | 关闭流程中执行一次                                                                           | 必须在相关 Task、IO 和 GPU Completion 满足后释放资源            |
 
 ### 4.5 枚举与 Mask 的转换规则
 
@@ -372,6 +375,10 @@ PreviewWorld[W2]
         -> WorldPlan[W2]
 ```
 
+图中的 `WorldPipelineHost` 表示 World Scope 的逻辑宿主角色；当前实现由
+`WorldScope::pipeline_host()` 返回的通用 `PipelineScopeHost` 承担，不应将图中的名称
+理解为已经存在的专用 C++ 类型。
+
 不同 World 可以共享 Pipeline 定义、Shader、Mesh、Texture、只读配置和编译缓存；不得
 共享 ECS 可变状态、物理求解器状态、World Artifact、Feature 可变成员或运行时完成点。
 
@@ -428,10 +435,14 @@ Editor 默认不得删除基础 Pass、重排 RenderGraph、替换主 Render Tar
 Plan 是 Compiler 根据 Definition、Instance 和 Feature 贡献生成的不可变执行计划，保存：
 
 - 扁平化后的节点和依赖边。
-- 可并行执行的批次。
-- Artifact 生命周期范围。
-- Scope Bridge 和完成点要求。
-- 运行时函数绑定和诊断索引。
+- 拓扑序和可并行执行的批次。
+- Artifact 声明、跨 Scope 暴露记录和 Feature 来源记录。
+- 编译时 Phase revision、运行时函数绑定以及保持定义/Feature 实现存活的所有权引用。
+
+当前 `PipelinePlan` 不直接保存 Artifact 生命周期范围、Scope Bridge、Completion、
+RenderGraph Barrier/Queue Dependency 或结构化诊断索引。Artifact 生命周期和 GPU 同步
+由 RenderGraph/RHI 管理，Scope Bridge 和 Completion 由运行时上下文管理，编译诊断通过
+`Result` 及日志/诊断系统返回或记录。
 
 三者关系：
 
@@ -441,7 +452,11 @@ PipelineDefinition
     +--> PipelinePlan[Topology/Capabilities/Bindings]
 ```
 
-Plan 不保存业务对象裸指针，也不保存 Vulkan、D3D12 等后端原生对象。
+Plan 不拥有业务对象，也不将业务对象的生命周期纳入 Plan 管理；同时不保存 Vulkan、D3D12
+等后端原生对象。当前实现会把 `TaskDescriptor::execute` 复制为
+`PipelineNode::execute`，并把 `TaskDescriptor::user_data` 复制为非拥有指针；该指针必须
+在所有可能的同步或异步执行完成前保持有效。`definition_owner` 和 `feature_owners` 只
+负责保持定义回调与 Feature 实现存活，不会自动保持 `user_data` 指向的业务对象存活。
 
 ## 7. 公共身份、版本和句柄
 
@@ -516,30 +531,34 @@ enum class EnginePhase : uint8_t {
 };
 ```
 
-| 枚举值            | 精确定义                                             | 典型输入与输出                                                                                       | 调度与可见性约束                                                                               |
-|-------------------|------------------------------------------------------|------------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------|
-| `kStartup`        | Engine、模块或 Scope 进入可运行状态前的引导阶段      | 输入为静态配置和模块定义；输出为 Registry、长期服务和初始能力档案                                    | 不得读取尚未建立的 World/Frame 状态；一次性初始化必须具备幂等或明确的重复调用策略              |
-| `kFrameBegin`     | 建立一次输出帧的身份、时间基准和帧槽上下文           | 输入为 Engine/World 入口和外部时钟；输出为 `WorldFrameKey`、Frame Slot 和帧级上下文                  | 必须先完成上一帧所占用帧槽的 GPU Completion 检查；不得使用尚未获得的 Frame Token               |
-| `kInput`          | 摄取并规范化设备输入、网络事件和 Editor 命令         | 输入为外部事件流；输出为版本化 `CommandBuffer` 或输入 Artifact                                       | 输入数据在此阶段完成格式归一化；不得绕过命令通道直接修改 World 可变状态                        |
-| `kPreUpdate`      | 在模拟迭代前消费命令并建立本次更新的初始条件         | 输入为 CommandBuffer、上一提交状态和时间参数；输出为 Tick 输入及求解前状态                           | 属于 World Owner 的受控写入窗口；下游只能通过声明的 Artifact 读取结果                          |
-| `kFixedUpdate`    | 按固定时间步长执行零次或多次确定性更新               | 输入为固定 Tick 上下文；输出为模拟状态、事件和中间求解 Artifact                                      | 同一渲染帧内允许重复执行；必须使用 Tick 序号和固定步长，不得以渲染帧时间替代                   |
-| `kVariableUpdate` | 按当前帧可变时间步长执行一次表现和业务更新           | 输入为可变 `delta_time`、已提交状态和帧输入；输出为摄像机、表现参数和非确定性业务结果                | 结果不得被隐式解释为固定 Tick 状态；若需确定性重放，必须另行记录输入与 Tick 数据               |
-| `kWorldCommit`    | 将 World 的可变状态发布为版本化、不可变的可见数据    | 输入为本帧 World 状态；输出为 `WorldSnapshot`、事件和统计快照                                        | 形成写入方到读取方的发布边界；发布后不得原地修改快照内容                                       |
-| `kRenderExtract`  | 从已发布的 World Snapshot 构造 Frame 级 Render Scene | 输入为 Snapshot、Engine 资源索引和 View 参数；输出为可渲染实体、视图和 Render Artifact               | 不得访问 World 的可变容器；多个 View 可以并行执行，但必须拥有独立的 Frame 身份                 |
-| `kRenderBuild`    | 以声明式方式构造并编译当前帧的 RenderGraph           | 输入为 Render Scene、Shader Contract 和运行时能力；输出为 Pass、资源、Binding、Barrier 和 Queue Plan | 在 CPU 构建域执行；不得把构建阶段误认为 GPU 执行，也不得在此阶段提交未编译拓扑                 |
-| `kRenderExecute`  | 录制并提交已编译的 RenderGraph 执行计划              | 输入为不可变 Plan、Frame Context 和资源解析结果；输出为 Queue Submission 与 GPU Completion           | 只允许使用当前 Frame 的 Plan 和资源；执行期间不得修改图拓扑或跨 Scope 借用可变数据             |
-| `kPresent`        | 将完成的 Frame 输出移交给 Presentation Surface       | 输入为已提交的 Swapchain Frame 和完成依赖；输出为 Present 状态、Suboptimal 或 OutOfDate 诊断         | 必须满足 `ResourceUsage::kPresent` 及全部 Queue 等待条件；不得在此阶段隐式重排基础 RenderGraph |
-| `kFrameEnd`       | 结束帧生命周期并推进帧槽、统计和资源退休             | 输入为 CPU/GPU Completion；输出为退休记录、性能统计和下一帧可复用状态                                | 只有满足所有引用的 Completion 后才能回收 Frame-local 资源；不得提前销毁 GPU 仍在使用的对象     |
-| `kShutdown`       | Engine、模块或 Scope 的有序静默与资源析构阶段        | 输入为关闭请求；输出为已排空的任务、回调、IO 和 GPU 使用                                             | 必须先阻止新工作，再等待既有工作完成，最后销毁依赖对象；不可与正常帧执行并发交错               |
+| 枚举值            | 精确定义                                                       | 典型输入与输出                                                                                       | 调度与可见性约束                                                                                                                                                                            |
+|-------------------|----------------------------------------------------------------|------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `kStartup`        | Engine、模块或 Scope 进入可运行状态前的引导阶段                | 输入为静态配置和模块定义；输出为 Registry、长期服务和初始能力档案                                    | 不得读取尚未建立的 World/Frame 状态；一次性初始化必须具备幂等或明确的重复调用策略                                                                                                           |
+| `kFrameBegin`     | 建立一次输出帧的身份、时间基准和帧槽上下文                     | 输入为 Engine/World 入口和外部时钟；输出为 `WorldFrameKey`、Frame Slot 和帧级上下文                  | 必须先完成上一帧所占用帧槽的 GPU Completion 检查；不得使用尚未获得的 Frame Token                                                                                                            |
+| `kInput`          | 摄取并规范化设备输入、网络事件和 Editor 命令                   | 输入为外部事件流；输出为版本化 `CommandBuffer` 或输入 Artifact                                       | 输入数据在此阶段完成格式归一化；不得绕过命令通道直接修改 World 可变状态                                                                                                                     |
+| `kPreUpdate`      | 在模拟迭代前消费命令并建立本次更新的初始条件                   | 输入为 CommandBuffer、上一提交状态和时间参数；输出为 Tick 输入及求解前状态                           | 属于 World Owner 的受控写入窗口；下游只能通过声明的 Artifact 读取结果                                                                                                                       |
+| `kFixedUpdate`    | 固定 Tick 驱动的确定性更新阶段；多次迭代由固定 Tick 驱动器控制 | 输入为固定 Tick 上下文；输出为模拟状态、事件和中间求解 Artifact                                      | 架构上允许同一渲染帧内重复进入；当前 `EngineFrameOrchestrator::run_frame()` 只在全局 Phase 序列中调度一次，重复 Tick 必须由宿主额外驱动；必须使用 Tick 序号和固定步长，不得以渲染帧时间替代 |
+| `kVariableUpdate` | 按当前帧可变时间步长执行一次表现和业务更新                     | 输入为可变 `delta_time`、已提交状态和帧输入；输出为摄像机、表现参数和非确定性业务结果                | 结果不得被隐式解释为固定 Tick 状态；若需确定性重放，必须另行记录输入与 Tick 数据                                                                                                            |
+| `kWorldCommit`    | 将 World 的可变状态发布为版本化、不可变的可见数据              | 输入为本帧 World 状态；输出为 `WorldSnapshot`、事件和统计快照                                        | 形成写入方到读取方的发布边界；发布后不得原地修改快照内容                                                                                                                                    |
+| `kRenderExtract`  | 从已发布的 World Snapshot 构造 Frame 级 Render Scene           | 输入为 Snapshot、Engine 资源索引和 View 参数；输出为可渲染实体、视图和 Render Artifact               | 不得访问 World 的可变容器；多个 View 可以并行执行，但必须拥有独立的 Frame 身份                                                                                                              |
+| `kRenderBuild`    | 以声明式方式构造当前帧的 RenderGraph                             | 输入为 Render Scene、Shader Contract 和运行时能力；输出为 Pass、资源和 Binding 声明；Barrier/Queue Plan 在后续编译阶段生成 | 在 CPU 构建域执行；不得把构建阶段误认为 GPU 执行，也不得在此阶段提交未编译拓扑                                                                                                      |
+| `kRenderExecute`  | 必要时先编译，再录制并提交当前帧的 RenderGraph 执行计划          | 输入为不可变 Plan、Frame Context 和资源解析结果；输出为 Queue Submission 与 GPU Completion           | 只允许使用当前 Frame 的 Plan 和资源；执行期间不得修改图拓扑或跨 Scope 借用可变数据                                                                                                          |
+| `kPresent`        | 将完成的 Frame 输出移交给 Presentation Surface                 | 输入为已提交的 Swapchain Frame 和完成依赖；输出为 Present 状态、Suboptimal 或 OutOfDate 诊断         | 必须满足 `ResourceUsage::kPresent` 及全部 Queue 等待条件；不得在此阶段隐式重排基础 RenderGraph                                                                                              |
+| `kFrameEnd`       | 结束帧生命周期并推进帧槽、统计和资源退休                       | 输入为 CPU/GPU Completion；输出为退休记录、性能统计和下一帧可复用状态                                | 只有满足所有引用的 Completion 后才能回收 Frame-local 资源；不得提前销毁 GPU 仍在使用的对象                                                                                                  |
+| `kShutdown`       | Engine、模块或 Scope 的有序静默与资源析构阶段                  | 输入为关闭请求；输出为已排空的任务、回调、IO 和 GPU 使用                                             | 必须先阻止新工作，再等待既有工作完成，最后销毁依赖对象；不可与正常帧执行并发交错                                                                                                            |
 
-标准客户端帧的**规范性阶段顺序**为：
+标准客户端生命周期的**规范性阶段顺序**分为一次性初始化、逐帧执行和一次性关闭三个
+区间。`Startup` 不属于每帧重复执行的 Phase：
 
 ```text
-Startup
-    -> FrameBegin
+Initialization (once)
+    Startup
+
+Each frame
+    FrameBegin
         -> Input
             -> PreUpdate
-                -> FixedUpdate (zero or more iterations)
+                -> FixedUpdate (one phase dispatch; fixed-tick iteration count is host-controlled)
                     -> VariableUpdate
                         -> WorldCommit
                             -> RenderExtract
@@ -548,13 +567,14 @@ Startup
                                         -> Present
                                             -> FrameEnd
 
-Shutdown (outside the normal frame loop)
+Shutdown (once, outside the normal frame loop)
 ```
 
 该顺序表达的是跨阶段的最低依赖约束，而非所有节点的全序。Compiler 可以在同一阶段
-内部对不存在数据冲突的 Stage/Task 进行并行化；`FixedUpdate` 是唯一允许在单个渲染帧
-内重复进入的标准阶段。服务器、离屏工具和编辑器模式可以省略不适用的阶段，但不得
-改变保留阶段的语义或将其重新解释为其他生命周期事件。
+内部对不存在数据冲突的 Stage/Task 进行并行化；`FixedUpdate` 是唯一允许由固定 Tick
+驱动器在单个渲染帧内重复进入的标准阶段。当前 `EngineFrameOrchestrator` 的普通
+`run_frame()` 路径只执行一次该 Phase；服务器、离屏工具和编辑器模式如需多个 Tick，
+必须显式实现外层 Tick 驱动，不得把当前 Orchestrator 的一次 Phase 调度解释为自动迭代。
 
 自定义 Phase 通过锚定到既有 Phase 的相对关系进入上述生命周期，而不是替换或重编号
 内置枚举。对于 `EngineFrameOrchestrator`，自定义 Phase 按其拓扑位置落入以下五个执行
@@ -615,9 +635,11 @@ const auto weather_stage = builder.add_stage({
 Phase 注册属于拓扑变更。`snapshot()` 将顺序和 revision 作为一个逻辑版本读取；Compiler
 在构建 Plan 时记录该 revision，并在已知的并发变更情况下返回 `kOutOfDate`，调用方应
 重新获取快照后重试。运行中的 Orchestrator 不在当前帧中替换 Phase 图；它会在下一
-个帧边界检测 revision，重编译并切换所有受影响的 Plan。若 Registry 在一帧执行期间被
-修改，当前帧必须在下一阶段边界检测到版本不一致并进入 Abort/恢复路径，不能让同一帧
-同时使用两个全局 Phase 图。
+个帧边界检测 `PhaseRegistry` revision，重编译并切换所有受影响的 Plan。若
+`PhaseRegistry` 在一帧执行期间被修改，当前帧必须在下一阶段边界检测到版本不一致并进入
+Abort/恢复路径，不能让同一帧同时使用两个全局 Phase 图。其他 `PipelineRegistry` 的
+注册、解绑或绑定变化不会由 Orchestrator 自动检测；调用方必须在安全边界显式调用
+`PipelineScopeHost::rebuild()`。
 
 自定义 Phase 的锚点可以是内置 Phase，也可以是已经注册的自定义 Phase。锚点被其他
 自定义 Phase 引用时不得删除；删除操作不会隐式修改其他 Phase 的锚点，也不会静默将
@@ -707,6 +729,80 @@ Artifact 版本、RenderGraph 资源读写、Queue Dependency 和显式顺序约
 Stage 名称只提供稳定的语义锚点，不等价于 Vulkan/D3D12 的 RenderPass、Subpass、
 Shader Stage 或硬件流水线阶段。
 
+#### Visibility 的几何输入与 Math/Renderer 边界
+
+`Visibility` 使用相机变换和场景包围体生成视图级可见集合。几何计算属于 Math 的
+职责，视图生命周期、可见性策略和结果发布属于 Renderer 的职责；Math 不得依赖
+Renderer、Pipeline、RenderGraph 或 RHI。
+
+当前 Math 的相机与矩阵语义如下：
+
+- 使用右手坐标系；`+X` 为右、`+Y` 为上，相机默认沿 `-Z` 方向观察。
+- `Mat4` 为列主序矩阵，向量为列向量，变换链为
+  `projection * view * model * local`。
+- `perspective()` 和 `orthographic()` 默认生成 `0..1` NDC 深度范围的投影矩阵。
+- `math::ClipSpaceConvention::y_down` 控制 NDC Y 轴方向。
+- `math::ClipSpaceConvention::reversed_z` 将 Near 映射到 `1`、Far 映射到 `0`；
+  默认情况下 Near 映射到 `0`、Far 映射到 `1`。
+- 当前公共 Math API 不承诺 OpenGL 风格的 `-1..1` NDC 深度范围。
+
+`RenderCamera` 保存 View Matrix、Projection Matrix 和对应的
+`ClipSpaceConvention`；`view_projection()` 返回 `projection * view`。
+`RenderView::frustum_culling` 启用后，Renderer 将组合矩阵和该约定传递给
+`math::try_extract_frustum()`，再使用 Math 提供的 Frustum 球体测试完成实例和光源裁剪。
+在默认 `0..1` 深度约定下，Frustum 平面排列为：
+
+```text
+Left -> Right -> Bottom -> Top -> Near -> Far
+```
+
+平面测试语义为：
+
+```text
+a * x + b * y + c * z + d >= 0
+```
+
+当前 Math 已公开以下通用几何契约：
+
+```cpp
+enum class FrustumPlane : uint8_t {
+    kLeft = 0,
+    kRight = 1,
+    kBottom = 2,
+    kTop = 3,
+    kNear = 4,
+    kFar = 5,
+    kCount = 6,
+};
+
+struct Plane {
+    Vec4 equation;
+    Vec3 normal() const noexcept;
+    float offset() const noexcept;
+    float signed_distance(Vec3 point) const noexcept;
+};
+
+struct Frustum {
+    std::array<Plane, 6> planes;
+    bool is_valid() const noexcept;
+    bool contains_point(Vec3 point) const noexcept;
+    bool intersects_sphere(Vec3 center, float radius) const noexcept;
+};
+
+bool try_extract_frustum(const Mat4& view_projection, Frustum& result,
+                         ClipSpaceConvention convention = {}) noexcept;
+```
+
+`try_extract_frustum()` 生成归一化平面，并在失败时保持输出参数不变。它根据
+`ClipSpaceConvention::y_down` 保持 Top/Bottom 的视图语义，根据
+`ClipSpaceConvention::reversed_z` 保持 Near/Far 的相机距离语义。`Frustum` 的
+`contains_point()` 和 `intersects_sphere()` 要求调用方先保证 Frustum 有效且平面已归一化；
+Renderer 在构建阶段完成一次验证，之后在对象热路径中只执行平面测试。
+
+Physics、Editor、Renderer 或其他模块需要视锥几何时，必须依赖 Math 的上述 API，
+不得复制平面提取公式，也不得访问 Renderer 的内部状态。Math 只提供几何运算，
+不持有 RenderView、RenderSceneSnapshot、RenderGraph 或 RHI 对象。
+
 #### 参考 Pipeline 与 `EnginePhase` 的映射
 
 下表给出参考 Pipeline Stage 与全局 `EnginePhase` 的默认映射。映射表示 Stage 的主要
@@ -729,10 +825,27 @@ Shader Stage 或硬件流水线阶段。
 | `RenderPipeline`     | `PostProcess`     | `kRenderBuild` / `kRenderExecute` | `kRenderThread` 和 `kGpu`     | 执行时域、空域和色彩空间处理                   |
 | `RenderPipeline`     | `BeforePresent`   | `kPresent`                        | `kRenderThread` 和 `kGpu`     | 生成最终输出并转换为可呈现状态                 |
 
+上表的“主要执行域”是 Stage 的架构声明，不等同于当前实现已经绑定了专用物理线程。
+当前 `EngineFrameOrchestrator` 在调用线程同步调用 RenderFeature 构图和
+`RenderGraph::execute()`；只有 Pipeline Task 节点会通过 `PipelineScheduler` 映射到
+`kRenderThread` 或 `kGpu` 的 Executor。RHI Queue Submission 之后的 Shader 和 GPU
+指令仍由设备执行，而不是由某个 C++ 执行线程执行。
+
+`BeforePresent -> kPresent` 是语义上的 Present 前扩展锚点，不表示当前 Runtime 会在
+`kPresent` 阶段重新打开 RenderGraph。当前 `RenderPipeline` 确实将该 FeaturePoint 声明
+为 `kPresent`，但 `EngineFrameOrchestrator` 会在 `kRenderBuild` 阶段统一展开当前帧的
+所有 RenderFeature，包括挂载到 `BeforePresent` 的贡献；对应 Pass 在 `kRenderExecute`
+阶段录制并提交。`kPresent` 阶段只负责 `FrameContext::present()` 等 Swapchain 生命周期
+操作。因此，BeforePresent Feature 必须在构图阶段声明最终输出及其 `kPresent` 状态，
+不能把新的 RenderGraph Pass 延迟到 Present 阶段创建。
+
 `kRenderBuild` 与 `kRenderExecute` 是 Render Pipeline 中必须区分的两个生命周期边界：
-前者负责声明式图构建、Shader Contract 校验和计划编译，后者负责命令录制、Queue 提交
-和 Completion 管理。一个 Render Stage 可以横跨这两个 Phase，但其构建数据与执行数据
-必须通过不可变 Plan 或 Frame Artifact 连接，不得在 GPU 执行期间回读或修改构建状态。
+前者负责声明式图构建和 Shader Contract 校验，后者负责 RenderGraph 编译、命令录制、
+Queue 提交和 Completion 管理。一个 Render Stage 可以横跨这两个 Phase，但其构建数据
+与执行数据必须通过不可变 Plan 或 Frame Artifact 连接，不得在 GPU 执行期间回读或修改
+构建状态。当前实现由 `RenderGraph::execute()` 在执行前自动调用 `compile()`；这属于
+RenderGraph 的资源、Barrier 和 Queue 计划编译，不属于 `PipelineCompiler` 对 Pipeline
+Plan 的编译。
 
 #### Stage 的公开性和扩展规则
 
@@ -765,11 +878,13 @@ enum class FeaturePointFlags : uint32_t {
     kMayCreateComputePass = 1u << 2,
     kMayCreateCopyPass = 1u << 3,
     kMayUseDedicatedQueue = 1u << 4,
-    kMayWriteFinalOutput = 1u << 5
+    kMayWriteFinalOutput = 1u << 5,
+    kMayPublishSnapshot = 1u << 6
 };
 
 struct FeaturePointDescriptor {
     FeaturePointId id;
+    std::string_view name;
     PipelineId pipeline;
     StageId anchor_stage;
     FeaturePointPosition position;
@@ -784,12 +899,13 @@ struct FeaturePointDescriptor {
 | 枚举值    | 精确定义                           | 依赖可见性                     | 使用限制                                                             |
 |-----------|------------------------------------|--------------------------------|----------------------------------------------------------------------|
 | `kBefore` | Feature 插入到锚点 Stage 执行之前  | 可以读取锚点之前已发布的数据   | 不得读取由锚点 Stage 首次写入且未提前发布的 Artifact                 |
-| `kInside` | Feature 插入到锚点提供的内部扩展槽 | 由锚点契约明确可见的输入和输出 | 只有声明支持内部扩展的 FeaturePoint 才允许使用；不得自行定义内部顺序 |
+| `kInside` | 契约上表示 Feature 插入到锚点提供的内部扩展槽 | 由锚点契约明确可见的输入和输出 | 当前 Compiler 尚未建立独立的内部扩展顺序；构建期按 `kAfter` 的依赖关系处理。只有声明支持内部扩展的 FeaturePoint 才允许使用；不得自行定义内部顺序 |
 | `kAfter`  | Feature 插入到锚点 Stage 完成之后  | 可以读取锚点发布的输出         | 不得将锚点输出改写为隐式覆盖；需要新版本或显式写入契约               |
 
 `FeaturePointPosition` 不是资源访问权限，也不是“替换 Pass”指令。当前契约不提供
 隐式 `kReplace` 语义；需要替换基础功能时，应由 Pipeline 提供新的 Definition 或
-明确的替代 FeaturePoint。
+明确的替代 FeaturePoint。当前实现中，`kInside` 会记录在 Feature 贡献诊断中，但其
+执行顺序与 `kAfter` 相同；独立内部扩展槽仍属于目标语义。
 
 #### `FeaturePointFlags` 的值语义
 
@@ -805,6 +921,7 @@ struct FeaturePointDescriptor {
 | `kMayCreateCopyPass`     | 可以添加 Copy/Transfer Pass                   | Copy Pass 创建必须失败                      |
 | `kMayUseDedicatedQueue`  | 可以请求专用 GPU 队列或执行队列               | 必须使用 Host 分配的默认队列                |
 | `kMayWriteFinalOutput`   | 可以写入 FeaturePoint 标记的最终输出          | 只能写临时或中间 Artifact，不得触碰最终输出 |
+| `kMayPublishSnapshot`    | 可以通过领域 Builder 声明不可变 Snapshot 发布 | Snapshot 发布声明必须失败                   |
 
 设置标志只表示“允许请求”，不保证设备或运行模式一定提供对应能力。Compiler 仍需
 检查 RHI 能力、队列可用性、Scope 权限和 Artifact 写入规则。未知 bit 必须拒绝，不得
@@ -819,6 +936,7 @@ struct FeaturePointDescriptor {
 - 是否允许创建 Graphics、Compute 或 Copy Pass。
 - 是否允许使用专用队列。
 - 是否允许修改最终输出。
+- 是否允许发布不可变 Snapshot。
 
 ### 8.4 顺序规则
 
@@ -1212,9 +1330,9 @@ struct StageDescriptor {
 
 struct TaskDescriptor {
     TaskId id;
-    StageId stage;
     TaskFlags flags;
     TaskExecutionFunction execute;
+    void* user_data;
 };
 ```
 
@@ -1257,9 +1375,9 @@ public:
             const StageDescriptor& descriptor);
     [[nodiscard]] PipelineTaskHandle add_task(
             const TaskDescriptor& descriptor);
-    [[nodiscard]] FeaturePointHandle add_feature_point(
+    [[nodiscard]] PipelineFeaturePointHandle add_feature_point(
             const FeaturePointDescriptor& descriptor);
-    [[nodiscard]] ArtifactHandle declare_artifact(
+    [[nodiscard]] PipelineArtifactHandle declare_artifact(
             const ArtifactDescriptor& descriptor);
 
     [[nodiscard]] foundation::Result bind_task(
@@ -1283,7 +1401,11 @@ public:
 
 - `add_*()` 返回的 Handle 只在当前 Definition 构建事务中有效。
 - `reads()`、`writes()` 声明的是契约，不会复制或立即分配数据。
-- `runs_before()` 和 `runs_after()` 只补充顺序信息，不替代 Artifact 读写关系。
+- `runs_before()` 和 `runs_after()` 只补充顺序信息，不替代 Artifact 读写关系；其目标
+  `StageId` 必须属于同一个 Pipeline Definition 中已经声明的 Stage。
+- `runs_before()` 和 `runs_after()` 不能直接引用另一个 Pipeline 的 Stage，也不能把
+  全局 `EnginePhase` 当作 Stage。跨 Pipeline 的顺序必须通过 Artifact 依赖、Scope
+  Bridge 或 Phase/PhaseId 关系表达。
 - `expose_artifact()` 必须明确目标 Scope，不能隐式广播到所有 Scope。
 - Builder 失败时，当前 Definition 不提交，调用方得到带来源信息的 `Result`。
 
@@ -1531,7 +1653,7 @@ public:
     [[nodiscard]] const Part& part() const noexcept;
 
 protected:
-    std::tuple<Parts...> parts_;
+    std::tuple<Parts...> parts{};
 };
 ```
 
@@ -1542,19 +1664,23 @@ protected:
 推荐的静态派发过程如下：
 
 ```cpp
-for_each_part(parts_, [&](auto& part) {
+for_each_part(parts, [&](auto& part) {
     using PartType = std::remove_cvref_t<decltype(part)>;
     using BuilderType = typename PartType::BuilderType;
 
     if constexpr (builder_is_compatible_with<BuilderType>) {
         auto domain_context = context.for_domain(PartType::kDomain);
-        return part.setup(domain_context.builder<BuilderType>());
+        return dispatch_to_domain_builder<BuilderType>(
+                part, domain_context);
     }
 });
 ```
 
 上例中的 `for_each_part` 和 `builder_is_compatible_with` 是概念性伪代码，表达的不是
-对外 ABI，而是以下不可变的行为契约：
+对外 ABI；其中 `dispatch_to_domain_builder<BuilderType>()` 是引擎内部的静态派发辅助
+函数，用于取得与 Part 领域匹配的受限 Builder。当前公共 `FeatureBuildContext` 暴露的是具体的
+`logic_builder()`、`physics_builder()`、`render_builder()`、`audio_builder()` 和
+`stream_builder()` 方法，而不是这个模板方法。上述伪代码表达的是以下不可变的行为契约：
 
 1. 每个 Part 只能向其声明的领域 Builder 收集贡献；不进行运行时 RTTI 猜测。
 2. 派发顺序只用于构建期的确定性遍历，不构成最终执行顺序。
@@ -1619,21 +1745,34 @@ Part 读取，而不是通过 Part 之间保存裸指针传递。
 
 ### 12.1 FeatureBuildContext
 
-Context 自动携带当前构建位置和权限：
+`FeatureBuildContext` 自动携带当前构建位置和权限。当前公共实现提供的接口如下：
 
 ```cpp
 class FeatureBuildContext {
 public:
     [[nodiscard]] PipelineScope scope() const noexcept;
     [[nodiscard]] PipelineId pipeline_id() const noexcept;
-    [[nodiscard]] FeatureInstanceId feature_id() const noexcept;
+    [[nodiscard]] FeatureId feature_id() const noexcept;
+    [[nodiscard]] FeatureInstanceId feature_instance_id() const noexcept;
     [[nodiscard]] FeaturePartId part_id() const noexcept;
     [[nodiscard]] FeaturePointId feature_point() const noexcept;
-    [[nodiscard]] const ArtifactRegistry& artifacts() const noexcept;
-    [[nodiscard]] DiagnosticSink& diagnostics() const noexcept;
+    [[nodiscard]] FeatureDomain domain() const noexcept;
+    [[nodiscard]] const FeaturePointDescriptor& feature_point_descriptor() const noexcept;
+    [[nodiscard]] FeaturePointFlags feature_point_flags() const noexcept;
+    [[nodiscard]] bool domain_is_active(FeatureDomain domain) const noexcept;
+    [[nodiscard]] bool allows(FeaturePointFlags flag) const noexcept;
+    [[nodiscard]] uint32_t stage_count() const noexcept;
 
     [[nodiscard]] FeatureBuildContext for_domain(
             FeatureDomain domain) const;
+    [[nodiscard]] FeatureBuildContext for_part(
+            FeaturePartId part) const;
+
+    [[nodiscard]] LogicGraphBuilder logic_builder() noexcept;
+    [[nodiscard]] PhysicsGraphBuilder physics_builder() noexcept;
+    [[nodiscard]] RenderGraphBuilder render_builder() noexcept;
+    [[nodiscard]] AudioGraphBuilder audio_builder() noexcept;
+    [[nodiscard]] StreamGraphBuilder stream_builder() noexcept;
 };
 ```
 
@@ -1641,7 +1780,7 @@ Context 的作用：
 
 - 自动限定当前 Pipeline、Scope、Feature 和 Part。
 - 拒绝读取不属于当前 Scope 的 Artifact。
-- 把诊断定位到完整的来源路径。
+- 通过 `Result` 和 Builder 状态报告构建错误，并把诊断定位到完整的来源路径。
 - 为 Composite 的每个 Part 提供隔离的领域视图。
 - 不暴露 World 可变指针、Frame 内部容器或后端原生句柄。
 
@@ -1711,8 +1850,9 @@ public:
 
 `PipelineRegistry::phase_registry()` 返回与该 Registry 绑定的全局 Phase 注册表。Pipeline
 定义、Feature 绑定和 Phase 集合分别受各自的注册操作管理；Registry 不会因为新的 Phase
-或绑定注册而隐式修改已发布的 `PipelinePlan`。需要把拓扑变更反映到运行时，必须通过
-`PipelineScopeHost::rebuild()`，或者交由 `EngineFrameOrchestrator` 在下一帧边界完成。
+或绑定注册而隐式修改已发布的 `PipelinePlan`。Pipeline 或 Feature 定义/绑定发生变化时，
+必须由调用方显式执行 `PipelineScopeHost::rebuild()`；只有 `PhaseRegistry` 的 revision
+变化可以由 `EngineFrameOrchestrator` 在初始化或下一帧边界同步并触发必要的重建。
 
 当前 `PipelineRegistry` 不提供 `request_rebuild()` 公共方法。下表中的 `RebuildReason`
 是面向未来重配置系统的结构化原因约定，调用方可以在自己的重配置管理器中使用，但不得
@@ -1898,9 +2038,10 @@ RenderFeature 构图、RenderGraph 执行、Present 和 Shutdown。
 ```cpp
 aeg::engine::EngineFrameOrchestrator orchestrator(
         registry, scheduler, frame_context, render_graph);
-orchestrator.register_pipeline(engine_host);
-orchestrator.register_pipeline(world_host);
-orchestrator.register_pipeline(frame_host);
+// engine_scope_host、world_scope 和 frame_host 已按前文完成创建、绑定和初始化。
+orchestrator.register_pipeline(engine_scope_host);
+orchestrator.register_world(world_scope);
+orchestrator.register_world_frame(world_scope, frame_host);
 
 if (auto result = orchestrator.initialize(); !result) {
     return result;
@@ -1917,8 +2058,11 @@ return orchestrator.shutdown();
 
 Orchestrator 不拥有传入的 Registry、Scheduler、FrameContext、RenderGraph 或 Host；这些
 对象必须在 Orchestrator 整个生命周期内保持有效。Host 在 `begin_frame()` 时按 Scope、
-PipelineId 和 InstanceId 进行稳定排序，并固定每个 Active Plan；帧执行期间 Registry
-或 Host 的拓扑变化不会替换已固定的 Plan，而是在边界处被检测并要求重建。
+PipelineId 和 InstanceId 进行稳定排序，并固定每个 Active Plan；帧执行期间已固定的 Plan
+不会被 Registry 或 Host 的拓扑变化替换。`EngineFrameOrchestrator` 只会自动检测
+`PhaseRegistry::revision()`；Pipeline/Feature 的注册、解绑和绑定变化没有独立的自动检测
+机制，调用方必须在安全边界显式调用 `PipelineScopeHost::rebuild()`，并由 Host 在合适的
+边界应用 Pending Plan。
 World 命令在 `PreUpdate` 由 World Owner 线程消费；`WorldCommit` 为每个已登记 World
 生成单调递增 revision 的不可变 `WorldSnapshot`，随后为所有已登记 View 捕获同一提交
 边界上的快照。Frame Pipeline 只能经由其 `WorldFrameScope` 的 Bridge 读取该快照。
@@ -1931,7 +2075,7 @@ Compiler 把静态定义和运行时绑定编译为不可变 Plan：
 class PipelineCompiler {
 public:
     [[nodiscard]] foundation::ResultValue<PipelinePlan> compile(
-            const PipelineCompileInput& input);
+            const PipelineCompileInput& input) const;
 };
 ```
 
@@ -1941,15 +2085,16 @@ Compiler 负责：
 2. 展开 Composite 的 Part，并记录来源路径。
 3. 验证 ID、版本、Scope、Domain 和能力要求。
 4. 验证 Artifact 类型、Owner、访问方式和生产者。
-5. 建立 Data、Ordering、Resource 和 Completion 依赖。
+5. 建立 Artifact 数据依赖和显式 Ordering 依赖。
 6. 检查循环、多写者和跨 Scope 非法访问。
-7. 生成稳定拓扑、并行批次和生命周期范围。
+7. 生成稳定拓扑和执行批次。
 8. 保存领域贡献及其实现引用；`PipelineCompiler::compile()` 只生成 Pipeline Plan，
    不直接编译或提交 RenderGraph。统一的 `EngineFrameOrchestrator` 在
    `RenderBuild`/`RenderExecute` 边界调用运行期适配器完成连接。
 9. 从 `PhaseRegistry::snapshot()` 同时读取有序 Phase 列表和 revision；如果已知的
    编译期间 Phase 版本发生变化，则返回 `kOutOfDate`，不发布与新旧版本都不一致的 Plan。
-10. 输出完整诊断；失败时不发布部分 Plan。
+10. 通过 `Result` 和统一日志/诊断系统返回带上下文的编译诊断；失败时不发布部分
+    Plan。
 
 ### 13.4 PipelinePlan
 
@@ -1967,7 +2112,10 @@ Compiler 负责：
 | `PipelinePlanHandle`                  | `shared_ptr<const PipelinePlan>`；用于获取和持有不可变计划快照                               |
 | `phase_revision`                      | 记录该 Plan 所依据的 `PhaseRegistry::revision()`；不匹配时必须在帧边界重编译                 |
 
-通用 Completion 列表、结构化诊断列表及 `PipelinePlanKey` 不属于当前 Plan 的字段。
+`PipelinePlan` 当前不保存通用 Completion 列表、Scope Bridge、RenderGraph 资源生命周期、
+Barrier、Queue Dependency、结构化诊断列表或 `PipelinePlanKey`。这些信息分别由运行时
+Context/Bridge、RenderGraph/RHI 或诊断系统管理；Pipeline Plan 只保存 Pipeline 拓扑、
+Artifact 契约、Feature 来源和执行回调所需的不可变数据。
 
 Plan 是只读对象。执行线程只读取紧凑的索引数组和函数绑定，不在普通帧中修改图结构。
 
@@ -1982,19 +2130,21 @@ Scheduler 执行 Plan，不重新分析拓扑。它为五种 `ExecutionDomain` �
 
 ```cpp
 struct PipelineSchedulerDesc {
-    uint32_t cpu_worker_count;
-    uint32_t io_worker_count;
-    uint32_t render_thread_worker_count;
-    uint32_t gpu_worker_count;
+    uint32_t cpu_worker_count{0};
+    uint32_t io_worker_count{0};
+    uint32_t render_thread_worker_count{1};
+    uint32_t gpu_worker_count{1};
 };
 
 class PipelineScheduler {
 public:
     [[nodiscard]] foundation::Result execute(
-            const PipelinePlan& plan, PipelineExecutionContext& context);
+            const PipelinePlan& plan, PipelineExecutionContext& context,
+            concurrency::CancellationToken cancellation = {}) const;
     [[nodiscard]] foundation::Result execute_phase(
             const PipelinePlan& plan, PipelineExecutionContext& context,
-            PhaseId phase);
+            PhaseId phase,
+            concurrency::CancellationToken cancellation = {}) const;
     [[nodiscard]] uint32_t worker_count(ExecutionDomain domain) const noexcept;
     [[nodiscard]] foundation::Result set_executor(
             ExecutionDomain domain,
@@ -2025,10 +2175,17 @@ Task 并行安全条件的节点才会并行。`kGpu` 的 C++ 回调是 GPU 工�
 适合 World、Streaming 和 Tooling 的通用任务图，不替代 Pipeline Compiler 对领域
 Artifact DAG 的编译与优化。
 
-`PipelineSchedulerDesc` 中计数为 `0` 时使用默认策略：CPU Worker 使用硬件并发度的
-至少一个线程，IO、RenderThread 和 GPU 编排域各保留至少一个 Worker。调用方可以在
-初始化或安全切换边界通过 `set_executor()` 注入专用执行器；替换不会改变已编译 Plan
-的拓扑，但新提交会使用新的执行器，旧执行器由其共享所有权保持到既有任务结束。
+需要区分结构体初始化值和 WorkerExecutor 的解析结果。`PipelineSchedulerDesc{}` 的字段
+值是 `{0, 0, 1, 1}`；将这些值传入默认 WorkerExecutor 后，CPU Worker 的 `0` 解析为
+硬件并发度且至少为一个 Worker，IO Worker 的 `0` 解析为一个 Worker，RenderThread 和
+GPU 编排域的默认值已经是一个 Worker。显式填写大于零的值时使用调用方指定的数量，
+但最终仍至少创建一个 Worker。便捷构造 `PipelineScheduler(0)` 实际转换为
+`PipelineSchedulerDesc{0, 1, 1, 1}`，因此它与 `PipelineSchedulerDesc{}` 的有效 Worker
+数量相同，但结构体字段值并不相同。
+
+调用方可以在初始化或安全切换边界通过 `set_executor()` 注入专用执行器；替换不会改变
+已编译 Plan 的拓扑，但新提交会使用新的执行器，旧执行器由其共享所有权保持到既有任务
+结束。
 Scheduler 的执行接口允许不同 Context 并发调用；同一个 `PipelineExecutionContext`
 不得被并发共享。Task 不得递归调用同一个 Scheduler 的执行方法，也不得依赖未声明的
 共享可变状态。`wait_idle()` 是生命周期边界操作，会以独占执行闸门阻止新的 Scheduler
@@ -2208,8 +2365,10 @@ RenderFeature 身份。
 
 `RenderGraphPassType::kGraphics`、`kCompute`、`kCopy` 分别表示绘制、计算和复制声明类别。
 当前类别用于选择挂载点权限，不能视为命令录制的完整隔离机制。三个专用 add 接口的默认
-Queue 分别为 `kGraphics`、`kCompute`、`kCopy`；后两者请求独立队列时还需要
-`kMayUseDedicatedQueue`，否则必须显式选择获准的 Queue。
+Queue 分别为 `kGraphics`、`kCompute`、`kCopy`。当前权限实现中，只要 Pass 显式选择
+`kCompute` 或 `kCopy` Queue，就必须具备 `kMayUseDedicatedQueue`；该标志表示允许选择
+非 Graphics Queue，不保证底层一定存在物理独立队列。`kCompute`/`kCopy` 即使最终与
+Graphics Queue 共享，也不能绕过这一权限检查。
 
 创建和导入资源需要 `kMayCreateArtifacts`；创建 Pass 需要对应的
 `kMayCreateGraphicsPass`、`kMayCreateComputePass` 或 `kMayCreateCopyPass`；导出资源及
@@ -2259,9 +2418,11 @@ Pass、导出标记及编译计划状态，可以重试；没有图变更时保�
 不得跨重试保留或使用。
 
 跨图或不再存在的资源绑定返回 `kNotFound`；字段不完整的绑定返回 `kInvalidArgument`。
-回滚不销毁导入的外部 RHI 资源。低层 API 的调用方在 `build()` 成功后仍必须显式调用
-`RenderGraph::compile()` 和 `RenderGraph::execute()`；这是便于工具、离屏渲染和特殊
-提交策略使用的原始控制路径。
+回滚不销毁导入的外部 RHI 资源。低层 API 的调用方在 `build()` 成功后调用
+`RenderGraph::execute()` 即可；当前 `execute()` 会先自动调用 `compile()`。如果工具或
+离屏流程需要提前检查拓扑、统计和 Barrier 计划，可以先显式调用 `compile()`，但随后
+`execute()` 仍会再次执行编译校验。这是便于工具、离屏渲染和特殊提交策略使用的原始
+控制路径。
 
 常规 Engine 帧应使用 `aeg::engine::EngineFrameOrchestrator`。Orchestrator 在
 `RenderBuild` 阶段自动以帧内固定的 `PipelinePlanHandle` 调用该 Runtime，在
@@ -2300,6 +2461,12 @@ rhi::Device
 
 `rhi::Device` 的公共接口不能出现 Vulkan、D3D12 或其他后端类型。后端专有对象只能存在
 于 `Engine/RHI/private/<backend>` 中。
+
+这里的“后端无关”针对 Buffer、Texture、View、Binding、Pipeline、Command、Queue、
+Resource Usage 和 GPU Sync Point 等公共语义模型，而不是禁止公共 API 出现后端选择信息。
+`BackendType` 是合法的后端选择 token：它只表示请求哪一种 RHI 实现，不携带原生 API
+对象、原生状态或后端专属布局。`SurfaceDesc` 中的 native handle 也只是创建调用期间
+借用的 opaque 边界句柄；它们不构成公共 RHI 对窗口系统或后端对象的所有权。
 
 #### RHI 示例中的 `Format` 枚举值
 
@@ -2350,7 +2517,9 @@ AEG 的 ABI 需要区分两种使用场景：
 公共 C++ 头文件必须遵守：
 
 - 不包含后端私有头文件。
-- 不在公共类型中保存 `Vk*`、`ID3D12*` 或平台窗口对象。
+- 不在公共类型中保存具有具体布局的 `Vk*`、`ID3D12*` 或平台窗口对象；`SurfaceDesc`
+  允许使用仅在创建调用期间借用的 opaque native handle，但不得将其解释为公共 RHI
+  对象或跨调用保存的后端状态。
 - 使用固定宽度整数表达跨模块的 ID、版本和容量。
 - 非拥有引用必须明确生命周期，拥有资源使用 Host/Device 管理。
 - 不用异常表达普通运行时失败，使用 `aeg::foundation::Result`。
@@ -2401,8 +2570,8 @@ extern "C" const ModuleApi* aeg_get_module_api();
 ```text
 Host creates -> Host destroys
 Plugin creates -> Plugin destroys
-Registry owns registered definitions
-Scope Host owns Pipeline instances
+Registry owns registered Pipeline and Feature definitions
+Scope Host owns one Pipeline instance state and its Plan references
 Device owns RHI handles
 FrameContext owns frame-local allocations until retirement
 ```
@@ -2544,41 +2713,51 @@ public:
 3. 声明它生成 `WeatherState`。
 4. 让 Compiler 根据这些关系决定它与其他节点的顺序和并行关系。
 
-如果需要明确约束，可以继续声明：
+需要注意，当前示例只声明了 Stage 和 Artifact 依赖，没有调用
+`PipelineBuilder::add_task()` 及 `bind_task()`，因此编译结果只包含一个声明性节点，
+不会执行实际的天气更新逻辑。需要执行代码时，必须另外创建带有
+`TaskExecutionFunction` 的 `TaskDescriptor`，再通过 `bind_task()` 将 Task 绑定到该
+Stage；Task 的运行期输入应从 `PipelineTaskContext` 获取，不能在 `build()` 中捕获帧内
+对象或保存运行期指针。
+
+如果 `WeatherPipeline` 另外声明了同一 Definition 内的 `WeatherPublish` Stage，才可以
+补充局部顺序约束：
 
 ```cpp
-builder.runs_before(stage, aeg::pipeline::StageId("RenderExtract"));
+builder.runs_before(stage, aeg::pipeline::StageId("WeatherPublish"));
 ```
 
-但如果 `RenderExtract` 本身读取 `WeatherState`，通常无需额外声明 `runs_before`；数据
-依赖已经足以生成正确顺序。只有无法通过数据表达的纯顺序关系才使用显式约束。
+不能把全局 `RenderExtract` Phase 作为这里的 `StageId` 传入，也不能用该 API 直接建立
+不同 Pipeline 之间的 Stage 顺序。如果 Render Pipeline 读取 `WeatherState`，Artifact
+依赖通常已经足以生成正确顺序；只有无法通过数据表达的同 Pipeline 纯顺序关系才使用
+显式约束。
 
 ### 17.2 注册 Pipeline 类型
 
 模块在初始化时向 Registry 注册类型：
 
 ```cpp
-class GameModule final : public aeg::module::Module {
-public:
-    [[nodiscard]] aeg::foundation::Result register_types(
-            aeg::pipeline::PipelineRegistry& registry) override {
-        return registry.register_pipeline(
-                [] { return std::make_unique<WeatherPipeline>(); });
-    }
-};
+[[nodiscard]] aeg::foundation::Result register_game_pipelines(
+        aeg::pipeline::PipelineRegistry& registry) {
+    return registry.register_pipeline(
+            [] { return std::make_unique<WeatherPipeline>(); });
+}
 ```
+
+上例使用当前仓库已经提供的 C++ 注册 API。`aeg::module::Module` 等模块对象模型属于
+动态插件 ABI 的目标设计，当前仓库没有该公共类型；若由插件导出注册入口，应在入口内
+调用同一个 `register_game_pipelines()`，并遵守第 16 节规定的 ABI 边界。
 
 注册表示“该类型具备可创建性”，不表示它已经绑定到某个 World。注册失败时模块不得继续
 发布依赖该类型的实例。
 
 ### 17.3 创建 World Pipeline 实例
 
-创建 World 时，由 `WorldPipelineHost` 根据 `WorldHandle` 创建实例：
+创建 World 时，由 `WorldScope` 持有的通用 `PipelineScopeHost` 绑定实例：
 
 ```cpp
-const aeg::pipeline::WorldHandle world_handle = world.handle();
-
-if (const auto result = world.pipeline_host().bind_pipeline(
+// world.initialize() 已成功完成，且 world 尚未激活。
+if (const auto result = world.bind_pipeline(
             aeg::pipeline::PipelineId("WeatherPipeline"));
         !result) {
     return result;
@@ -2600,7 +2779,7 @@ registry.bind_feature({
         .feature = aeg::pipeline::FeatureId("WeatherRenderFeature"),
         .pipeline = aeg::pipeline::PipelineId("RenderPipeline"),
         .scope = aeg::pipeline::PipelineScope::kFrame,
-        .point = aeg::pipeline::FeaturePointId("PostProcess"),
+        .point = aeg::pipeline::FeaturePointId("RenderPipeline.PostProcess"),
         .priority = 0,
         .enabled = true,
 });
@@ -2616,25 +2795,20 @@ registry.bind_feature({
 
 ### 17.5 启动时编译
 
-所有定义和绑定准备完成后，Host 请求编译：
+所有定义和绑定准备完成后，通过 `PipelineScopeHost::rebuild()` 显式编译。当前公共
+`PipelineCompileInput` 由 Host 内部组装，调用方不需要也不能自行填充 World、Profile 或
+Registry 快照：
 
 ```cpp
-const auto plan_result = pipeline_compiler.compile({
-        .scope = aeg::pipeline::PipelineScope::kWorld,
-        .world = world.handle(),
-        .profile = runtime_profile,
-        .registry = registry.snapshot(),
-});
-
-if (!plan_result) {
-    log_pipeline_compile_error(plan_result.result);
-    return plan_result.result;
+if (const auto result = world.rebuild(); !result) {
+    return result;
 }
-
-world.pipeline_host().install_plan(plan_result.value);
 ```
 
-安装成功后，运行时只使用已编译的 Plan；普通帧数据变化无需重新调用 Compiler。
+当 Host 尚未激活时，`rebuild()` 会直接安装 Active Plan；当 Host 已经激活时，
+`rebuild()` 会把新 Plan 放入 Pending 状态，由安全边界调用
+`apply_pending_plan()`，或交由 `EngineFrameOrchestrator` 在帧边界处理。安装成功后，
+运行时只使用已编译的 Plan；普通帧数据变化无需重新调用 Compiler。
 
 ## 18. Feature 使用方法
 
@@ -2649,17 +2823,54 @@ public:
             const noexcept override;
 
 protected:
+    static aeg::foundation::Result execute_wind(
+            aeg::pipeline::PipelineTaskContext&) {
+        return aeg::foundation::Result::success();
+    }
+
     [[nodiscard]] aeg::foundation::Result setup(
             aeg::pipeline::LogicGraphBuilder& builder) const override {
-        const auto task = builder.add_task("UpdateWindState");
+        const auto stage = builder.add_stage({
+                .id = aeg::pipeline::StageId("WindUpdate"),
+                .phase = aeg::pipeline::EnginePhase::kVariableUpdate,
+                .execution_domain = aeg::pipeline::ExecutionDomain::kCpuWorker,
+                .time_policy = aeg::pipeline::TimePolicy::kFrame,
+                .parallelizable = true,
+        });
+        if (!stage) {
+            return aeg::foundation::Result::failure(
+                    aeg::foundation::ResultCode::kInvalidArgument,
+                    "WindUpdate stage could not be created");
+        }
+
+        const auto task = builder.add_task({
+                .id = aeg::pipeline::TaskId("UpdateWindState"),
+                .flags = aeg::pipeline::TaskFlags::kParallelSafe,
+                .execute = &execute_wind,
+                .user_data = nullptr,
+        });
+        if (!task) {
+            return aeg::foundation::Result::failure(
+                    aeg::foundation::ResultCode::kInvalidArgument,
+                    "UpdateWindState task could not be created");
+        }
+        if (const auto result = builder.bind_task(task, stage); !result) {
+            return result;
+        }
         return builder.writes(
-                task, aeg::pipeline::ArtifactId("WindState"));
+                stage, {aeg::pipeline::ArtifactId("WindState"),
+                        aeg::pipeline::ArtifactAccess::kWrite,
+                        1,
+                        {}});
     }
 };
 ```
 
-Feature 只负责贡献自己的节点和契约，不负责决定其他 Feature 的执行顺序，也不直接
-调用其他 Feature 的方法。
+示例假定 `WindState` 已由所属 Pipeline 声明，或当前 FeaturePoint 已被授予创建
+Artifact 的权限。`TaskDescriptor::execute` 是 Task 的运行期函数指针；Compiler 将其
+复制到编译后的 `PipelineNode::execute`，而 `bind_task()` 单独建立 Task 到 Stage 的
+归属关系。Feature 只负责贡献自己的节点和契约，不负责决定其他 Feature 的执行顺序，
+也不直接调用其他 Feature 的方法。
 
 ### 18.2 CompositeFeature
 
@@ -2728,10 +2939,11 @@ RenderGraph 绑定到同一个帧状态机中，调用方不再需要分别驱�
 // 必须覆盖 Orchestrator 的整个生命周期。
 aeg::engine::EngineFrameOrchestrator orchestrator(
         registry, scheduler, frame_context, render_graph);
-orchestrator.register_pipeline(engine_host);
-orchestrator.register_pipeline(world_host);
-orchestrator.register_pipeline(frame_host);
-orchestrator.register_pipeline(editor_overlay_host);
+// engine_scope_host、world_scope、frame_host 和可选的
+// editor_overlay_scope_host 已按各自 Scope 创建并完成 Pipeline 绑定。
+orchestrator.register_pipeline(engine_scope_host);
+orchestrator.register_world(world_scope);
+orchestrator.register_world_frame(world_scope, frame_host);
 
 if (auto result = orchestrator.initialize(); !result) {
     return result;
@@ -2749,6 +2961,9 @@ if (auto result = orchestrator.run_frame(frame_desc); !result) {
 return orchestrator.shutdown();
 ```
 
+若启用了 Editor Overlay，再将已创建的 `editor_overlay_scope_host` 通过
+`register_pipeline()` 登记；它不是普通 World View 的必需依赖。
+
 `initialize()` 完成 Phase Registry 同步、所有已登记 Host 的必要重建和激活，并执行一次
 `Startup`。`run_frame()` 完成以下不可分割的帧内操作：
 
@@ -2756,8 +2971,9 @@ return orchestrator.shutdown();
 2. 复制调用方提供的绑定 span，并在帧边界固定每个 Active `PipelinePlan`。
 3. 按 `PhaseRegistry::snapshot()` 的全局顺序执行 `FrameBegin` 至 `FrameEnd` 之间的
    所有 Phase；落在该区间内的自定义 Phase 会自动参与执行。
-4. 在 `RenderBuild` 后自动展开当前固定 Plan 中的 RenderFeature。
-5. 在 `RenderExecute` 后自动编译并执行 RenderGraph，提交 Queue Batch 和 GPU Completion。
+4. 在 `RenderBuild` 阶段自动展开当前固定 Plan 中的所有 RenderFeature，包括挂载到
+   `BeforePresent` 语义锚点的贡献。
+5. 在 `RenderExecute` 阶段自动编译并执行 RenderGraph，提交 Queue Batch 和 GPU Completion。
 6. 在 `Present` 或 `FrameEnd` 处理 acquired frame，并结束 FrameContext 生命周期。
 
 `present_acquired_frame == true` 时，Orchestrator 在 `Present` Phase 尝试呈现；为 `false`
@@ -2827,9 +3043,7 @@ aeg::foundation::Result build_and_execute(
                 graph, plan, registry, desc); !result) {
         return result;
     }
-    if (auto result = graph.compile(); !result) {
-        return result;
-    }
+    // execute() 会在提交前自动编译当前图。
     return graph.execute(frame).result;
 }
 ```
@@ -2852,9 +3066,7 @@ if (auto result = aeg::render_graph::build_render_graph_features(
         graph, plan_snapshot, registry, desc); !result) {
     return result;
 }
-if (auto result = graph.compile(); !result) {
-    return result;
-}
+// execute() 会在提交前自动编译当前图。
 return graph.execute(frame).result;
 ```
 
@@ -2924,8 +3136,10 @@ Host 未激活时，`rebuild()` 安装 Active Plan；已激活时只暂存 Pendi
 `apply_pending_plan()`：Orchestrator 在初始化以及每个帧边界同步 Phase Registry 时，会
 为所有已登记 Host 检查 Active Plan 的 `phase_revision`，必要时调用 `rebuild()` 并应用
 Pending Plan。随后 `begin_frame()` 固定新的 Plan 快照，当前帧不会观察到中途切换。
-若 Registry 在帧执行过程中发生变化，Orchestrator 在下一阶段边界返回状态错误并中止
-当前帧；它不会把新 Phase 拓扑部分混入旧帧。
+若 `PhaseRegistry` 在帧执行过程中发生变化，Orchestrator 在下一阶段边界返回状态错误
+并中止当前帧；它不会把新 Phase 拓扑部分混入旧帧。`PipelineRegistry` 的 Pipeline/Feature
+拓扑变化不会由 Orchestrator 自动报告，调用方必须自行安排重建，并且不得在当前帧中替换
+已固定的 Plan。
 
 ```text
 Registry change -> rebuild -> Pending Plan
@@ -2943,8 +3157,9 @@ Old Active Plan -> Retired Plans -> collect_retired_plans
 
 Plan 锁协调 Host 的计划切换与 CPU 执行，引用计数负责对象生命周期；两者均不表示 GPU
 完成。当前 Host 不轮询或等待 GPU Completion。调用方必须单独管理仍在执行的
-RenderGraph、资源、模块代码和完成点，再释放相关持有者。`request_rebuild()` 自动通知、
-通用 CPU/GPU 完成门控与动态库卸载管理仍属于架构约定。
+RenderGraph、资源、模块代码和完成点，再释放相关持有者。Registry 变更不会自动通知
+Host；调用方必须显式调用 `PipelineScopeHost::rebuild(registry)`。通用 CPU/GPU 完成
+门控与动态库卸载管理仍属于架构约定。
 
 ### 20.2 卸载模块
 
@@ -3264,8 +3479,11 @@ PluginLoader
 
 ### 24.1 编译与执行分离
 
-拓扑分析、循环检查、批次生成和生命周期分析只在定义或绑定变化时执行。普通帧只更新
-Artifact 内容，不重新分析图结构。
+Pipeline 拓扑分析、依赖检查和批次生成只在调用方显式执行
+`PipelineScopeHost::rebuild()` 时运行；Registry 的 Pipeline/Feature 定义或绑定变化本身
+不会自动触发该调用。普通帧只更新 Artifact 内容，不重新分析 Pipeline 图结构。
+RenderGraph 的声明变化会使其编译结果失效；`RenderGraph::execute()` 会在执行前自动调用
+`compile()`，工具或特殊提交路径也可以先显式编译以读取拓扑、统计和 Barrier 计划。
 
 ### 24.2 计划缓存
 
@@ -3304,22 +3522,24 @@ Pipeline Cache。
 
 当前仓库中已经存在的模块与本架构的关系如下：
 
-| 模块                 | 架构角色                                                | 公共边界                              |
-|----------------------|---------------------------------------------------------|---------------------------------------|
-| `Engine/Foundation`  | Result、通用基础类型和错误                              | 不依赖任何图形后端                    |
-| `Engine/Logging`     | 统一日志和诊断输出                                      | 供 Runtime/模块使用                   |
-| `Engine/Math`        | SIMD 数学、变换和图形基础计算                           | 不参与 Pipeline 拓扑                  |
-| `Engine/RHI`         | Buffer、Texture、View、Binding、Pipeline、Command、Sync | 公共接口后端无关                      |
-| `Engine/RenderGraph` | FrameContext、资源图、Barrier、Queue Sync               | 只管理 Render Domain 图               |
-| `Engine/Shader`      | HLSL 产物、Reflection、Shader Contract、Layout          | 不决定 EnginePhase                    |
-| `Engine/Resource`    | Mesh、Texture、上传和 Render Target                     | 通过 RHI/RenderGraph 使用 GPU         |
-| `Engine/Concurrency` | Executor、Worker、Completion、Cancellation 和任务批次   | 平台中立；不持有领域状态              |
-| `Engine/Pipeline`    | Pipeline、Feature、Registry、Compiler、Scheduler        | 本文档描述的扩展层                    |
-| `Engine/Runtime`     | EngineFrameOrchestrator 与统一 Engine 帧生命周期        | 连接 Pipeline Runtime 与 RenderGraph  |
-| `Engine/World`       | WorldHandle、WorldScope、ECS 快照和命令                 | World Scope 数据所有者                |
+| 模块                 | 架构角色                                                       | 公共边界                                                  |
+|----------------------|----------------------------------------------------------------|-----------------------------------------------------------|
+| `Engine/Foundation`  | Result、通用基础类型和错误                                     | 不依赖任何图形后端                                        |
+| `Engine/Logging`     | 统一日志和诊断输出                                             | 供 Runtime/模块使用                                       |
+| `Engine/Math`        | SIMD 数学、变换、投影约定和 Plane/Frustum 几何                 | 不参与 Pipeline 拓扑                                      |
+| `Engine/Renderer`    | RenderView、World-to-Render 提取、Visibility 和 RenderPipeline | 依赖 Math、Pipeline、Resource、RenderGraph 的后端无关语义 |
+| `Engine/RHI`         | Buffer、Texture、View、Binding、Pipeline、Command、Sync        | 公共接口后端无关                                          |
+| `Engine/RenderGraph` | FrameContext、资源图、Barrier、Queue Sync                      | 只管理 Render Domain 图                                   |
+| `Engine/Shader`      | HLSL 产物、Reflection、Shader Contract、Layout                 | 不决定 EnginePhase                                        |
+| `Engine/Resource`    | Mesh、Texture、上传和 Render Target                            | 通过 RHI/RenderGraph 使用 GPU                             |
+| `Engine/Concurrency` | Executor、Worker、Completion、Cancellation 和任务批次          | 平台中立；不持有领域状态                                  |
+| `Engine/Pipeline`    | Pipeline、Feature、Registry、Compiler、Scheduler               | 本文档描述的扩展层                                        |
+| `Engine/Runtime`     | EngineFrameOrchestrator 与统一 Engine 帧生命周期               | 连接 Pipeline Runtime 与 RenderGraph                      |
+| `Engine/World`       | WorldHandle、WorldScope、ECS 快照和命令                        | World Scope 数据所有者                                    |
 
-当前专用 Scope Host、Renderer 和部分模块化运行时仍属于架构目标。`WorldScope` 已提供
-World/ECS 与通用 `PipelineScopeHost` 的基础适配，但尚未引入独立的
+当前专用 Scope Host 和部分模块化运行时仍属于架构目标；Renderer 已作为当前实现的
+独立模块提供 World-to-Render 提取、RenderSceneSnapshot 和标准 RenderPipeline。
+`WorldScope` 已提供 World/ECS 与通用 `PipelineScopeHost` 的基础适配，但尚未引入独立的
 `WorldPipelineHost`/`FramePipelineHost` 公共类型。本文档不会把目标 API 误写成当前已经
 存在的头文件；实现时应优先保持这里定义的调用方向和所有权规则。通用 Concurrency
 基建已经存在，但 GPU 队列提交适配器仍由 RHI/RenderGraph 负责，不能将默认
@@ -3336,10 +3556,10 @@ WorkerExecutor 视为真实 GPU 执行线程。
 | 新增跨领域功能    | 继承 `CompositeFeature<Parts...>`，组合具体领域 Part                                      |
 | 声明输入输出      | 使用 `PipelineBuilder`/领域 Builder 声明 ArtifactBinding                                  |
 | 接入已有 Pipeline | 注册 Feature 类型并绑定到公开 FeaturePoint                                                |
-| 使用多个 World    | 由 `WorldManager` 创建独立 World，并为每个 World 创建独立 `WorldScope` 和 Host           |
-| 修改运行拓扑      | 通过 Registry 请求重建，在安全点切换 Plan                                                 |
+| 使用多个 World    | 由 `WorldManager` 创建独立 World，并为每个 World 创建独立 `WorldScope` 和 Host            |
+| 修改运行拓扑      | 显式调用 `PipelineScopeHost::rebuild(registry)`，并在安全点切换 Plan                   |
 | 增加渲染能力      | 实现 `RenderFeature`，使用 `RenderGraphBuilder`                                           |
-| 增加编辑器绘制    | 使用 `FrameOverlayBuilder`，不直接修改基础 RenderGraph                                    |
+| 增加编辑器绘制    | 当前使用 `PipelineScopeHost(kEditor)` 与 RenderFeature/RenderGraphRuntime；`FrameOverlayBuilder` 仍属于目标封装，不直接修改基础 RenderGraph |
 | 增加动态插件      | 实现版本化 Module ABI，不跨 DLL 传递 STL/异常                                             |
 
 ### 26.2 禁止用法
@@ -3373,8 +3593,12 @@ WorkerExecutor 视为真实 GPU 执行线程。
 13. Composite 的 Part 不具有独立顶层注册身份。
 14. tuple 顺序不代表执行顺序，执行顺序由契约和约束决定。
 15. 多写者、跨 Scope 写入和资源所有权转移必须显式声明。
-16. 拓扑变化才触发重编译，普通帧数据变化只更新 Artifact 内容。
-17. 已发布 Plan 只读，Plan 切换必须等待相关 CPU/GPU Completion。
+16. 拓扑变化才需要重编译，普通帧数据变化只更新 Artifact 内容；Pipeline/Feature 拓扑
+    变化必须由调用方显式触发 `PipelineScopeHost::rebuild()`，只有 `PhaseRegistry`
+    revision 变化会由 `EngineFrameOrchestrator` 自动检测并同步。
+17. 已发布 Plan 只读；Plan 切换只在 Host 的安全 CPU 边界执行。当前 Host 不负责轮询
+    或等待 GPU Completion，GPU 完成、资源退休和模块卸载由调用方、`FrameContext` 或
+    RHI 生命周期管理。
 18. RenderGraph 负责资源生命周期、Barrier 和 Queue Sync；RHI 负责后端无关 GPU 接口。
 19. 公共 Pipeline/RHI/Shader API 不得暴露 Vulkan、D3D12 或其他后端专属类型。
 20. 诊断必须能够定位到 Pipeline、Feature、Part、Stage 和 Artifact 来源路径。
@@ -3516,9 +3740,11 @@ enum class BackendType : uint8_t {
 };
 ```
 
-`kVulkan` 表示选择 Vulkan 后端实现，不表示公共 API 可以暴露 Vulkan 类型。未来增加
-`kD3D12` 等后端时，应追加新的枚举值并复用同一组 `Device`、资源、同步和错误契约；
-不得在 `rhi.hpp` 或 `rhi_struct.hpp` 增加 `Vk*`/`ID3D12*` 字段。
+`kVulkan` 表示选择 Vulkan 后端实现，不表示公共 API 可以暴露 Vulkan 类型；当前
+`DeviceCreateDesc::backend` 的默认值也是 `kVulkan`。未来增加 `kD3D12` 等后端时，应
+追加新的选择 token，并复用同一组 `Device`、资源、同步和错误契约；不得在 `rhi.hpp`
+或 `rhi_struct.hpp` 增加 `Vk*`/`ID3D12*` 字段。上层 Renderer、Pipeline 和 RenderGraph
+只依赖这些公共语义，不应根据 `BackendType` 分支访问后端原生对象。
 
 #### `AdapterType`
 
@@ -3873,10 +4099,16 @@ Swizzle 只改变 View 读取出的分量映射，不修改底层资源内容，
 
 | 枚举值           | 精确定义                                         | 时序和画面特征                                                         | 不支持时的处理                                                                   |
 |------------------|--------------------------------------------------|------------------------------------------------------------------------|----------------------------------------------------------------------------------|
-| `kImmediate`     | 尽快把最新完成的图像交给显示系统，不等待显示刷新 | 延迟通常较低，但可能撕裂；不保证每个提交都显示                         | 选择支持的安全模式，并通过 `SwapchainInfo` 报告；当前 Vulkan 优先回退到 `kVsync` |
-| `kLowLatency`    | 优先显示最新完成的图像，允许呈现队列丢弃较旧图像 | 适合交互和低延迟场景；不等于绝对无撕裂，也不保证设备一定有额外队列容量 | 当前 Vulkan 映射为 Mailbox；不可用时回退到 FIFO 或 Surface 的第一个可用模式      |
-| `kVsync`         | 以显示刷新为节奏进行排队和呈现                   | 通常避免撕裂；生产者可能因队列满而等待；是 `SwapchainDesc` 默认值      | 应优先保留该语义；若 Surface 连 FIFO 都不提供，只能选择实际可用模式并报告结果    |
-| `kAdaptiveVsync` | 正常时按刷新同步，生产者落后时允许放宽同步       | 尽量减少撕裂和卡顿的折中模式；属于可选能力                             | 当前 Vulkan 映射为 FIFO Relaxed；不可用时按普通回退规则处理                      |
+| `kImmediate`     | 尽快把最新完成的图像交给显示系统，不等待显示刷新 | 延迟通常较低，但可能撕裂；不保证每个提交都显示                         | 请求不可用时按统一回退规则选择，并通过 `SwapchainInfo` 报告实际值                |
+| `kLowLatency`    | 优先显示最新完成的图像，允许呈现队列丢弃较旧图像 | 适合交互和低延迟场景；不等于绝对无撕裂，也不保证设备一定有额外队列容量 | 请求不可用时按统一回退规则选择，并通过 `SwapchainInfo` 报告实际值                |
+| `kVsync`         | 以显示刷新为节奏进行排队和呈现                   | 通常避免撕裂；生产者可能因队列满而等待；是 `SwapchainDesc` 默认值      | 请求不可用时按统一回退规则选择，并通过 `SwapchainInfo` 报告实际值                |
+| `kAdaptiveVsync` | 正常时按刷新同步，生产者落后时允许放宽同步       | 尽量减少撕裂和卡顿的折中模式；属于可选能力                             | 请求不可用时按统一回退规则选择，并通过 `SwapchainInfo` 报告实际值                |
+
+当前 Vulkan 实现对所有 `PresentMode` 使用同一回退算法：请求模式可用时使用请求模式；
+请求模式不可用且 `VK_PRESENT_MODE_FIFO_KHR` 可用时使用 FIFO；FIFO 也不可用时选择 Surface
+枚举结果中的第一个可用模式。Surface 没有任何模式时返回 `kUnsupported`。因此，公共
+`kVsync` 默认值不等于 Vulkan 一定能够使用 FIFO，调用方必须读取最终的
+`SwapchainInfo::present_mode`。
 
 以下规则对所有呈现模式都成立：
 
@@ -3998,10 +4230,12 @@ Format；各向异性由 `anisotropy_enable/max_anisotropy` 单独控制。
 | `kVariable`  | 每个 Binding Set 可使用不超过运行时声明容量的可变数组 | 公共 Shader Contract 中必须为 `0`，容量由实现/布局扩展提供 | 需要支持可变数组；当前 Vulkan 后端尚未实现                                   |
 | `kUnbounded` | 无固定上限的 Bindless/Unbounded 数组                  | 必须为 `0`                                                 | 需要 Bindless 设备能力和分配策略；当前 Vulkan 后端尚未实现                   |
 
-当前 Shader 包解析器和 Vulkan Binding Layout 创建路径都执行以下硬校验：`kSingle`
-且 count 不是 1、`kFixed` 且 count 为 0、`kVariable/kUnbounded` 且 count 不是 0，
-都返回 `kInvalidArgument`。`kVariable`、`kUnbounded` 或任何 Bindless/部分填充请求在
-当前 Vulkan 实现中返回 `kUnsupported`，不会静默降级为固定数组。
+Shader 包解析器和 Shader Contract 校验执行以下数组形状硬校验：`kSingle` 且 count
+不是 1、`kFixed` 且 count 为 0、`kVariable/kUnbounded` 且 count 不是 0，都返回
+`kInvalidArgument`。Vulkan Binding Layout 创建路径会拒绝 `kFixed` 的零计数，并对
+`kSingle` 固定使用一个描述符槽位；它不依赖 `kSingle` 的 `array_count` 字段。`kVariable`、
+`kUnbounded` 或任何 Bindless/部分填充请求在当前 Vulkan 实现中返回 `kUnsupported`，
+不会静默降级为固定数组。
 
 #### `BindingFlags`
 
@@ -4026,8 +4260,12 @@ Format；各向异性由 `anisotropy_enable/max_anisotropy` 单独控制。
 | `kFrameLocal` | Binding Set 只属于创建它的 Frame Slot | 该 Slot 回收后不能继续使用；适合每帧常量、临时 RenderGraph 绑定；通常由 `FrameContext` 延迟回收 |
 
 Lifetime 只控制 Descriptor 分配和 Set 对象的有效期，不改变被绑定 Buffer/Texture 的
-所有权，也不允许绕过 GPU Completion。当前 Vulkan 为两种 Lifetime 分开维护 Descriptor
-Pool 页面；Frame Local 页面在对应 Set 全部释放后可以整体重置。
+所有权，也不允许绕过 GPU Completion。`Frame Slot` 的归属由 `FrameContext` 或调用方
+维护，RHI 不记录 Slot ID，也不会自动验证 Set 是否仍处于所属帧内；调用方必须保证
+FrameLocal Set 不会在对应 Slot 回收后继续使用，并在 GPU 使用完成后再释放或退休。
+当前 Vulkan 为两种 Lifetime 分开维护 Descriptor Pool 页面；FrameLocal 页面只有在其中
+所有 live Set 都完成退休并被释放后才会尝试整体重置。Pool 重置本身不是 GPU 同步原语，
+不能被解释为 GPU 工作已经完成。
 
 ### 28.8 RHI：附件、绘制、索引和命令状态
 
@@ -4072,12 +4310,14 @@ Pool 页面；Frame Local 页面在对应 Set 全部释放后可以整体重置�
 
 | 枚举值      | 精确定义                                                             | 调用方责任                                                                                        | 错误表现                                                             |
 |-------------|----------------------------------------------------------------------|---------------------------------------------------------------------------------------------------|----------------------------------------------------------------------|
-| `kImplicit` | RHI 根据命令使用的资源和已跟踪状态自动插入必要的本地状态转换         | 仍必须声明正确的资源用途、队列和跨提交等待；不能把自动转换当作跨队列依赖                          | 参数非法、资源缺失或队列依赖无法满足时仍返回错误                     |
+| `kImplicit` | RHI 根据当前 Command List 中资源命令使用的资源和已跟踪状态自动插入必要的本地状态转换 | 仍必须声明正确的资源用途、队列和跨 Command List/跨 Queue 依赖；不能把自动转换当作跨提交等待 | 参数非法、资源缺失或队列依赖无法满足时仍返回错误                     |
 | `kExplicit` | RHI 不替调用方补齐资源状态转换；调用方必须先提交精确的 `BarrierDesc` | `before` 必须匹配跟踪状态，`after` 必须覆盖后续命令的 Usage/Stage/Queue；跨队列必须有对应提交等待 | 未声明 Barrier、before 状态不匹配或 Usage 不匹配返回 `kInvalidState` |
 
 RenderGraph 执行使用 `kExplicit`，因为 Graph Compiler 已经拥有完整的资源依赖和
 生命周期信息。直接使用 RHI 的独立 Command List 可以选择 `kImplicit`，但一个命令
-列表缓存不能在复用时改变其 BarrierMode；否则返回 `kInvalidState`。
+列表缓存不能在复用时改变其 BarrierMode；否则返回 `kInvalidState`。`kImplicit` 只负责
+当前 Command List 内可由资源命令局部推导的状态转换，不负责推导跨提交等待、Queue
+Ownership 转移或其他 Submission 依赖；这些关系必须由调用方或 RenderGraph 显式提供。
 
 ### 28.9 RenderGraph：资源生命周期、访问和 Barrier
 
@@ -4246,7 +4486,7 @@ Swapchain 生命周期操作，必须通过 `submit_frame()` 和 `present()` 完
 
 | 功能类别      | 当前可用值/组合                                                                     | 当前明确返回 `kUnsupported` 的情况                        |
 |---------------|-------------------------------------------------------------------------------------|-----------------------------------------------------------|
-| Present Mode  | 请求值若存在则使用；否则按 FIFO/可用模式回退并报告有效值                            | Surface 没有任何呈现模式，或请求的图像 Usage 不受支持     |
+| Present Mode  | 请求值若存在则使用；否则使用 FIFO（若可用），再否则使用 Surface 的第一个可用模式并报告有效值 | Surface 没有任何呈现模式，或请求的图像 Usage 不受支持     |
 | Buffer View   | Uniform、Storage、Raw、Structured、Typed（Typed 需 Format）                         | 加速结构相关 Buffer Capability                            |
 | Texture View  | Sampled、Storage、ColorAttachment、DepthStencil，遵守 Format/Aspect/Capability 约束 | 不支持的格式、维度或 Capability 组合会被拒绝              |
 | Binding Array | Single、Fixed（Fixed count 非零）                                                   | Variable、Unbounded、Bindless、PartiallyPopulated         |
