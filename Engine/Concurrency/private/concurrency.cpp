@@ -6,7 +6,6 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <exception>
@@ -63,12 +62,12 @@ namespace {
     return remaining.count() <= 0 ? 1 : static_cast<uint64_t>(remaining.count());
 }
 
-[[nodiscard]] foundation::Result execute_task(const TaskDesc& task) {
-    if (task.cancellation.is_cancellation_requested()) {
+[[nodiscard]] foundation::Result execute_task(const TaskDesc& task, std::stop_token stop_token = {}) {
+    if (stop_token.stop_requested() || task.cancellation.is_cancellation_requested()) {
         return cancelled();
     }
     try {
-        return task.execute(TaskContext{task.cancellation, task.user_data});
+        return task.execute(TaskContext{task.cancellation, task.user_data, stop_token});
     } catch (const std::exception& exception) {
         return foundation::Result::failure(foundation::ResultCode::kUnknown, exception.what());
     } catch (...) {
@@ -79,16 +78,21 @@ namespace {
 }  // namespace
 
 struct CancellationToken::State final {
-    std::atomic<bool> requested{false};
-    std::shared_ptr<const State> parent_a{};
-    std::shared_ptr<const State> parent_b{};
+    struct PropagateStop final {
+        std::weak_ptr<State> target{};
 
-    [[nodiscard]] bool is_requested() const noexcept {
-        if (requested.load(std::memory_order_acquire)) {
-            return true;
+        void operator()() const noexcept {
+            if (const std::shared_ptr<State> state = target.lock(); state != nullptr) {
+                static_cast<void>(state->source.request_stop());
+            }
         }
-        return (parent_a != nullptr && parent_a->is_requested()) || (parent_b != nullptr && parent_b->is_requested());
-    }
+    };
+
+    using ParentStopCallback = std::stop_callback<PropagateStop>;
+
+    std::stop_source source{};
+    std::unique_ptr<ParentStopCallback> parent_a_callback{};
+    std::unique_ptr<ParentStopCallback> parent_b_callback{};
 };
 
 CancellationToken::CancellationToken(std::shared_ptr<const State> state) noexcept : state_(std::move(state)) {}
@@ -98,7 +102,11 @@ bool CancellationToken::is_valid() const noexcept {
 }
 
 bool CancellationToken::is_cancellation_requested() const noexcept {
-    return state_ != nullptr && state_->is_requested();
+    return state_ != nullptr && state_->source.stop_requested();
+}
+
+std::stop_token CancellationToken::native_stop_token() const noexcept {
+    return state_ == nullptr ? std::stop_token{} : state_->source.get_token();
 }
 
 foundation::ResultValue<CancellationToken> CancellationToken::combine(const CancellationToken& first,
@@ -111,8 +119,11 @@ foundation::ResultValue<CancellationToken> CancellationToken::combine(const Canc
     }
     try {
         auto combined_state = std::make_shared<State>();
-        combined_state->parent_a = first.state_;
-        combined_state->parent_b = second.state_;
+        const std::weak_ptr<State> weak_state = combined_state;
+        combined_state->parent_a_callback =
+            std::make_unique<State::ParentStopCallback>(first.native_stop_token(), State::PropagateStop{weak_state});
+        combined_state->parent_b_callback =
+            std::make_unique<State::ParentStopCallback>(second.native_stop_token(), State::PropagateStop{weak_state});
         return {foundation::Result::success(), CancellationToken{std::move(combined_state)}};
     } catch (const std::bad_alloc&) {
         return {out_of_memory("combined cancellation state allocation failed"), {}};
@@ -132,11 +143,11 @@ CancellationToken CancellationSource::token() const noexcept {
 }
 
 bool CancellationSource::cancel() noexcept {
-    return state_ != nullptr && !state_->requested.exchange(true, std::memory_order_acq_rel);
+    return state_ != nullptr && state_->source.request_stop();
 }
 
 bool CancellationSource::is_cancellation_requested() const noexcept {
-    return state_ != nullptr && state_->is_requested();
+    return state_ != nullptr && state_->source.stop_requested();
 }
 
 struct Completion::State final {
@@ -144,6 +155,7 @@ struct Completion::State final {
     std::condition_variable condition;
     bool complete{false};
     foundation::Result result{};
+    std::vector<std::function<void(const foundation::Result&)>> continuations{};
 };
 
 Completion::Completion(std::shared_ptr<State> state) noexcept : state_(std::move(state)) {}
@@ -190,6 +202,35 @@ foundation::Result Completion::result() const {
     return state_->result;
 }
 
+Completion::Awaiter Completion::operator co_await() const& {
+    return Awaiter{*this};
+}
+
+Completion::Awaiter Completion::operator co_await() && {
+    return Awaiter{std::move(*this)};
+}
+
+bool Completion::register_continuation(std::function<void(const foundation::Result&)> continuation) const {
+    if (state_ == nullptr || !continuation) {
+        return false;
+    }
+
+    std::lock_guard lock(state_->mutex);
+    if (state_->complete) {
+        return false;
+    }
+    state_->continuations.push_back(std::move(continuation));
+    return true;
+}
+
+bool Completion::Awaiter::await_ready() const noexcept {
+    return completion_.is_complete();
+}
+
+foundation::Result Completion::Awaiter::await_resume() const {
+    return completion_.result();
+}
+
 CompletionSource::CompletionSource() : state_(std::make_shared<Completion::State>()) {}
 
 CompletionSource::~CompletionSource() = default;
@@ -211,16 +252,362 @@ foundation::Result CompletionSource::complete(foundation::Result result) {
         return invalid_state("completion source is not initialized");
     }
 
+    const std::shared_ptr<Completion::State> state = state_;
+    std::vector<std::function<void(const foundation::Result&)>> continuations;
     {
-        std::lock_guard lock(state_->mutex);
-        if (state_->complete) {
+        std::lock_guard lock(state->mutex);
+        if (state->complete) {
             return invalid_state("completion source has already completed");
         }
-        state_->result = std::move(result);
-        state_->complete = true;
+        state->result = std::move(result);
+        state->complete = true;
+        continuations.swap(state->continuations);
     }
-    state_->condition.notify_all();
+    state->condition.notify_all();
+    for (std::function<void(const foundation::Result&)>& continuation : continuations) {
+        continuation(state->result);
+    }
     return foundation::Result::success();
+}
+
+struct CoroutineTask::State final : std::enable_shared_from_this<CoroutineTask::State> {
+    using Handle = std::coroutine_handle<promise_type>;
+
+    struct RequestCancellation final {
+        std::weak_ptr<State> target{};
+
+        void operator()() const noexcept {
+            if (const std::shared_ptr<State> state = target.lock(); state != nullptr) {
+                state->request_cancellation();
+            }
+        }
+    };
+
+    using CancellationCallback = std::stop_callback<RequestCancellation>;
+
+    explicit State(Handle coroutine_handle) noexcept : coroutine(coroutine_handle) {}
+
+    ~State() {
+        if (coroutine) {
+            if (!coroutine.promise().completion().is_complete()) {
+                coroutine.promise().publish_completion(cancelled());
+            }
+            coroutine.destroy();
+        }
+    }
+
+    [[nodiscard]] foundation::ResultValue<Completion> schedule(Executor& target_executor, TaskPriority task_priority,
+                                                               CancellationToken task_cancellation) {
+        if (!coroutine) {
+            return {invalid_state("coroutine task has no coroutine state"), {}};
+        }
+        const Completion task_completion = coroutine.promise().completion();
+        {
+            std::lock_guard lock(mutex);
+            if (scheduled) {
+                return {invalid_state("coroutine task has already been scheduled"), {}};
+            }
+            scheduled = true;
+            cancellation = std::move(task_cancellation);
+            keep_alive = shared_from_this();
+        }
+
+        std::unique_ptr<CancellationCallback> callback{};
+        try {
+            if (cancellation.is_valid()) {
+                callback = std::make_unique<CancellationCallback>(cancellation.native_stop_token(),
+                                                                  RequestCancellation{weak_from_this()});
+            }
+        } catch (const std::bad_alloc&) {
+            const foundation::Result result = out_of_memory("coroutine cancellation callback allocation failed");
+            complete_without_resume(result);
+            return {result, {}};
+        }
+
+        {
+            std::lock_guard lock(mutex);
+            if (!completed) {
+                cancellation_callback = std::move(callback);
+            }
+        }
+        if (task_completion.is_complete()) {
+            return {foundation::Result::success(), task_completion};
+        }
+
+        TaskDesc resume_task{};
+        resume_task.domain = target_executor.domain();
+        resume_task.priority = task_priority;
+        resume_task.cancellation = cancellation;
+        const std::shared_ptr<State> state = shared_from_this();
+        resume_task.execute = [state](const TaskContext& context) {
+            if (context.is_stop_requested()) {
+                state->request_cancellation();
+                return foundation::Result::success();
+            }
+            if (const foundation::Result result = state->bind_executor_stop_token(context.stop_token); !result) {
+                state->complete_without_resume(result);
+                return result;
+            }
+            state->resume();
+            return foundation::Result::success();
+        };
+
+        const foundation::ResultValue<Completion> submitted = target_executor.submit(std::move(resume_task));
+        if (!submitted) {
+            complete_without_resume(submitted.result);
+            return {submitted.result, {}};
+        }
+        if (const foundation::Result observed = observe_dispatch(submitted.value); !observed) {
+            complete_without_resume(observed);
+            return {observed, {}};
+        }
+        return {foundation::Result::success(), task_completion};
+    }
+
+    [[nodiscard]] foundation::Result observe_dispatch(const Completion& dispatch_completion) {
+        const std::weak_ptr<State> weak_state = weak_from_this();
+        try {
+            if (dispatch_completion.register_continuation([weak_state](const foundation::Result& result) noexcept {
+                    if (const std::shared_ptr<State> state = weak_state.lock(); state != nullptr && !result) {
+                        state->complete_without_resume(result);
+                    }
+                })) {
+                return foundation::Result::success();
+            }
+        } catch (const std::bad_alloc&) {
+            return out_of_memory("coroutine dispatch continuation allocation failed");
+        } catch (const std::exception& exception) {
+            return foundation::Result::failure(foundation::ResultCode::kUnknown, exception.what());
+        } catch (...) {
+            return foundation::Result::failure(foundation::ResultCode::kUnknown,
+                                               "coroutine dispatch continuation allocation failed");
+        }
+
+        const foundation::Result result = dispatch_completion.result();
+        if (result.code == foundation::ResultCode::kNotReady) {
+            return invalid_state("coroutine dispatch completion changed without publishing a result");
+        }
+        if (!result) {
+            complete_without_resume(result);
+        }
+        return foundation::Result::success();
+    }
+
+    [[nodiscard]] foundation::Result bind_executor_stop_token(std::stop_token stop_token) {
+        if (!stop_token.stop_possible()) {
+            return foundation::Result::success();
+        }
+
+        std::unique_ptr<CancellationCallback> callback;
+        try {
+            callback = std::make_unique<CancellationCallback>(stop_token, RequestCancellation{weak_from_this()});
+        } catch (const std::bad_alloc&) {
+            return out_of_memory("coroutine executor stop callback allocation failed");
+        }
+
+        {
+            std::lock_guard lock(mutex);
+            if (!completed && executor_stop_callback == nullptr) {
+                executor_stop_callback = std::move(callback);
+            }
+        }
+        return foundation::Result::success();
+    }
+
+    void resume() noexcept {
+        {
+            std::lock_guard lock(mutex);
+            if (completed) {
+                return;
+            }
+            if (running) {
+                resume_pending = true;
+                return;
+            }
+            if (cancellation_requested || cancellation.is_cancellation_requested()) {
+                cancellation_requested = true;
+            } else {
+                running = true;
+            }
+        }
+
+        while (true) {
+            bool should_cancel = false;
+            {
+                std::lock_guard lock(mutex);
+                should_cancel = cancellation_requested && !running;
+            }
+            if (should_cancel) {
+                complete_without_resume(cancelled());
+                return;
+            }
+
+            coroutine.resume();
+            if (coroutine.done()) {
+                finish(std::move(coroutine.promise().result_));
+                return;
+            }
+
+            bool resume_again = false;
+            {
+                std::lock_guard lock(mutex);
+                if (cancellation_requested || cancellation.is_cancellation_requested()) {
+                    cancellation_requested = true;
+                    running = false;
+                    should_cancel = true;
+                } else if (resume_pending) {
+                    resume_pending = false;
+                    resume_again = true;
+                } else {
+                    running = false;
+                }
+            }
+            if (should_cancel) {
+                complete_without_resume(cancelled());
+                return;
+            }
+            if (!resume_again) {
+                return;
+            }
+        }
+    }
+
+    void request_cancellation() noexcept {
+        bool cancel_suspended = false;
+        {
+            std::lock_guard lock(mutex);
+            if (completed) {
+                return;
+            }
+            cancellation_requested = true;
+            cancel_suspended = scheduled && !running;
+        }
+        if (cancel_suspended) {
+            complete_without_resume(cancelled());
+        }
+    }
+
+    void complete_without_resume(foundation::Result result) noexcept {
+        {
+            std::lock_guard lock(mutex);
+            if (completed || running) {
+                return;
+            }
+            completed = true;
+        }
+        coroutine.promise().publish_completion(std::move(result));
+        release_keep_alive();
+    }
+
+    void finish(foundation::Result result) noexcept {
+        {
+            std::lock_guard lock(mutex);
+            if (completed) {
+                return;
+            }
+            completed = true;
+            running = false;
+        }
+        coroutine.promise().publish_completion(std::move(result));
+        release_keep_alive();
+    }
+
+    void release_keep_alive() noexcept {
+        std::shared_ptr<State> lifetime_guard{};
+        {
+            std::lock_guard lock(mutex);
+            lifetime_guard = std::move(keep_alive);
+        }
+    }
+
+    std::mutex mutex{};
+    Handle coroutine{};
+    CancellationToken cancellation{};
+    std::unique_ptr<CancellationCallback> cancellation_callback{};
+    std::unique_ptr<CancellationCallback> executor_stop_callback{};
+    std::shared_ptr<State> keep_alive{};
+    bool scheduled{false};
+    bool running{false};
+    bool resume_pending{false};
+    bool completed{false};
+    bool cancellation_requested{false};
+};
+
+CoroutineTask CoroutineTask::promise_type::get_return_object() {
+    const auto coroutine = std::coroutine_handle<promise_type>::from_promise(*this);
+    auto state = std::make_shared<State>(coroutine);
+    state_ = state;
+    return CoroutineTask{std::move(state)};
+}
+
+std::suspend_always CoroutineTask::promise_type::initial_suspend() const noexcept {
+    return {};
+}
+
+std::suspend_always CoroutineTask::promise_type::final_suspend() const noexcept {
+    return {};
+}
+
+void CoroutineTask::promise_type::return_value(foundation::Result result) noexcept {
+    result_ = std::move(result);
+}
+
+void CoroutineTask::promise_type::unhandled_exception() noexcept {
+    try {
+        throw;
+    } catch (const std::bad_alloc&) {
+        result_ = out_of_memory("coroutine task allocation failed");
+    } catch (const std::exception& exception) {
+        result_ = foundation::Result::failure(foundation::ResultCode::kUnknown, exception.what());
+    } catch (...) {
+        result_ =
+            foundation::Result::failure(foundation::ResultCode::kUnknown, "coroutine task threw an unknown exception");
+    }
+}
+
+Completion CoroutineTask::promise_type::completion() const noexcept {
+    return completion_source_.completion();
+}
+
+void CoroutineTask::promise_type::publish_completion(foundation::Result result) noexcept {
+    static_cast<void>(completion_source_.complete(std::move(result)));
+}
+
+std::function<void(const foundation::Result&)> CoroutineTask::promise_type::make_completion_continuation(
+    std::coroutine_handle<promise_type> coroutine) const {
+    const std::weak_ptr<State> weak_state = state_;
+    return [weak_state, coroutine](const foundation::Result&) noexcept {
+        const std::shared_ptr<State> state = weak_state.lock();
+        if (state == nullptr) {
+            return;
+        }
+        static_cast<void>(coroutine);
+        state->resume();
+    };
+}
+
+CoroutineTask::CoroutineTask(std::shared_ptr<State> state) noexcept : state_(std::move(state)) {}
+
+CoroutineTask::~CoroutineTask() = default;
+
+CoroutineTask::CoroutineTask(CoroutineTask&&) noexcept = default;
+
+CoroutineTask& CoroutineTask::operator=(CoroutineTask&&) noexcept = default;
+
+bool CoroutineTask::is_valid() const noexcept {
+    return state_ != nullptr;
+}
+
+Completion CoroutineTask::completion() const noexcept {
+    return state_ == nullptr || !state_->coroutine ? Completion{} : state_->coroutine.promise().completion();
+}
+
+foundation::ResultValue<Completion> CoroutineTask::schedule(Executor& executor, TaskPriority priority,
+                                                            CancellationToken cancellation) {
+    if (state_ == nullptr) {
+        return {invalid_state("coroutine task is not initialized"), {}};
+    }
+    return state_->schedule(executor, priority, std::move(cancellation));
 }
 
 struct WorkerExecutor::Impl final {
@@ -256,7 +643,7 @@ struct WorkerExecutor::Impl final {
         workers.reserve(resolved_count);
         try {
             for (uint32_t index = 0; index < resolved_count; ++index) {
-                workers.emplace_back([this] { worker_loop(); });
+                workers.emplace_back([this](std::stop_token stop_token) { worker_loop(stop_token); });
             }
         } catch (...) {
             stop();
@@ -280,26 +667,29 @@ struct WorkerExecutor::Impl final {
             }
         }
 
+        for (std::jthread& worker : workers) {
+            static_cast<void>(worker.request_stop());
+        }
         for (const std::shared_ptr<QueuedTask>& pending_task : pending_tasks) {
             static_cast<void>(pending_task->source.complete(cancelled()));
         }
         work_available.notify_all();
         idle.notify_all();
-        for (std::thread& worker : workers) {
+        for (std::jthread& worker : workers) {
             if (worker.joinable()) {
                 worker.join();
             }
         }
     }
 
-    void worker_loop() {
+    void worker_loop(std::stop_token stop_token) {
         while (true) {
             std::shared_ptr<QueuedTask> queued_task;
             {
                 std::unique_lock lock(mutex);
-                work_available.wait(lock, [this] { return stopping || !queue.empty(); });
+                work_available.wait(lock, stop_token, [this] { return stopping || !queue.empty(); });
                 if (queue.empty()) {
-                    if (stopping) {
+                    if (stopping || stop_token.stop_requested()) {
                         return;
                     }
                     continue;
@@ -309,7 +699,7 @@ struct WorkerExecutor::Impl final {
                 ++active_count;
             }
 
-            const foundation::Result result = execute_task(queued_task->task);
+            const foundation::Result result = execute_task(queued_task->task, stop_token);
             static_cast<void>(queued_task->source.complete(result));
 
             {
@@ -325,10 +715,10 @@ struct WorkerExecutor::Impl final {
     ExecutorDomain domain{ExecutorDomain::kCpuWorker};
     bool deterministic{false};
     mutable std::mutex mutex;
-    std::condition_variable work_available;
+    std::condition_variable_any work_available;
     std::condition_variable idle;
     std::priority_queue<std::shared_ptr<QueuedTask>, std::vector<std::shared_ptr<QueuedTask>>, QueueCompare> queue;
-    std::vector<std::thread> workers;
+    std::vector<std::jthread> workers;
     uint64_t next_sequence{0};
     uint32_t active_count{0};
     bool stopping{false};

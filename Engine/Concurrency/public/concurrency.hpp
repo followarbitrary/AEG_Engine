@@ -4,11 +4,14 @@
  */
 #pragma once
 
+#include <coroutine>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <limits>
 #include <memory>
+#include <stop_token>
+#include <utility>
 #include <vector>
 
 #include "result.hpp"
@@ -41,6 +44,7 @@ public:
 
     [[nodiscard]] bool is_valid() const noexcept;
     [[nodiscard]] bool is_cancellation_requested() const noexcept;
+    [[nodiscard]] std::stop_token native_stop_token() const noexcept;
     [[nodiscard]] static foundation::ResultValue<CancellationToken> combine(const CancellationToken& first,
                                                                             const CancellationToken& second);
 
@@ -77,6 +81,8 @@ private:
 /** @brief Read-only view of the completion state of one asynchronous task. */
 class Completion final {
 public:
+    class Awaiter;
+
     Completion() noexcept = default;
     ~Completion();
 
@@ -89,15 +95,45 @@ public:
     [[nodiscard]] bool is_complete() const noexcept;
     [[nodiscard]] foundation::Result wait(uint64_t timeout_nanoseconds = kWaitIndefinitely) const;
     [[nodiscard]] foundation::Result result() const;
+    [[nodiscard]] Awaiter operator co_await() const&;
+    [[nodiscard]] Awaiter operator co_await() &&;
 
 private:
     struct State;
 
     explicit Completion(std::shared_ptr<State> state) noexcept;
+    [[nodiscard]] bool register_continuation(std::function<void(const foundation::Result&)> continuation) const;
 
     std::shared_ptr<State> state_{};
 
     friend class CompletionSource;
+    friend class CoroutineTask;
+};
+
+/** @brief Suspends a coroutine until a Completion reaches its terminal result. */
+class Completion::Awaiter final {
+public:
+    explicit Awaiter(Completion completion) noexcept : completion_(std::move(completion)) {}
+
+    [[nodiscard]] bool await_ready() const noexcept;
+
+    template <typename Promise>
+    bool await_suspend(std::coroutine_handle<Promise> continuation) {
+        std::function<void(const foundation::Result&)> resume;
+        if constexpr (requires(std::coroutine_handle<Promise> handle) {
+                          handle.promise().make_completion_continuation(handle);
+                      }) {
+            resume = continuation.promise().make_completion_continuation(continuation);
+        } else {
+            resume = [continuation](const foundation::Result&) noexcept { continuation.resume(); };
+        }
+        return completion_.register_continuation(std::move(resume));
+    }
+
+    [[nodiscard]] foundation::Result await_resume() const;
+
+private:
+    Completion completion_{};
 };
 
 /** @brief Completes a Completion exactly once. */
@@ -123,6 +159,11 @@ private:
 struct TaskContext final {
     CancellationToken cancellation{};
     void* user_data{nullptr};
+    std::stop_token stop_token{};
+
+    [[nodiscard]] bool is_stop_requested() const noexcept {
+        return stop_token.stop_requested() || cancellation.is_cancellation_requested();
+    }
 };
 
 using TaskFunction = std::function<foundation::Result(const TaskContext&)>;
@@ -154,6 +195,53 @@ public:
     [[nodiscard]] virtual uint32_t worker_count() const noexcept = 0;
     [[nodiscard]] virtual foundation::ResultValue<Completion> submit(TaskDesc task) = 0;
     [[nodiscard]] virtual foundation::Result wait_idle(uint64_t timeout_nanoseconds = kWaitIndefinitely) = 0;
+};
+
+/** @brief Lazy Result-producing coroutine scheduled through an Executor. */
+class CoroutineTask final {
+private:
+    struct State;
+
+public:
+    struct promise_type final {  // NOLINT(readability-identifier-naming)
+        [[nodiscard]] CoroutineTask get_return_object();
+        [[nodiscard]] std::suspend_always initial_suspend() const noexcept;
+        [[nodiscard]] std::suspend_always final_suspend() const noexcept;
+        void return_value(foundation::Result result) noexcept;
+        void unhandled_exception() noexcept;
+
+        [[nodiscard]] Completion completion() const noexcept;
+        void publish_completion(foundation::Result result) noexcept;
+        [[nodiscard]] std::function<void(const foundation::Result&)> make_completion_continuation(
+            std::coroutine_handle<promise_type> coroutine) const;
+
+    private:
+        CompletionSource completion_source_{};
+        foundation::Result result_{};
+        std::weak_ptr<State> state_{};
+
+        friend class CoroutineTask;
+        friend struct State;
+    };
+
+    CoroutineTask() noexcept = default;
+    ~CoroutineTask();
+
+    CoroutineTask(const CoroutineTask&) = delete;
+    CoroutineTask& operator=(const CoroutineTask&) = delete;
+    CoroutineTask(CoroutineTask&&) noexcept;
+    CoroutineTask& operator=(CoroutineTask&&) noexcept;
+
+    [[nodiscard]] bool is_valid() const noexcept;
+    [[nodiscard]] Completion completion() const noexcept;
+    [[nodiscard]] foundation::ResultValue<Completion> schedule(Executor& executor,
+                                                               TaskPriority priority = TaskPriority::kNormal,
+                                                               CancellationToken cancellation = {});
+
+private:
+    explicit CoroutineTask(std::shared_ptr<State> state) noexcept;
+
+    std::shared_ptr<State> state_{};
 };
 
 /** @brief Configuration for a worker-backed executor. */

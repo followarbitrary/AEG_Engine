@@ -12,8 +12,9 @@ Renderer 可以依赖这些原语，但不得在各自模块内重复实现线�
 
 - `CancellationSource` / `CancellationToken`：发布和观察协作式取消请求。
 - `CompletionSource` / `Completion`：以 `Result` 表示异步任务的最终结果。
+- `CoroutineTask`：可由 `Executor` 启动、可直接 `co_await Completion` 的惰性协程任务。
 - `Executor`：执行器抽象；实现可以是 Worker、Render Thread 或 RHI 提交适配器。
-- `WorkerExecutor`：带优先级队列和专属工作线程的通用执行器。
+- `WorkerExecutor`：带优先级队列和专属 `std::jthread` 工作线程的通用执行器。
 - `InlineExecutor`：同步执行器，用于主线程路径和确定性测试。
 - `ExecutorRegistry`：线程安全的逻辑执行域到执行器映射。
 - `TaskGroup`：批量等待、首个失败传播和失败后的协作式取消。
@@ -35,11 +36,28 @@ Pipeline 私有线程池，也不再以调度器级全局互斥锁串行化不�
 - `Completion` 可复制，只读观察同一个共享完成状态；未完成时 `result()` 返回
   `kNotReady`。
 - `Completion::wait()` 超时返回 `kTimeout`，不会取消任务。
-- `CancellationToken` 是协作式信号；执行器只保证尚未开始的任务在取消后不再调用
-  回调，已经运行的回调必须自行检查 Token。
-- `WorkerExecutor` 析构时取消尚未开始的任务，并等待正在执行的任务结束。
+- `CancellationToken` 基于 `std::stop_source` / `std::stop_token`。执行器只保证尚未
+  开始的任务在取消后不再调用回调；已经运行的普通任务必须周期性调用
+  `TaskContext::is_stop_requested()`。
+- `WorkerExecutor` 析构时向全部 `std::jthread` 请求停止，取消尚未开始的任务，并等待
+  正在执行的任务完成协作式收敛。
 - `TaskGroup` 的析构会请求取消并等待已提交任务收敛，调用方不得让任务回调反向等待
   正在析构的 `TaskGroup`。
+
+### 协程语义
+
+- `CoroutineTask` 采用惰性启动模型：创建协程不会执行函数体，首次调用 `schedule()`
+  后才通过目标 `Executor` 开始执行。
+- 每个 `CoroutineTask` 只能调度一次。任务完成后，`schedule()` 返回的 `Completion`
+  保存协程最终 `Result`；被等待的 `Completion` 失败时，该失败结果由协程显式传播。
+- `co_await Completion` 仅登记延续并挂起协程，不占用 Worker，也不会创建监视线程。
+- 当前延续在完成 `CompletionSource` 的线程上恢复。因此，`co_await` 后的代码不得假定
+  仍具有原 Worker 或 Render Thread 的线程亲和性；需要亲和性的任务应在恢复后显式提交
+  到对应 `Executor`。
+- 显式 `CancellationToken` 与首次执行协程的 `std::jthread` 停止请求都会终止处于挂起
+  状态的协程。协程正在运行时仍采用协作式语义，在下一次挂起或返回时收敛。
+- 未调度的 `CoroutineTask` 在析构时不会执行函数体，并以 `kCancelled` 完成其
+  `Completion`；已经调度的任务由内部状态保持存活，调用方可以只保留 `Completion`。
 
 ### 线程安全语义
 
