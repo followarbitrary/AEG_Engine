@@ -574,6 +574,8 @@ public:
 
     [[nodiscard]] PipelineScope source_scope() const noexcept;
     [[nodiscard]] PipelineScope target_scope() const noexcept;
+    /** @brief Verifies that the bridge reads from the supplied source registry. */
+    [[nodiscard]] bool is_bound_to(const ArtifactRegistry& source_registry) const noexcept;
 
     /** @brief Allows one immutable snapshot contract to cross the Scope boundary. */
     [[nodiscard]] foundation::Result expose(ArtifactId id);
@@ -593,14 +595,22 @@ class PipelineExecutionContext final {
 public:
     explicit PipelineExecutionContext(void* user_data = nullptr, PipelineScope scope = PipelineScope::kEngine,
                                       ArtifactRegistry* artifact_registry = nullptr,
-                                      const ArtifactScopeBridge* scope_bridge = nullptr) noexcept
-        : user_data_(user_data), scope_(scope), artifact_registry_(artifact_registry), scope_bridge_(scope_bridge) {}
+                                      const ArtifactScopeBridge* scope_bridge = nullptr,
+                                      void* scope_data = nullptr) noexcept
+        : user_data_(user_data),
+          scope_(scope),
+          artifact_registry_(artifact_registry),
+          scope_bridge_(scope_bridge),
+          scope_data_(scope_data) {}
 
     [[nodiscard]] void* user_data() const noexcept { return user_data_; }
+    /** @brief Returns scope-owned runtime context supplied by the frame orchestrator. */
+    [[nodiscard]] void* scope_data() const noexcept { return scope_data_; }
     [[nodiscard]] PipelineScope scope() const noexcept { return scope_; }
     [[nodiscard]] ArtifactRegistry* artifact_registry() const noexcept { return artifact_registry_; }
     [[nodiscard]] const ArtifactScopeBridge* scope_bridge() const noexcept { return scope_bridge_; }
     [[nodiscard]] concurrency::CancellationToken cancellation() const noexcept { return cancellation_; }
+    void set_scope_data(void* scope_data) noexcept { scope_data_ = scope_data; }
     void set_artifact_runtime(ArtifactRegistry* artifact_registry,
                               const ArtifactScopeBridge* scope_bridge = nullptr) noexcept {
         artifact_registry_ = artifact_registry;
@@ -612,6 +622,7 @@ private:
     PipelineScope scope_{PipelineScope::kEngine};
     ArtifactRegistry* artifact_registry_{nullptr};
     const ArtifactScopeBridge* scope_bridge_{nullptr};
+    void* scope_data_{nullptr};
     const PipelinePlan* active_plan_{nullptr};
     concurrency::CancellationToken cancellation_{};
 
@@ -640,6 +651,8 @@ public:
     [[nodiscard]] PipelineExecutionContext& execution_context() const noexcept { return execution_context_; }
     [[nodiscard]] const PipelineNode& node() const noexcept { return node_; }
     [[nodiscard]] void* user_data() const noexcept { return node_.user_data; }
+    /** @brief Returns scope-owned runtime context supplied by the pipeline host. */
+    [[nodiscard]] void* scope_data() const noexcept { return execution_context_.scope_data(); }
     [[nodiscard]] concurrency::CancellationToken cancellation() const noexcept {
         return execution_context_.cancellation();
     }
@@ -1222,6 +1235,7 @@ public:
     [[nodiscard]] PipelinePlanHandle active_plan_snapshot() const noexcept;
     [[nodiscard]] bool has_pending_plan() const noexcept;
     [[nodiscard]] std::size_t retired_plan_count() const noexcept;
+    [[nodiscard]] const ArtifactScopeBridge* scope_bridge() const noexcept { return scope_bridge_; }
 
     [[nodiscard]] foundation::Result bind_pipeline(PipelineId pipeline);
     [[nodiscard]] foundation::Result rebuild(const PipelineRegistry& registry,

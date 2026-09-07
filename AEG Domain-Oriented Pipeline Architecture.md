@@ -2,7 +2,7 @@
 
 > 文档性质：架构说明、公共 API 和 ABI 使用手册
 >
-> 更新时间：2026-09-05
+> 更新时间：2026-09-07
 >
 > 适用范围：Pipeline、PipelineFeature、Scope、Artifact、Domain Graph、RenderGraph、RHI
 
@@ -37,9 +37,16 @@
 驱动各执行域。通用 Host 通过 Scope、实例 ID 和非拥有的 `owner` 指针关联宿主对象；
 Orchestrator 通过非拥有的 Host 注册表统一驱动这些实例。
 
-下文的 `WorldHandle`、`WorldFrameKey`、专用 Engine/World/Frame/Editor Host、
+当前还实现了 `Engine/ECS` 的 `WorldManager`、`World`、`WorldCommandBuffer`、
+`WorldSnapshot`，以及 `Engine/World` 的 `WorldScope`、`WorldFrameScope` 和
+`WorldFrameKey`。`EngineFrameOrchestrator` 可以自动消费 World 命令、执行
+`WorldCommit` 快照发布，并为注册的 Frame View 安装 World-to-Frame Bridge。
+
+下文的专用 Engine/World/Frame/Editor Host、
 `FeatureExecutionContext`、动态模块 C ABI，以及 Simulation/Render
-参考 Stage 编排属于架构约定，不表示当前已有同名公共实现。`RebuildReason` 和
+参考 Stage 编排属于架构约定，不表示当前已有同名公共实现。`WorldPipelineHost` 和
+`FramePipelineHost` 当前由通用 `PipelineScopeHost` 分别承担，专用类型仍属于文档层抽象。
+`RebuildReason` 和
 `PipelineRegistry::request_rebuild()` 仍属于设计接口；当前重建由调用方显式执行
 `PipelineScopeHost::rebuild(registry)`，Orchestrator 会在帧边界检测 Phase revision 并
 自动执行必要的重建和 Plan 切换。这些约定说明目标语义，不构成实现排期。
@@ -1802,7 +1809,86 @@ Host 会在本次调用中使用该不可变快照，而不会读取可能已经
 尝试应用 Pending Plan。直接使用该接口时，调用方必须按照 `PhaseRegistry::snapshot()`
 返回的全局顺序驱动 Phase，并自行保证帧边界和跨作用域 Bridge 已就绪。
 
-### 13.2.1 EngineFrameOrchestrator
+### 13.2.1 当前 World/ECS Scope 适配
+
+当前仓库使用 `aeg::ecs::WorldManager` 管理 World 实例，使用
+`aeg::world::WorldScope` 将一个具体的 ECS World 绑定到 `PipelineScope::kWorld`：
+
+```cpp
+aeg::ecs::WorldManager world_manager;
+const auto handle = world_manager.create_world({"GameWorld", true});
+const auto state = world_manager.find(handle.value);
+
+aeg::world::WorldScope world_scope(
+        state.value,
+        pipeline_registry,
+        {
+                .pipeline = aeg::pipeline::PipelineId("GameplayPipeline"),
+        });
+
+if (const auto result = world_scope.initialize(); !result) {
+    return result;
+}
+```
+
+`WorldScope` 的 `std::shared_ptr<ecs::World>` 构造函数是唯一公共构造路径。它保证
+Scope、`WorldManager::find()` 和 World Pipeline 访问同一个可变 ECS 实例。`WorldHandle`
+仅用于标识和校验，不携带可变 World 状态，不能据此重新构造 World。
+
+组件注册和命令输入如下：
+
+```cpp
+world_scope.state().register_component<Transform>(
+        aeg::ecs::ComponentTypeId("Transform"), "Transform");
+const auto entity = world_scope.state().create_entity();
+world_scope.state().emplace<Transform>(entity.value, Transform{});
+
+world_scope.command_buffer().enqueue([entity = entity.value](aeg::ecs::World& world) {
+    auto* transform = world.get<Transform>(entity);
+    if (transform == nullptr) {
+        return aeg::foundation::Result::failure(
+                aeg::foundation::ResultCode::kNotFound, "entity is missing");
+    }
+    transform->position.x += 1.0f;
+    return aeg::foundation::Result::success();
+});
+```
+
+直接修改 ECS 的 API 只能在 World owner thread 使用。命令缓冲本身支持跨线程生产；
+`EngineFrameOrchestrator` 在 `PreUpdate` 自动消费 `WorldScope::command_buffer()`，
+因此输入、网络和 Editor 不应通过裸指针直接写入组件。
+
+`WorldScope::commit()` 会生成 `WorldSnapshot` 并写入标准
+`WorldSnapshot` Artifact。Orchestrator 已注册该 World 时，会在 `WorldCommit` 自动执行
+同一操作；调用方通常不需要在普通帧中手工调用 `commit()`。
+
+Frame View 的连接方式如下：
+
+```cpp
+aeg::pipeline::PipelineScopeHost frame_host(
+        aeg::pipeline::PipelineScope::kFrame,
+        aeg::pipeline::PipelineInstanceId("GameWorldMainView"));
+frame_host.bind_pipeline(aeg::pipeline::PipelineId("RenderPipeline"));
+
+orchestrator.register_world_frame(world_scope, frame_host, /*view_id=*/0);
+orchestrator.initialize();
+orchestrator.run_frame({});
+```
+
+`register_world_frame()` 会为该 View 创建 `WorldFrameKey` 和 World-to-Frame
+`ArtifactScopeBridge`。`WorldCommit` 完成后，Bridge 捕获不可变快照；Frame Pipeline
+在 `RenderExtract` 中通过声明的 `ArtifactBinding` 读取它。Frame Pipeline 永远不会
+获得 `ecs::World&`，也不能绕过 Artifact 合约访问 World 可变存储。
+
+执行上下文中的两个不透明指针具有不同语义：`EngineFrameDesc::user_data` 会原样传递
+给本帧执行的每个 `PipelineExecutionContext`，用于承载宿主上下文；
+`PipelineExecutionContext::scope_data()` 则由编排器注入当前 Scope 的运行时对象。
+World Pipeline 的 `scope_data()` 是 `WorldScope*`，Frame Pipeline 的 `scope_data()` 是
+对应 View 的 `WorldFrameScope*`。Task 自身的 `TaskDescriptor::user_data` 仍通过
+`PipelineTaskContext::user_data()` 取得。三者均为非拥有借用，调用方必须保证其生命周期
+覆盖所有可能的执行与异步完成点。
+
+### 13.2.2 EngineFrameOrchestrator
 
 `aeg::engine::EngineFrameOrchestrator` 是当前实现的统一帧编排入口，位于
 `Engine/Runtime/public/engine_frame_orchestrator.hpp`。它以非拥有方式登记多个
@@ -1833,6 +1919,9 @@ Orchestrator 不拥有传入的 Registry、Scheduler、FrameContext、RenderGrap
 对象必须在 Orchestrator 整个生命周期内保持有效。Host 在 `begin_frame()` 时按 Scope、
 PipelineId 和 InstanceId 进行稳定排序，并固定每个 Active Plan；帧执行期间 Registry
 或 Host 的拓扑变化不会替换已固定的 Plan，而是在边界处被检测并要求重建。
+World 命令在 `PreUpdate` 由 World Owner 线程消费；`WorldCommit` 为每个已登记 World
+生成单调递增 revision 的不可变 `WorldSnapshot`，随后为所有已登记 View 捕获同一提交
+边界上的快照。Frame Pipeline 只能经由其 `WorldFrameScope` 的 Bridge 读取该快照。
 
 ### 13.3 PipelineCompiler
 
@@ -2045,6 +2134,18 @@ World mutable state
 - 不包含指向 World 可变容器的裸引用。
 - 可以包含帧间插值所需的前后状态。
 - 其生命周期由引用计数、帧槽或明确的完成点管理。
+
+当前实现要求通过 `WorldScope` 发布的快照属于该 Scope 的 World，且其 revision 必须
+等于 World 当前 revision；已发布 revision 不能向后回退。该约束防止旧 Frame 或异步
+生产者把过期状态重新写入 World Artifact。快照发布成功后，World Scope 的
+`latest_snapshot()` 与 World Artifact 指向同一逻辑版本；Frame Bridge 在 `capture()`
+时复制的是 `ArtifactView`，因此后续 World Commit 不会改变已捕获 View 的内容。
+每次 `WorldScope::initialize()` 都建立新的 Scope 活跃代际；`shutdown()` 使当前代际
+失效并清空尚未消费的命令。已经完成捕获的 `WorldFrameScope` 仍可读取其持有的不可变
+Snapshot，但关闭后的 Scope 不得再次 `capture()`，重新初始化也不会使旧 Frame Scope
+恢复可捕获状态。一个 World 可以同时绑定多个 View，每个 View 必须使用独立的
+`WorldFrameScope` 和 Bridge；Orchestrator 在 Frame 结束时恢复 Frame Host 原先的
+Bridge，避免临时绑定泄漏到下一帧或其他 World。
 
 ### 14.3 CommandBuffer
 
@@ -3215,12 +3316,14 @@ Pipeline Cache。
 | `Engine/Concurrency` | Executor、Worker、Completion、Cancellation 和任务批次   | 平台中立；不持有领域状态              |
 | `Engine/Pipeline`    | Pipeline、Feature、Registry、Compiler、Scheduler        | 本文档描述的扩展层                    |
 | `Engine/Runtime`     | EngineFrameOrchestrator 与统一 Engine 帧生命周期        | 连接 Pipeline Runtime 与 RenderGraph  |
-| `Engine/World`       | WorldHandle、World Host、ECS 快照和命令                 | World Scope 数据所有者                |
+| `Engine/World`       | WorldHandle、WorldScope、ECS 快照和命令                 | World Scope 数据所有者                |
 
-当前 World、专用 Scope Host、Renderer 和部分模块化运行时仍属于架构目标。本文档不会
-把目标 API 误写成当前已经存在的头文件；实现时应优先保持这里定义的调用方向和所有权
-规则。通用 Concurrency 基建已经存在，但 GPU 队列提交适配器仍由 RHI/RenderGraph
-负责，不能将默认 WorkerExecutor 视为真实 GPU 执行线程。
+当前专用 Scope Host、Renderer 和部分模块化运行时仍属于架构目标。`WorldScope` 已提供
+World/ECS 与通用 `PipelineScopeHost` 的基础适配，但尚未引入独立的
+`WorldPipelineHost`/`FramePipelineHost` 公共类型。本文档不会把目标 API 误写成当前已经
+存在的头文件；实现时应优先保持这里定义的调用方向和所有权规则。通用 Concurrency
+基建已经存在，但 GPU 队列提交适配器仍由 RHI/RenderGraph 负责，不能将默认
+WorkerExecutor 视为真实 GPU 执行线程。
 
 ## 26. API 快速参考
 
@@ -3233,7 +3336,7 @@ Pipeline Cache。
 | 新增跨领域功能    | 继承 `CompositeFeature<Parts...>`，组合具体领域 Part                                      |
 | 声明输入输出      | 使用 `PipelineBuilder`/领域 Builder 声明 ArtifactBinding                                  |
 | 接入已有 Pipeline | 注册 Feature 类型并绑定到公开 FeaturePoint                                                |
-| 使用多个 World    | 为每个 World 创建独立 `WorldPipelineHost` 和 Instance                                     |
+| 使用多个 World    | 由 `WorldManager` 创建独立 World，并为每个 World 创建独立 `WorldScope` 和 Host           |
 | 修改运行拓扑      | 通过 Registry 请求重建，在安全点切换 Plan                                                 |
 | 增加渲染能力      | 实现 `RenderFeature`，使用 `RenderGraphBuilder`                                           |
 | 增加编辑器绘制    | 使用 `FrameOverlayBuilder`，不直接修改基础 RenderGraph                                    |

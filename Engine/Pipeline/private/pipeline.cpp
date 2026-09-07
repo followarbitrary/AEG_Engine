@@ -1202,6 +1202,10 @@ PipelineScope ArtifactScopeBridge::target_scope() const noexcept {
     return impl_ == nullptr ? PipelineScope::kFrame : impl_->target_scope;
 }
 
+bool ArtifactScopeBridge::is_bound_to(const ArtifactRegistry& source_registry) const noexcept {
+    return impl_ != nullptr && impl_->source_registry == &source_registry;
+}
+
 foundation::Result ArtifactScopeBridge::expose(ArtifactId id) {
     if (impl_ == nullptr || impl_->source_registry == nullptr) {
         return invalid_state("artifact scope bridge is not initialized");
