@@ -104,7 +104,8 @@ Artifact 和 Bridge 规则为准。
 5. Pipeline 之间通过 Artifact 和显式依赖通信，不通过隐式系统调用链通信。
 6. `PipelineDefinition`、`PipelineInstance` 和 `PipelinePlan` 必须分离。
 7. World Pipeline 必须绑定具体 `WorldHandle`，不得采用 Singleton 实例化策略。
-8. 跨领域 Feature 使用成员组合 `CompositeFeature<Parts...>`，不使用多重继承。
+8. 跨领域 Feature 按开发约定使用成员组合 `CompositeFeature<Parts...>`，不以多重继承
+   叠加多个领域 Builder。
 9. RenderGraph 负责渲染资源、生命周期、Barrier 和 Queue Sync；RHI 负责后端无关的
    GPU 对象和命令接口。
 10. Vulkan、D3D12 或其他后端类型不得越过 RHI private 边界进入公共 Pipeline API。
@@ -1443,8 +1444,8 @@ public:
 
 `PipelineFeature` 是所有 Feature 的多态根接口，负责提供统一的注册、描述、构建贡献
 和诊断入口。内置领域基类固定为五个；它们分别形成独立的 Builder 能力边界。具体
-Feature 应直接选择一个主领域基类。只有当一个功能在语义上同时产生两个或多个领域
-的 Artifact，且这些 Artifact 之间存在明确的跨域数据流时，才使用
+Feature 通常应选择一个主领域基类。只有当一个功能在语义上同时产生两个或多个领域
+的 Artifact，且这些 Artifact 之间存在明确的跨域数据流时，才建议使用
 `CompositeFeature<Parts...>`。
 
 ```text
@@ -1459,28 +1460,31 @@ PipelineFeature
 
 上图表示公共继承关系和能力边界，不表示运行时执行顺序。`AnimationFeature`、
 `AiFeature`、`ParticleFeature`、`UiFeature` 等是业务侧的具体 Feature 类型，不构成新的
-基础继承层级；它们必须根据主要数据语义选择上述领域之一。领域名称不能仅凭功能名称
+基础继承层级；它们应根据主要数据语义选择上述领域之一。领域名称不能仅凭功能名称
 推断，最终分类以 Feature 的输入、输出和 Builder 使用方式为准。
 
-| 类型                         | 领域标识                                                   | Builder 能力边界                     | 语义职责                                                                | 不应承载的职责                                                       |
-|------------------------------|------------------------------------------------------------|--------------------------------------|-------------------------------------------------------------------------|----------------------------------------------------------------------|
-| `PipelineFeature`            | 无具体领域                                                 | 仅提供统一元数据、贡献收集和诊断入口 | 作为 Registry 的类型擦除接口和 Feature 生命周期契约                     | 不直接创建领域 Task，不暴露聚合所有领域能力的统一 Builder            |
-| `LogicFeature`               | `FeatureDomain::kLogic`                                    | `LogicGraphBuilder`                  | CPU 业务逻辑、状态变换，以及不以像素输出为主要结果的 GPU Compute 工作   | 不直接构造 Render Pass 或持有 World 外部可变指针                     |
-| `PhysicsFeature`             | `FeatureDomain::kPhysics`                                  | `PhysicsGraphBuilder`                | 刚体、碰撞、约束、布料和流体等连续状态求解                              | 不直接写入 RenderGraph 资源或绕过 Tick/快照发布协议                  |
-| `RenderFeature`              | `FeatureDomain::kRender`                                   | `RenderGraphBuilder`                 | 几何绘制、光照、阴影、后处理和 Frame 输出的声明式构建                   | 不直接操作后端原生对象或维护全局 Image Layout                        |
-| `AudioFeature`               | `FeatureDomain::kAudio`                                    | `AudioGraphBuilder`                  | 空间化、混音、DSP 处理、声场和音频事件调度                              | 不直接修改 World 状态或依赖 Render Thread 的隐式时序                 |
-| `StreamFeature`              | `FeatureDomain::kStream`                                   | `StreamGraphBuilder`                 | IO、解码、资源上传准备、取消和资源发布                                  | 不在 IO Worker 中录制 RHI Command List，不把未完成资源发布为可用版本 |
-| `CompositeFeature<Parts...>` | `FeatureDomain::kComposite`，具体领域由 `domain_mask` 表示 | 按 Part 静态派发到各领域 Builder     | 将多个单领域 Part 组合为一个外部 Feature 身份，并保留各 Part 的领域隔离 | 不作为独立执行领域，不通过多重继承合并多个领域接口                   |
+| 类型                         | 领域标识                                                   | Builder 能力边界                                     | 语义职责                                                                | 不应承载的职责                                                       |
+|------------------------------|------------------------------------------------------------|------------------------------------------------------|-------------------------------------------------------------------------|----------------------------------------------------------------------|
+| `PipelineFeature`            | 无具体领域                                                 | 无领域 Builder；仅提供统一元数据、贡献收集和诊断入口 | 作为 Registry 的类型擦除接口和 Feature 生命周期契约；业务侧通常不直接以其扩展 | 直接承载领域 Builder 语义、手动维护领域元数据或聚合所有领域 Builder |
+| `LogicFeature`               | `FeatureDomain::kLogic`                                    | `LogicGraphBuilder`                                  | CPU 业务逻辑、状态变换，以及不以像素输出为主要结果的 GPU Compute 工作   | 不直接构造 Render Pass 或持有 World 外部可变指针                     |
+| `PhysicsFeature`             | `FeatureDomain::kPhysics`                                  | `PhysicsGraphBuilder`                                | 刚体、碰撞、约束、布料和流体等连续状态求解                              | 不直接写入 RenderGraph 资源或绕过 Tick/快照发布协议                  |
+| `RenderFeature`              | `FeatureDomain::kRender`                                   | `RenderGraphBuilder`                                 | 几何绘制、光照、阴影、后处理和 Frame 输出的声明式构建                   | 不直接操作后端原生对象或维护全局 Image Layout                        |
+| `AudioFeature`               | `FeatureDomain::kAudio`                                    | `AudioGraphBuilder`                                  | 空间化、混音、DSP 处理、声场和音频事件调度                              | 不直接修改 World 状态或依赖 Render Thread 的隐式时序                 |
+| `StreamFeature`              | `FeatureDomain::kStream`                                   | `StreamGraphBuilder`                                 | IO、解码、资源上传准备、取消和资源发布                                  | 不在 IO Worker 中录制 RHI Command List，不把未完成资源发布为可用版本 |
+| `CompositeFeature<Parts...>` | `FeatureDomain::kComposite`，具体领域由 `domain_mask` 表示 | 按 Part 静态派发到各领域 Builder                     | 将多个单领域 Part 组合为一个外部 Feature 身份，并保留各 Part 的领域隔离 | 不作为独立执行领域，不通过多重继承合并多个领域接口                   |
 
 Feature 的继承关系只解决“可以声明哪些类型的贡献”，不决定 Stage 的先后关系。所有
 先后、并行、资源可见性和完成条件仍必须通过 Artifact、FeaturePoint、显式顺序约束和
 Execution Domain 声明表达。
 
-#### 基类选择和继承约束
+#### 基类选择与开发约定
 
-- `PipelineFeature` 是类型擦除和生命周期管理所需的抽象根；游戏侧的具体 Feature 不应
-  直接继承它，否则其领域能力无法在编译期得到约束。
-- 单领域 Feature 必须且只能选择一个领域基类。该限制是能力隔离规则，而不是命名约定。
+- `PipelineFeature` 是类型擦除和生命周期管理所需的公开抽象根。`FeatureFactory`、
+  `PipelineRegistry` 与已编译 Plan 均通过该类型持有 Feature。直接派生在 C++ 层面合法；
+  本架构只将“业务 Feature 从领域基类或 `CompositeFeature` 扩展”定义为开发约定，当前
+  不使用构造令牌、模板约束或 Registry RTTI 检查强制执行。
+- 对于单领域 Feature，开发约定是只选择一个领域基类。该规则用于保持 Builder 能力边界
+  可推导，而不是 C++ 类型系统提供的限制。
 - `LogicFeature` 中的 GPU Compute 仅限于其主要结果属于逻辑或计算 Artifact 的情形；若
   任务直接生产颜色、深度、阴影或其他 RenderGraph 输出，应选择 `RenderFeature`。
 - `PhysicsFeature` 的状态推进必须服从 Tick、版本和快照发布协议；渲染线程不得读取其
@@ -1489,8 +1493,11 @@ Execution Domain 声明表达。
   保存跨帧的后端原生资源状态。
 - `AudioFeature` 和 `StreamFeature` 的执行结果分别通过 Audio Artifact 和 Resource
   Artifact 发布；二者不能借助全局队列或隐式线程局部状态向其他领域传递数据。
-- 多领域职责必须拆分为 Part，并由 `CompositeFeature<Parts...>` 进行组合；不得使用
-  多重继承规避领域边界。
+- 对于确有多个领域职责的 Feature，开发约定是拆分为 Part 并由
+  `CompositeFeature<Parts...>` 组合，而不以多重继承叠加多个 Builder 接口。
+- `CompositeFeature` 的 Part 通常应选择一个领域基类。以 `PipelineFeature` 直接派生的
+  Part、多个领域基类的 Part，或嵌套 `CompositeFeature`，均不符合该领域隔离约定；其中
+  只有嵌套 `CompositeFeature` 会被当前模板的静态断言直接拒绝。
 
 ### 11.2 `PipelineFeature`
 
@@ -1512,6 +1519,24 @@ public:
 };
 ```
 
+`PipelineFeature` 保持公共多态类型，使
+`FeatureFactory`、`PipelineRegistry` 和已编译 `PipelinePlan` 能继续以
+`std::unique_ptr<PipelineFeature>` 或 `std::shared_ptr<const PipelineFeature>` 进行类型擦除。
+这一公开性是实现需求，而不是语言层面的扩展禁令：`class X : public PipelineFeature` 可以
+编译并在描述符元数据自洽时注册。直接派生会绕过领域基类对
+`feature_domain()`、`feature_domain_mask()` 和 `collect_contributions()` 的固定实现；因此
+业务代码通常应改从领域基类扩展。Registry 只验证描述符与实现返回的领域元数据是否自洽，
+不分析 C++ 继承图，也不执行该开发约定。
+
+需要复用 Feature 的公共实现时，开发者应使用普通成员组合，或者声明一个仍然只继承一个
+领域基类的抽象中间类，例如 `GameplayLogicFeature : public LogicFeature`。框架不会阻止
+以 `PipelineFeature` 为直接父类的通用业务基类；但这种结构要求每个派生类自行维护领域
+元数据和 Builder 使用边界，故不属于推荐的业务扩展方式。
+
+当前 Module Runtime 只承诺同一构建产物内的静态 C++ 模块协作，尚未将
+`PipelineFeature` 定义为跨动态库的稳定 C++ ABI；未来动态插件必须经版本化 C ABI 工厂
+边界创建对象，不能依赖跨 DLL 的 C++ 继承布局或构造函数可见性。
+
 `collect_contributions()` 必须是非模板虚入口，因为 Registry 只持有类型擦除后的
 `PipelineFeature`。领域 Builder 的静态匹配只在内部实现中进行，不能让模板函数成为
 Registry 的唯一入口。
@@ -1527,6 +1552,11 @@ Builder 类型，并把通用的 `collect_contributions()` 入口适配到领域
 该设计使 Registry 可以通过 `PipelineFeature` 进行类型擦除，同时使领域 Compiler 只
 看到本领域允许的声明操作。
 
+`feature_domain()`、`feature_domain_mask()` 和 `collect_contributions()` 在领域基类中被
+固定，具体 Feature 只需重写 `descriptor()` 与本领域 `setup()`。这保证经由领域基类扩展
+的实现不能覆写其领域元数据。直接派生 `PipelineFeature` 在语言层面可行，但不享有这一
+保护；是否遵守领域基类扩展约定由开发人员负责。
+
 领域基类的选择规则如下：
 
 1. 若 Feature 的主要输出是 CPU 状态、命令或非视觉 Compute Artifact，选择
@@ -1538,7 +1568,7 @@ Builder 类型，并把通用的 `collect_contributions()` 入口适配到领域
 5. 若 Feature 的主要工作是外部数据摄取、解码、上传准备或资源发布，选择
    `StreamFeature`。
 6. 若同一功能同时满足多个领域条件，使用 `CompositeFeature`，并将每一类职责拆分
-   为独立 Part；不得通过多重继承把多个 Builder 接口叠加到一个类上。
+   为独立 Part；开发约定不通过多重继承把多个 Builder 接口叠加到一个类上。
 
 所有领域基类都必须满足以下共同约束：
 
@@ -1639,10 +1669,16 @@ struct FeatureDescriptor {
 
 ### 11.5 CompositeFeature
 
-`CompositeFeature<Parts...>` 是组合适配器，不是新的业务领域。它通过成员组合承载多个
-单领域 Part，并在编译期根据 Part 的 `kDomain` 与 `BuilderType` 完成静态派发。外部
-Registry 只看到一个 Composite Feature 身份；内部每个 Part 仍保持独立的领域契约、
-FeaturePoint、Artifact 命名空间和诊断来源。
+`CompositeFeature<Parts...>` 是组合适配器，不是新的业务领域。它通过成员组合承载一个
+或多个 Part，并在编译期根据 Part 的 `kDomain` 与 `BuilderType` 完成静态派发。外部 Registry
+只看到一个 Composite Feature 身份；内部每个 Part 仍保持独立的领域契约、FeaturePoint、
+Artifact 命名空间和诊断来源。模板允许一个 Part，但若功能只属于一个领域，开发约定仍是
+直接继承相应领域基类，而不是使用 `CompositeFeature<Part>` 包装。
+
+模板仅验证 Part 数量非零、Part 与 `PipelineFeature` 存在继承关系、Part 暴露 `kDomain` 与
+`BuilderType`，并拒绝 `kDomain == kComposite` 的嵌套组合。它不会验证 Part 是否公开继承、
+是否恰好属于一个领域，或是否借由多重继承规避领域边界；这些均属于开发约定，不由模板
+实例化或 Registry 注册阶段自动拒绝。
 
 ```cpp
 template <typename... Parts>
@@ -1664,9 +1700,11 @@ protected:
 };
 ```
 
-`part<Part>()` 是组合对象内部访问具体 Part 的类型安全入口；它不改变 Part 的领域
-身份，也不授予该 Part 访问其他 Builder 的权限。若 Part 需要运行时多态，应将对应
-成员替换为 `std::unique_ptr<Domain>`，并由 Composite 明确拥有其生命周期。
+`part<Part>()` 是组合对象内部访问具体 Part 的类型安全入口；它不改变 Part 的领域身份，
+也不授予该 Part 访问其他 Builder 的权限。该访问器使用 `std::get<Part>`，因此同一 Part
+类型在 `Parts...` 中应只出现一次。当前模板直接存储 `std::tuple<Parts...>`，不支持将
+`std::unique_ptr` 直接用作 Part；如需运行时多态，应在具体领域 Part 内部持有策略对象，
+或在未来扩展专门的间接存储 API。
 
 推荐的静态派发过程如下：
 
@@ -1689,9 +1727,11 @@ for_each_part(parts, [&](auto& part) {
 `logic_builder()`、`physics_builder()`、`render_builder()`、`audio_builder()` 和
 `stream_builder()` 方法，而不是这个模板方法。上述伪代码表达的是以下不可变的行为契约：
 
-1. 每个 Part 只能向其声明的领域 Builder 收集贡献；不进行运行时 RTTI 猜测。
+1. 按约定从领域基类派生的 Part 只能获得其声明领域的 Builder 视图；派发不进行运行时
+   RTTI 猜测。
 2. 派发顺序只用于构建期的确定性遍历，不构成最终执行顺序。
-3. 任一 Part 返回失败时，整个 Composite 的贡献收集事务必须回滚，不得发布部分图。
+3. 任一 Part 返回失败时，Compiler 中止本次 Plan 编译；尚未完成的局部声明不会作为 Plan
+   发布。
 4. Part 的 `FeaturePartId`、诊断路径和 Artifact 声明必须保留父 Feature 身份。
 5. Composite 的 `domain` 固定为 `kComposite`，`domain_mask` 必须是全部 Part 具体领域的
    并集；不得仅填写 `kComposite`。
@@ -1710,15 +1750,15 @@ CompositeFeature::collect_contributions()
 
 成员存储和注册规则：
 
-1. 具体 Part 类型已知且无需运行时替换时，优先使用 `std::tuple<Parts...>` 的值语义。
-2. 如果模板参数是抽象领域基类，使用 `std::unique_ptr<Domain>` 保存具体实现，并由
-   Composite 独占其生命周期。
-3. `std::shared_ptr` 仅在确有跨对象共享所有权需求时采用，不作为默认存储策略。
-4. tuple 顺序只决定收集阶段的稳定遍历顺序，不决定 Runtime Plan 的拓扑顺序。
-5. 每个 Part 都拥有由父 Feature 限定的 `FeaturePartId`，但不拥有独立的顶层注册身份。
-6. 只有顶层 CompositeFeature 具有外部 `FeatureInstanceId`、启停状态和 Registry 绑定。
-7. 任意 Part 构建失败时，Composite 的全部贡献均不得提交。
-8. 每个 Part 可以绑定不同的 FeaturePoint、Artifact 和 Execution Domain；跨 Part 通信
+1. 当前实现以 `std::tuple<Parts...>` 保存具体 Part 的值语义；模板参数必须是可存储的具体
+   Part 类型，不能直接使用抽象领域基类或智能指针包装器。
+2. Part 如需共享或运行时可替换的对象，可在其自身内部管理相应的所有权；`CompositeFeature`
+   本身不提供通用的间接存储机制。
+3. tuple 顺序只决定收集阶段的稳定遍历顺序，不决定 Runtime Plan 的拓扑顺序。
+4. 每个 Part 都拥有由父 Feature 限定的 `FeaturePartId`，但不拥有独立的顶层注册身份。
+5. 只有顶层 CompositeFeature 具有外部 `FeatureInstanceId`、启停状态和 Registry 绑定。
+6. 任意 Part 构建失败时，当前 Plan 编译终止，不会发布部分构建结果。
+7. 每个 Part 可以绑定不同的 FeaturePoint、Artifact 和 Execution Domain；跨 Part 通信
    必须使用版本化 Artifact 或 Bridge。
 
 跨领域布料功能的使用方式：
@@ -2823,7 +2863,10 @@ if (const auto result = world.rebuild(); !result) {
 
 ### 18.1 单领域 Feature
 
-单领域 Feature 只继承一个领域基类：
+单领域 Feature 的标准扩展入口是一个领域基类。直接以 `PipelineFeature` 为父类的具体类型
+在 C++ 层面可以构造并作为 `FeatureFactory` 的返回对象；框架不会自动拒绝这种写法。
+AEG Domain-Oriented Pipeline Architecture 将其列为非推荐的业务扩展方式，因为它会绕过
+领域基类已经固定的 Builder 能力边界和领域元数据：
 
 ```cpp
 class WindFeature final : public aeg::pipeline::LogicFeature {
@@ -3567,6 +3610,7 @@ WorkerExecutor 视为真实 GPU 执行线程。
 | 新增功能调度单元       | 继承 `Pipeline`，实现 `descriptor()` 和 `build()`                                                                                           |
 | 新增单领域功能         | 继承 `LogicFeature`、`PhysicsFeature`、`RenderFeature`、`AudioFeature` 或 `StreamFeature`                                                   |
 | 新增跨领域功能         | 继承 `CompositeFeature<Parts...>`，组合具体领域 Part                                                                                        |
+| 复用 Feature 公共逻辑  | 优先使用成员组合，或声明仍只继承一个领域基类的抽象中间类；避免让业务 Feature 直接继承 `PipelineFeature`（开发约定）                         |
 | 声明输入输出           | 使用 `PipelineBuilder`/领域 Builder 声明 ArtifactBinding                                                                                    |
 | 接入已有 Pipeline      | 注册 Feature 类型并绑定到公开 FeaturePoint                                                                                                  |
 | 使用多个 World         | 由 `WorldManager` 创建独立 World，并为每个 World 创建独立 `WorldScope` 和 Host                                                              |
@@ -3576,14 +3620,19 @@ WorkerExecutor 视为真实 GPU 执行线程。
 | 增加静态 Gameplay 模块 | 继承 `aeg::module::Module`，通过 `ModuleRegistrationContext` 注册 Pipeline、Feature 和 Reflection Type                                      |
 | 增加动态插件           | 在静态 Module Runtime 之上实现版本化 Module ABI，不跨 DLL 传递 STL/异常                                                                     |
 
-### 26.2 禁止用法
+### 26.2 架构约束与不推荐用法
+
+本节中涉及 Feature 继承方式的条目属于当前的开发约定，由开发人员遵守；它们不是
+`PipelineFeature` 构造函数、模板元编程或 Registry 运行时检查提供的语言级屏障。其余
+条目描述公共 API、数据流和执行期的不变量，仍然属于引擎实现必须维护的架构边界。
 
 ```text
 不得在 Pipeline 中直接调用另一个 Pipeline 的 execute。
 不得以注册顺序替代 Artifact 依赖。
 不得使 Frame 读取 World 可变指针。
 不得使 Engine 读取 World/Frame 业务数据。
-不得将 Composite 的 Part 再次注册为顶层 Feature。
+避免将具体业务 Feature 直接派生自 PipelineFeature。
+不应将 Composite 的 Part 再次注册为顶层 Feature。
 不得在公共 API 暴露 Vk*、ID3D12* 或平台对象。
 不得在 RenderFeature 中手写全局 Image Layout 状态。
 不得在执行期间修改当前 PipelinePlan。
@@ -3602,8 +3651,10 @@ WorkerExecutor 视为真实 GPU 执行线程。
 8. World Pipeline 必须绑定 `WorldHandle`，不得采用 Singleton 实例化策略。
 9. Frame 只能读取发布后的 World Snapshot，不得读取 World 可变状态。
 10. Editor 只能通过 Frame Overlay 和 Command Channel 参与，不得直接改写 World。
-11. 所有内置领域 Feature 都继承 `PipelineFeature`。
-12. 跨领域功能使用成员组合 `CompositeFeature<Parts...>`，不使用多重继承。
+11. `PipelineFeature` 是公开的类型擦除根；具体业务 Feature 通常经由一个领域基类或
+    `CompositeFeature` 构造。直接根派生在 C++ 层面可表达，框架不自动拦截；是否遵守该
+    扩展约定由开发人员负责。
+12. 跨领域功能按开发约定使用成员组合 `CompositeFeature<Parts...>`，不使用多重继承。
 13. Composite 的 Part 不具有独立顶层注册身份。
 14. tuple 顺序不代表执行顺序，执行顺序由契约和约束决定。
 15. 多写者、跨 Scope 写入和资源所有权转移必须显式声明。

@@ -12,12 +12,11 @@ using aeg::foundation::Result;
 using aeg::pipeline::EnginePhase;
 using aeg::pipeline::ExecutionDomain;
 using aeg::pipeline::FeatureDescriptor;
-using aeg::pipeline::FeatureDomain;
 using aeg::pipeline::FeatureId;
+using aeg::pipeline::LogicFeature;
 using aeg::pipeline::Pipeline;
 using aeg::pipeline::PipelineBuilder;
 using aeg::pipeline::PipelineDescriptor;
-using aeg::pipeline::PipelineFeature;
 using aeg::pipeline::PipelineId;
 using aeg::pipeline::PipelineScopeMask;
 using aeg::pipeline::StageDescriptor;
@@ -71,22 +70,18 @@ private:
                                                       0}};
 };
 
-class BaseFeature final : public PipelineFeature {
+class BaseFeature final : public LogicFeature {
 public:
     [[nodiscard]] const FeatureDescriptor& descriptor() const noexcept override { return descriptor_; }
-    [[nodiscard]] FeatureDomain feature_domain() const noexcept override { return FeatureDomain::kLogic; }
-    [[nodiscard]] aeg::pipeline::FeatureDomainMask feature_domain_mask() const noexcept override {
-        return aeg::pipeline::to_mask(FeatureDomain::kLogic);
-    }
-    [[nodiscard]] Result collect_contributions(aeg::pipeline::FeatureBuildContext&) const override {
-        return Result::success();
-    }
+
+protected:
+    [[nodiscard]] Result setup(BuilderType&) const override { return Result::success(); }
 
 private:
     FeatureDescriptor descriptor_{FeatureDescriptor{kBaseFeature,
                                                     "Game.BaseFeature",
-                                                    FeatureDomain::kLogic,
-                                                    aeg::pipeline::to_mask(FeatureDomain::kLogic),
+                                                    aeg::pipeline::FeatureDomain::kLogic,
+                                                    aeg::pipeline::to_mask(aeg::pipeline::FeatureDomain::kLogic),
                                                     aeg::pipeline::kAllPipelineScopes,
                                                     {1, 0, 0},
                                                     kBaseModule}};
