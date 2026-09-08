@@ -14,6 +14,7 @@
 #include "pipeline.hpp"
 #include "render_feature_runtime.hpp"
 #include "render_graph.hpp"
+#include "renderer.hpp"
 #include "world_scope.hpp"
 
 namespace aeg::engine {
@@ -36,7 +37,11 @@ struct EngineFrameDesc final {
     std::span<const render_graph::RenderGraphFeatureBufferBinding> render_feature_buffers{};
     std::span<const render_graph::RenderGraphFeatureTextureBinding> render_feature_textures{};
     std::span<const render_graph::RenderGraphExecutionLease> render_graph_execution_leases{};
+    renderer::Renderer* renderer{nullptr};
+    std::span<const renderer::RenderView> render_views{};
     void* user_data{nullptr};
+    const renderer::RenderResourceResolver* render_resource_resolver{nullptr};
+    bool require_resolved_render_resources{false};
 };
 
 /** @brief Non-owning registration of one World view and its Frame pipeline host. */
@@ -122,8 +127,10 @@ private:
     [[nodiscard]] foundation::Result prepare_world_frames();
     [[nodiscard]] foundation::Result apply_world_commands();
     [[nodiscard]] foundation::Result commit_worlds();
+    [[nodiscard]] foundation::Result extract_render_scenes();
     [[nodiscard]] foundation::Result build_render_features();
     [[nodiscard]] foundation::Result execute_render_graph();
+    [[nodiscard]] foundation::Result release_frame_artifacts();
     [[nodiscard]] foundation::Result finish_frame(bool clear_state);
     [[nodiscard]] foundation::Result fail_frame(foundation::Result result);
     [[nodiscard]] foundation::Result clear_frame_state() noexcept;
@@ -132,6 +139,8 @@ private:
     [[nodiscard]] world::WorldScope* find_world_for_host(const pipeline::PipelineScopeHost& host) const noexcept;
     [[nodiscard]] world::WorldFrameScope* find_frame_scope_for_host(
         const pipeline::PipelineScopeHost& host) const noexcept;
+    [[nodiscard]] const renderer::RenderSceneSnapshot* find_render_scene_snapshot(
+        const renderer::RenderView& view) const noexcept;
     [[nodiscard]] pipeline::PipelineScopeHost* find_pipeline_registration(
         pipeline::PipelineInstanceId instance) const noexcept;
     void remove_pipeline_registration(pipeline::PipelineScopeHost& host) noexcept;
@@ -155,9 +164,16 @@ private:
         const pipeline::ArtifactScopeBridge* previous_bridge{nullptr};
     };
     std::vector<ActiveWorldFrame> active_world_frames_{};
+    struct RenderFeatureContextBinding final {
+        pipeline::PipelineScopeHost* host{nullptr};
+        std::unique_ptr<renderer::RenderFeatureContext> context{};
+    };
+    std::vector<RenderFeatureContextBinding> render_feature_contexts_{};
     std::vector<render_graph::RenderGraphFeatureBufferBinding> feature_buffers_{};
     std::vector<render_graph::RenderGraphFeatureTextureBinding> feature_textures_{};
     std::vector<render_graph::RenderGraphExecutionLease> execution_leases_{};
+    std::vector<renderer::RenderView> render_views_{};
+    std::vector<std::shared_ptr<const renderer::RenderSceneSnapshot>> render_scene_snapshots_{};
     render_graph::RenderGraphTexture swapchain_resource_{};
     EngineFrameDesc frame_desc_{};
     uint64_t phase_revision_{0};

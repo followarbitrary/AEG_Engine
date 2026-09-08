@@ -33,6 +33,12 @@ namespace aeg::math {
  * - ClipSpaceConvention::reversed_z maps the near plane to 1 and the far
  *   plane to 0. The default maps near to 0 and far to 1.
  *
+ * Frustum:
+ * - Plane equations use n.x * x + n.y * y + n.z * z + offset.
+ * - Frustum planes are ordered Left, Right, Bottom, Top, Near, Far.
+ * - try_extract_frustum() returns normalized planes and preserves its output
+ *   argument when extraction fails.
+ *
  * Failure and comparison rules:
  * - try_* functions return false and leave their output argument unchanged
  *   when the input is invalid or the operation cannot be completed.
@@ -149,10 +155,60 @@ struct alignas(16) Mat4 {
     [[nodiscard]] const float& at(std::size_t row, std::size_t column) const noexcept;
 };
 
+/** @brief Projection-space conventions used by camera matrix construction. */
 struct ClipSpaceConvention {
     bool y_down{false};
 
     bool reversed_z{false};
+};
+
+/** @brief Stable semantic index of one view-space frustum plane. */
+enum class FrustumPlane : uint8_t {
+    kLeft = 0,
+    kRight = 1,
+    kBottom = 2,
+    kTop = 3,
+    kNear = 4,
+    kFar = 5,
+    kCount = 6,
+};
+
+inline constexpr std::size_t kFrustumPlaneCount = static_cast<std::size_t>(FrustumPlane::kCount);
+
+/**
+ * @brief Normalized plane equation stored in SIMD-friendly form.
+ *
+ * The equation is n.x * x + n.y * y + n.z * z + offset. A plane produced by
+ * try_extract_frustum() has a unit-length normal, so signed_distance() returns
+ * a geometric distance in world or view space.
+ */
+struct alignas(16) Plane {
+    Vec4 equation{};
+
+    constexpr Plane() = default;
+    constexpr explicit Plane(Vec4 equation_value) : equation(equation_value) {}
+
+    [[nodiscard]] Vec3 normal() const noexcept;
+    [[nodiscard]] float offset() const noexcept;
+    [[nodiscard]] float signed_distance(Vec3 point) const noexcept;
+    [[nodiscard]] bool is_valid() const noexcept;
+};
+
+/**
+ * @brief Six-plane convex view volume used for visibility and spatial queries.
+ *
+ * Planes are ordered by FrustumPlane and are normalized. A point is inside when
+ * every plane evaluates to a non-negative value. Query methods require a valid
+ * Frustum and are optimized for repeated hot-path tests.
+ */
+struct Frustum final {
+    std::array<Plane, kFrustumPlaneCount> planes{};
+
+    [[nodiscard]] Plane& operator[](FrustumPlane plane) noexcept;
+    [[nodiscard]] const Plane& operator[](FrustumPlane plane) const noexcept;
+    [[nodiscard]] bool is_valid() const noexcept;
+    [[nodiscard]] bool contains_point(Vec3 point) const noexcept;
+    [[nodiscard]] bool intersects_sphere(Vec3 center, float radius) const noexcept;
 };
 
 /**
@@ -176,6 +232,7 @@ static_assert(sizeof(Vec3) == sizeof(float) * 4);
 static_assert(sizeof(Vec4) == sizeof(float) * 4);
 static_assert(sizeof(Quat) == sizeof(float) * 4);
 static_assert(sizeof(Mat4) == sizeof(float) * 16);
+static_assert(sizeof(Plane) == sizeof(Vec4));
 
 // Vector operations use component-wise arithmetic. Division does not apply a
 // special zero-divisor policy and follows the platform floating-point rules.
@@ -267,16 +324,17 @@ Vec4& operator/=(Vec4& value, float scalar) noexcept;
 // Projection matrices assume a right-handed camera looking down -Z and map
 // depth to the 0..1 NDC range. try_* leaves result unchanged on failure;
 // non-try wrappers return a zero matrix on failure.
-[[nodiscard]] bool try_perspective(float vertical_fov_radians, float aspect_ratio, float near_plane,
-                                   float far_plane, Mat4& result,
-                                   ClipSpaceConvention convention = {}) noexcept;
-[[nodiscard]] Mat4 perspective(float vertical_fov_radians, float aspect_ratio, float near_plane,
-                               float far_plane, ClipSpaceConvention convention = {}) noexcept;
-[[nodiscard]] bool try_orthographic(float left, float right, float bottom, float top, float near_plane,
-                                    float far_plane, Mat4& result,
-                                    ClipSpaceConvention convention = {}) noexcept;
-[[nodiscard]] Mat4 orthographic(float left, float right, float bottom, float top, float near_plane,
-                                float far_plane, ClipSpaceConvention convention = {}) noexcept;
+[[nodiscard]] bool try_perspective(float vertical_fov_radians, float aspect_ratio, float near_plane, float far_plane,
+                                   Mat4& result, ClipSpaceConvention convention = {}) noexcept;
+[[nodiscard]] Mat4 perspective(float vertical_fov_radians, float aspect_ratio, float near_plane, float far_plane,
+                               ClipSpaceConvention convention = {}) noexcept;
+[[nodiscard]] bool try_orthographic(float left, float right, float bottom, float top, float near_plane, float far_plane,
+                                    Mat4& result, ClipSpaceConvention convention = {}) noexcept;
+[[nodiscard]] Mat4 orthographic(float left, float right, float bottom, float top, float near_plane, float far_plane,
+                                ClipSpaceConvention convention = {}) noexcept;
+/** @brief Extracts normalized view-volume planes from a projection or view-projection matrix. */
+[[nodiscard]] bool try_extract_frustum(const Mat4& view_projection, Frustum& result,
+                                       ClipSpaceConvention convention = {}) noexcept;
 [[nodiscard]] bool try_look_at(Vec3 eye, Vec3 target, Vec3 up, Mat4& result) noexcept;
 [[nodiscard]] Mat4 look_at(Vec3 eye, Vec3 target, Vec3 up) noexcept;
 // try_inverse() fails for non-finite or numerically singular matrices and

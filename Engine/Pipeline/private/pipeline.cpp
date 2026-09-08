@@ -197,21 +197,10 @@ std::string append_message(std::string prefix, const foundation::Result& result)
     return node.execution_domain != ExecutionDomain::kMainThread;
 }
 
-[[nodiscard]] foundation::Result invalid_argument(std::string message) {
-    return foundation::Result::failure(foundation::ResultCode::kInvalidArgument, std::move(message));
-}
-
-[[nodiscard]] foundation::Result invalid_state(std::string message) {
-    return foundation::Result::failure(foundation::ResultCode::kInvalidState, std::move(message));
-}
-
-[[nodiscard]] foundation::Result not_found(std::string message) {
-    return foundation::Result::failure(foundation::ResultCode::kNotFound, std::move(message));
-}
-
-[[nodiscard]] foundation::Result unsupported(std::string message) {
-    return foundation::Result::failure(foundation::ResultCode::kUnsupported, std::move(message));
-}
+using foundation::invalid_argument;
+using foundation::invalid_state;
+using foundation::not_found;
+using foundation::unsupported;
 
 [[nodiscard]] foundation::Result validate_artifact_descriptor(const ArtifactDescriptor& descriptor) {
     if (!descriptor.id.is_valid() || !descriptor.type.is_valid() || descriptor.version == 0 ||

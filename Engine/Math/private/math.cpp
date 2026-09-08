@@ -4,17 +4,18 @@
  */
 #include "../public/math.hpp"
 
-#include "simd/simd.hpp"
-
 #include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstddef>
 #include <limits>
 
+#include "simd/simd.hpp"
+
 namespace aeg::math {
 namespace {
 constexpr float kHalf = 0.5f;
+constexpr float kPlaneNormalizationTolerance = 1.0e-3f;
 
 [[nodiscard]] bool is_valid_scalar(float value) noexcept {
     return std::isfinite(value);
@@ -29,13 +30,36 @@ constexpr float kHalf = 0.5f;
 }
 
 [[nodiscard]] bool is_valid_vector(Vec4 value) noexcept {
-    return is_valid_scalar(value.x) && is_valid_scalar(value.y) && is_valid_scalar(value.z) &&
-           is_valid_scalar(value.w);
+    return is_valid_scalar(value.x) && is_valid_scalar(value.y) && is_valid_scalar(value.z) && is_valid_scalar(value.w);
+}
+
+[[nodiscard]] Vec4 matrix_row(const Mat4& matrix, std::size_t row) noexcept {
+    return Vec4{matrix.at(row, 0), matrix.at(row, 1), matrix.at(row, 2), matrix.at(row, 3)};
+}
+
+[[nodiscard]] bool try_normalize_plane(Vec4 equation, Plane& result) noexcept {
+    if (!is_valid_vector(equation)) {
+        return false;
+    }
+
+    const float normal_length = std::sqrt(equation.x * equation.x + equation.y * equation.y + equation.z * equation.z);
+    if (!is_valid_scalar(normal_length) || normal_length <= kEpsilon) {
+        return false;
+    }
+
+    const float inverse_length = 1.0f / normal_length;
+    const Vec4 normalized{equation.x * inverse_length, equation.y * inverse_length, equation.z * inverse_length,
+                          equation.w * inverse_length};
+    if (!is_valid_vector(normalized)) {
+        return false;
+    }
+
+    result = Plane{normalized};
+    return true;
 }
 
 [[nodiscard]] bool is_valid_quat(Quat value) noexcept {
-    return is_valid_scalar(value.x) && is_valid_scalar(value.y) && is_valid_scalar(value.z) &&
-           is_valid_scalar(value.w);
+    return is_valid_scalar(value.x) && is_valid_scalar(value.y) && is_valid_scalar(value.z) && is_valid_scalar(value.w);
 }
 
 [[nodiscard]] float safe_sqrt(float value) noexcept {
@@ -131,6 +155,81 @@ float& Mat4::at(std::size_t row, std::size_t column) noexcept {
 const float& Mat4::at(std::size_t row, std::size_t column) const noexcept {
     assert(row < 4 && column < 4);
     return columns[column][row];
+}
+
+Vec3 Plane::normal() const noexcept {
+    return Vec3{equation.x, equation.y, equation.z};
+}
+
+float Plane::offset() const noexcept {
+    return equation.w;
+}
+
+float Plane::signed_distance(Vec3 point) const noexcept {
+    return equation.x * point.x + equation.y * point.y + equation.z * point.z + equation.w;
+}
+
+bool Plane::is_valid() const noexcept {
+    if (!is_valid_vector(equation)) {
+        return false;
+    }
+
+    const float normal_length = std::sqrt(equation.x * equation.x + equation.y * equation.y + equation.z * equation.z);
+    return is_valid_scalar(normal_length) && normal_length > kEpsilon;
+}
+
+Plane& Frustum::operator[](FrustumPlane plane) noexcept {
+    const auto index = static_cast<std::size_t>(plane);
+    assert(index < kFrustumPlaneCount);
+    return planes[index];
+}
+
+const Plane& Frustum::operator[](FrustumPlane plane) const noexcept {
+    const auto index = static_cast<std::size_t>(plane);
+    assert(index < kFrustumPlaneCount);
+    return planes[index];
+}
+
+bool Frustum::is_valid() const noexcept {
+    for (const Plane& plane : planes) {
+        if (!plane.is_valid()) {
+            return false;
+        }
+
+        const float normal_length = length(plane.normal());
+        if (!is_valid_scalar(normal_length) || std::abs(normal_length - 1.0f) > kPlaneNormalizationTolerance) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool Frustum::contains_point(Vec3 point) const noexcept {
+    assert(is_valid());
+    if (!is_valid_vector(point)) {
+        return false;
+    }
+
+    for (const Plane& plane : planes) {
+        if (plane.signed_distance(point) < 0.0f) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool Frustum::intersects_sphere(Vec3 center, float radius) const noexcept {
+    assert(is_valid());
+    if (!is_valid_vector(center) || !is_valid_scalar(radius) || radius < 0.0f) {
+        return false;
+    }
+
+    for (const Plane& plane : planes) {
+        if (plane.signed_distance(center) < -radius) {
+            return false;
+        }
+    }
+    return true;
 }
 
 Vec2 operator+(Vec2 lhs, Vec2 rhs) noexcept {
@@ -365,8 +464,7 @@ Vec3 cross(Vec3 lhs, Vec3 rhs) noexcept {
 #if AEG_MATH_HAS_SSE2
     return detail::store_vec3(detail::cross3(detail::load(lhs), detail::load(rhs)));
 #else
-    return Vec3{lhs.y * rhs.z - lhs.z * rhs.y, lhs.z * rhs.x - lhs.x * rhs.z,
-                lhs.x * rhs.y - lhs.y * rhs.x};
+    return Vec3{lhs.y * rhs.z - lhs.z * rhs.y, lhs.z * rhs.x - lhs.x * rhs.z, lhs.x * rhs.y - lhs.y * rhs.x};
 #endif
 }
 
@@ -481,8 +579,8 @@ Quat quat_from_axis_angle(Vec3 axis, float radians) noexcept {
     }
     const float half_angle = radians * kHalf;
     const float sine = std::sin(half_angle);
-    return normalize(Quat{normalized_axis.x * sine, normalized_axis.y * sine, normalized_axis.z * sine,
-                         std::cos(half_angle)});
+    return normalize(
+        Quat{normalized_axis.x * sine, normalized_axis.y * sine, normalized_axis.z * sine, std::cos(half_angle)});
 }
 
 Vec3 rotate(Quat rotation, Vec3 value) noexcept {
@@ -501,14 +599,11 @@ Vec4 operator*(const Mat4& matrix, Vec4 value) noexcept {
     }
     return detail::store_vec4(result);
 #else
-    return Vec4{matrix.at(0, 0) * value.x + matrix.at(0, 1) * value.y + matrix.at(0, 2) * value.z +
-                    matrix.at(0, 3) * value.w,
-                matrix.at(1, 0) * value.x + matrix.at(1, 1) * value.y + matrix.at(1, 2) * value.z +
-                    matrix.at(1, 3) * value.w,
-                matrix.at(2, 0) * value.x + matrix.at(2, 1) * value.y + matrix.at(2, 2) * value.z +
-                    matrix.at(2, 3) * value.w,
-                matrix.at(3, 0) * value.x + matrix.at(3, 1) * value.y + matrix.at(3, 2) * value.z +
-                    matrix.at(3, 3) * value.w};
+    return Vec4{
+        matrix.at(0, 0) * value.x + matrix.at(0, 1) * value.y + matrix.at(0, 2) * value.z + matrix.at(0, 3) * value.w,
+        matrix.at(1, 0) * value.x + matrix.at(1, 1) * value.y + matrix.at(1, 2) * value.z + matrix.at(1, 3) * value.w,
+        matrix.at(2, 0) * value.x + matrix.at(2, 1) * value.y + matrix.at(2, 2) * value.z + matrix.at(2, 3) * value.w,
+        matrix.at(3, 0) * value.x + matrix.at(3, 1) * value.y + matrix.at(3, 2) * value.z + matrix.at(3, 3) * value.w};
 #endif
 }
 
@@ -518,9 +613,8 @@ Mat4 operator*(const Mat4& lhs, const Mat4& rhs) noexcept {
     for (std::size_t column = 0; column < 4; ++column) {
         detail::Float4 result_column = detail::zero();
         for (std::size_t source_column = 0; source_column < 4; ++source_column) {
-            result_column = detail::add(result_column,
-                                        detail::multiply(detail::load(lhs[source_column]),
-                                                         detail::splat(rhs[column][source_column])));
+            result_column = detail::add(result_column, detail::multiply(detail::load(lhs[source_column]),
+                                                                        detail::splat(rhs[column][source_column])));
         }
         result[column] = detail::store_vec4(result_column);
     }
@@ -632,9 +726,9 @@ Mat4 trs(Vec3 translation_value, Quat rotation, Vec3 scale_value) noexcept {
 
 bool try_perspective(float vertical_fov_radians, float aspect_ratio, float near_plane, float far_plane, Mat4& result,
                      ClipSpaceConvention convention) noexcept {
-    if (!is_valid_scalar(vertical_fov_radians) || !is_valid_scalar(aspect_ratio) ||
-        !is_valid_scalar(near_plane) || !is_valid_scalar(far_plane) || vertical_fov_radians <= 0.0f ||
-        vertical_fov_radians >= kPi || aspect_ratio <= 0.0f || near_plane <= 0.0f || far_plane <= near_plane) {
+    if (!is_valid_scalar(vertical_fov_radians) || !is_valid_scalar(aspect_ratio) || !is_valid_scalar(near_plane) ||
+        !is_valid_scalar(far_plane) || vertical_fov_radians <= 0.0f || vertical_fov_radians >= kPi ||
+        aspect_ratio <= 0.0f || near_plane <= 0.0f || far_plane <= near_plane) {
         return false;
     }
 
@@ -694,6 +788,36 @@ Mat4 orthographic(float left, float right, float bottom, float top, float near_p
     Mat4 result{};
     (void)try_orthographic(left, right, bottom, top, near_plane, far_plane, result, convention);
     return result;
+}
+
+bool try_extract_frustum(const Mat4& view_projection, Frustum& result, ClipSpaceConvention convention) noexcept {
+    const Vec4 row0 = matrix_row(view_projection, 0);
+    const Vec4 row1 = matrix_row(view_projection, 1);
+    const Vec4 row2 = matrix_row(view_projection, 2);
+    const Vec4 row3 = matrix_row(view_projection, 3);
+
+    std::array<Vec4, kFrustumPlaneCount> raw{};
+    raw[static_cast<std::size_t>(FrustumPlane::kLeft)] = row3 + row0;
+    raw[static_cast<std::size_t>(FrustumPlane::kRight)] = row3 - row0;
+    raw[static_cast<std::size_t>(FrustumPlane::kBottom)] = convention.y_down ? row3 - row1 : row3 + row1;
+    raw[static_cast<std::size_t>(FrustumPlane::kTop)] = convention.y_down ? row3 + row1 : row3 - row1;
+    if (convention.reversed_z) {
+        raw[static_cast<std::size_t>(FrustumPlane::kNear)] = row3 - row2;
+        raw[static_cast<std::size_t>(FrustumPlane::kFar)] = row2;
+    } else {
+        raw[static_cast<std::size_t>(FrustumPlane::kNear)] = row2;
+        raw[static_cast<std::size_t>(FrustumPlane::kFar)] = row3 - row2;
+    }
+
+    Frustum extracted{};
+    for (std::size_t index = 0; index < kFrustumPlaneCount; ++index) {
+        if (!try_normalize_plane(raw[index], extracted.planes[index])) {
+            return false;
+        }
+    }
+
+    result = extracted;
+    return true;
 }
 
 bool try_look_at(Vec3 eye, Vec3 target, Vec3 up, Mat4& result) noexcept {

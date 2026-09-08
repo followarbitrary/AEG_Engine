@@ -61,6 +61,7 @@ struct RenderGraphFeatureContext {
     FeaturePointPosition point_position{FeaturePointPosition::kBefore};
     FeaturePointFlags point_flags{FeaturePointFlags::kNone};
     void* user_data{nullptr};
+    const void* feature_data{nullptr};
 
     [[nodiscard]] bool allows(FeaturePointFlags flag) const noexcept { return has_flag(point_flags, flag); }
 };
@@ -206,6 +207,7 @@ public:
     [[nodiscard]] FeaturePointPosition feature_point_position() const noexcept;
     [[nodiscard]] FeaturePointFlags feature_point_flags() const noexcept;
     [[nodiscard]] void* user_data() const noexcept;
+    [[nodiscard]] const void* feature_data() const noexcept;
     [[nodiscard]] bool allows(FeaturePointFlags flag) const noexcept;
     [[nodiscard]] bool is_runtime() const noexcept;
 
@@ -1413,6 +1415,10 @@ inline FeaturePointFlags RenderGraphBuilder::feature_point_flags() const noexcep
 
 inline void* RenderGraphBuilder::user_data() const noexcept {
     return declaration_context_ != nullptr ? nullptr : runtime_context_.user_data;
+}
+
+inline const void* RenderGraphBuilder::feature_data() const noexcept {
+    return declaration_context_ != nullptr ? nullptr : runtime_context_.feature_data;
 }
 
 inline bool RenderGraphBuilder::allows(FeaturePointFlags flag) const noexcept {

@@ -9,6 +9,8 @@
 
 - `public/result.hpp`：`Result` 与 `ResultValue`。
 - `private/result.cpp`：结果类型的非内联实现。
+- `invalid_argument()`、`invalid_state()`、`unsupported()`、`not_found()`、
+  `not_ready()`、`out_of_memory()` 和 `unknown_exception()`：跨模块共享的标准错误结果构造函数。
 - `ResultCode::kCancelled`：用于任务、批次和帧级协作式取消的稳定错误分类。
 
 ## 依赖边界

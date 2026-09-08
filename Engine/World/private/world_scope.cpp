@@ -12,21 +12,10 @@
 
 namespace aeg::world {
 namespace {
-[[nodiscard]] foundation::Result invalid_argument(std::string message) {
-    return foundation::Result::failure(foundation::ResultCode::kInvalidArgument, std::move(message));
-}
-
-[[nodiscard]] foundation::Result invalid_state(std::string message) {
-    return foundation::Result::failure(foundation::ResultCode::kInvalidState, std::move(message));
-}
-
-[[nodiscard]] foundation::Result not_ready(std::string message) {
-    return foundation::Result::failure(foundation::ResultCode::kNotReady, std::move(message));
-}
-
-[[nodiscard]] foundation::Result out_of_memory(std::string message) {
-    return foundation::Result::failure(foundation::ResultCode::kOutOfMemory, std::move(message));
-}
+using foundation::invalid_argument;
+using foundation::invalid_state;
+using foundation::not_ready;
+using foundation::out_of_memory;
 
 [[nodiscard]] pipeline::PipelineInstanceId make_world_pipeline_instance_id(WorldHandle handle) noexcept {
     uint64_t value = 14695981039346656037ull;

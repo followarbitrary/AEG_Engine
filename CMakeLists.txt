@@ -345,6 +345,29 @@ if (WIN32)
     target_compile_definitions(aeg_world_multi_view_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
+add_library(aeg_renderer STATIC
+    Engine/Renderer/private/renderer.cpp
+)
+target_compile_features(aeg_renderer PUBLIC cxx_std_20)
+target_include_directories(aeg_renderer
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Renderer/public
+)
+target_link_libraries(aeg_renderer
+    PUBLIC
+        aeg_ecs
+        aeg_math
+        aeg_pipeline
+    PRIVATE
+        aeg_world
+)
+
+if (MSVC)
+    target_compile_options(aeg_renderer PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(aeg_renderer PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
 include(CTest)
 
 set(AEG_VMA_INCLUDE_DIR
@@ -481,7 +504,7 @@ target_include_directories(aeg_engine
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Runtime/public
 )
-target_link_libraries(aeg_engine PUBLIC aeg_foundation aeg_pipeline aeg_render_graph aeg_world)
+target_link_libraries(aeg_engine PUBLIC aeg_foundation aeg_pipeline aeg_render_graph aeg_world aeg_renderer)
 
 if (MSVC)
     target_compile_options(aeg_engine PRIVATE /W4 /permissive-)
@@ -495,6 +518,14 @@ add_executable(aeg_engine_frame_orchestrator_smoke
 target_link_libraries(aeg_engine_frame_orchestrator_smoke PRIVATE aeg_engine aeg_rhi)
 if (WIN32)
     target_compile_definitions(aeg_engine_frame_orchestrator_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
+add_executable(aeg_renderer_smoke
+    tests/renderer_smoke.cpp
+)
+target_link_libraries(aeg_renderer_smoke PRIVATE aeg_engine aeg_renderer aeg_rhi)
+if (WIN32)
+    target_compile_definitions(aeg_renderer_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
 add_executable(aeg_render_feature_runtime_smoke
@@ -646,6 +677,7 @@ if (BUILD_TESTING)
     add_test(NAME aeg_world_frame_orchestrator_smoke COMMAND aeg_world_frame_orchestrator_smoke)
     add_test(NAME aeg_world_multi_view_smoke COMMAND aeg_world_multi_view_smoke)
     add_test(NAME aeg_engine_frame_orchestrator_smoke COMMAND aeg_engine_frame_orchestrator_smoke)
+    add_test(NAME aeg_renderer_smoke COMMAND aeg_renderer_smoke)
     add_test(NAME aeg_render_feature_runtime_smoke COMMAND aeg_render_feature_runtime_smoke)
     add_test(NAME aeg_frame_retention_smoke COMMAND aeg_frame_retention_smoke)
     add_test(NAME aeg_rhi_smoke COMMAND aeg_rhi_smoke)
@@ -653,7 +685,7 @@ if (BUILD_TESTING)
     add_test(NAME aeg_triangle COMMAND aeg_triangle --frames 1)
     if (MINGW)
         get_filename_component(AEG_MINGW_RUNTIME_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
-        set_tests_properties(aeg_math_smoke aeg_result_smoke aeg_concurrency_smoke aeg_ecs_smoke aeg_pipeline_smoke aeg_pipeline_extension_smoke aeg_pipeline_runtime_smoke aeg_pipeline_hot_swap_smoke aeg_pipeline_phase_scheduler_smoke aeg_world_scope_smoke aeg_world_frame_orchestrator_smoke aeg_world_multi_view_smoke aeg_engine_frame_orchestrator_smoke aeg_render_feature_runtime_smoke aeg_frame_retention_smoke aeg_rhi_smoke aeg_logging_smoke aeg_triangle PROPERTIES
+        set_tests_properties(aeg_math_smoke aeg_result_smoke aeg_concurrency_smoke aeg_ecs_smoke aeg_pipeline_smoke aeg_pipeline_extension_smoke aeg_pipeline_runtime_smoke aeg_pipeline_hot_swap_smoke aeg_pipeline_phase_scheduler_smoke aeg_world_scope_smoke aeg_world_frame_orchestrator_smoke aeg_world_multi_view_smoke aeg_engine_frame_orchestrator_smoke aeg_renderer_smoke aeg_render_feature_runtime_smoke aeg_frame_retention_smoke aeg_rhi_smoke aeg_logging_smoke aeg_triangle PROPERTIES
             ENVIRONMENT "PATH=${AEG_MINGW_RUNTIME_DIR};$ENV{PATH}"
         )
     endif()

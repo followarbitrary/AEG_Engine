@@ -14,25 +14,11 @@
 
 namespace aeg::engine {
 namespace {
-[[nodiscard]] foundation::Result invalid_argument(std::string message) {
-    return foundation::Result::failure(foundation::ResultCode::kInvalidArgument, std::move(message));
-}
-
-[[nodiscard]] foundation::Result invalid_state(std::string message) {
-    return foundation::Result::failure(foundation::ResultCode::kInvalidState, std::move(message));
-}
-
-[[nodiscard]] foundation::Result not_found(std::string message) {
-    return foundation::Result::failure(foundation::ResultCode::kNotFound, std::move(message));
-}
-
-[[nodiscard]] foundation::Result out_of_memory(std::string message) {
-    return foundation::Result::failure(foundation::ResultCode::kOutOfMemory, std::move(message));
-}
-
-[[nodiscard]] foundation::Result unsupported(std::string message) {
-    return foundation::Result::failure(foundation::ResultCode::kUnsupported, std::move(message));
-}
+using foundation::invalid_argument;
+using foundation::invalid_state;
+using foundation::not_found;
+using foundation::out_of_memory;
+using foundation::unsupported;
 
 [[nodiscard]] bool is_present_status(foundation::ResultCode code) noexcept {
     return code == foundation::ResultCode::kOutOfDate || code == foundation::ResultCode::kSurfaceLost;
@@ -74,6 +60,7 @@ EngineFrameOrchestrator::~EngineFrameOrchestrator() {
     if (frame_active_ || frame_context_.is_frame_active()) {
         (void)frame_context_.abort_frame();
     }
+    (void)release_frame_artifacts();
     if (initialized_ && !frame_context_.is_frame_active()) {
         (void)deactivate_all();
     }
@@ -508,6 +495,9 @@ foundation::Result EngineFrameOrchestrator::begin_frame(const EngineFrameDesc& d
         feature_buffers_.assign(desc.render_feature_buffers.begin(), desc.render_feature_buffers.end());
         feature_textures_.assign(desc.render_feature_textures.begin(), desc.render_feature_textures.end());
         execution_leases_.assign(desc.render_graph_execution_leases.begin(), desc.render_graph_execution_leases.end());
+        render_views_.assign(desc.render_views.begin(), desc.render_views.end());
+        render_scene_snapshots_.clear();
+        render_feature_contexts_.clear();
     } catch (const std::bad_alloc&) {
         return out_of_memory("frame descriptor copy allocation failed");
     }
@@ -518,6 +508,7 @@ foundation::Result EngineFrameOrchestrator::begin_frame(const EngineFrameDesc& d
         feature_textures_.data(), feature_textures_.size());
     frame_desc_.render_graph_execution_leases =
         std::span<const render_graph::RenderGraphExecutionLease>(execution_leases_.data(), execution_leases_.size());
+    frame_desc_.render_views = std::span<const renderer::RenderView>(render_views_.data(), render_views_.size());
 
     const foundation::Result begin_result = frame_context_.begin_frame();
     if (!begin_result) {
@@ -685,6 +676,17 @@ world::WorldFrameScope* EngineFrameOrchestrator::find_frame_scope_for_host(
     return nullptr;
 }
 
+const renderer::RenderSceneSnapshot* EngineFrameOrchestrator::find_render_scene_snapshot(
+    const renderer::RenderView& view) const noexcept {
+    for (std::size_t index = 0; index < render_views_.size() && index < render_scene_snapshots_.size(); ++index) {
+        const renderer::RenderView& candidate = render_views_[index];
+        if (candidate.id == view.id || (candidate.world == view.world && candidate.view_id == view.view_id)) {
+            return render_scene_snapshots_[index].get();
+        }
+    }
+    return nullptr;
+}
+
 foundation::Result EngineFrameOrchestrator::prepare_world_frames() {
     clear_world_frames();
     try {
@@ -763,6 +765,120 @@ foundation::Result EngineFrameOrchestrator::commit_worlds() {
     return foundation::Result::success();
 }
 
+foundation::Result EngineFrameOrchestrator::extract_render_scenes() {
+    if (frame_desc_.renderer == nullptr && !render_views_.empty()) {
+        return invalid_argument("render views require a Renderer instance");
+    }
+    if (frame_desc_.renderer == nullptr) {
+        return foundation::Result::success();
+    }
+    if (!worlds_committed_) {
+        return invalid_state("RenderExtract requires committed World snapshots");
+    }
+
+    try {
+        if (render_views_.empty()) {
+            render_views_.reserve(active_world_frames_.size());
+            for (const ActiveWorldFrame& active : active_world_frames_) {
+                if (active.binding.world == nullptr) {
+                    return invalid_state("active World Frame binding has no World Scope");
+                }
+                renderer::RenderView view{};
+                view.id = renderer::make_render_view_id(active.binding.world->handle(), active.binding.view_id);
+                view.world = active.binding.world->handle();
+                view.view_id = active.binding.view_id;
+                if (frame_desc_.acquire_swapchain_image) {
+                    view.output_extent = {frame_desc_.swapchain_image_desc.extent.width,
+                                          frame_desc_.swapchain_image_desc.extent.height};
+                }
+                render_views_.push_back(view);
+            }
+        }
+        if (render_views_.empty()) {
+            return foundation::Result::success();
+        }
+
+        const bool single_swapchain_view = frame_desc_.acquire_swapchain_image && render_views_.size() == 1;
+        const pipeline::RenderResourceId default_color_target =
+            single_swapchain_view ? frame_desc_.swapchain_resource_id : pipeline::RenderResourceId{};
+        render_scene_snapshots_.reserve(render_views_.size());
+        for (std::size_t view_index = 0; view_index < render_views_.size(); ++view_index) {
+            renderer::RenderView& view = render_views_[view_index];
+            if (single_swapchain_view && !view.color_target.is_valid()) {
+                view.output_extent = {frame_desc_.swapchain_image_desc.extent.width,
+                                      frame_desc_.swapchain_image_desc.extent.height};
+            }
+            if (const foundation::Result result = frame_desc_.renderer->prepare_view(view, default_color_target);
+                !result) {
+                return result;
+            }
+            if (frame_desc_.acquire_swapchain_image && render_views_.size() > 1 && !view.color_target.is_valid()) {
+                return invalid_argument("multiple swapchain views require explicit color targets");
+            }
+            for (std::size_t previous_index = 0; previous_index < view_index; ++previous_index) {
+                const renderer::RenderView& previous = render_views_[previous_index];
+                if (previous.id == view.id || (previous.world == view.world && previous.view_id == view.view_id)) {
+                    return invalid_state("RenderExtract received duplicate RenderView identity");
+                }
+            }
+
+            ActiveWorldFrame* active_frame = nullptr;
+            for (ActiveWorldFrame& candidate : active_world_frames_) {
+                if (candidate.binding.world != nullptr && candidate.scope != nullptr &&
+                    candidate.binding.world->handle() == view.world && candidate.binding.view_id == view.view_id) {
+                    if (active_frame != nullptr) {
+                        return invalid_state("RenderView matches more than one active World view");
+                    }
+                    active_frame = &candidate;
+                }
+            }
+            if (active_frame == nullptr || active_frame->binding.frame_host == nullptr ||
+                active_frame->scope == nullptr) {
+                return not_found("RenderView has no registered World Frame scope");
+            }
+
+            const foundation::ResultValue<std::shared_ptr<const renderer::RenderSceneSnapshot>> snapshot =
+                frame_desc_.renderer->extract(
+                    *active_frame->scope, view,
+                    renderer::RenderExtractionDesc{frame_context_.frame_number(), frame_desc_.user_data,
+                                                   frame_desc_.render_resource_resolver,
+                                                   frame_desc_.require_resolved_render_resources});
+            if (!snapshot) {
+                return snapshot.result;
+            }
+            if (const foundation::Result result =
+                    frame_desc_.renderer->publish_frame_snapshot(*active_frame->binding.frame_host, snapshot.value);
+                !result) {
+                return result;
+            }
+            render_scene_snapshots_.push_back(snapshot.value);
+        }
+        frame_desc_.render_views = std::span<const renderer::RenderView>(render_views_.data(), render_views_.size());
+    } catch (const std::bad_alloc&) {
+        return out_of_memory("RenderExtract scene snapshot bookkeeping allocation failed");
+    } catch (const std::exception& exception) {
+        return foundation::Result::failure(foundation::ResultCode::kUnknown, exception.what());
+    } catch (...) {
+        return foundation::Result::failure(foundation::ResultCode::kUnknown,
+                                           "RenderExtract threw an unknown exception");
+    }
+    return foundation::Result::success();
+}
+
+foundation::Result EngineFrameOrchestrator::release_frame_artifacts() {
+    foundation::Result first_error = foundation::Result::success();
+    for (pipeline::PipelineScopeHost* host : pipelines_) {
+        if (host == nullptr) {
+            continue;
+        }
+        const foundation::Result result = host->artifacts().release_lifetime(pipeline::ArtifactLifetime::kFrame);
+        if (!result && first_error) {
+            first_error = result;
+        }
+    }
+    return first_error;
+}
+
 void EngineFrameOrchestrator::clear_world_frames() noexcept {
     for (const ActiveWorldFrame& active : active_world_frames_) {
         if (active.binding.frame_host != nullptr) {
@@ -777,14 +893,40 @@ foundation::Result EngineFrameOrchestrator::build_render_features() {
     if (render_features_built_) {
         return foundation::Result::success();
     }
-    const render_graph::RenderGraphFeatureRuntimeDesc desc{
-        std::span<const render_graph::RenderGraphFeatureBufferBinding>(feature_buffers_.data(),
-                                                                       feature_buffers_.size()),
-        std::span<const render_graph::RenderGraphFeatureTextureBinding>(feature_textures_.data(),
-                                                                        feature_textures_.size()),
-        frame_desc_.user_data};
     try {
+        render_feature_contexts_.clear();
+        render_feature_contexts_.reserve(pinned_pipelines_.size());
         for (const PinnedPipeline& pinned_pipeline : pinned_pipelines_) {
+            const renderer::RenderFeatureContext* feature_context = nullptr;
+            if (frame_desc_.renderer != nullptr && pinned_pipeline.host != nullptr &&
+                pinned_pipeline.host->scope() == pipeline::PipelineScope::kFrame) {
+                for (const ActiveWorldFrame& active : active_world_frames_) {
+                    if (active.binding.frame_host != pinned_pipeline.host || active.scope == nullptr ||
+                        active.binding.world == nullptr) {
+                        continue;
+                    }
+                    renderer::RenderView view{};
+                    view.id = renderer::make_render_view_id(active.binding.world->handle(), active.binding.view_id);
+                    view.world = active.binding.world->handle();
+                    view.view_id = active.binding.view_id;
+                    const renderer::RenderSceneSnapshot* snapshot = find_render_scene_snapshot(view);
+                    if (snapshot == nullptr) {
+                        return not_found("Frame pipeline has no extracted RenderSceneSnapshot");
+                    }
+                    auto context = std::make_unique<renderer::RenderFeatureContext>(renderer::RenderFeatureContext{
+                        snapshot, frame_desc_.render_resource_resolver, frame_desc_.user_data});
+                    feature_context = context.get();
+                    render_feature_contexts_.push_back(
+                        RenderFeatureContextBinding{pinned_pipeline.host, std::move(context)});
+                    break;
+                }
+            }
+            const render_graph::RenderGraphFeatureRuntimeDesc desc{
+                std::span<const render_graph::RenderGraphFeatureBufferBinding>(feature_buffers_.data(),
+                                                                               feature_buffers_.size()),
+                std::span<const render_graph::RenderGraphFeatureTextureBinding>(feature_textures_.data(),
+                                                                                feature_textures_.size()),
+                frame_desc_.user_data, feature_context};
             pipeline::PipelinePlanHandle plan = pinned_pipeline.plan;
             if (const foundation::Result result =
                     render_graph::build_render_graph_features(render_graph_, std::move(plan), registry_, desc);
@@ -921,6 +1063,11 @@ foundation::Result EngineFrameOrchestrator::execute_registered_phase(pipeline::P
             return result;
         }
     }
+    if (mode == PhaseExecutionMode::kFrame && is_builtin_phase(phase, pipeline::EnginePhase::kRenderExtract)) {
+        if (const foundation::Result result = extract_render_scenes(); !result) {
+            return result;
+        }
+    }
     if (frame_active_) {
         bool world_commit_executed = false;
         for (const PinnedPipeline& pinned_pipeline : pinned_pipelines_) {
@@ -1040,6 +1187,8 @@ foundation::Result EngineFrameOrchestrator::finish_frame(bool clear_state) {
         return fail_frame(end_result);
     }
 
+    const foundation::Result artifact_release_result = release_frame_artifacts();
+
     frame_active_ = false;
     if (clear_state) {
         (void)clear_frame_state();
@@ -1053,6 +1202,9 @@ foundation::Result EngineFrameOrchestrator::finish_frame(bool clear_state) {
         if (!result && retirement_error) {
             retirement_error = result;
         }
+    }
+    if (!artifact_release_result) {
+        retirement_error = append_failure(std::move(retirement_error), artifact_release_result);
     }
     if (!retirement_error) {
         return retirement_error;
@@ -1070,6 +1222,7 @@ foundation::Result EngineFrameOrchestrator::fail_frame(foundation::Result result
     } else {
         frame_active_ = true;
     }
+    result = append_failure(std::move(result), release_frame_artifacts());
     return result;
 }
 
@@ -1080,6 +1233,9 @@ foundation::Result EngineFrameOrchestrator::clear_frame_state() noexcept {
     feature_buffers_.clear();
     feature_textures_.clear();
     execution_leases_.clear();
+    render_views_.clear();
+    render_scene_snapshots_.clear();
+    render_feature_contexts_.clear();
     if (!preserve_swapchain_resource) {
         swapchain_resource_ = {};
     }
@@ -1204,6 +1360,10 @@ foundation::Result EngineFrameOrchestrator::shutdown() {
                 first_error = invalid_state("cannot shut down while the active frame remains unresolved");
             }
             return first_error;
+        }
+        const foundation::Result artifact_release_result = release_frame_artifacts();
+        if (!artifact_release_result && first_error) {
+            first_error = artifact_release_result;
         }
         (void)clear_frame_state();
     }

@@ -5,6 +5,7 @@
 #pragma once
 
 #include <cstdint>
+#include <exception>
 #include <string>
 #include <utility>
 
@@ -50,6 +51,27 @@ struct Result {
 
     [[nodiscard]] explicit operator bool() const noexcept { return code == ResultCode::kSuccess; }
 };
+
+/** @brief Creates an invalid-argument failure with the supplied diagnostic. */
+[[nodiscard]] Result invalid_argument(std::string message);
+
+/** @brief Creates an invalid-state failure with the supplied diagnostic. */
+[[nodiscard]] Result invalid_state(std::string message);
+
+/** @brief Creates an unsupported-operation failure with the supplied diagnostic. */
+[[nodiscard]] Result unsupported(std::string message);
+
+/** @brief Creates a not-found failure with the supplied diagnostic. */
+[[nodiscard]] Result not_found(std::string message);
+
+/** @brief Creates a not-ready failure with the supplied diagnostic. */
+[[nodiscard]] Result not_ready(std::string message);
+
+/** @brief Creates an out-of-memory failure with the supplied diagnostic. */
+[[nodiscard]] Result out_of_memory(std::string message);
+
+/** @brief Converts an exception into an unknown-result failure. */
+[[nodiscard]] Result unknown_exception(const std::exception& exception);
 
 /**
  * @brief Couples an operation status with a returned value.

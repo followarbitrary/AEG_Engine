@@ -7,27 +7,27 @@
 
 ## 一级模块
 
-| 目录              | 职责                                               | 状态     |
-|-------------------|----------------------------------------------------|----------|
-| `Foundation`      | 结果类型、错误传播和最低层通用定义                 | 已实现   |
-| `Logging`         | 统一日志、日志级别和 Quill 适配                    | 已实现   |
-| `Math`            | 标量/SIMD 数学与图形变换基础                       | 已实现   |
-| `Pipeline`        | Pipeline、Feature、Artifact、Compiler 和 Scheduler | 已实现   |
-| `RHI`             | 后端无关的 GPU 资源、命令和同步抽象                | 已实现   |
-| `RenderGraph`     | 帧内资源图、Pass、Barrier 和队列同步               | 已实现   |
-| `Resource`        | Mesh、Texture、Material、Render Target 和上传      | 已实现   |
-| `Shader`          | Shader Asset、Reflection、Contract 和布局信息      | 已实现   |
-| `Runtime`         | Engine 生命周期与统一帧编排                        | 已实现   |
-| `Renderer`        | 面向渲染域的高层策略和渲染管线                     | 预留     |
-| `ECS`             | World 数据组织和实体组件系统                       | 已实现   |
-| `World`           | ECS 与 World Scope Pipeline 的数据流适配           | 基础实现 |
-| `Concurrency`     | 通用任务系统、线程协调和并发原语                   | 基础实现 |
-| `Platform`        | 操作系统、窗口、文件和平台适配                     | 预留     |
-| `Diagnostics`     | 断言、性能分析、崩溃和运行时诊断                   | 预留     |
-| `Reflection`      | 类型元数据和运行时反射                             | 预留     |
-| `Serialization`   | 配置、存档和资产序列化                             | 预留     |
-| `EditorFramework` | 编辑器专用框架与工具扩展                           | 预留     |
-| `Tooling`         | 离线工具、代码生成和构建辅助                       | 预留     |
+| 目录              | 职责                                                 | 状态     |
+|-------------------|------------------------------------------------------|----------|
+| `Foundation`      | 结果类型、错误传播和最低层通用定义                   | 已实现   |
+| `Logging`         | 统一日志、日志级别和 Quill 适配                      | 已实现   |
+| `Math`            | 标量/SIMD 数学与图形变换基础                         | 已实现   |
+| `Pipeline`        | Pipeline、Feature、Artifact、Compiler 和 Scheduler   | 已实现   |
+| `RHI`             | 后端无关的 GPU 资源、命令和同步抽象                  | 已实现   |
+| `RenderGraph`     | 帧内资源图、Pass、Barrier 和队列同步                 | 已实现   |
+| `Resource`        | Mesh、Texture、Material、Render Target 和上传        | 已实现   |
+| `Shader`          | Shader Asset、Reflection、Contract 和布局信息        | 已实现   |
+| `Runtime`         | Engine 生命周期与统一帧编排                          | 已实现   |
+| `Renderer`        | RenderExtract、RenderSceneSnapshot 和 RenderPipeline | 基础实现 |
+| `ECS`             | World 数据组织和实体组件系统                         | 已实现   |
+| `World`           | ECS 与 World Scope Pipeline 的数据流适配             | 基础实现 |
+| `Concurrency`     | 通用任务系统、线程协调和并发原语                     | 基础实现 |
+| `Platform`        | 操作系统、窗口、文件和平台适配                       | 预留     |
+| `Diagnostics`     | 断言、性能分析、崩溃和运行时诊断                     | 预留     |
+| `Reflection`      | 类型元数据和运行时反射                               | 预留     |
+| `Serialization`   | 配置、存档和资产序列化                               | 预留     |
+| `EditorFramework` | 编辑器专用框架与工具扩展                             | 预留     |
+| `Tooling`         | 离线工具、代码生成和构建辅助                         | 预留     |
 
 ## 目录约定
 
