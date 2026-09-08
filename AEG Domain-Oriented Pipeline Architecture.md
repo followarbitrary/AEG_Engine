@@ -3549,18 +3549,18 @@ WorkerExecutor 视为真实 GPU 执行线程。
 
 ### 26.1 开发者通常需要实现的内容
 
-| 开发者需求        | 应实现/调用                                                                               |
-|-------------------|-------------------------------------------------------------------------------------------|
-| 新增功能调度单元  | 继承 `Pipeline`，实现 `descriptor()` 和 `build()`                                         |
-| 新增单领域功能    | 继承 `LogicFeature`、`PhysicsFeature`、`RenderFeature`、`AudioFeature` 或 `StreamFeature` |
-| 新增跨领域功能    | 继承 `CompositeFeature<Parts...>`，组合具体领域 Part                                      |
-| 声明输入输出      | 使用 `PipelineBuilder`/领域 Builder 声明 ArtifactBinding                                  |
-| 接入已有 Pipeline | 注册 Feature 类型并绑定到公开 FeaturePoint                                                |
-| 使用多个 World    | 由 `WorldManager` 创建独立 World，并为每个 World 创建独立 `WorldScope` 和 Host            |
-| 修改运行拓扑      | 显式调用 `PipelineScopeHost::rebuild(registry)`，并在安全点切换 Plan                   |
-| 增加渲染能力      | 实现 `RenderFeature`，使用 `RenderGraphBuilder`                                           |
+| 开发者需求        | 应实现/调用                                                                                                                                 |
+|-------------------|---------------------------------------------------------------------------------------------------------------------------------------------|
+| 新增功能调度单元  | 继承 `Pipeline`，实现 `descriptor()` 和 `build()`                                                                                           |
+| 新增单领域功能    | 继承 `LogicFeature`、`PhysicsFeature`、`RenderFeature`、`AudioFeature` 或 `StreamFeature`                                                   |
+| 新增跨领域功能    | 继承 `CompositeFeature<Parts...>`，组合具体领域 Part                                                                                        |
+| 声明输入输出      | 使用 `PipelineBuilder`/领域 Builder 声明 ArtifactBinding                                                                                    |
+| 接入已有 Pipeline | 注册 Feature 类型并绑定到公开 FeaturePoint                                                                                                  |
+| 使用多个 World    | 由 `WorldManager` 创建独立 World，并为每个 World 创建独立 `WorldScope` 和 Host                                                              |
+| 修改运行拓扑      | 显式调用 `PipelineScopeHost::rebuild(registry)`，并在安全点切换 Plan                                                                        |
+| 增加渲染能力      | 实现 `RenderFeature`，使用 `RenderGraphBuilder`                                                                                             |
 | 增加编辑器绘制    | 当前使用 `PipelineScopeHost(kEditor)` 与 RenderFeature/RenderGraphRuntime；`FrameOverlayBuilder` 仍属于目标封装，不直接修改基础 RenderGraph |
-| 增加动态插件      | 实现版本化 Module ABI，不跨 DLL 传递 STL/异常                                             |
+| 增加动态插件      | 实现版本化 Module ABI，不跨 DLL 传递 STL/异常                                                                                               |
 
 ### 26.2 禁止用法
 
@@ -4308,10 +4308,10 @@ FrameLocal Set 不会在对应 Slot 回收后继续使用，并在 GPU 使用完
 
 #### `BarrierMode`
 
-| 枚举值      | 精确定义                                                             | 调用方责任                                                                                        | 错误表现                                                             |
-|-------------|----------------------------------------------------------------------|---------------------------------------------------------------------------------------------------|----------------------------------------------------------------------|
-| `kImplicit` | RHI 根据当前 Command List 中资源命令使用的资源和已跟踪状态自动插入必要的本地状态转换 | 仍必须声明正确的资源用途、队列和跨 Command List/跨 Queue 依赖；不能把自动转换当作跨提交等待 | 参数非法、资源缺失或队列依赖无法满足时仍返回错误                     |
-| `kExplicit` | RHI 不替调用方补齐资源状态转换；调用方必须先提交精确的 `BarrierDesc` | `before` 必须匹配跟踪状态，`after` 必须覆盖后续命令的 Usage/Stage/Queue；跨队列必须有对应提交等待 | 未声明 Barrier、before 状态不匹配或 Usage 不匹配返回 `kInvalidState` |
+| 枚举值      | 精确定义                                                                             | 调用方责任                                                                                        | 错误表现                                                             |
+|-------------|--------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------|----------------------------------------------------------------------|
+| `kImplicit` | RHI 根据当前 Command List 中资源命令使用的资源和已跟踪状态自动插入必要的本地状态转换 | 仍必须声明正确的资源用途、队列和跨 Command List/跨 Queue 依赖；不能把自动转换当作跨提交等待       | 参数非法、资源缺失或队列依赖无法满足时仍返回错误                     |
+| `kExplicit` | RHI 不替调用方补齐资源状态转换；调用方必须先提交精确的 `BarrierDesc`                 | `before` 必须匹配跟踪状态，`after` 必须覆盖后续命令的 Usage/Stage/Queue；跨队列必须有对应提交等待 | 未声明 Barrier、before 状态不匹配或 Usage 不匹配返回 `kInvalidState` |
 
 RenderGraph 执行使用 `kExplicit`，因为 Graph Compiler 已经拥有完整的资源依赖和
 生命周期信息。直接使用 RHI 的独立 Command List 可以选择 `kImplicit`，但一个命令
@@ -4484,16 +4484,16 @@ Swapchain 生命周期操作，必须通过 `submit_frame()` 和 `present()` 完
 
 #### 当前 Vulkan 后端的能力边界速查
 
-| 功能类别      | 当前可用值/组合                                                                     | 当前明确返回 `kUnsupported` 的情况                        |
-|---------------|-------------------------------------------------------------------------------------|-----------------------------------------------------------|
+| 功能类别      | 当前可用值/组合                                                                              | 当前明确返回 `kUnsupported` 的情况                        |
+|---------------|----------------------------------------------------------------------------------------------|-----------------------------------------------------------|
 | Present Mode  | 请求值若存在则使用；否则使用 FIFO（若可用），再否则使用 Surface 的第一个可用模式并报告有效值 | Surface 没有任何呈现模式，或请求的图像 Usage 不受支持     |
-| Buffer View   | Uniform、Storage、Raw、Structured、Typed（Typed 需 Format）                         | 加速结构相关 Buffer Capability                            |
-| Texture View  | Sampled、Storage、ColorAttachment、DepthStencil，遵守 Format/Aspect/Capability 约束 | 不支持的格式、维度或 Capability 组合会被拒绝              |
-| Binding Array | Single、Fixed（Fixed count 非零）                                                   | Variable、Unbounded、Bindless、PartiallyPopulated         |
-| Binding Flags | `kNone`                                                                             | DynamicOffset、Immutable，以及当前实现无法支持的未知组合  |
-| Binding Type  | 除 Acceleration Structure 外的已实现 Buffer/Texture/Sampler 类型                    | `kAccelerationStructure`                                  |
-| Sampler       | Nearest/Linear、四种 Address Mode、可选 Anisotropy                                  | 各向异性 Feature 未启用；Border Mode 无法保持固定边界颜色 |
-| Barrier Mode  | Implicit、Explicit；RenderGraph 使用 Explicit                                       | 显式状态与跟踪状态不匹配、跨队列依赖缺失                  |
+| Buffer View   | Uniform、Storage、Raw、Structured、Typed（Typed 需 Format）                                  | 加速结构相关 Buffer Capability                            |
+| Texture View  | Sampled、Storage、ColorAttachment、DepthStencil，遵守 Format/Aspect/Capability 约束          | 不支持的格式、维度或 Capability 组合会被拒绝              |
+| Binding Array | Single、Fixed（Fixed count 非零）                                                            | Variable、Unbounded、Bindless、PartiallyPopulated         |
+| Binding Flags | `kNone`                                                                                      | DynamicOffset、Immutable，以及当前实现无法支持的未知组合  |
+| Binding Type  | 除 Acceleration Structure 外的已实现 Buffer/Texture/Sampler 类型                             | `kAccelerationStructure`                                  |
+| Sampler       | Nearest/Linear、四种 Address Mode、可选 Anisotropy                                           | 各向异性 Feature 未启用；Border Mode 无法保持固定边界颜色 |
+| Barrier Mode  | Implicit、Explicit；RenderGraph 使用 Explicit                                                | 显式状态与跟踪状态不匹配、跨队列依赖缺失                  |
 
 这张表只描述当前后端实现，不改变前面各枚举的公共语义。新增 D3D12 或其他后端时，
 应复用同一公共枚举和错误规则，并单独维护后端能力矩阵；不得为了迎合某个后端而把

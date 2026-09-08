@@ -281,6 +281,14 @@ if (WIN32)
     target_compile_definitions(aeg_pipeline_extension_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
+add_executable(aeg_pipeline_conformance_smoke
+    tests/pipeline_conformance_smoke.cpp
+)
+target_link_libraries(aeg_pipeline_conformance_smoke PRIVATE aeg_pipeline)
+if (WIN32)
+    target_compile_definitions(aeg_pipeline_conformance_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
 add_executable(aeg_pipeline_runtime_smoke
     tests/pipeline_runtime_smoke.cpp
 )
@@ -670,6 +678,7 @@ if (BUILD_TESTING)
     add_test(NAME aeg_ecs_smoke COMMAND aeg_ecs_smoke)
     add_test(NAME aeg_pipeline_smoke COMMAND aeg_pipeline_smoke)
     add_test(NAME aeg_pipeline_extension_smoke COMMAND aeg_pipeline_extension_smoke)
+    add_test(NAME aeg_pipeline_conformance_smoke COMMAND aeg_pipeline_conformance_smoke)
     add_test(NAME aeg_pipeline_runtime_smoke COMMAND aeg_pipeline_runtime_smoke)
     add_test(NAME aeg_pipeline_hot_swap_smoke COMMAND aeg_pipeline_hot_swap_smoke)
     add_test(NAME aeg_pipeline_phase_scheduler_smoke COMMAND aeg_pipeline_phase_scheduler_smoke)
@@ -685,7 +694,7 @@ if (BUILD_TESTING)
     add_test(NAME aeg_triangle COMMAND aeg_triangle --frames 1)
     if (MINGW)
         get_filename_component(AEG_MINGW_RUNTIME_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
-        set_tests_properties(aeg_math_smoke aeg_result_smoke aeg_concurrency_smoke aeg_ecs_smoke aeg_pipeline_smoke aeg_pipeline_extension_smoke aeg_pipeline_runtime_smoke aeg_pipeline_hot_swap_smoke aeg_pipeline_phase_scheduler_smoke aeg_world_scope_smoke aeg_world_frame_orchestrator_smoke aeg_world_multi_view_smoke aeg_engine_frame_orchestrator_smoke aeg_renderer_smoke aeg_render_feature_runtime_smoke aeg_frame_retention_smoke aeg_rhi_smoke aeg_logging_smoke aeg_triangle PROPERTIES
+        set_tests_properties(aeg_math_smoke aeg_result_smoke aeg_concurrency_smoke aeg_ecs_smoke aeg_pipeline_smoke aeg_pipeline_extension_smoke aeg_pipeline_conformance_smoke aeg_pipeline_runtime_smoke aeg_pipeline_hot_swap_smoke aeg_pipeline_phase_scheduler_smoke aeg_world_scope_smoke aeg_world_frame_orchestrator_smoke aeg_world_multi_view_smoke aeg_engine_frame_orchestrator_smoke aeg_renderer_smoke aeg_render_feature_runtime_smoke aeg_frame_retention_smoke aeg_rhi_smoke aeg_logging_smoke aeg_triangle PROPERTIES
             ENVIRONMENT "PATH=${AEG_MINGW_RUNTIME_DIR};$ENV{PATH}"
         )
     endif()
