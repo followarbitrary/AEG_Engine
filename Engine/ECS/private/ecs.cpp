@@ -12,6 +12,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 
 namespace aeg::ecs {
 namespace {
@@ -36,7 +37,10 @@ struct WorldSnapshot::SnapshotData final {
     uint64_t fixed_tick{0};
     std::vector<EntityId> entities{};
     std::vector<uint32_t> entity_generations{};
+    std::vector<ComponentTypeId> component_order{};
     std::unordered_map<std::type_index, std::shared_ptr<const detail::ComponentSnapshotBase>> components{};
+    std::unordered_map<ComponentTypeId, std::shared_ptr<const detail::ComponentSnapshotBase>, ComponentTypeIdHash>
+        components_by_id{};
 };
 
 struct WorldCommandBuffer::Impl final {
@@ -123,12 +127,50 @@ bool WorldSnapshot::contains(EntityId entity) const noexcept {
            data_->entity_generations[entity.index] == entity.generation;
 }
 
+ComponentTypeId WorldSnapshot::component_type_at(std::size_t index) const noexcept {
+    return data_ == nullptr || index >= data_->component_order.size() ? ComponentTypeId{}
+                                                                      : data_->component_order[index];
+}
+
+std::size_t WorldSnapshot::component_value_count(ComponentTypeId type) const noexcept {
+    const detail::ComponentSnapshotBase* component = find_component(type);
+    return component == nullptr ? 0 : component->size();
+}
+
+EntityId WorldSnapshot::component_entity_at(ComponentTypeId type, std::size_t index) const noexcept {
+    const detail::ComponentSnapshotBase* component = find_component(type);
+    return component == nullptr ? EntityId{} : component->entity_at(index);
+}
+
+const void* WorldSnapshot::component_value_at(ComponentTypeId type, std::size_t index) const noexcept {
+    const detail::ComponentSnapshotBase* component = find_component(type);
+    return component == nullptr ? nullptr : component->value_at(index);
+}
+
+reflection::TypeId WorldSnapshot::component_schema_type(ComponentTypeId type) const noexcept {
+    const detail::ComponentSnapshotBase* component = find_component(type);
+    return component == nullptr ? reflection::TypeId{} : component->schema_type();
+}
+
+uint32_t WorldSnapshot::component_schema_version(ComponentTypeId type) const noexcept {
+    const detail::ComponentSnapshotBase* component = find_component(type);
+    return component == nullptr ? 0 : component->schema_version();
+}
+
 const detail::ComponentSnapshotBase* WorldSnapshot::find_component(std::type_index type) const noexcept {
     if (data_ == nullptr) {
         return nullptr;
     }
     const auto iterator = data_->components.find(type);
     return iterator == data_->components.end() ? nullptr : iterator->second.get();
+}
+
+const detail::ComponentSnapshotBase* WorldSnapshot::find_component(ComponentTypeId type) const noexcept {
+    if (data_ == nullptr || !type.is_valid()) {
+        return nullptr;
+    }
+    const auto iterator = data_->components_by_id.find(type);
+    return iterator == data_->components_by_id.end() ? nullptr : iterator->second.get();
 }
 
 const void* WorldSnapshot::get_component(EntityId entity, std::type_index type) const noexcept {
@@ -303,6 +345,9 @@ foundation::Result World::register_component_type(const ComponentDescriptor& des
     if (!descriptor.snapshotable) {
         return unsupported("non-snapshotable components are not supported by this World implementation");
     }
+    if (descriptor.schema_type.is_valid() != (descriptor.schema_version != 0)) {
+        return invalid_argument("component schema type and version must be provided together");
+    }
     if (!factory) {
         return invalid_argument("component pool factory is empty");
     }
@@ -406,6 +451,39 @@ foundation::ResultValue<EntityId> World::create_entity() {
     }
 }
 
+foundation::Result World::clear() {
+    if (const foundation::Result owner_result = validate_owner_access(); !owner_result) {
+        return owner_result;
+    }
+    if (const foundation::Result mutation_result = validate_structural_mutation(); !mutation_result) {
+        return mutation_result;
+    }
+
+    std::vector<uint32_t> free_entities;
+    try {
+        free_entities.reserve(impl_->entities.size());
+        for (uint32_t index = 0; index < impl_->entities.size(); ++index) {
+            free_entities.push_back(index);
+        }
+    } catch (const std::bad_alloc&) {
+        return out_of_memory("World clear free-list allocation failed");
+    }
+
+    for (auto& [type, record] : impl_->components) {
+        static_cast<void>(type);
+        record.pool->clear();
+    }
+    for (EntityRecord& record : impl_->entities) {
+        if (record.alive) {
+            record.generation = next_generation(record.generation);
+            record.alive = false;
+        }
+    }
+    impl_->free_entities.swap(free_entities);
+    impl_->alive_entity_count = 0;
+    return foundation::Result::success();
+}
+
 foundation::Result World::destroy_entity(EntityId entity) {
     if (const foundation::Result owner_result = validate_owner_access(); !owner_result) {
         return owner_result;
@@ -457,6 +535,56 @@ foundation::ResultValue<void*> World::emplace_component(EntityId entity, Compone
         return {not_found("component type is not registered"), nullptr};
     }
     return iterator->second.pool->emplace_move(entity, value);
+}
+
+foundation::Result World::emplace_default_component(EntityId entity, ComponentTypeId type) {
+    if (const foundation::Result owner_result = validate_owner_access(); !owner_result) {
+        return owner_result;
+    }
+    if (const foundation::Result mutation_result = validate_structural_mutation(); !mutation_result) {
+        return mutation_result;
+    }
+    if (!entity.is_valid() || !is_alive(entity)) {
+        return not_found("entity is not alive in this World");
+    }
+    const auto iterator = impl_->components.find(type);
+    if (iterator == impl_->components.end()) {
+        return not_found("component type is not registered");
+    }
+    return iterator->second.pool->emplace_default(entity).result;
+}
+
+foundation::ResultValue<void*> World::get_component_data(EntityId entity, ComponentTypeId type) {
+    if (const foundation::Result owner_result = validate_owner_access(); !owner_result) {
+        return {owner_result, nullptr};
+    }
+    if (!entity.is_valid() || !is_alive(entity)) {
+        return {not_found("entity is not alive in this World"), nullptr};
+    }
+    const auto iterator = impl_->components.find(type);
+    if (iterator == impl_->components.end()) {
+        return {not_found("component type is not registered"), nullptr};
+    }
+    void* value = iterator->second.pool->get(entity);
+    return value == nullptr ? foundation::ResultValue<void*>{not_found("entity does not own this component"), nullptr}
+                            : foundation::ResultValue<void*>{foundation::Result::success(), value};
+}
+
+foundation::ResultValue<const void*> World::get_component_data(EntityId entity, ComponentTypeId type) const {
+    if (const foundation::Result owner_result = validate_owner_access(); !owner_result) {
+        return {owner_result, nullptr};
+    }
+    if (!entity.is_valid() || !is_alive(entity)) {
+        return {not_found("entity is not alive in this World"), nullptr};
+    }
+    const auto iterator = impl_->components.find(type);
+    if (iterator == impl_->components.end()) {
+        return {not_found("component type is not registered"), nullptr};
+    }
+    const void* value = iterator->second.pool->get(entity);
+    return value == nullptr
+               ? foundation::ResultValue<const void*>{not_found("entity does not own this component"), nullptr}
+               : foundation::ResultValue<const void*>{foundation::Result::success(), value};
 }
 
 void* World::get_component(EntityId entity, ComponentTypeId type) noexcept {
@@ -601,10 +729,16 @@ foundation::ResultValue<WorldSnapshot> World::commit(uint64_t frame_number, uint
             }
         }
         data->components.reserve(impl_->components.size());
+        data->components_by_id.reserve(impl_->components.size());
+        data->component_order.reserve(impl_->components.size());
         for (const auto& [type, record] : impl_->components) {
-            data->components.emplace(record.cpp_type, record.pool->snapshot());
-            static_cast<void>(type);
+            const std::shared_ptr<const detail::ComponentSnapshotBase> snapshot =
+                record.pool->snapshot(record.descriptor);
+            data->components.emplace(record.cpp_type, snapshot);
+            data->components_by_id.emplace(type, snapshot);
+            data->component_order.push_back(type);
         }
+        std::sort(data->component_order.begin(), data->component_order.end());
 
         impl_->revision.store(data->revision, std::memory_order_release);
         {

@@ -2,7 +2,7 @@
 
 > 文档性质：架构说明、公共 API 和 ABI 使用手册
 >
-> 更新时间：2026-09-07
+> 更新时间：2026-09-08
 >
 > 适用范围：Pipeline、PipelineFeature、Scope、Artifact、Domain Graph、RenderGraph、RHI
 
@@ -43,8 +43,15 @@ Orchestrator 通过非拥有的 Host 注册表统一驱动这些实例。
 `WorldFrameKey`。`EngineFrameOrchestrator` 可以自动消费 World 命令、执行
 `WorldCommit` 快照发布，并为注册的 Frame View 安装 World-to-Frame Bridge。
 
+当前还实现了 `Engine/Reflection` 的 `TypeRegistry`、`TypeBuilder`、字段元数据和成员
+访问器，`Engine/Serialization` 的小端自描述二进制对象编解码，`Engine/World` 的
+`WorldSerializer` 运行时 World Archive，`Engine/Scene` 的稳定场景文档、层级、组件载荷
+和 World 实例化，以及 `Engine/Module` 的静态 C++ 模块注册运行时。
+`ModuleRegistry` 负责依赖版本校验、注册事务回滚和 Pipeline、Feature、Phase、Reflection
+Type 的注册产物所有权；动态 DLL Loader 与固定布局 C ABI 仍属于目标层设计。
+
 下文的专用 Engine/World/Frame/Editor Host、
-`FeatureExecutionContext`、动态模块 C ABI，以及 Simulation/Render
+`FeatureExecutionContext`、动态模块 Loader/C ABI，以及 Simulation/Render
 参考 Stage 编排属于架构约定，不表示当前已有同名公共实现。`WorldPipelineHost` 和
 `FramePipelineHost` 当前由通用 `PipelineScopeHost` 分别承担，专用类型仍属于文档层抽象。
 `RebuildReason` 和 `PipelineRegistry::request_rebuild()` 仍属于设计接口；当前
@@ -2744,9 +2751,11 @@ builder.runs_before(stage, aeg::pipeline::StageId("WeatherPublish"));
 }
 ```
 
-上例使用当前仓库已经提供的 C++ 注册 API。`aeg::module::Module` 等模块对象模型属于
-动态插件 ABI 的目标设计，当前仓库没有该公共类型；若由插件导出注册入口，应在入口内
-调用同一个 `register_game_pipelines()`，并遵守第 16 节规定的 ABI 边界。
+上例使用当前仓库已经提供的直接 C++ 注册 API。对于具有多个 Pipeline、Feature、Phase
+或 Reflection Type 的 Engine/Gameplay 模块，应优先通过当前已实现的
+`aeg::module::Module` 与 `aeg::module::ModuleRegistry` 注册，使所有产物归属于同一个
+`ModuleId` 并获得事务回滚和逆序注销语义。动态插件导出入口仍应通过第 16 节规定的
+固定布局 C ABI 门面适配为同一内部模块模型。
 
 注册表示“该类型具备可创建性”，不表示它已经绑定到某个 World。注册失败时模块不得继续
 发布依赖该类型的实例。
@@ -3522,45 +3531,50 @@ Pipeline Cache。
 
 当前仓库中已经存在的模块与本架构的关系如下：
 
-| 模块                 | 架构角色                                                       | 公共边界                                                  |
-|----------------------|----------------------------------------------------------------|-----------------------------------------------------------|
-| `Engine/Foundation`  | Result、通用基础类型和错误                                     | 不依赖任何图形后端                                        |
-| `Engine/Logging`     | 统一日志和诊断输出                                             | 供 Runtime/模块使用                                       |
-| `Engine/Math`        | SIMD 数学、变换、投影约定和 Plane/Frustum 几何                 | 不参与 Pipeline 拓扑                                      |
-| `Engine/Renderer`    | RenderView、World-to-Render 提取、Visibility 和 RenderPipeline | 依赖 Math、Pipeline、Resource、RenderGraph 的后端无关语义 |
-| `Engine/RHI`         | Buffer、Texture、View、Binding、Pipeline、Command、Sync        | 公共接口后端无关                                          |
-| `Engine/RenderGraph` | FrameContext、资源图、Barrier、Queue Sync                      | 只管理 Render Domain 图                                   |
-| `Engine/Shader`      | HLSL 产物、Reflection、Shader Contract、Layout                 | 不决定 EnginePhase                                        |
-| `Engine/Resource`    | Mesh、Texture、上传和 Render Target                            | 通过 RHI/RenderGraph 使用 GPU                             |
-| `Engine/Concurrency` | Executor、Worker、Completion、Cancellation 和任务批次          | 平台中立；不持有领域状态                                  |
-| `Engine/Pipeline`    | Pipeline、Feature、Registry、Compiler、Scheduler               | 本文档描述的扩展层                                        |
-| `Engine/Runtime`     | EngineFrameOrchestrator 与统一 Engine 帧生命周期               | 连接 Pipeline Runtime 与 RenderGraph                      |
-| `Engine/World`       | WorldHandle、WorldScope、ECS 快照和命令                        | World Scope 数据所有者                                    |
+| 模块                   | 架构角色                                                       | 公共边界                                                  |
+|------------------------|----------------------------------------------------------------|-----------------------------------------------------------|
+| `Engine/Foundation`    | Result、通用基础类型和错误                                     | 不依赖任何图形后端                                        |
+| `Engine/Logging`       | 统一日志和诊断输出                                             | 供 Runtime/模块使用                                       |
+| `Engine/Math`          | SIMD 数学、变换、投影约定和 Plane/Frustum 几何                 | 不参与 Pipeline 拓扑                                      |
+| `Engine/Renderer`      | RenderView、World-to-Render 提取、Visibility 和 RenderPipeline | 依赖 Math、Pipeline、Resource、RenderGraph 的后端无关语义 |
+| `Engine/RHI`           | Buffer、Texture、View、Binding、Pipeline、Command、Sync        | 公共接口后端无关                                          |
+| `Engine/RenderGraph`   | FrameContext、资源图、Barrier、Queue Sync                      | 只管理 Render Domain 图                                   |
+| `Engine/Shader`        | HLSL 产物、Reflection、Shader Contract、Layout                 | 不决定 EnginePhase                                        |
+| `Engine/Resource`      | Mesh、Texture、上传和 Render Target                            | 通过 RHI/RenderGraph 使用 GPU                             |
+| `Engine/Concurrency`   | Executor、Worker、Completion、Cancellation 和任务批次          | 平台中立；不持有领域状态                                  |
+| `Engine/Pipeline`      | Pipeline、Feature、Registry、Compiler、Scheduler               | 本文档描述的扩展层                                        |
+| `Engine/Module`        | C++ 模块生命周期、依赖版本和注册产物所有权                     | 当前提供静态模块运行时；动态 Loader/C ABI 仍属目标层      |
+| `Engine/Reflection`    | Type/Field 元数据、成员访问器和运行时类型注册                  | 当前提供 C++ 反射注册表；不负责对象生命周期               |
+| `Engine/Serialization` | 反射驱动的基础二进制对象编解码                                 | 当前提供运行时编码；World Archive 由 Engine/World 定义，场景/Prefab/资产容器仍需上层定义 |
+| `Engine/Runtime`       | EngineFrameOrchestrator 与统一 Engine 帧生命周期               | 连接 Pipeline Runtime 与 RenderGraph                      |
+| `Engine/World`         | WorldHandle、WorldScope、ECS 快照、命令和 World Archive       | World Scope 数据所有者；不持有稳定场景身份 |
+| `Engine/Scene`         | SceneAsset、稳定实体层级、反射组件载荷和运行时实例化         | 当前提供版本化 Scene Asset；Prefab 继承、资源解析和迁移回调仍未实现 |
 
-当前专用 Scope Host 和部分模块化运行时仍属于架构目标；Renderer 已作为当前实现的
+当前专用 Scope Host、动态模块 Loader 和部分模块化运行时仍属于架构目标；Renderer 已作为当前实现的
 独立模块提供 World-to-Render 提取、RenderSceneSnapshot 和标准 RenderPipeline。
 `WorldScope` 已提供 World/ECS 与通用 `PipelineScopeHost` 的基础适配，但尚未引入独立的
 `WorldPipelineHost`/`FramePipelineHost` 公共类型。本文档不会把目标 API 误写成当前已经
 存在的头文件；实现时应优先保持这里定义的调用方向和所有权规则。通用 Concurrency
-基建已经存在，但 GPU 队列提交适配器仍由 RHI/RenderGraph 负责，不能将默认
+静态 C++ Module、Reflection 和基础 Serialization 基建已经存在，但 GPU 队列提交适配器仍由 RHI/RenderGraph 负责，不能将默认
 WorkerExecutor 视为真实 GPU 执行线程。
 
 ## 26. API 快速参考
 
 ### 26.1 开发者通常需要实现的内容
 
-| 开发者需求        | 应实现/调用                                                                                                                                 |
-|-------------------|---------------------------------------------------------------------------------------------------------------------------------------------|
-| 新增功能调度单元  | 继承 `Pipeline`，实现 `descriptor()` 和 `build()`                                                                                           |
-| 新增单领域功能    | 继承 `LogicFeature`、`PhysicsFeature`、`RenderFeature`、`AudioFeature` 或 `StreamFeature`                                                   |
-| 新增跨领域功能    | 继承 `CompositeFeature<Parts...>`，组合具体领域 Part                                                                                        |
-| 声明输入输出      | 使用 `PipelineBuilder`/领域 Builder 声明 ArtifactBinding                                                                                    |
-| 接入已有 Pipeline | 注册 Feature 类型并绑定到公开 FeaturePoint                                                                                                  |
-| 使用多个 World    | 由 `WorldManager` 创建独立 World，并为每个 World 创建独立 `WorldScope` 和 Host                                                              |
-| 修改运行拓扑      | 显式调用 `PipelineScopeHost::rebuild(registry)`，并在安全点切换 Plan                                                                        |
-| 增加渲染能力      | 实现 `RenderFeature`，使用 `RenderGraphBuilder`                                                                                             |
-| 增加编辑器绘制    | 当前使用 `PipelineScopeHost(kEditor)` 与 RenderFeature/RenderGraphRuntime；`FrameOverlayBuilder` 仍属于目标封装，不直接修改基础 RenderGraph |
-| 增加动态插件      | 实现版本化 Module ABI，不跨 DLL 传递 STL/异常                                                                                               |
+| 开发者需求             | 应实现/调用                                                                                                                                 |
+|------------------------|---------------------------------------------------------------------------------------------------------------------------------------------|
+| 新增功能调度单元       | 继承 `Pipeline`，实现 `descriptor()` 和 `build()`                                                                                           |
+| 新增单领域功能         | 继承 `LogicFeature`、`PhysicsFeature`、`RenderFeature`、`AudioFeature` 或 `StreamFeature`                                                   |
+| 新增跨领域功能         | 继承 `CompositeFeature<Parts...>`，组合具体领域 Part                                                                                        |
+| 声明输入输出           | 使用 `PipelineBuilder`/领域 Builder 声明 ArtifactBinding                                                                                    |
+| 接入已有 Pipeline      | 注册 Feature 类型并绑定到公开 FeaturePoint                                                                                                  |
+| 使用多个 World         | 由 `WorldManager` 创建独立 World，并为每个 World 创建独立 `WorldScope` 和 Host                                                              |
+| 修改运行拓扑           | 显式调用 `PipelineScopeHost::rebuild(registry)`，并在安全点切换 Plan                                                                        |
+| 增加渲染能力           | 实现 `RenderFeature`，使用 `RenderGraphBuilder`                                                                                             |
+| 增加编辑器绘制         | 当前使用 `PipelineScopeHost(kEditor)` 与 RenderFeature/RenderGraphRuntime；`FrameOverlayBuilder` 仍属于目标封装，不直接修改基础 RenderGraph |
+| 增加静态 Gameplay 模块 | 继承 `aeg::module::Module`，通过 `ModuleRegistrationContext` 注册 Pipeline、Feature 和 Reflection Type                                      |
+| 增加动态插件           | 在静态 Module Runtime 之上实现版本化 Module ABI，不跨 DLL 传递 STL/异常                                                                     |
 
 ### 26.2 禁止用法
 

@@ -200,6 +200,54 @@ if (WIN32)
     target_compile_definitions(aeg_result_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
+add_library(aeg_reflection STATIC
+    Engine/Reflection/private/reflection.cpp
+)
+target_compile_features(aeg_reflection PUBLIC cxx_std_20)
+target_include_directories(aeg_reflection
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Reflection/public
+)
+target_link_libraries(aeg_reflection PUBLIC aeg_foundation)
+
+if (MSVC)
+    target_compile_options(aeg_reflection PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(aeg_reflection PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+add_executable(aeg_reflection_smoke
+    tests/reflection_smoke.cpp
+)
+target_link_libraries(aeg_reflection_smoke PRIVATE aeg_reflection)
+if (WIN32)
+    target_compile_definitions(aeg_reflection_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
+add_library(aeg_serialization STATIC
+    Engine/Serialization/private/serialization.cpp
+)
+target_compile_features(aeg_serialization PUBLIC cxx_std_20)
+target_include_directories(aeg_serialization
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Serialization/public
+)
+target_link_libraries(aeg_serialization PUBLIC aeg_foundation aeg_reflection)
+
+if (MSVC)
+    target_compile_options(aeg_serialization PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(aeg_serialization PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+add_executable(aeg_serialization_smoke
+    tests/serialization_smoke.cpp
+)
+target_link_libraries(aeg_serialization_smoke PRIVATE aeg_serialization)
+if (WIN32)
+    target_compile_definitions(aeg_serialization_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
 add_library(aeg_concurrency STATIC
     Engine/Concurrency/private/concurrency.cpp
 )
@@ -232,7 +280,7 @@ target_include_directories(aeg_ecs
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/Engine/ECS/public
 )
-target_link_libraries(aeg_ecs PUBLIC aeg_foundation)
+target_link_libraries(aeg_ecs PUBLIC aeg_foundation aeg_reflection)
 
 if (MSVC)
     target_compile_options(aeg_ecs PRIVATE /W4 /permissive-)
@@ -313,15 +361,40 @@ if (WIN32)
     target_compile_definitions(aeg_pipeline_phase_scheduler_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
+add_library(aeg_module STATIC
+    Engine/Module/private/module.cpp
+)
+target_compile_features(aeg_module PUBLIC cxx_std_20)
+target_include_directories(aeg_module
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Module/public
+)
+target_link_libraries(aeg_module PUBLIC aeg_foundation aeg_pipeline aeg_reflection)
+
+if (MSVC)
+    target_compile_options(aeg_module PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(aeg_module PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+add_executable(aeg_module_smoke
+    tests/module_smoke.cpp
+)
+target_link_libraries(aeg_module_smoke PRIVATE aeg_module)
+if (WIN32)
+    target_compile_definitions(aeg_module_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
 add_library(aeg_world STATIC
     Engine/World/private/world_scope.cpp
+    Engine/World/private/world_serializer.cpp
 )
 target_compile_features(aeg_world PUBLIC cxx_std_20)
 target_include_directories(aeg_world
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/Engine/World/public
 )
-target_link_libraries(aeg_world PUBLIC aeg_ecs aeg_pipeline)
+target_link_libraries(aeg_world PUBLIC aeg_ecs aeg_pipeline aeg_serialization)
 
 if (MSVC)
     target_compile_options(aeg_world PRIVATE /W4 /permissive-)
@@ -335,6 +408,38 @@ add_executable(aeg_world_scope_smoke
 target_link_libraries(aeg_world_scope_smoke PRIVATE aeg_world)
 if (WIN32)
     target_compile_definitions(aeg_world_scope_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
+add_executable(aeg_world_serialization_smoke
+    tests/world_serialization_smoke.cpp
+)
+target_link_libraries(aeg_world_serialization_smoke PRIVATE aeg_world)
+if (WIN32)
+    target_compile_definitions(aeg_world_serialization_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
+add_library(aeg_scene STATIC
+    Engine/Scene/private/scene_asset.cpp
+)
+target_compile_features(aeg_scene PUBLIC cxx_std_20)
+target_include_directories(aeg_scene
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Scene/public
+)
+target_link_libraries(aeg_scene PUBLIC aeg_world aeg_serialization)
+
+if (MSVC)
+    target_compile_options(aeg_scene PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(aeg_scene PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+add_executable(aeg_scene_asset_smoke
+    tests/scene_asset_smoke.cpp
+)
+target_link_libraries(aeg_scene_asset_smoke PRIVATE aeg_scene)
+if (WIN32)
+    target_compile_definitions(aeg_scene_asset_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
 add_executable(aeg_world_frame_orchestrator_smoke
@@ -674,6 +779,8 @@ endif()
 if (BUILD_TESTING)
     add_test(NAME aeg_math_smoke COMMAND aeg_math_smoke)
     add_test(NAME aeg_result_smoke COMMAND aeg_result_smoke)
+    add_test(NAME aeg_reflection_smoke COMMAND aeg_reflection_smoke)
+    add_test(NAME aeg_serialization_smoke COMMAND aeg_serialization_smoke)
     add_test(NAME aeg_concurrency_smoke COMMAND aeg_concurrency_smoke)
     add_test(NAME aeg_ecs_smoke COMMAND aeg_ecs_smoke)
     add_test(NAME aeg_pipeline_smoke COMMAND aeg_pipeline_smoke)
@@ -682,7 +789,10 @@ if (BUILD_TESTING)
     add_test(NAME aeg_pipeline_runtime_smoke COMMAND aeg_pipeline_runtime_smoke)
     add_test(NAME aeg_pipeline_hot_swap_smoke COMMAND aeg_pipeline_hot_swap_smoke)
     add_test(NAME aeg_pipeline_phase_scheduler_smoke COMMAND aeg_pipeline_phase_scheduler_smoke)
+    add_test(NAME aeg_module_smoke COMMAND aeg_module_smoke)
     add_test(NAME aeg_world_scope_smoke COMMAND aeg_world_scope_smoke)
+    add_test(NAME aeg_world_serialization_smoke COMMAND aeg_world_serialization_smoke)
+    add_test(NAME aeg_scene_asset_smoke COMMAND aeg_scene_asset_smoke)
     add_test(NAME aeg_world_frame_orchestrator_smoke COMMAND aeg_world_frame_orchestrator_smoke)
     add_test(NAME aeg_world_multi_view_smoke COMMAND aeg_world_multi_view_smoke)
     add_test(NAME aeg_engine_frame_orchestrator_smoke COMMAND aeg_engine_frame_orchestrator_smoke)
@@ -694,7 +804,13 @@ if (BUILD_TESTING)
     add_test(NAME aeg_triangle COMMAND aeg_triangle --frames 1)
     if (MINGW)
         get_filename_component(AEG_MINGW_RUNTIME_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
-        set_tests_properties(aeg_math_smoke aeg_result_smoke aeg_concurrency_smoke aeg_ecs_smoke aeg_pipeline_smoke aeg_pipeline_extension_smoke aeg_pipeline_conformance_smoke aeg_pipeline_runtime_smoke aeg_pipeline_hot_swap_smoke aeg_pipeline_phase_scheduler_smoke aeg_world_scope_smoke aeg_world_frame_orchestrator_smoke aeg_world_multi_view_smoke aeg_engine_frame_orchestrator_smoke aeg_renderer_smoke aeg_render_feature_runtime_smoke aeg_frame_retention_smoke aeg_rhi_smoke aeg_logging_smoke aeg_triangle PROPERTIES
+        set_tests_properties(aeg_math_smoke aeg_result_smoke aeg_reflection_smoke aeg_serialization_smoke
+                aeg_concurrency_smoke aeg_ecs_smoke aeg_pipeline_smoke aeg_pipeline_extension_smoke
+                aeg_pipeline_conformance_smoke aeg_pipeline_runtime_smoke aeg_pipeline_hot_swap_smoke
+                aeg_pipeline_phase_scheduler_smoke aeg_module_smoke aeg_world_scope_smoke aeg_world_serialization_smoke
+                aeg_scene_asset_smoke aeg_world_frame_orchestrator_smoke aeg_world_multi_view_smoke
+                aeg_engine_frame_orchestrator_smoke aeg_renderer_smoke aeg_render_feature_runtime_smoke
+                aeg_frame_retention_smoke aeg_rhi_smoke aeg_logging_smoke aeg_triangle PROPERTIES
             ENVIRONMENT "PATH=${AEG_MINGW_RUNTIME_DIR};$ENV{PATH}"
         )
     endif()

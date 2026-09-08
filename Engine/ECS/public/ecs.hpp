@@ -19,6 +19,7 @@
 #include <utility>
 #include <vector>
 
+#include "reflection.hpp"
 #include "result.hpp"
 
 namespace aeg::ecs {
@@ -46,6 +47,15 @@ struct EntityId final {
 
     constexpr explicit operator bool() const noexcept { return is_valid(); }
     friend constexpr bool operator==(EntityId, EntityId) = default;
+};
+
+/** @brief Hash function for EntityId values. */
+struct EntityIdHash final {
+    [[nodiscard]] std::size_t operator()(EntityId entity) const noexcept {
+        const std::size_t index = static_cast<std::size_t>(entity.index);
+        const std::size_t generation = static_cast<std::size_t>(entity.generation);
+        return index ^ (generation + static_cast<std::size_t>(0x9e3779b9u) + (index << 6u) + (index >> 2u));
+    }
 };
 
 /** @brief Stable identity of a registered component type. */
@@ -88,6 +98,8 @@ struct ComponentDescriptor final {
     std::size_t size{0};
     std::size_t alignment{0};
     bool snapshotable{true};
+    reflection::TypeId schema_type{};
+    uint32_t schema_version{0};
 };
 
 /** @brief Construction options for one World. */
@@ -102,6 +114,9 @@ class ComponentSnapshotBase {
 public:
     virtual ~ComponentSnapshotBase() = default;
 
+    [[nodiscard]] virtual ComponentTypeId type() const noexcept = 0;
+    [[nodiscard]] virtual reflection::TypeId schema_type() const noexcept = 0;
+    [[nodiscard]] virtual uint32_t schema_version() const noexcept = 0;
     [[nodiscard]] virtual const void* get(EntityId entity) const noexcept = 0;
     [[nodiscard]] virtual std::size_t size() const noexcept = 0;
     [[nodiscard]] virtual EntityId entity_at(std::size_t index) const noexcept = 0;
@@ -112,12 +127,24 @@ public:
 template <typename Type>
 class ComponentSnapshot final : public ComponentSnapshotBase {
 public:
-    ComponentSnapshot(ComponentTypeId type, const std::vector<EntityId>& entities, const std::vector<Type>& values)
-        : type_(type), entities_(entities), values_(values), sparse_(max_entity_index(entities), kInvalidDenseIndex) {
+    ComponentSnapshot(ComponentTypeId type, reflection::TypeId schema_type, uint32_t schema_version,
+                      const std::vector<EntityId>& entities, const std::vector<Type>& values)
+        : type_(type),
+          schema_type_(schema_type),
+          schema_version_(schema_version),
+          entities_(entities),
+          values_(values),
+          sparse_(max_entity_index(entities), kInvalidDenseIndex) {
         for (uint32_t index = 0; index < entities_.size(); ++index) {
             sparse_[entities_[index].index] = index;
         }
     }
+
+    [[nodiscard]] ComponentTypeId type() const noexcept override { return type_; }
+
+    [[nodiscard]] reflection::TypeId schema_type() const noexcept override { return schema_type_; }
+
+    [[nodiscard]] uint32_t schema_version() const noexcept override { return schema_version_; }
 
     [[nodiscard]] const void* get(EntityId entity) const noexcept override {
         if (!entity.is_valid() || entity.index >= sparse_.size()) {
@@ -140,8 +167,6 @@ public:
         return index < values_.size() ? &values_[index] : nullptr;
     }
 
-    [[nodiscard]] ComponentTypeId type() const noexcept { return type_; }
-
 private:
     [[nodiscard]] static std::size_t max_entity_index(const std::vector<EntityId>& entities) noexcept {
         std::size_t maximum = 0;
@@ -152,6 +177,8 @@ private:
     }
 
     ComponentTypeId type_{};
+    reflection::TypeId schema_type_{};
+    uint32_t schema_version_{0};
     std::vector<EntityId> entities_{};
     std::vector<Type> values_{};
     std::vector<uint32_t> sparse_{};
@@ -162,6 +189,7 @@ class ComponentPoolBase {
 public:
     virtual ~ComponentPoolBase() = default;
 
+    [[nodiscard]] virtual foundation::ResultValue<void*> emplace_default(EntityId entity) = 0;
     [[nodiscard]] virtual foundation::ResultValue<void*> emplace_move(EntityId entity, void* value) = 0;
     [[nodiscard]] virtual bool has(EntityId entity) const noexcept = 0;
     [[nodiscard]] virtual void* get(EntityId entity) noexcept = 0;
@@ -171,7 +199,9 @@ public:
     [[nodiscard]] virtual void* value_at(std::size_t index) noexcept = 0;
     [[nodiscard]] virtual const void* value_at(std::size_t index) const noexcept = 0;
     virtual bool remove(EntityId entity) noexcept = 0;
-    [[nodiscard]] virtual std::shared_ptr<const ComponentSnapshotBase> snapshot() const = 0;
+    virtual void clear() noexcept = 0;
+    [[nodiscard]] virtual std::shared_ptr<const ComponentSnapshotBase> snapshot(
+        const ComponentDescriptor& descriptor) const = 0;
 };
 
 /** @brief Dense/sparse mutable storage for one concrete component type. */
@@ -179,6 +209,25 @@ template <typename Type>
 class ComponentPool final : public ComponentPoolBase {
 public:
     explicit ComponentPool(ComponentTypeId type) : type_(type) {}
+
+    [[nodiscard]] foundation::ResultValue<void*> emplace_default(EntityId entity) override {
+        if constexpr (!std::is_default_constructible_v<Type>) {
+            return {foundation::unsupported("component type is not default constructible"), nullptr};
+        } else {
+            try {
+                Type value{};
+                return emplace_move(entity, &value);
+            } catch (const std::bad_alloc&) {
+                return {foundation::out_of_memory("default component construction allocation failed"), nullptr};
+            } catch (const std::exception& exception) {
+                return {foundation::unknown_exception(exception), nullptr};
+            } catch (...) {
+                return {foundation::Result::failure(foundation::ResultCode::kUnknown,
+                                                    "default component construction threw an unknown exception"),
+                        nullptr};
+            }
+        }
+    }
 
     [[nodiscard]] foundation::ResultValue<void*> emplace_move(EntityId entity, void* value) override {
         if (!entity.is_valid() || value == nullptr) {
@@ -268,8 +317,16 @@ public:
         return true;
     }
 
-    [[nodiscard]] std::shared_ptr<const ComponentSnapshotBase> snapshot() const override {
-        return std::make_shared<const ComponentSnapshot<Type>>(type_, entities_, values_);
+    void clear() noexcept override {
+        entities_.clear();
+        values_.clear();
+        sparse_.clear();
+    }
+
+    [[nodiscard]] std::shared_ptr<const ComponentSnapshotBase> snapshot(
+        const ComponentDescriptor& descriptor) const override {
+        return std::make_shared<const ComponentSnapshot<Type>>(type_, descriptor.schema_type, descriptor.schema_version,
+                                                               entities_, values_);
     }
 
 private:
@@ -294,6 +351,12 @@ public:
     [[nodiscard]] std::size_t component_type_count() const noexcept;
     [[nodiscard]] EntityId entity_at(std::size_t index) const noexcept;
     [[nodiscard]] bool contains(EntityId entity) const noexcept;
+    [[nodiscard]] ComponentTypeId component_type_at(std::size_t index) const noexcept;
+    [[nodiscard]] std::size_t component_value_count(ComponentTypeId type) const noexcept;
+    [[nodiscard]] EntityId component_entity_at(ComponentTypeId type, std::size_t index) const noexcept;
+    [[nodiscard]] const void* component_value_at(ComponentTypeId type, std::size_t index) const noexcept;
+    [[nodiscard]] reflection::TypeId component_schema_type(ComponentTypeId type) const noexcept;
+    [[nodiscard]] uint32_t component_schema_version(ComponentTypeId type) const noexcept;
 
     template <typename Type>
     [[nodiscard]] const Type* get(EntityId entity) const noexcept {
@@ -321,6 +384,7 @@ private:
     explicit WorldSnapshot(std::shared_ptr<const SnapshotData> data) noexcept : data_(std::move(data)) {}
 
     [[nodiscard]] const detail::ComponentSnapshotBase* find_component(std::type_index type) const noexcept;
+    [[nodiscard]] const detail::ComponentSnapshotBase* find_component(ComponentTypeId type) const noexcept;
     [[nodiscard]] const void* get_component(EntityId entity, std::type_index type) const noexcept;
 
     std::shared_ptr<const SnapshotData> data_{};
@@ -460,6 +524,25 @@ public:
     }
 
     template <typename Type>
+    [[nodiscard]] foundation::Result register_reflected_component(const reflection::TypeDescriptor& schema,
+                                                                  ComponentTypeId id = {}, std::string_view name = {}) {
+        static_assert(std::is_copy_constructible_v<Type>, "World snapshot components must be copy constructible");
+        static_assert(std::is_default_constructible_v<Type>,
+                      "Reflected components must be default constructible for deserialization");
+        static_assert(std::is_nothrow_move_constructible_v<Type> && std::is_nothrow_move_assignable_v<Type>,
+                      "World components must be nothrow move constructible and move assignable");
+        static_assert(std::is_nothrow_destructible_v<Type>, "World components must be nothrow destructible");
+        if (!schema.id.is_valid() || schema.kind != reflection::TypeKind::kComponent || schema.version == 0 ||
+            schema.size != sizeof(Type) || schema.alignment != alignof(Type)) {
+            return foundation::invalid_argument("reflected component schema does not match the C++ component type");
+        }
+        const ComponentTypeId component_id = id.is_valid() ? id : ComponentTypeId(schema.id.value());
+        const std::string_view component_name = name.empty() ? std::string_view(schema.name) : name;
+        return register_component<Type>(ComponentDescriptor{component_id, component_name, sizeof(Type), alignof(Type),
+                                                            true, schema.id, schema.version});
+    }
+
+    template <typename Type>
     [[nodiscard]] ComponentTypeId component_type_id() const noexcept {
         const auto result = find_component_type(std::type_index(typeid(Type)));
         return result ? result.value : ComponentTypeId{};
@@ -467,9 +550,16 @@ public:
 
     [[nodiscard]] foundation::ResultValue<ComponentDescriptor> find_component_descriptor(ComponentTypeId id) const;
 
+    /** @brief Creates one entity in the World owner thread. */
     [[nodiscard]] foundation::ResultValue<EntityId> create_entity();
+    /** @brief Destroys one entity and all components owned by it. */
     [[nodiscard]] foundation::Result destroy_entity(EntityId entity);
+    [[nodiscard]] foundation::Result clear();
     [[nodiscard]] bool is_alive(EntityId entity) const noexcept;
+
+    [[nodiscard]] foundation::Result emplace_default_component(EntityId entity, ComponentTypeId type);
+    [[nodiscard]] foundation::ResultValue<void*> get_component_data(EntityId entity, ComponentTypeId type);
+    [[nodiscard]] foundation::ResultValue<const void*> get_component_data(EntityId entity, ComponentTypeId type) const;
 
     template <typename Type, typename... Arguments>
     [[nodiscard]] foundation::ResultValue<Type*> emplace(EntityId entity, Arguments&&... arguments) {
