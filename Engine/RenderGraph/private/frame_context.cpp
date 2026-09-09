@@ -502,7 +502,10 @@ namespace aeg::render_graph {
         rhi::BufferDesc buffer_desc{};
         buffer_desc.size = capacity;
         buffer_desc.capabilities = rhi::BufferCapability::kTransferSource |
-                                   rhi::BufferCapability::kTransferDestination;
+                                   rhi::BufferCapability::kTransferDestination |
+                                   rhi::BufferCapability::kVertex |
+                                   rhi::BufferCapability::kIndex |
+                                   rhi::BufferCapability::kUniform;
         buffer_desc.memory = readback ? rhi::MemoryClass::kReadback : rhi::MemoryClass::kUpload;
         buffer_desc.initial_usage = readback ? rhi::ResourceUsage::kHostRead : rhi::ResourceUsage::kHostWrite;
         buffer_desc.initial_stages = rhi::PipelineStage::kHost;

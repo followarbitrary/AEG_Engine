@@ -14,6 +14,7 @@
 #include "window_event.hpp"
 
 namespace aeg::editor {
+/** @brief Thread-confined owner of one Dear ImGui context and its editor panels. */
 class EditorImGuiHost final {
 public:
     EditorImGuiHost();
@@ -33,6 +34,8 @@ public:
     [[nodiscard]] foundation::Result submit_event(const platform::WindowEvent& event);
     /** @brief Associates the uploaded font atlas with an engine-managed texture identity. */
     [[nodiscard]] foundation::Result set_font_texture(ImGuiTextureHandle texture);
+    /** @brief Copies the engine-owned RGBA8 font atlas for upload through Resource/RHI APIs. */
+    [[nodiscard]] foundation::Result capture_font_atlas(ImGuiFontAtlasData& atlas) const;
 
     /** @brief Starts one ImGui frame using engine-owned display timing. */
     [[nodiscard]] foundation::Result begin_frame(const EditorImGuiFrameDesc& desc);

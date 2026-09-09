@@ -201,6 +201,10 @@ public:
         pipeline::RenderResourceId id) const override;
     [[nodiscard]] foundation::ResultValue<pipeline::RenderGraphTexture> find_texture(
         pipeline::RenderResourceId id) const override;
+    [[nodiscard]] foundation::Result bind_buffer(pipeline::RenderResourceId id,
+                                                 pipeline::RenderGraphBuffer buffer) override;
+    [[nodiscard]] foundation::Result bind_texture(pipeline::RenderResourceId id,
+                                                  pipeline::RenderGraphTexture texture) override;
     [[nodiscard]] foundation::Result export_buffer(pipeline::RenderGraphBuffer buffer) override;
     [[nodiscard]] foundation::Result export_texture(pipeline::RenderGraphTexture texture) override;
     void set_feature_owner(std::shared_ptr<const pipeline::PipelineFeature> owner) override {
@@ -422,6 +426,36 @@ foundation::ResultValue<pipeline::RenderGraphTexture> RenderGraphBuilderBackendI
         return {not_found("render graph texture resource id is not registered"), {}};
     }
     return {foundation::Result::success(), iterator->second};
+}
+
+foundation::Result RenderGraphBuilderBackendImpl::bind_buffer(pipeline::RenderResourceId id,
+                                                              pipeline::RenderGraphBuffer buffer) {
+    if (!id.is_valid() || !buffer.is_valid()) {
+        return invalid_argument("render graph buffer binding is invalid");
+    }
+    if (resource_id_taken(id)) {
+        return invalid_state("render graph resource id is already registered");
+    }
+    const foundation::ResultValue<RenderGraphBuffer> resolved = resolve_buffer(buffer);
+    if (!resolved) {
+        return resolved.result;
+    }
+    return remember_buffer(id, buffer);
+}
+
+foundation::Result RenderGraphBuilderBackendImpl::bind_texture(pipeline::RenderResourceId id,
+                                                               pipeline::RenderGraphTexture texture) {
+    if (!id.is_valid() || !texture.is_valid()) {
+        return invalid_argument("render graph texture binding is invalid");
+    }
+    if (resource_id_taken(id)) {
+        return invalid_state("render graph resource id is already registered");
+    }
+    const foundation::ResultValue<RenderGraphTexture> resolved = resolve_texture(texture);
+    if (!resolved) {
+        return resolved.result;
+    }
+    return remember_texture(id, texture);
 }
 
 foundation::Result RenderGraphBuilderBackendImpl::export_buffer(pipeline::RenderGraphBuffer buffer) {

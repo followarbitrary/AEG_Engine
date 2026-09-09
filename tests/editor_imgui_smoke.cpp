@@ -33,6 +33,9 @@ int main() {
 
     editor::EditorImGuiHost host;
     assert(host.initialize());
+    editor::ImGuiFontAtlasData font_atlas;
+    assert(host.capture_font_atlas(font_atlas));
+    assert(font_atlas.is_valid());
     assert(host.set_font_texture(texture_result.value));
     auto panel = std::make_unique<SmokePanel>();
     SmokePanel* panel_pointer = panel.get();

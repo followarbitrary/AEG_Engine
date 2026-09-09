@@ -16,8 +16,12 @@ namespace aeg::editor {
 struct ImGuiTextureBinding final {
     rhi::TextureViewHandle sampled_view{};
     rhi::SamplerHandle sampler{};
+    rhi::TextureHandle texture{};
+    rhi::TextureDesc texture_desc{};
+    rhi::ResourceState initial_state{};
 };
 
+/** @brief Thread-safe borrowed mapping from ImGui texture identities to RHI resources. */
 class ImGuiTextureRegistry final {
 public:
     ImGuiTextureRegistry() = default;

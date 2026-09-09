@@ -42,7 +42,7 @@
 | `Runtime`         | Engine 生命周期、Scope 注册、Pipeline 执行和 RenderGraph 帧编排                 |
 | `Platform`        | 窗口、Surface、文件系统、动态库和操作系统适配；当前为预留目录                   |
 | `Diagnostics`     | 断言、验证、性能分析、崩溃上下文和运行时诊断；当前为预留目录                    |
-| `EditorFramework` | 编辑器状态、工具窗口、选择集、属性面板和预览；当前为预留目录                    |
+| `EditorFramework` | 编辑器状态、工具窗口、选择集、属性面板和预览；当前提供 Experimental 编辑器接口  |
 | `Tooling`         | Shader、资产、代码生成和格式验证工具；当前为预留目录                            |
 
 ### 2.2 `RHI` 后端目录

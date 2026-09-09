@@ -4,7 +4,9 @@
  */
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+#include <vector>
 
 #include "window_types.hpp"
 
@@ -21,6 +23,29 @@ struct EditorImGuiFrameDesc final {
     float delta_seconds{1.0f / 60.0f};
     float framebuffer_scale_x{1.0f};
     float framebuffer_scale_y{1.0f};
+};
+
+/** @brief Engine-owned RGBA8 snapshot of the ImGui font atlas. */
+struct ImGuiFontAtlasData final {
+    uint32_t width{0};
+    uint32_t height{0};
+    uint32_t row_pitch{0};
+    std::vector<std::byte> rgba8_pixels{};
+
+    [[nodiscard]] bool is_valid() const noexcept {
+        const uint64_t required_row_pitch = static_cast<uint64_t>(width) * 4u;
+        const uint64_t required_size = required_row_pitch * static_cast<uint64_t>(height);
+        return width != 0 && height != 0 && row_pitch >= required_row_pitch &&
+               static_cast<uint64_t>(rgba8_pixels.size()) >= static_cast<uint64_t>(row_pitch) * height &&
+               required_size != 0;
+    }
+
+    void clear() noexcept {
+        width = 0;
+        height = 0;
+        row_pitch = 0;
+        rgba8_pixels.clear();
+    }
 };
 
 struct EditorPanelId final {

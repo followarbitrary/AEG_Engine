@@ -759,6 +759,14 @@ else()
     target_compile_options(aeg_resource PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
+target_sources(aeg_editor_framework PRIVATE
+    Engine/EditorFramework/private/imgui/imgui_renderer.cpp
+)
+target_include_directories(aeg_editor_framework PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Math/public
+)
+target_link_libraries(aeg_editor_framework PUBLIC aeg_resource aeg_rhi aeg_shader)
+
 add_executable(aeg_rhi_smoke
     tests/rhi_smoke.cpp
 )
@@ -829,6 +837,34 @@ if (WIN32)
         GENERATED_SOURCE_DIRECTORY "${AEG_SHADER_GENERATED_SOURCE_DIR}"
         MODE CORE
     )
+    set(AEG_EDITOR_IMGUI_SHADER_PACKAGE
+        "${AEG_SHADER_OUTPUT_DIR}/core_contract/editor_imgui_draw_mesh.aegshader")
+    aeg_add_hlsl_gameplay_shader_program(
+        TARGET aeg_core_shaders
+        NAME editor_imgui_draw_mesh
+        OUTPUT_DIRECTORY "${AEG_SHADER_OUTPUT_DIR}/core_contract"
+        CONTRACT_TOOL aeg_shader_contract_tool
+        STAGES
+            "vertex|vs_6_0|${CMAKE_CURRENT_SOURCE_DIR}/shaders/core/editor/imgui/draw_mesh.vert.hlsl"
+            "fragment|ps_6_0|${CMAKE_CURRENT_SOURCE_DIR}/shaders/core/editor/imgui/draw_mesh.frag.hlsl"
+        PACKAGE_OUTPUT_VARIABLE AEG_EDITOR_IMGUI_SHADER_PACKAGE
+    )
+    target_compile_definitions(aeg_editor_framework PRIVATE
+        AEG_EDITOR_IMGUI_SHADER_PACKAGE_PATH="${AEG_EDITOR_IMGUI_SHADER_PACKAGE}"
+    )
+    add_dependencies(aeg_editor_framework aeg_core_shaders)
+
+    add_executable(aeg_editor_imgui_renderer_smoke
+        tests/editor_imgui_renderer_smoke.cpp
+    )
+    target_link_libraries(aeg_editor_imgui_renderer_smoke PRIVATE
+        aeg_editor_framework
+        aeg_renderer
+        aeg_core_shaders
+    )
+    target_compile_definitions(aeg_editor_imgui_renderer_smoke PRIVATE
+        _CRT_SECURE_NO_WARNINGS
+    )
 
     add_executable(aeg_triangle
         tests/triangle.cpp
@@ -887,9 +923,12 @@ if (BUILD_TESTING)
     add_test(NAME aeg_rhi_smoke COMMAND aeg_rhi_smoke)
     add_test(NAME aeg_logging_smoke COMMAND aeg_logging_smoke)
     add_test(NAME aeg_triangle COMMAND aeg_triangle --frames 1)
+    if (WIN32)
+        add_test(NAME aeg_editor_imgui_renderer_smoke COMMAND aeg_editor_imgui_renderer_smoke)
+    endif()
     if (MINGW)
         get_filename_component(AEG_MINGW_RUNTIME_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
-        set_tests_properties(aeg_editor_imgui_smoke aeg_math_smoke aeg_result_smoke aeg_reflection_smoke aeg_serialization_smoke
+        set_tests_properties(aeg_editor_imgui_smoke aeg_editor_imgui_renderer_smoke aeg_math_smoke aeg_result_smoke aeg_reflection_smoke aeg_serialization_smoke
                 aeg_concurrency_smoke aeg_ecs_smoke aeg_pipeline_smoke aeg_pipeline_extension_smoke
                 aeg_pipeline_conformance_smoke aeg_pipeline_runtime_smoke aeg_pipeline_hot_swap_smoke
                 aeg_pipeline_phase_scheduler_smoke aeg_module_smoke aeg_world_scope_smoke aeg_world_serialization_smoke

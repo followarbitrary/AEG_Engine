@@ -184,6 +184,8 @@ public:
         const rhi::ResourceState& initial_state) = 0;
     [[nodiscard]] virtual foundation::ResultValue<RenderGraphBuffer> find_buffer(RenderResourceId id) const = 0;
     [[nodiscard]] virtual foundation::ResultValue<RenderGraphTexture> find_texture(RenderResourceId id) const = 0;
+    [[nodiscard]] virtual foundation::Result bind_buffer(RenderResourceId id, RenderGraphBuffer buffer) = 0;
+    [[nodiscard]] virtual foundation::Result bind_texture(RenderResourceId id, RenderGraphTexture texture) = 0;
     [[nodiscard]] virtual foundation::Result export_buffer(RenderGraphBuffer buffer) = 0;
     [[nodiscard]] virtual foundation::Result export_texture(RenderGraphTexture texture) = 0;
     virtual void set_feature_owner(std::shared_ptr<const PipelineFeature> owner) = 0;
@@ -245,6 +247,8 @@ public:
         const rhi::ResourceState& initial_state = {});
     [[nodiscard]] foundation::ResultValue<RenderGraphBuffer> find_buffer(RenderResourceId id) const;
     [[nodiscard]] foundation::ResultValue<RenderGraphTexture> find_texture(RenderResourceId id) const;
+    [[nodiscard]] foundation::Result bind_buffer(RenderResourceId id, RenderGraphBuffer buffer);
+    [[nodiscard]] foundation::Result bind_texture(RenderResourceId id, RenderGraphTexture texture);
     [[nodiscard]] foundation::Result export_buffer(RenderGraphBuffer buffer);
     [[nodiscard]] foundation::Result export_texture(RenderGraphTexture texture);
 
@@ -1535,6 +1539,26 @@ inline foundation::ResultValue<RenderGraphTexture> RenderGraphBuilder::find_text
         return {render_graph_builder_invalid_state(), {}};
     }
     return runtime_backend_->find_texture(id);
+}
+
+inline foundation::Result RenderGraphBuilder::bind_buffer(RenderResourceId id, RenderGraphBuffer buffer) {
+    if (runtime_backend_ == nullptr) {
+        return render_graph_builder_invalid_state();
+    }
+    if (!allows(FeaturePointFlags::kMayCreateArtifacts)) {
+        return render_graph_builder_permission_denied(FeaturePointFlags::kMayCreateArtifacts);
+    }
+    return runtime_backend_->bind_buffer(id, buffer);
+}
+
+inline foundation::Result RenderGraphBuilder::bind_texture(RenderResourceId id, RenderGraphTexture texture) {
+    if (runtime_backend_ == nullptr) {
+        return render_graph_builder_invalid_state();
+    }
+    if (!allows(FeaturePointFlags::kMayCreateArtifacts)) {
+        return render_graph_builder_permission_denied(FeaturePointFlags::kMayCreateArtifacts);
+    }
+    return runtime_backend_->bind_texture(id, texture);
 }
 
 inline foundation::Result RenderGraphBuilder::export_buffer(RenderGraphBuffer buffer) {
