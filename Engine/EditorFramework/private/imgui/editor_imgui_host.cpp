@@ -25,6 +25,8 @@ struct EditorImGuiHost::Impl final {
     std::vector<platform::WindowEvent> pending_events{};
     std::vector<platform::WindowEvent> frame_events{};
     std::vector<PanelSlot> panels{};
+    ImGuiTextureHandle font_texture{};
+    uint64_t frame_number{0};
     bool initialized{false};
     bool frame_active{false};
 };
@@ -106,6 +108,24 @@ foundation::Result EditorImGuiHost::submit_event(const platform::WindowEvent& ev
     return foundation::Result::success();
 }
 
+foundation::Result EditorImGuiHost::set_font_texture(ImGuiTextureHandle texture) {
+    if (!impl_->initialized) {
+        return foundation::invalid_state("EditorImGuiHost is not initialized");
+    }
+    if (!texture.is_valid()) {
+        return foundation::invalid_argument("ImGui font texture identity is invalid");
+    }
+    if (impl_->frame_active) {
+        return foundation::invalid_state("ImGui font texture cannot change during an active frame");
+    }
+
+    ImGui::SetCurrentContext(impl_->context);
+    ImGuiIO& io = ImGui::GetIO();
+    io.Fonts->SetTexID(ImTextureRef(static_cast<ImTextureID>(make_imgui_texture_id(texture))));
+    impl_->font_texture = texture;
+    return foundation::Result::success();
+}
+
 foundation::Result EditorImGuiHost::begin_frame(const EditorImGuiFrameDesc& desc) {
     if (!impl_->initialized) {
         return foundation::invalid_state("EditorImGuiHost is not initialized");
@@ -137,6 +157,7 @@ foundation::Result EditorImGuiHost::begin_frame(const EditorImGuiFrameDesc& desc
         }
     }
     ImGui::NewFrame();
+    ++impl_->frame_number;
     impl_->frame_active = true;
     return foundation::Result::success();
 }
@@ -163,6 +184,77 @@ foundation::Result EditorImGuiHost::end_frame() {
     ImGui::SetCurrentContext(impl_->context);
     ImGui::Render();
     impl_->frame_active = false;
+    return foundation::Result::success();
+}
+
+foundation::Result EditorImGuiHost::capture_draw_packet(ImGuiDrawPacket& packet) const {
+    if (!impl_->initialized || impl_->frame_active) {
+        return foundation::invalid_state("ImGui draw data requires a finalized frame");
+    }
+
+    ImGui::SetCurrentContext(impl_->context);
+    const ImDrawData* draw_data = ImGui::GetDrawData();
+    if (draw_data == nullptr || !draw_data->Valid) {
+        return foundation::invalid_state("Dear ImGui has no valid draw data");
+    }
+
+    ImGuiDrawPacket captured;
+    captured.display_pos_x = draw_data->DisplayPos.x;
+    captured.display_pos_y = draw_data->DisplayPos.y;
+    captured.display_width = draw_data->DisplaySize.x;
+    captured.display_height = draw_data->DisplaySize.y;
+    captured.framebuffer_scale_x = draw_data->FramebufferScale.x;
+    captured.framebuffer_scale_y = draw_data->FramebufferScale.y;
+    captured.frame_number = impl_->frame_number;
+    if (draw_data->TotalVtxCount > 0) {
+        captured.vertices.reserve(static_cast<std::size_t>(draw_data->TotalVtxCount));
+    }
+    if (draw_data->TotalIdxCount > 0) {
+        captured.indices.reserve(static_cast<std::size_t>(draw_data->TotalIdxCount));
+    }
+
+    for (int list_index = 0; list_index < draw_data->CmdLists.Size; ++list_index) {
+        const ImDrawList* list = draw_data->CmdLists[list_index];
+        if (list == nullptr) {
+            continue;
+        }
+        const uint32_t vertex_base = static_cast<uint32_t>(captured.vertices.size());
+        const uint32_t index_base = static_cast<uint32_t>(captured.indices.size());
+        for (const ImDrawVert& vertex : list->VtxBuffer) {
+            captured.vertices.push_back(ImGuiDrawVertex{
+                vertex.pos.x,
+                vertex.pos.y,
+                vertex.uv.x,
+                vertex.uv.y,
+                vertex.col,
+            });
+        }
+        for (const ImDrawIdx index : list->IdxBuffer) {
+            captured.indices.push_back(static_cast<uint32_t>(index));
+        }
+        for (const ImDrawCmd& command : list->CmdBuffer) {
+            if (command.UserCallback != nullptr) {
+                return foundation::unsupported("ImGui user draw callbacks are not supported by ImGuiDrawPacket");
+            }
+            const uint64_t texture_id = static_cast<uint64_t>(command.GetTexID());
+            const ImGuiTextureHandle texture = decode_imgui_texture_id(texture_id);
+            if (!texture.is_valid()) {
+                return foundation::invalid_argument("ImGui draw command contains an invalid texture ID");
+            }
+            captured.commands.push_back(ImGuiDrawCommand{
+                texture,
+                command.ClipRect.x,
+                command.ClipRect.y,
+                command.ClipRect.z,
+                command.ClipRect.w,
+                command.ElemCount,
+                index_base + command.IdxOffset,
+                static_cast<int32_t>(vertex_base) + static_cast<int32_t>(command.VtxOffset),
+            });
+        }
+    }
+
+    packet = std::move(captured);
     return foundation::Result::success();
 }
 

@@ -9,6 +9,7 @@
 
 #include "editor_imgui_types.hpp"
 #include "editor_panel.hpp"
+#include "imgui_draw_packet.hpp"
 #include "result.hpp"
 #include "window_event.hpp"
 
@@ -30,6 +31,8 @@ public:
 
     /** @brief Queues one engine event for translation at the next frame boundary. */
     [[nodiscard]] foundation::Result submit_event(const platform::WindowEvent& event);
+    /** @brief Associates the uploaded font atlas with an engine-managed texture identity. */
+    [[nodiscard]] foundation::Result set_font_texture(ImGuiTextureHandle texture);
 
     /** @brief Starts one ImGui frame using engine-owned display timing. */
     [[nodiscard]] foundation::Result begin_frame(const EditorImGuiFrameDesc& desc);
@@ -37,6 +40,8 @@ public:
     [[nodiscard]] foundation::Result build_panels();
     /** @brief Finalizes the current frame and makes its draw data available internally. */
     [[nodiscard]] foundation::Result end_frame();
+    /** @brief Copies the finalized ImGui draw lists into engine-owned storage. */
+    [[nodiscard]] foundation::Result capture_draw_packet(ImGuiDrawPacket& packet) const;
 
     /** @brief Takes ownership of one panel and returns its generation-checked identity. */
     [[nodiscard]] foundation::ResultValue<EditorPanelId> register_panel(std::unique_ptr<EditorPanel> panel);
