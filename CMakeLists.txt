@@ -216,6 +216,41 @@ else()
     target_compile_options(aeg_input PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
+if (WIN32)
+    add_library(aeg_application_platform_win32 STATIC
+        Application/Platform/private/win32/win32_window.cpp
+        Application/Platform/private/win32/win32_window_system.cpp
+    )
+    target_compile_features(aeg_application_platform_win32 PUBLIC cxx_std_20)
+    target_include_directories(aeg_application_platform_win32
+        PUBLIC
+            ${CMAKE_CURRENT_SOURCE_DIR}/Application/Platform/public
+            ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Platform/public
+        PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/Application/Platform/private/win32
+    )
+    target_compile_definitions(aeg_application_platform_win32
+        PRIVATE
+            NOMINMAX
+            UNICODE
+            _UNICODE
+            WIN32_LEAN_AND_MEAN
+    )
+    target_link_libraries(aeg_application_platform_win32 PUBLIC aeg_platform aeg_input user32)
+
+    if (MSVC)
+        target_compile_options(aeg_application_platform_win32 PRIVATE /W4 /permissive-)
+    else()
+        target_compile_options(aeg_application_platform_win32 PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+
+    add_executable(aeg_application_platform_win32_smoke
+        tests/application_platform_win32_smoke.cpp
+    )
+    target_link_libraries(aeg_application_platform_win32_smoke PRIVATE aeg_application_platform_win32)
+    target_compile_definitions(aeg_application_platform_win32_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
 set(AEG_IMGUI_DIR
     "${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/ImGui")
 if (NOT EXISTS "${AEG_IMGUI_DIR}/imgui.h" OR
@@ -900,6 +935,9 @@ if (BUILD_TESTING)
     add_test(NAME aeg_math_smoke COMMAND aeg_math_smoke)
     add_test(NAME aeg_result_smoke COMMAND aeg_result_smoke)
     add_test(NAME aeg_editor_imgui_smoke COMMAND aeg_editor_imgui_smoke)
+    if (WIN32)
+        add_test(NAME aeg_application_platform_win32_smoke COMMAND aeg_application_platform_win32_smoke)
+    endif()
     add_test(NAME aeg_reflection_smoke COMMAND aeg_reflection_smoke)
     add_test(NAME aeg_serialization_smoke COMMAND aeg_serialization_smoke)
     add_test(NAME aeg_concurrency_smoke COMMAND aeg_concurrency_smoke)
@@ -928,7 +966,7 @@ if (BUILD_TESTING)
     endif()
     if (MINGW)
         get_filename_component(AEG_MINGW_RUNTIME_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
-        set_tests_properties(aeg_editor_imgui_smoke aeg_editor_imgui_renderer_smoke aeg_math_smoke aeg_result_smoke aeg_reflection_smoke aeg_serialization_smoke
+        set_tests_properties(aeg_application_platform_win32_smoke aeg_editor_imgui_smoke aeg_editor_imgui_renderer_smoke aeg_math_smoke aeg_result_smoke aeg_reflection_smoke aeg_serialization_smoke
                 aeg_concurrency_smoke aeg_ecs_smoke aeg_pipeline_smoke aeg_pipeline_extension_smoke
                 aeg_pipeline_conformance_smoke aeg_pipeline_runtime_smoke aeg_pipeline_hot_swap_smoke
                 aeg_pipeline_phase_scheduler_smoke aeg_module_smoke aeg_world_scope_smoke aeg_world_serialization_smoke

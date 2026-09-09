@@ -1,0 +1,350 @@
+/**
+ * @file win32_window.cpp
+ * @brief Win32 message dispatch and semantic event conversion.
+ */
+#include "win32_window.hpp"
+
+#include <windowsx.h>
+
+#include <cstdint>
+#include <utility>
+
+#include "win32_window_system.hpp"
+
+namespace aeg::application::win32 {
+namespace {
+using aeg::platform::KeyAction;
+using aeg::platform::KeyCode;
+using aeg::platform::KeyModifiers;
+using aeg::platform::MouseButton;
+using aeg::platform::WindowEvent;
+using aeg::platform::WindowEventType;
+
+constexpr bool is_high_surrogate(wchar_t value) noexcept {
+    return value >= 0xd800 && value <= 0xdbff;
+}
+
+constexpr bool is_low_surrogate(wchar_t value) noexcept {
+    return value >= 0xdc00 && value <= 0xdfff;
+}
+
+constexpr char32_t combine_surrogates(wchar_t high, wchar_t low) noexcept {
+    return 0x10000u + ((static_cast<char32_t>(high) - 0xd800u) << 10u) + (static_cast<char32_t>(low) - 0xdc00u);
+}
+
+KeyCode translate_extended_key(UINT virtual_key, LPARAM l_param) noexcept {
+    const UINT scan_code = (static_cast<uint64_t>(l_param) >> 16u) & 0xffu;
+    const bool extended = (static_cast<uint64_t>(l_param) & (1ull << 24u)) != 0;
+    switch (virtual_key) {
+        case VK_SHIFT:
+            return scan_code == MapVirtualKeyW(VK_RSHIFT, MAPVK_VK_TO_VSC) ? KeyCode::kRightShift : KeyCode::kLeftShift;
+        case VK_CONTROL:
+            return extended ? KeyCode::kRightCtrl : KeyCode::kLeftCtrl;
+        case VK_MENU:
+            return extended ? KeyCode::kRightAlt : KeyCode::kLeftAlt;
+        case VK_LWIN:
+            return KeyCode::kLeftSuper;
+        case VK_RWIN:
+            return KeyCode::kRightSuper;
+        default:
+            return KeyCode::kUnknown;
+    }
+}
+
+KeyCode translate_virtual_key(WPARAM w_param, LPARAM l_param) noexcept {
+    const UINT virtual_key = static_cast<UINT>(w_param);
+    if (virtual_key == VK_SHIFT || virtual_key == VK_CONTROL || virtual_key == VK_MENU || virtual_key == VK_LWIN ||
+        virtual_key == VK_RWIN) {
+        return translate_extended_key(virtual_key, l_param);
+    }
+    if (virtual_key >= 'A' && virtual_key <= 'Z') {
+        return static_cast<KeyCode>(static_cast<uint16_t>(KeyCode::kA) + (virtual_key - 'A'));
+    }
+    if (virtual_key >= VK_F1 && virtual_key <= VK_F12) {
+        return static_cast<KeyCode>(static_cast<uint16_t>(KeyCode::kF1) + (virtual_key - VK_F1));
+    }
+    switch (virtual_key) {
+        case VK_TAB:
+            return KeyCode::kTab;
+        case VK_LEFT:
+            return KeyCode::kLeft;
+        case VK_RIGHT:
+            return KeyCode::kRight;
+        case VK_UP:
+            return KeyCode::kUp;
+        case VK_DOWN:
+            return KeyCode::kDown;
+        case VK_PRIOR:
+            return KeyCode::kPageUp;
+        case VK_NEXT:
+            return KeyCode::kPageDown;
+        case VK_HOME:
+            return KeyCode::kHome;
+        case VK_END:
+            return KeyCode::kEnd;
+        case VK_INSERT:
+            return KeyCode::kInsert;
+        case VK_DELETE:
+            return KeyCode::kDelete;
+        case VK_BACK:
+            return KeyCode::kBackspace;
+        case VK_SPACE:
+            return KeyCode::kSpace;
+        case VK_RETURN:
+            return KeyCode::kEnter;
+        case VK_ESCAPE:
+            return KeyCode::kEscape;
+        default:
+            return KeyCode::kUnknown;
+    }
+}
+
+KeyModifiers modifiers_from_key_state(WPARAM w_param) noexcept {
+    KeyModifiers modifiers = KeyModifiers::kNone;
+    const auto is_down = [w_param](int virtual_key, WPARAM message_mask) noexcept {
+        return (GetKeyState(virtual_key) & 0x8000) != 0 || (message_mask != 0 && (w_param & message_mask) != 0);
+    };
+    if (is_down(VK_CONTROL, MK_CONTROL)) {
+        modifiers = modifiers | KeyModifiers::kCtrl;
+    }
+    if (is_down(VK_SHIFT, MK_SHIFT)) {
+        modifiers = modifiers | KeyModifiers::kShift;
+    }
+    if (is_down(VK_MENU, 0)) {
+        modifiers = modifiers | KeyModifiers::kAlt;
+    }
+    if (is_down(VK_LWIN, 0) || is_down(VK_RWIN, 0)) {
+        modifiers = modifiers | KeyModifiers::kSuper;
+    }
+    return modifiers;
+}
+
+MouseButton mouse_button_from_message(UINT message, WPARAM w_param) noexcept {
+    switch (message) {
+        case WM_LBUTTONDOWN:
+        case WM_LBUTTONUP:
+            return MouseButton::kLeft;
+        case WM_RBUTTONDOWN:
+        case WM_RBUTTONUP:
+            return MouseButton::kRight;
+        case WM_MBUTTONDOWN:
+        case WM_MBUTTONUP:
+            return MouseButton::kMiddle;
+        case WM_XBUTTONDOWN:
+        case WM_XBUTTONUP:
+            return GET_XBUTTON_WPARAM(w_param) == XBUTTON1 ? MouseButton::kX1 : MouseButton::kX2;
+        default:
+            return MouseButton::kLeft;
+    }
+}
+}  // namespace
+
+Win32Window::Win32Window(platform::WindowId id, Win32WindowSystem* owner, platform::WindowDesc desc) noexcept
+    : id_(id), owner_(owner), desc_(std::move(desc)), state_{desc_.extent, false, false, false} {}
+
+Win32Window::~Win32Window() {
+    destroy_native();
+}
+
+platform::WindowSurfaceBinding Win32Window::surface_binding() const noexcept {
+    return platform::WindowSurfaceBinding{
+        owner_ != nullptr ? reinterpret_cast<void*>(owner_->instance()) : nullptr,
+        reinterpret_cast<void*>(hwnd_),
+    };
+}
+
+foundation::Result Win32Window::request_close() noexcept {
+    if (hwnd_ == nullptr) {
+        return foundation::Result::failure(foundation::ResultCode::kInvalidState);
+    }
+    if (PostMessageW(hwnd_, WM_CLOSE, 0, 0) == FALSE) {
+        return foundation::Result::failure(foundation::ResultCode::kBackendError);
+    }
+    return foundation::Result::success();
+}
+
+void Win32Window::destroy_native() noexcept {
+    if (hwnd_ != nullptr) {
+        DestroyWindow(hwnd_);
+        hwnd_ = nullptr;
+    }
+}
+
+LRESULT CALLBACK Win32Window::window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l_param) noexcept {
+    auto* instance = reinterpret_cast<Win32Window*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+    if (message == WM_NCCREATE) {
+        const auto* create = reinterpret_cast<const CREATESTRUCTW*>(l_param);
+        instance = static_cast<Win32Window*>(create->lpCreateParams);
+        if (instance != nullptr) {
+            instance->attach(window);
+            SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(instance));
+        }
+    }
+    if (instance == nullptr) {
+        return DefWindowProcW(window, message, w_param, l_param);
+    }
+
+    const LRESULT result = instance->handle_message(message, w_param, l_param);
+    if (message == WM_NCDESTROY) {
+        SetWindowLongPtrW(window, GWLP_USERDATA, 0);
+    }
+    return result;
+}
+
+LRESULT Win32Window::handle_message(UINT message, WPARAM w_param, LPARAM l_param) noexcept {
+    switch (message) {
+        case WM_CLOSE:
+            state_.close_requested = true;
+            emit_event(WindowEvent{WindowEventType::kWindowCloseRequested});
+            DestroyWindow(hwnd_);
+            return 0;
+        case WM_DESTROY:
+            state_.close_requested = true;
+            return 0;
+        case WM_NCDESTROY: {
+            const HWND current_window = hwnd_;
+            hwnd_ = nullptr;
+            return DefWindowProcW(current_window, message, w_param, l_param);
+        }
+        case WM_SIZE: {
+            const uint32_t width = static_cast<uint32_t>(LOWORD(l_param));
+            const uint32_t height = static_cast<uint32_t>(HIWORD(l_param));
+            state_.minimized = w_param == SIZE_MINIMIZED;
+            state_.extent = platform::WindowExtent{width == 0 ? 1u : width, height == 0 ? 1u : height};
+            WindowEvent event{WindowEventType::kWindowResized};
+            event.extent = state_.extent;
+            emit_event(event);
+            return 0;
+        }
+        case WM_SETFOCUS:
+        case WM_KILLFOCUS: {
+            state_.focused = message == WM_SETFOCUS;
+            WindowEvent event{WindowEventType::kWindowFocusChanged};
+            event.focused = state_.focused;
+            emit_event(event);
+            return 0;
+        }
+        case WM_KEYDOWN:
+        case WM_SYSKEYDOWN: {
+            WindowEvent event{WindowEventType::kKey};
+            event.key = translate_key(w_param, l_param);
+            event.key_action =
+                (static_cast<uint64_t>(l_param) & (1ull << 30u)) != 0 ? KeyAction::kRepeated : KeyAction::kPressed;
+            event.modifiers = current_modifiers();
+            emit_event(event);
+            return 0;
+        }
+        case WM_KEYUP:
+        case WM_SYSKEYUP: {
+            WindowEvent event{WindowEventType::kKey};
+            event.key = translate_key(w_param, l_param);
+            event.key_action = KeyAction::kReleased;
+            event.modifiers = current_modifiers();
+            emit_event(event);
+            return 0;
+        }
+        case WM_CHAR:
+        case WM_SYSCHAR: {
+            const wchar_t code_unit = static_cast<wchar_t>(w_param);
+            if (is_high_surrogate(code_unit)) {
+                pending_high_surrogate_ = code_unit;
+            } else if (is_low_surrogate(code_unit) && pending_high_surrogate_ != 0) {
+                emit_text_codepoint(combine_surrogates(pending_high_surrogate_, code_unit));
+                pending_high_surrogate_ = 0;
+            } else if (!is_low_surrogate(code_unit)) {
+                pending_high_surrogate_ = 0;
+                emit_text_codepoint(static_cast<char32_t>(code_unit));
+            }
+            return 0;
+        }
+        case WM_UNICHAR:
+            if (w_param == UNICODE_NOCHAR) {
+                return TRUE;
+            }
+            emit_text_codepoint(static_cast<char32_t>(w_param));
+            return 0;
+        case WM_MOUSEMOVE: {
+            WindowEvent event{WindowEventType::kMouseMoved};
+            event.mouse_x = static_cast<float>(GET_X_LPARAM(l_param));
+            event.mouse_y = static_cast<float>(GET_Y_LPARAM(l_param));
+            emit_event(event);
+            return 0;
+        }
+        case WM_LBUTTONDOWN:
+        case WM_RBUTTONDOWN:
+        case WM_MBUTTONDOWN:
+        case WM_XBUTTONDOWN: {
+            SetCapture(hwnd_);
+            WindowEvent event{WindowEventType::kMouseButton};
+            event.mouse_button = translate_mouse_button(message, w_param);
+            event.mouse_button_down = true;
+            event.modifiers = current_modifiers(w_param);
+            emit_event(event);
+            return message == WM_XBUTTONDOWN ? TRUE : 0;
+        }
+        case WM_LBUTTONUP:
+        case WM_RBUTTONUP:
+        case WM_MBUTTONUP:
+        case WM_XBUTTONUP: {
+            if (GetCapture() == hwnd_) {
+                ReleaseCapture();
+            }
+            WindowEvent event{WindowEventType::kMouseButton};
+            event.mouse_button = translate_mouse_button(message, w_param);
+            event.mouse_button_down = false;
+            event.modifiers = current_modifiers(w_param);
+            emit_event(event);
+            return message == WM_XBUTTONUP ? TRUE : 0;
+        }
+        case WM_MOUSEWHEEL: {
+            WindowEvent event{WindowEventType::kMouseWheel};
+            event.wheel_y = static_cast<float>(GET_WHEEL_DELTA_WPARAM(w_param)) / static_cast<float>(WHEEL_DELTA);
+            event.modifiers = current_modifiers(GET_KEYSTATE_WPARAM(w_param));
+            emit_event(event);
+            return 0;
+        }
+        case WM_MOUSEHWHEEL: {
+            WindowEvent event{WindowEventType::kMouseWheel};
+            event.wheel_x = static_cast<float>(GET_WHEEL_DELTA_WPARAM(w_param)) / static_cast<float>(WHEEL_DELTA);
+            event.modifiers = current_modifiers(GET_KEYSTATE_WPARAM(w_param));
+            emit_event(event);
+            return 0;
+        }
+        case WM_ERASEBKGND:
+            return 1;
+        default:
+            return DefWindowProcW(hwnd_, message, w_param, l_param);
+    }
+}
+
+void Win32Window::emit_event(platform::WindowEvent event) noexcept {
+    if (owner_ == nullptr) {
+        return;
+    }
+    event.window = id_;
+    event.timestamp_seconds = owner_->timestamp_seconds();
+    event.sequence = owner_->next_sequence();
+    owner_->enqueue_event(std::move(event));
+}
+
+void Win32Window::emit_text_codepoint(char32_t codepoint) noexcept {
+    if (codepoint == 0) {
+        return;
+    }
+    WindowEvent event{WindowEventType::kTextInput};
+    event.codepoint = codepoint;
+    emit_event(event);
+}
+
+platform::KeyCode Win32Window::translate_key(WPARAM w_param, LPARAM l_param) noexcept {
+    return translate_virtual_key(w_param, l_param);
+}
+
+platform::KeyModifiers Win32Window::current_modifiers(WPARAM w_param) noexcept {
+    return modifiers_from_key_state(w_param);
+}
+
+platform::MouseButton Win32Window::translate_mouse_button(UINT message, WPARAM w_param) noexcept {
+    return mouse_button_from_message(message, w_param);
+}
+}  // namespace aeg::application::win32
