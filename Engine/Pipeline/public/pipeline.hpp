@@ -112,8 +112,6 @@ class RenderPassExecutionContextBackend {
 public:
     virtual ~RenderPassExecutionContextBackend() = default;
 
-    [[nodiscard]] virtual rhi::Device& device() const noexcept = 0;
-    [[nodiscard]] virtual rhi::CommandListHandle command_list() const noexcept = 0;
     [[nodiscard]] virtual RenderGraphPass pass() const noexcept = 0;
     [[nodiscard]] virtual foundation::ResultValue<rhi::BufferHandle> buffer(RenderGraphBuffer buffer) const = 0;
     [[nodiscard]] virtual foundation::ResultValue<rhi::TextureHandle> texture(RenderGraphTexture texture) const = 0;
@@ -129,6 +127,21 @@ public:
     [[nodiscard]] virtual foundation::Result end_rendering() = 0;
     [[nodiscard]] virtual bool rendering_active() const noexcept = 0;
     [[nodiscard]] virtual bool rendering_started() const noexcept = 0;
+    [[nodiscard]] virtual foundation::Result set_viewport(const rhi::Viewport& viewport) = 0;
+    [[nodiscard]] virtual foundation::Result set_scissor(const rhi::ScissorRect& scissor) = 0;
+    [[nodiscard]] virtual foundation::Result bind_pipeline(rhi::PipelineHandle pipeline) = 0;
+    [[nodiscard]] virtual foundation::Result bind_binding_set(uint32_t group, rhi::BindingSetHandle set,
+                                                              std::span<const uint32_t> dynamic_offsets) = 0;
+    [[nodiscard]] virtual foundation::Result set_inline_constants(uint32_t offset, rhi::ShaderStageMask shader_stages,
+                                                                  std::span<const std::byte> data) = 0;
+    [[nodiscard]] virtual foundation::Result bind_vertex_buffer(uint32_t binding, rhi::BufferHandle buffer,
+                                                                uint64_t offset) = 0;
+    [[nodiscard]] virtual foundation::Result bind_index_buffer(rhi::BufferHandle buffer, uint64_t offset,
+                                                               rhi::IndexFormat format) = 0;
+    [[nodiscard]] virtual foundation::Result draw(const rhi::DrawDesc& desc) = 0;
+    [[nodiscard]] virtual foundation::Result draw_indexed(const rhi::DrawIndexedDesc& desc) = 0;
+    [[nodiscard]] virtual foundation::Result dispatch(const rhi::DispatchDesc& desc) = 0;
+    [[nodiscard]] virtual foundation::Result dispatch_indirect(const rhi::DispatchIndirectDesc& desc) = 0;
     [[nodiscard]] virtual foundation::Result copy_buffer(RenderGraphBuffer source, RenderGraphBuffer destination,
                                                          uint64_t source_offset, uint64_t destination_offset,
                                                          uint64_t size) = 0;
@@ -313,8 +326,6 @@ class RenderPassExecutionContext final {
 public:
     explicit RenderPassExecutionContext(RenderPassExecutionContextBackend& backend) noexcept : backend_(&backend) {}
 
-    [[nodiscard]] rhi::Device& device() const noexcept;
-    [[nodiscard]] rhi::CommandListHandle command_list() const noexcept;
     [[nodiscard]] RenderGraphPass pass() const noexcept;
     [[nodiscard]] foundation::ResultValue<rhi::BufferHandle> buffer(RenderGraphBuffer buffer) const;
     [[nodiscard]] foundation::ResultValue<rhi::TextureHandle> texture(RenderGraphTexture texture) const;
@@ -330,6 +341,21 @@ public:
     [[nodiscard]] foundation::Result end_rendering();
     [[nodiscard]] bool rendering_active() const noexcept;
     [[nodiscard]] bool rendering_started() const noexcept;
+    [[nodiscard]] foundation::Result set_viewport(const rhi::Viewport& viewport);
+    [[nodiscard]] foundation::Result set_scissor(const rhi::ScissorRect& scissor);
+    [[nodiscard]] foundation::Result bind_pipeline(rhi::PipelineHandle pipeline);
+    [[nodiscard]] foundation::Result bind_binding_set(uint32_t group, rhi::BindingSetHandle set,
+                                                      std::span<const uint32_t> dynamic_offsets = {});
+    [[nodiscard]] foundation::Result set_inline_constants(uint32_t offset, rhi::ShaderStageMask shader_stages,
+                                                          std::span<const std::byte> data);
+    [[nodiscard]] foundation::Result bind_vertex_buffer(uint32_t binding, rhi::BufferHandle buffer,
+                                                        uint64_t offset = 0);
+    [[nodiscard]] foundation::Result bind_index_buffer(rhi::BufferHandle buffer, uint64_t offset,
+                                                       rhi::IndexFormat format);
+    [[nodiscard]] foundation::Result draw(const rhi::DrawDesc& desc);
+    [[nodiscard]] foundation::Result draw_indexed(const rhi::DrawIndexedDesc& desc);
+    [[nodiscard]] foundation::Result dispatch(const rhi::DispatchDesc& desc);
+    [[nodiscard]] foundation::Result dispatch_indirect(const rhi::DispatchIndirectDesc& desc);
     [[nodiscard]] foundation::Result copy_buffer(RenderGraphBuffer source, RenderGraphBuffer destination,
                                                  uint64_t source_offset, uint64_t destination_offset, uint64_t size);
     [[nodiscard]] foundation::Result copy_buffer_to_texture(RenderGraphBuffer source, uint64_t source_offset,
@@ -1674,14 +1700,6 @@ inline void RenderPassBuilder::set_side_effects(bool enabled) noexcept {
     }
 }
 
-inline rhi::Device& RenderPassExecutionContext::device() const noexcept {
-    return backend_->device();
-}
-
-inline rhi::CommandListHandle RenderPassExecutionContext::command_list() const noexcept {
-    return backend_->command_list();
-}
-
 inline RenderGraphPass RenderPassExecutionContext::pass() const noexcept {
     return backend_->pass();
 }
@@ -1721,6 +1739,55 @@ inline bool RenderPassExecutionContext::rendering_active() const noexcept {
 
 inline bool RenderPassExecutionContext::rendering_started() const noexcept {
     return backend_->rendering_started();
+}
+
+inline foundation::Result RenderPassExecutionContext::set_viewport(const rhi::Viewport& viewport) {
+    return backend_->set_viewport(viewport);
+}
+
+inline foundation::Result RenderPassExecutionContext::set_scissor(const rhi::ScissorRect& scissor) {
+    return backend_->set_scissor(scissor);
+}
+
+inline foundation::Result RenderPassExecutionContext::bind_pipeline(rhi::PipelineHandle pipeline) {
+    return backend_->bind_pipeline(pipeline);
+}
+
+inline foundation::Result RenderPassExecutionContext::bind_binding_set(uint32_t group, rhi::BindingSetHandle set,
+                                                                       std::span<const uint32_t> dynamic_offsets) {
+    return backend_->bind_binding_set(group, set, dynamic_offsets);
+}
+
+inline foundation::Result RenderPassExecutionContext::set_inline_constants(uint32_t offset,
+                                                                           rhi::ShaderStageMask shader_stages,
+                                                                           std::span<const std::byte> data) {
+    return backend_->set_inline_constants(offset, shader_stages, data);
+}
+
+inline foundation::Result RenderPassExecutionContext::bind_vertex_buffer(uint32_t binding, rhi::BufferHandle buffer,
+                                                                         uint64_t offset) {
+    return backend_->bind_vertex_buffer(binding, buffer, offset);
+}
+
+inline foundation::Result RenderPassExecutionContext::bind_index_buffer(rhi::BufferHandle buffer, uint64_t offset,
+                                                                        rhi::IndexFormat format) {
+    return backend_->bind_index_buffer(buffer, offset, format);
+}
+
+inline foundation::Result RenderPassExecutionContext::draw(const rhi::DrawDesc& desc) {
+    return backend_->draw(desc);
+}
+
+inline foundation::Result RenderPassExecutionContext::draw_indexed(const rhi::DrawIndexedDesc& desc) {
+    return backend_->draw_indexed(desc);
+}
+
+inline foundation::Result RenderPassExecutionContext::dispatch(const rhi::DispatchDesc& desc) {
+    return backend_->dispatch(desc);
+}
+
+inline foundation::Result RenderPassExecutionContext::dispatch_indirect(const rhi::DispatchIndirectDesc& desc) {
+    return backend_->dispatch_indirect(desc);
 }
 
 inline foundation::Result RenderPassExecutionContext::copy_buffer(RenderGraphBuffer source,

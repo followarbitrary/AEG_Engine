@@ -120,8 +120,6 @@ public:
                                           PassExecutionContext& context) noexcept
         : owner_(std::move(owner)), context_(context) {}
 
-    [[nodiscard]] rhi::Device& device() const noexcept override;
-    [[nodiscard]] rhi::CommandListHandle command_list() const noexcept override;
     [[nodiscard]] pipeline::RenderGraphPass pass() const noexcept override;
     [[nodiscard]] foundation::ResultValue<rhi::BufferHandle> buffer(pipeline::RenderGraphBuffer buffer) const override;
     [[nodiscard]] foundation::ResultValue<rhi::TextureHandle> texture(
@@ -137,6 +135,21 @@ public:
     [[nodiscard]] foundation::Result end_rendering() override;
     [[nodiscard]] bool rendering_active() const noexcept override;
     [[nodiscard]] bool rendering_started() const noexcept override;
+    [[nodiscard]] foundation::Result set_viewport(const rhi::Viewport& viewport) override;
+    [[nodiscard]] foundation::Result set_scissor(const rhi::ScissorRect& scissor) override;
+    [[nodiscard]] foundation::Result bind_pipeline(rhi::PipelineHandle pipeline) override;
+    [[nodiscard]] foundation::Result bind_binding_set(uint32_t group, rhi::BindingSetHandle set,
+                                                      std::span<const uint32_t> dynamic_offsets) override;
+    [[nodiscard]] foundation::Result set_inline_constants(uint32_t offset, rhi::ShaderStageMask shader_stages,
+                                                          std::span<const std::byte> data) override;
+    [[nodiscard]] foundation::Result bind_vertex_buffer(uint32_t binding, rhi::BufferHandle buffer,
+                                                        uint64_t offset) override;
+    [[nodiscard]] foundation::Result bind_index_buffer(rhi::BufferHandle buffer, uint64_t offset,
+                                                       rhi::IndexFormat format) override;
+    [[nodiscard]] foundation::Result draw(const rhi::DrawDesc& desc) override;
+    [[nodiscard]] foundation::Result draw_indexed(const rhi::DrawIndexedDesc& desc) override;
+    [[nodiscard]] foundation::Result dispatch(const rhi::DispatchDesc& desc) override;
+    [[nodiscard]] foundation::Result dispatch_indirect(const rhi::DispatchIndirectDesc& desc) override;
     [[nodiscard]] foundation::Result copy_buffer(pipeline::RenderGraphBuffer source,
                                                  pipeline::RenderGraphBuffer destination, uint64_t source_offset,
                                                  uint64_t destination_offset, uint64_t size) override;
@@ -653,14 +666,6 @@ void RenderPassBuilderBackendImpl::set_side_effects(bool enabled) noexcept {
     builder_.set_side_effects(enabled);
 }
 
-rhi::Device& RenderPassExecutionContextBackendImpl::device() const noexcept {
-    return context_.device();
-}
-
-rhi::CommandListHandle RenderPassExecutionContextBackendImpl::command_list() const noexcept {
-    return context_.command_list();
-}
-
 pipeline::RenderGraphPass RenderPassExecutionContextBackendImpl::pass() const noexcept {
     return to_pipeline_pass(context_.pass());
 }
@@ -717,6 +722,55 @@ bool RenderPassExecutionContextBackendImpl::rendering_active() const noexcept {
 
 bool RenderPassExecutionContextBackendImpl::rendering_started() const noexcept {
     return context_.rendering_started();
+}
+
+foundation::Result RenderPassExecutionContextBackendImpl::set_viewport(const rhi::Viewport& viewport) {
+    return context_.device().set_viewport(context_.command_list(), viewport);
+}
+
+foundation::Result RenderPassExecutionContextBackendImpl::set_scissor(const rhi::ScissorRect& scissor) {
+    return context_.device().set_scissor(context_.command_list(), scissor);
+}
+
+foundation::Result RenderPassExecutionContextBackendImpl::bind_pipeline(rhi::PipelineHandle pipeline) {
+    return context_.device().bind_pipeline(context_.command_list(), pipeline);
+}
+
+foundation::Result RenderPassExecutionContextBackendImpl::bind_binding_set(uint32_t group, rhi::BindingSetHandle set,
+                                                                           std::span<const uint32_t> dynamic_offsets) {
+    return context_.device().bind_binding_set(context_.command_list(), group, set, dynamic_offsets);
+}
+
+foundation::Result RenderPassExecutionContextBackendImpl::set_inline_constants(uint32_t offset,
+                                                                               rhi::ShaderStageMask shader_stages,
+                                                                               std::span<const std::byte> data) {
+    return context_.device().set_inline_constants(context_.command_list(), offset, shader_stages, data);
+}
+
+foundation::Result RenderPassExecutionContextBackendImpl::bind_vertex_buffer(uint32_t binding, rhi::BufferHandle buffer,
+                                                                             uint64_t offset) {
+    return context_.device().bind_vertex_buffer(context_.command_list(), binding, buffer, offset);
+}
+
+foundation::Result RenderPassExecutionContextBackendImpl::bind_index_buffer(rhi::BufferHandle buffer, uint64_t offset,
+                                                                            rhi::IndexFormat format) {
+    return context_.device().bind_index_buffer(context_.command_list(), buffer, offset, format);
+}
+
+foundation::Result RenderPassExecutionContextBackendImpl::draw(const rhi::DrawDesc& desc) {
+    return context_.device().draw(context_.command_list(), desc);
+}
+
+foundation::Result RenderPassExecutionContextBackendImpl::draw_indexed(const rhi::DrawIndexedDesc& desc) {
+    return context_.device().draw_indexed(context_.command_list(), desc);
+}
+
+foundation::Result RenderPassExecutionContextBackendImpl::dispatch(const rhi::DispatchDesc& desc) {
+    return context_.device().dispatch(context_.command_list(), desc);
+}
+
+foundation::Result RenderPassExecutionContextBackendImpl::dispatch_indirect(const rhi::DispatchIndirectDesc& desc) {
+    return context_.device().dispatch_indirect(context_.command_list(), desc);
 }
 
 foundation::Result RenderPassExecutionContextBackendImpl::copy_buffer(pipeline::RenderGraphBuffer source,

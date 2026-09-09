@@ -7,8 +7,13 @@
 
 ## 当前状态
 
-目录目前仅作为架构预留。编辑器属于插件式叠加作用域，可在 Frame 阶段对 View 或
-Render Target 执行 Overlay，但不能改变 Engine 或 World 的所有权规则。
+`EditorImGuiHost` 负责 Dear ImGui Context、事件输入和 Panel 生命周期。项目只集成
+ImGui Core，不使用官方平台或渲染 Backend。编辑器 UI 的 GPU 资源必须通过
+`ImGuiTextureRegistry` 注册 RHI View/Sampler，注册表不拥有这些资源，也不接收 native
+图形 API 句柄。
+
+后续 ImGui RenderFeature 将消费 `ImDrawData`，并在 `RenderPipeline.BeforePresent`
+阶段通过受限 Render Pass 接口录制绘制命令。
 
 ## 边界
 

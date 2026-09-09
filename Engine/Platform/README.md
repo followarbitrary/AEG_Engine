@@ -5,10 +5,14 @@
 该目录用于承载操作系统和运行环境适配，包括窗口与 Surface 创建、文件系统、线程
 属性、时间源、动态库加载和平台事件转换。
 
-## 当前状态
+## 公共契约
 
-目录目前仅作为架构预留。平台实现应按目标平台进一步分层，公共层只暴露稳定的
-引擎语义，不把 Win32、X11 或其他系统对象泄漏到上层模块。
+`public/window.hpp`、`public/window_types.hpp` 和 `public/window_event.hpp` 提供窗口
+身份、窗口状态、Surface 绑定和平台事件的引擎语义。具体操作系统实现必须放在
+`Application/Platform/private/<platform>`，不得将系统头文件加入本目录公共头文件。
+
+`WindowSurfaceBinding` 中的句柄是不透明值，仅由 Application 平台实现填充；RHI 的
+Surface Bridge 负责将其转换为后端需要的 Surface 描述。
 
 ## 边界
 

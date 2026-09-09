@@ -192,6 +192,90 @@ else()
     target_compile_options(aeg_foundation PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
+add_library(aeg_platform INTERFACE)
+target_include_directories(aeg_platform
+    INTERFACE
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Platform/public
+)
+target_link_libraries(aeg_platform INTERFACE aeg_foundation)
+
+add_library(aeg_input STATIC
+    Engine/Input/private/input_system.cpp
+)
+target_compile_features(aeg_input PUBLIC cxx_std_20)
+target_include_directories(aeg_input
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Input/public
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Platform/public
+)
+target_link_libraries(aeg_input PUBLIC aeg_platform)
+
+if (MSVC)
+    target_compile_options(aeg_input PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(aeg_input PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+set(AEG_IMGUI_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/ImGui")
+if (NOT EXISTS "${AEG_IMGUI_DIR}/imgui.h" OR
+    NOT EXISTS "${AEG_IMGUI_DIR}/imgui.cpp" OR
+    NOT EXISTS "${AEG_IMGUI_DIR}/imgui_draw.cpp" OR
+    NOT EXISTS "${AEG_IMGUI_DIR}/imgui_tables.cpp" OR
+    NOT EXISTS "${AEG_IMGUI_DIR}/imgui_widgets.cpp")
+    message(FATAL_ERROR
+        "Vendored Dear ImGui core source is incomplete under ThirdParty/ImGui.")
+endif()
+
+add_library(aeg_imgui_core STATIC
+    ThirdParty/ImGui/imgui.cpp
+    ThirdParty/ImGui/imgui_draw.cpp
+    ThirdParty/ImGui/imgui_tables.cpp
+    ThirdParty/ImGui/imgui_widgets.cpp
+)
+target_compile_features(aeg_imgui_core PUBLIC cxx_std_20)
+target_include_directories(aeg_imgui_core
+    SYSTEM PUBLIC
+        ${AEG_IMGUI_DIR}
+)
+if (MSVC)
+    target_compile_options(aeg_imgui_core PRIVATE /W0)
+else()
+    target_compile_options(aeg_imgui_core PRIVATE -w)
+endif()
+
+add_library(aeg_editor_framework STATIC
+    Engine/EditorFramework/private/imgui/editor_imgui_host.cpp
+    Engine/EditorFramework/private/imgui/imgui_platform_bridge.cpp
+    Engine/EditorFramework/private/imgui/imgui_texture_registry.cpp
+)
+target_compile_features(aeg_editor_framework PUBLIC cxx_std_20)
+target_include_directories(aeg_editor_framework
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/EditorFramework/public
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Input/public
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Platform/public
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RHI/public
+    PRIVATE
+        ${AEG_IMGUI_DIR}
+)
+target_link_libraries(aeg_editor_framework PUBLIC aeg_foundation aeg_platform aeg_input)
+target_link_libraries(aeg_editor_framework PUBLIC aeg_imgui_core)
+
+if (MSVC)
+    target_compile_options(aeg_editor_framework PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(aeg_editor_framework PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+add_executable(aeg_editor_imgui_smoke
+    tests/editor_imgui_smoke.cpp
+)
+target_link_libraries(aeg_editor_imgui_smoke PRIVATE aeg_editor_framework)
+if (WIN32)
+    target_compile_definitions(aeg_editor_imgui_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
 add_executable(aeg_result_smoke
     tests/result_smoke.cpp
 )
@@ -779,6 +863,7 @@ endif()
 if (BUILD_TESTING)
     add_test(NAME aeg_math_smoke COMMAND aeg_math_smoke)
     add_test(NAME aeg_result_smoke COMMAND aeg_result_smoke)
+    add_test(NAME aeg_editor_imgui_smoke COMMAND aeg_editor_imgui_smoke)
     add_test(NAME aeg_reflection_smoke COMMAND aeg_reflection_smoke)
     add_test(NAME aeg_serialization_smoke COMMAND aeg_serialization_smoke)
     add_test(NAME aeg_concurrency_smoke COMMAND aeg_concurrency_smoke)
@@ -804,7 +889,7 @@ if (BUILD_TESTING)
     add_test(NAME aeg_triangle COMMAND aeg_triangle --frames 1)
     if (MINGW)
         get_filename_component(AEG_MINGW_RUNTIME_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
-        set_tests_properties(aeg_math_smoke aeg_result_smoke aeg_reflection_smoke aeg_serialization_smoke
+        set_tests_properties(aeg_editor_imgui_smoke aeg_math_smoke aeg_result_smoke aeg_reflection_smoke aeg_serialization_smoke
                 aeg_concurrency_smoke aeg_ecs_smoke aeg_pipeline_smoke aeg_pipeline_extension_smoke
                 aeg_pipeline_conformance_smoke aeg_pipeline_runtime_smoke aeg_pipeline_hot_swap_smoke
                 aeg_pipeline_phase_scheduler_smoke aeg_module_smoke aeg_world_scope_smoke aeg_world_serialization_smoke

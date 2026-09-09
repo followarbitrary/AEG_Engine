@@ -21,14 +21,14 @@
 | `Renderer`        | RenderExtract、RenderSceneSnapshot 和 RenderPipeline | 基础实现 |
 | `ECS`             | World 数据组织和实体组件系统                         | 已实现   |
 | `World`           | ECS 与 World Scope Pipeline 的数据流及运行时归档适配 | 基础实现 |
-| `Scene`           | 稳定场景文档、实体层级、组件载荷和 World 实例化       | 基础实现 |
+| `Scene`           | 稳定场景文档、实体层级、组件载荷和 World 实例化      | 基础实现 |
 | `Concurrency`     | 通用任务系统、线程协调和并发原语                     | 基础实现 |
 | `Module`          | C++ 模块生命周期、依赖和注册产物所有权               | 基础实现 |
-| `Platform`        | 操作系统、窗口、文件和平台适配                       | 预留     |
+| `Platform`        | 操作系统、窗口、文件和平台适配                       | 基础实现 |
 | `Diagnostics`     | 断言、性能分析、崩溃和运行时诊断                     | 预留     |
 | `Reflection`      | 类型元数据和运行时反射                               | 基础实现 |
 | `Serialization`   | 反射驱动的基础对象编码                               | 基础实现 |
-| `EditorFramework` | 编辑器专用框架与工具扩展                             | 预留     |
+| `EditorFramework` | 编辑器专用框架与工具扩展                             | 基础实现 |
 | `Tooling`         | 离线工具、代码生成和构建辅助                         | 预留     |
 
 ## 目录约定
