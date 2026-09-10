@@ -2,7 +2,7 @@
 
 > 文档性质：项目级目录、模块边界、命名和扩展约定
 >
-> 维护日期：2026-09-09
+> 维护日期：2026-09-10
 >
 > 详细 API 语义以各模块 `public` 头文件为准；AEG Domain-Oriented Pipeline Architecture
 > 文档负责说明完整的 Pipeline 架构。本文件只保留所有开发者都必须遵守的项目级规则。
@@ -63,9 +63,79 @@ D3D12、Metal 或其他后端时，必须在 `private` 下建立独立后端目�
 | `shaders/private` | 生成的 Shader `.cpp` 数据定义和私有生成物   |
 | `tests`           | smoke test、契约验证和最小可运行示例        |
 
-## 3. 新建目录契约
+## 3. Math 数学约定
 
-### 3.1 先确定目录所属层级
+本节定义跨模块共享的数学语义、数值行为和数据布局。详细 API 以
+`Engine/Math/public/math.hpp` 为准；实现不得改变本节的可观察语义。
+
+### 3.1 坐标系、角度和基础类型
+
+- 世界空间和视图空间统一使用右手坐标系：`+X` 向右、`+Y` 向上，相机默认沿 `-Z`
+  方向观察。
+- 角度统一使用弧度；正旋转遵循右手定则。
+- `Vec2`、`Vec3`、`Vec4` 的语义分量顺序分别为 `x, y`、`x, y, z` 和 `x, y, z, w`。
+- `Quat` 的存储顺序为 `x, y, z, w`，默认值是单位旋转 `(0, 0, 0, 1)`；旋转 API
+  使用弧度，要求使用单位四元数表达旋转。
+- `Vec3` 为 16 字节对齐且占用 16 字节；第四个浮点数仅用于对齐，不是语义分量，
+  不得按紧凑的三个浮点数序列化。
+
+### 3.2 矩阵和变换
+
+- `Mat4` 是由四个列向量组成的列主序 4x4 矩阵；`operator[]` 按列访问，`at(row, column)`
+  是规范的元素访问方式。
+- 向量是列向量，放在矩阵右侧相乘。变换链统一写作
+  `clip = projection * view * model * local`，矩阵乘法从右向左组合。
+- `trs(translation, rotation, scale)` 先缩放、再旋转、最后平移，等价于
+  `translation(translation) * from_quat(rotation) * scale(scale)`。
+- `Mat4{}` 是零矩阵；需要单位矩阵时必须调用 `identity()`。
+- 点变换使用齐次 `w = 1` 并执行透视除法；向量变换使用 `w = 0`，不得受到平移影响。
+- `Mat4` 直接上传 Shader 的前提是 Shader 使用相同的列主序约定；引擎不会隐式转置。
+
+### 3.3 相机和 Clip Space
+
+- `perspective()` 和 `orthographic()` 默认使用 `0..1` 的 NDC 深度范围。
+- `near_plane` 和 `far_plane` 是正距离；可见的相机空间 Z 位于
+  `[-far_plane, -near_plane]`。
+- `ClipSpaceConvention::y_down` 使正的 NDC Y 轴向下。
+- `ClipSpaceConvention::reversed_z` 将 Near 映射到 `1`、Far 映射到 `0`；默认约定将
+  Near 映射到 `0`、Far 映射到 `1`。
+- 公共 Math API 不承诺 OpenGL 风格的 `-1..1` NDC 深度范围。调用方不得仅凭后端习惯
+  推断深度映射。
+- `RenderCamera::view_projection()` 必须返回 `projection * view`；Renderer 传递相机
+  矩阵时必须同时传递对应的 `ClipSpaceConvention`。
+
+### 3.4 平面和视锥体
+
+- 平面方程统一表示为 `n.x * x + n.y * y + n.z * z + offset`。
+- Frustum 平面顺序固定为 `Left, Right, Bottom, Top, Near, Far`，对应
+  `FrustumPlane::kLeft` 至 `FrustumPlane::kFar`。
+- `try_extract_frustum()` 生成归一化平面；提取失败时必须保持输出参数不变。
+- 平面测试的“内部”语义为方程值大于或等于零：
+  `a * x + b * y + c * z + d >= 0`。
+- `Frustum::contains_point()` 和 `intersects_sphere()` 的调用方必须先确保 Frustum
+  有效且平面已归一化。其他模块不得复制平面提取公式。
+
+### 3.5 失败、比较和数值规则
+
+- `try_*` 函数失败时返回 `false`，并保持输出参数不变。
+- 值返回包装函数失败时返回零向量或零矩阵；`normalize(Quat)`、`inverse(Quat)` 和
+  轴角构造失败时返回单位四元数 `(0, 0, 0, 1)`。
+- `operator==` 执行逐分量精确比较；有限浮点值的近似比较必须使用 `nearly_equal()`
+  并显式选择合适的绝对容差。
+- `kEpsilon` 是默认的数值阈值，不表示单位换算，也不得被当作世界尺度或时间步长。
+- 非有限输入或数值奇异矩阵属于无效输入；不得静默映射为另一个有效数学对象。
+
+### 3.6 SIMD 和 ABI
+
+- SIMD 仅是 Math 的实现细节；公共 API 不暴露 SIMD 类型。
+- SSE2 和标量回退路径必须保持相同的语义、布局约束和边界行为；允许存在轻微浮点
+  舍入差异，但不得改变可观察的失败规则或坐标/矩阵约定。
+- `Mat4` 的公共布局和列主序语义属于跨模块 ABI 契约；序列化、上传或跨模块传递时
+  不得依据具体 SIMD 实现推断布局。
+
+## 4. 新建目录契约
+
+### 4.1 先确定目录所属层级
 
 新目录必须先回答两个问题：
 
@@ -75,7 +145,7 @@ D3D12、Metal 或其他后端时，必须在 `private` 下建立独立后端目�
 目录职责必须单一。若一个目录同时承担资源管理、调度、渲染策略和平台适配，应拆分为
 不同模块，而不是继续增加内部开关。
 
-### 3.2 `public` / `private` 分离
+### 4.2 `public` / `private` 分离
 
 - 需要跨模块使用的类型和接口放入 `public`。
 - 实现细节、缓存、后端对象、线程实现和临时工具放入 `private`。
@@ -86,7 +156,7 @@ D3D12、Metal 或其他后端时，必须在 `private` 下建立独立后端目�
 - 仅用于实现细节的深层目录不要求单独 README，但 `RHI` 后端等具有独立边界的目录必须
   有说明文档。
 
-### 3.3 依赖方向
+### 4.3 依赖方向
 
 - 基础模块不得依赖上层领域模块。
 - 上层模块只能通过公共接口使用下层模块，不得 include private 文件。
@@ -96,7 +166,7 @@ D3D12、Metal 或其他后端时，必须在 `private` 下建立独立后端目�
 - Renderer 不得直接修改 World；RenderGraph 不得承担通用业务 Pipeline 调度；RHI 不得
   依赖 Renderer 或游戏逻辑。
 
-### 3.4 生命周期与所有权
+### 4.4 生命周期与所有权
 
 - 新增对象必须明确由谁创建、谁持有、谁销毁以及何时可以销毁。
 - `std::span`、`std::string_view`、引用、裸指针和 `void*` 默认均为借用，不转移所有权。
@@ -106,7 +176,7 @@ D3D12、Metal 或其他后端时，必须在 `private` 下建立独立后端目�
 - World Pipeline 必须绑定具体 `WorldHandle`，不得使用 Singleton 表示 World 状态。
 - 任何跨 Scope 数据必须通过不可变 Snapshot、Artifact 或显式 Bridge 传递。
 
-### 3.5 错误处理
+### 4.5 错误处理
 
 - 可能失败的公共函数必须返回 `foundation::Result` 或 `ResultValue<T>`。
 - 通用错误构造函数统一放在 `Foundation`，其他模块不得复制实现同语义的 helper。
@@ -116,9 +186,9 @@ D3D12、Metal 或其他后端时，必须在 `private` 下建立独立后端目�
 - 非法参数、非法状态、不支持能力、未找到对象和内存不足必须使用对应错误类别，不能
   全部返回 `kUnknown`。
 
-## 4. 命名与格式约定
+## 5. 命名与格式约定
 
-### 4.1 命名
+### 5.1 命名
 
 本项目采用以下约定。函数命名是项目特例，使用 snake_case；其他命名遵循下表：
 
@@ -137,7 +207,7 @@ D3D12、Metal 或其他后端时，必须在 `private` 下建立独立后端目�
 名称必须表达语义，不得使用无意义的 `Manager2`、`DataObject`、`Temp`、`Misc` 等名称。
 Shader 名称另遵守 `shaders/SHADER_NAMING.md`。
 
-### 4.2 头文件与 Include
+### 5.2 头文件与 Include
 
 - 优先使用 `#pragma once`。
 - 头文件必须自洽：直接使用的类型应显式 include 对应声明，不依赖传递包含。
@@ -145,7 +215,7 @@ Shader 名称另遵守 `shaders/SHADER_NAMING.md`。
 - 第三方依赖必须来自 `ThirdParty`，不得依赖开发机上的本地安装副本。
 - 公共头文件尽量减少传递依赖；可以使用前置声明时，不应无条件 include 完整实现头。
 
-### 4.3 排版与注释
+### 5.3 排版与注释
 
 - 使用 4 个空格缩进，禁止 Tab。
 - 代码格式以仓库 `.clang-format` 为准；提交前必须执行项目配置的格式化流程。
@@ -157,7 +227,7 @@ Shader 名称另遵守 `shaders/SHADER_NAMING.md`。
 - 只添加必要注释：类、模块和复杂契约需要说明；普通显而易见的逐行代码不写注释。
 - 函数注释只说明作用，不重复书写返回值和参数说明。
 
-## 5. Pipeline 与 Feature 口头约定
+## 6. Pipeline 与 Feature 口头约定
 
 - 所有具有明确执行时机、输入输出和依赖关系的功能，优先建模为 Pipeline。
 - 基础服务，如 Math、Logging、Allocator、RHI Device 和资源缓存，不应伪装成业务 Pipeline。
@@ -174,9 +244,9 @@ Shader 名称另遵守 `shaders/SHADER_NAMING.md`。
 - 新增 Pipeline 可以注册自定义 Stage 和 FeaturePoint；新增全局 Phase 必须通过
   `PhaseRegistry` 相对已有 Phase 注册。
 
-## 6. RHI、RenderGraph 与 Shader 约定
+## 7. RHI、RenderGraph 与 Shader 约定
 
-### 6.1 RHI
+### 7.1 RHI
 
 - `rhi.hpp`、`rhi_struct.hpp`、`rhi_config.hpp` 必须保持后端无关。
 - Vulkan、D3D12、VMA 和平台窗口类型只能出现在 RHI private 后端或适配实现中。
@@ -186,7 +256,7 @@ Shader 名称另遵守 `shaders/SHADER_NAMING.md`。
   只按“独立显卡”分类选择。
 - GPU 同步必须通过 `GpuSyncPoint`、Queue Submission 和明确的等待关系表达。
 
-### 6.2 RenderGraph
+### 7.2 RenderGraph
 
 - RenderGraph 必须先声明资源和 Pass，再 Compile，最后 Execute。
 - Pass Setup 负责声明资源访问；Pass Execute 负责录制命令，二者不能混用生命周期。
@@ -196,7 +266,7 @@ Shader 名称另遵守 `shaders/SHADER_NAMING.md`。
   生命周期。
 - Graph Handle 不能跨 Graph、跨 generation 或跨 reset 使用。
 
-### 6.3 Shader
+### 7.3 Shader
 
 - Shader 使用原生、平台无关的 HLSL，不写入 Vulkan、D3D12 或平台专属语法。
 - Shader 文件名使用 `<functional_name>.<stage>.hlsl`，功能名和目录使用小写 snake_case。
@@ -207,7 +277,7 @@ Shader 名称另遵守 `shaders/SHADER_NAMING.md`。
   编译命令。
 - Shader Contract 必须先经过 Reflection/验证，再生成 Binding Layout 和 RHI Pipeline。
 
-## 7. API 状态标记
+## 8. API 状态标记
 
 公共模块、类型或接口在 README、头文件注释或架构文档中应标记其成熟度。未标记的公共
 接口默认视为 `Experimental`，不得被游戏业务作为长期稳定依赖。
@@ -222,7 +292,7 @@ Shader 名称另遵守 `shaders/SHADER_NAMING.md`。
 状态标记用于表达演进承诺，不替代版本号。一个模块可以整体为 `Stable`，但其中新增的
 独立 API 仍可标为 `Experimental`。
 
-## 8. 线程安全标注规范
+## 9. 线程安全标注规范
 
 公共类型只要存在并发使用可能，就应在类注释、构造函数注释或 README 中明确其线程模型。
 不允许要求调用方通过阅读 private 实现推断锁、线程亲和性或回调恢复线程。
@@ -239,7 +309,7 @@ Shader 名称另遵守 `shaders/SHADER_NAMING.md`。
 任务收敛，以及回调捕获对象必须维持到何时。`Completion` 恢复协程时的线程亲和性不得被
 隐式假设。
 
-## 9. 资源与对象命名规则
+## 10. 资源与对象命名规则
 
 名称用于诊断、缓存、序列化、图构建和资产定位时，必须具备稳定且可读的语义；不得用内存
 地址、递增临时编号或后端对象名替代公开身份。
@@ -259,7 +329,7 @@ Shader 名称另遵守 `shaders/SHADER_NAMING.md`。
 名称变更若影响 `StableId`、Reflection TypeId、ArtifactId、Shader Contract、序列化字段或资产
 定位，即属于兼容性变更，不能被当作普通重命名处理。
 
-## 10. 测试契约
+## 11. 测试契约
 
 新增稳定模块或改变既有公共行为时，应新增与风险匹配的最小验证。测试应优先使用
 `tests/<module>_smoke.cpp` 命名，并通过 CMake/CTest 注册。
@@ -276,7 +346,7 @@ Shader 名称另遵守 `shaders/SHADER_NAMING.md`。
 测试必须验证可观察契约，而不是 private 实现细节。无法在当前平台自动测试的后端或窗口行为，
 应保留最小 smoke 覆盖，并在模块 README 中说明人工验证前提。
 
-## 11. 变更兼容性规则
+## 12. 变更兼容性规则
 
 以下改动属于兼容性变更，实施前必须评估调用方、持久化数据和插件边界，并同步更新文档、
 版本和测试：
@@ -296,7 +366,7 @@ Shader 名称另遵守 `shaders/SHADER_NAMING.md`。
 给出替代路径，并完成项目内调用点迁移；`Reserved` 目录或类型改为可用 API 时，必须先明确
 其状态、所有权、线程模型和最小测试覆盖。
 
-## 12. 新模块/新目录提交前检查
+## 13. 新模块/新目录提交前检查
 
 1. 目录职责是否单一，名称是否能直接说明用途？
 2. 是否明确依赖方向，并且没有形成循环依赖？
@@ -309,7 +379,7 @@ Shader 名称另遵守 `shaders/SHADER_NAMING.md`。
 9. 若新增公共枚举、结构体、文件格式或稳定 ID，是否同步说明版本兼容影响？
 10. 若实现与架构文档不一致，是否先修正文档再继续扩展？
 
-## 13. 文档维护
+## 14. 文档维护
 
 新增模块、公共 API、目录边界、Pipeline/Feature 规则或第三方依赖时，必须同步更新：
 

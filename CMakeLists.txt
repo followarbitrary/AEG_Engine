@@ -901,6 +901,24 @@ if (WIN32)
         _CRT_SECURE_NO_WARNINGS
     )
 
+    add_executable(aeg_editor_application
+        Application/Editor/private/editor_application.cpp
+    )
+    target_link_libraries(aeg_editor_application PRIVATE
+        aeg_application_platform_win32
+        aeg_engine
+        aeg_editor_framework
+        aeg_renderer
+        aeg_resource
+        aeg_rhi
+        aeg_core_shaders
+    )
+    target_compile_definitions(aeg_editor_application PRIVATE
+        _CRT_SECURE_NO_WARNINGS
+        AEG_EDITOR_IMGUI_SHADER_PACKAGE_PATH="${AEG_EDITOR_IMGUI_SHADER_PACKAGE}"
+    )
+    add_dependencies(aeg_editor_application aeg_core_shaders)
+
     add_executable(aeg_triangle
         tests/triangle.cpp
     )
@@ -963,6 +981,7 @@ if (BUILD_TESTING)
     add_test(NAME aeg_triangle COMMAND aeg_triangle --frames 1)
     if (WIN32)
         add_test(NAME aeg_editor_imgui_renderer_smoke COMMAND aeg_editor_imgui_renderer_smoke)
+        add_test(NAME aeg_editor_application COMMAND aeg_editor_application --frames 3)
     endif()
     if (MINGW)
         get_filename_component(AEG_MINGW_RUNTIME_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
@@ -972,7 +991,7 @@ if (BUILD_TESTING)
                 aeg_pipeline_phase_scheduler_smoke aeg_module_smoke aeg_world_scope_smoke aeg_world_serialization_smoke
                 aeg_scene_asset_smoke aeg_world_frame_orchestrator_smoke aeg_world_multi_view_smoke
                 aeg_engine_frame_orchestrator_smoke aeg_renderer_smoke aeg_render_feature_runtime_smoke
-                aeg_frame_retention_smoke aeg_rhi_smoke aeg_logging_smoke aeg_triangle PROPERTIES
+                aeg_frame_retention_smoke aeg_rhi_smoke aeg_logging_smoke aeg_triangle aeg_editor_application PROPERTIES
             ENVIRONMENT "PATH=${AEG_MINGW_RUNTIME_DIR};$ENV{PATH}"
         )
     endif()

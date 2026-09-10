@@ -743,69 +743,17 @@ Shader Stage 或硬件流水线阶段。
 职责，视图生命周期、可见性策略和结果发布属于 Renderer 的职责；Math 不得依赖
 Renderer、Pipeline、RenderGraph 或 RHI。
 
-当前 Math 的相机与矩阵语义如下：
-
-- 使用右手坐标系；`+X` 为右、`+Y` 为上，相机默认沿 `-Z` 方向观察。
-- `Mat4` 为列主序矩阵，向量为列向量，变换链为
-  `projection * view * model * local`。
-- `perspective()` 和 `orthographic()` 默认生成 `0..1` NDC 深度范围的投影矩阵。
-- `math::ClipSpaceConvention::y_down` 控制 NDC Y 轴方向。
-- `math::ClipSpaceConvention::reversed_z` 将 Near 映射到 `1`、Far 映射到 `0`；
-  默认情况下 Near 映射到 `0`、Far 映射到 `1`。
-- 当前公共 Math API 不承诺 OpenGL 风格的 `-1..1` NDC 深度范围。
+当前 Math 的坐标系、矩阵、变换、投影和数值语义统一遵循
+`AEG Engine Contracts.md` 第 3 节“Math 数学约定”。本节只说明这些约定在
+Visibility 流程中的使用方式。
 
 `RenderCamera` 保存 View Matrix、Projection Matrix 和对应的
 `ClipSpaceConvention`；`view_projection()` 返回 `projection * view`。
 `RenderView::frustum_culling` 启用后，Renderer 将组合矩阵和该约定传递给
 `math::try_extract_frustum()`，再使用 Math 提供的 Frustum 球体测试完成实例和光源裁剪。
-在默认 `0..1` 深度约定下，Frustum 平面排列为：
-
-```text
-Left -> Right -> Bottom -> Top -> Near -> Far
-```
-
-平面测试语义为：
-
-```text
-a * x + b * y + c * z + d >= 0
-```
-
-当前 Math 已公开以下通用几何契约：
-
-```cpp
-enum class FrustumPlane : uint8_t {
-    kLeft = 0,
-    kRight = 1,
-    kBottom = 2,
-    kTop = 3,
-    kNear = 4,
-    kFar = 5,
-    kCount = 6,
-};
-
-struct Plane {
-    Vec4 equation;
-    Vec3 normal() const noexcept;
-    float offset() const noexcept;
-    float signed_distance(Vec3 point) const noexcept;
-};
-
-struct Frustum {
-    std::array<Plane, 6> planes;
-    bool is_valid() const noexcept;
-    bool contains_point(Vec3 point) const noexcept;
-    bool intersects_sphere(Vec3 center, float radius) const noexcept;
-};
-
-bool try_extract_frustum(const Mat4& view_projection, Frustum& result,
-                         ClipSpaceConvention convention = {}) noexcept;
-```
-
-`try_extract_frustum()` 生成归一化平面，并在失败时保持输出参数不变。它根据
-`ClipSpaceConvention::y_down` 保持 Top/Bottom 的视图语义，根据
-`ClipSpaceConvention::reversed_z` 保持 Near/Far 的相机距离语义。`Frustum` 的
-`contains_point()` 和 `intersects_sphere()` 要求调用方先保证 Frustum 有效且平面已归一化；
-Renderer 在构建阶段完成一次验证，之后在对象热路径中只执行平面测试。
+`try_extract_frustum()` 根据 `ClipSpaceConvention::y_down` 保持 Top/Bottom 的视图语义，
+根据 `ClipSpaceConvention::reversed_z` 保持 Near/Far 的相机距离语义；Renderer 在构建
+阶段完成一次 Frustum 有效性验证，之后在对象热路径中只执行平面测试。
 
 Physics、Editor、Renderer 或其他模块需要视锥几何时，必须依赖 Math 的上述 API，
 不得复制平面提取公式，也不得访问 Renderer 的内部状态。Math 只提供几何运算，

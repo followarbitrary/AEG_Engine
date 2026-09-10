@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <span>
 #include <vector>
@@ -21,6 +22,26 @@ namespace aeg::engine {
 /** @brief Conventional RenderGraph resource identity for the acquired swapchain image. */
 inline constexpr pipeline::RenderResourceId kSwapchainImageResourceId{"SwapchainImage"};
 
+/**
+ * @brief Context supplied to a frame-local render-feature preparation callback.
+ *
+ * The callback runs after FrameContext has begun and, when requested, after a
+ * swapchain image has been acquired and imported into the RenderGraph. It is a
+ * controlled RenderBuild hook for producers that must upload or prepare
+ * frame-local resources before RenderFeature graph construction. The callback
+ * must not retain the context or its acquired-frame pointer.
+ */
+struct EngineFramePreparationContext final {
+    render_graph::FrameContext& frame_context;
+    render_graph::RenderGraph& render_graph;
+    const rhi::FrameAcquireResult* acquired_frame{nullptr};
+    /** @brief Logical RenderGraph texture for the acquired swapchain image. */
+    render_graph::RenderGraphTexture swapchain_resource{};
+};
+
+using EngineFramePreparationFunction =
+    std::function<foundation::Result(const EngineFramePreparationContext& context)>;
+
 /** @brief Per-frame inputs consumed by EngineFrameOrchestrator. */
 struct EngineFrameDesc final {
     uint64_t fixed_tick{0};
@@ -28,10 +49,8 @@ struct EngineFrameDesc final {
     bool acquire_swapchain_image{false};
     rhi::SwapchainHandle swapchain{};
     rhi::TextureDesc swapchain_image_desc{};
-    rhi::ResourceState swapchain_image_initial_state{
-        rhi::ResourceUsage::kPresent,     rhi::ShaderStage::kAll, rhi::QueueClass::kGraphics, false,
-        rhi::PipelineStage::kAllCommands,
-    };
+    /** @brief Optional override; undefined uses the state reported by image acquisition. */
+    rhi::ResourceState swapchain_image_initial_state{};
     pipeline::RenderResourceId swapchain_resource_id{kSwapchainImageResourceId};
     bool present_acquired_frame{false};
     std::span<const render_graph::RenderGraphFeatureBufferBinding> render_feature_buffers{};
@@ -42,6 +61,8 @@ struct EngineFrameDesc final {
     void* user_data{nullptr};
     const renderer::RenderResourceResolver* render_resource_resolver{nullptr};
     bool require_resolved_render_resources{false};
+    /** @brief Optional controlled hook run before RenderFeature graph construction. */
+    EngineFramePreparationFunction render_feature_preparation{};
 };
 
 /** @brief Non-owning registration of one World view and its Frame pipeline host. */
@@ -181,6 +202,7 @@ private:
     bool has_last_phase_{false};
     bool initialized_{false};
     bool frame_active_{false};
+    bool render_feature_prepared_{false};
     bool render_features_built_{false};
     bool render_graph_executed_{false};
     bool frame_presented_{false};

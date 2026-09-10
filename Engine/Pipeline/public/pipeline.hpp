@@ -115,11 +115,13 @@ public:
     [[nodiscard]] virtual RenderGraphPass pass() const noexcept = 0;
     [[nodiscard]] virtual foundation::ResultValue<rhi::BufferHandle> buffer(RenderGraphBuffer buffer) const = 0;
     [[nodiscard]] virtual foundation::ResultValue<rhi::TextureHandle> texture(RenderGraphTexture texture) const = 0;
+    /** @brief Resolves a view prepared before the pass execute callback. */
     [[nodiscard]] virtual foundation::ResultValue<rhi::BufferViewHandle> buffer_view(RenderGraphBuffer buffer,
                                                                                      rhi::BufferViewKind kind,
                                                                                      uint64_t offset, uint64_t size,
                                                                                      rhi::Format format,
                                                                                      uint32_t structure_stride) = 0;
+    /** @brief Resolves a view prepared before the pass execute callback. */
     [[nodiscard]] virtual foundation::ResultValue<rhi::TextureViewHandle> texture_view(
         RenderGraphTexture texture, rhi::TextureViewKind kind, rhi::SubresourceRange subresources, rhi::Format format,
         rhi::TextureViewDimension dimension) = 0;

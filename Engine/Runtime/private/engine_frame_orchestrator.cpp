@@ -516,6 +516,7 @@ foundation::Result EngineFrameOrchestrator::begin_frame(const EngineFrameDesc& d
         return begin_result;
     }
     frame_active_ = true;
+    render_feature_prepared_ = false;
     render_features_built_ = false;
     render_graph_executed_ = false;
     frame_presented_ = false;
@@ -572,17 +573,17 @@ foundation::Result EngineFrameOrchestrator::begin_frame(const EngineFrameDesc& d
                 swapchain_desc.extent.height == 0) {
                 return fail_frame(invalid_argument("swapchain image description is incomplete"));
             }
+            const rhi::FrameAcquireResult& acquired = *frame_context_.acquired_frame();
             if (frame_desc_.swapchain_image_initial_state.usage == rhi::ResourceUsage::kUndefined) {
-                frame_desc_.swapchain_image_initial_state.usage = rhi::ResourceUsage::kPresent;
-                frame_desc_.swapchain_image_initial_state.shader_stages = rhi::ShaderStage::kAll;
-                frame_desc_.swapchain_image_initial_state.queue = rhi::QueueClass::kGraphics;
-                frame_desc_.swapchain_image_initial_state.pipeline_stages = rhi::PipelineStage::kAllCommands;
+                frame_desc_.swapchain_image_initial_state = acquired.initial_state;
+            }
+            if (frame_desc_.swapchain_image_initial_state.usage == rhi::ResourceUsage::kUndefined) {
+                swapchain_desc.initial_usage = rhi::ResourceUsage::kUndefined;
             }
             frame_desc_.swapchain_image_desc = swapchain_desc;
 
             if (!desc.reset_render_graph && swapchain_resource_.is_valid() &&
                 render_graph_.contains_texture(swapchain_resource_)) {
-                const rhi::FrameAcquireResult& acquired = *frame_context_.acquired_frame();
                 if (const foundation::Result result = render_graph_.update_imported_texture(
                         swapchain_resource_, acquired.image.texture, acquired.image.view,
                         frame_desc_.swapchain_image_desc, frame_desc_.swapchain_image_initial_state);
@@ -1106,6 +1107,33 @@ foundation::Result EngineFrameOrchestrator::execute_registered_phase(pipeline::P
         }
     }
 
+    if (mode == PhaseExecutionMode::kFrame && is_builtin_phase(phase, pipeline::EnginePhase::kRenderBuild) &&
+        !render_feature_prepared_) {
+        if (frame_desc_.render_feature_preparation) {
+            const EngineFramePreparationContext preparation_context{
+                frame_context_,
+                render_graph_,
+                frame_context_.acquired_frame(),
+                swapchain_resource_,
+            };
+            try {
+                if (const foundation::Result result = frame_desc_.render_feature_preparation(preparation_context);
+                    !result) {
+                    return result;
+                }
+            } catch (const std::bad_alloc&) {
+                return out_of_memory("render feature preparation allocation failed");
+            } catch (const std::exception& exception) {
+                return foundation::unknown_exception(exception);
+            } catch (...) {
+                return foundation::Result::failure(
+                    foundation::ResultCode::kUnknown,
+                    "render feature preparation threw an unknown exception");
+            }
+        }
+        render_feature_prepared_ = true;
+    }
+
     if (mode == PhaseExecutionMode::kFrame && is_builtin_phase(phase, pipeline::EnginePhase::kRenderBuild)) {
         if (const foundation::Result result = build_render_features(); !result) {
             return result;
@@ -1243,6 +1271,7 @@ foundation::Result EngineFrameOrchestrator::clear_frame_state() noexcept {
     last_phase_rank_ = 0;
     has_last_phase_ = false;
     frame_active_ = false;
+    render_feature_prepared_ = false;
     render_features_built_ = false;
     render_graph_executed_ = false;
     frame_presented_ = false;

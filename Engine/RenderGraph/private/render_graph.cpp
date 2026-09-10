@@ -628,10 +628,18 @@ namespace aeg::render_graph {
                                                                            uint32_t frame_slot) const;
         [[nodiscard]] foundation::ResultValue<rhi::BufferViewHandle> resolve_buffer_view(
                 RenderGraphBuffer handle, uint32_t frame_slot, rhi::BufferViewKind kind, uint64_t offset,
-                uint64_t size, rhi::Format format, uint32_t structure_stride);
+                uint64_t size, rhi::Format format, uint32_t structure_stride) const;
         [[nodiscard]] foundation::ResultValue<rhi::TextureViewHandle> resolve_texture_view(
                 RenderGraphTexture handle, uint32_t frame_slot, rhi::TextureViewKind kind,
+                rhi::SubresourceRange subresources, rhi::Format format, rhi::TextureViewDimension dimension) const;
+        [[nodiscard]] foundation::ResultValue<rhi::BufferViewHandle> ensure_buffer_view(
+                RenderGraphBuffer handle, uint32_t frame_slot, rhi::BufferViewKind kind, uint64_t offset,
+                uint64_t size, rhi::Format format, uint32_t structure_stride);
+        [[nodiscard]] foundation::ResultValue<rhi::TextureViewHandle> ensure_texture_view(
+                RenderGraphTexture handle, uint32_t frame_slot, rhi::TextureViewKind kind,
                 rhi::SubresourceRange subresources, rhi::Format format, rhi::TextureViewDimension dimension);
+        [[nodiscard]] foundation::Result prepare_execution_views(const RenderGraphPlan& execution_plan,
+                                                                 uint32_t frame_slot);
         [[nodiscard]] foundation::Result record_barrier_batch(
                 rhi::CommandListHandle command_list, uint32_t frame_slot,
                 const RenderGraphPassPlan& pass_plan, RenderGraphBarrierPhase phase,
@@ -1131,7 +1139,13 @@ namespace aeg::render_graph {
             return {foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                          "Swapchain image import requires a valid acquired frame"), {}};
         }
-        return import_texture(acquired.image.texture, acquired.image.view, desc, initial_state);
+        const rhi::ResourceState resolved_initial_state =
+                initial_state.usage == rhi::ResourceUsage::kUndefined ? acquired.initial_state : initial_state;
+        rhi::TextureDesc import_desc = desc;
+        if (resolved_initial_state.usage == rhi::ResourceUsage::kUndefined) {
+            import_desc.initial_usage = rhi::ResourceUsage::kUndefined;
+        }
+        return import_texture(acquired.image.texture, acquired.image.view, import_desc, resolved_initial_state);
     }
 
     foundation::Result RenderGraph::export_buffer(RenderGraphBuffer resource) {
@@ -2997,7 +3011,42 @@ namespace aeg::render_graph {
 
     foundation::ResultValue<rhi::BufferViewHandle> RenderGraph::Impl::resolve_buffer_view(
             RenderGraphBuffer handle, uint32_t frame_slot, rhi::BufferViewKind kind, uint64_t offset, uint64_t size,
+            rhi::Format format, uint32_t structure_stride) const {
+        const BufferRecord* record = get_buffer(handle);
+        if (record == nullptr) {
+            return {foundation::Result::failure(foundation::ResultCode::kNotFound,
+                                         "Invalid render graph buffer handle"), {}};
+        }
+        const PhysicalBuffer* physical = physical_buffer(*record, frame_slot);
+        if (physical == nullptr || !physical->handle.is_valid()) {
+            return {foundation::Result::failure(foundation::ResultCode::kInvalidState,
+                                         "Render graph buffer has no physical allocation"), {}};
+        }
+        rhi::BufferViewDesc desc{};
+        desc.buffer = physical->handle;
+        desc.kind = kind;
+        desc.offset = offset;
+        desc.size = size;
+        desc.format = format;
+        desc.structure_stride = structure_stride;
+        for (const BufferViewCacheEntry& view: physical->views) {
+            if (buffer_view_desc_equal(view.desc, desc)) {
+                return {foundation::Result::success(), view.handle};
+            }
+        }
+        return {foundation::Result::failure(foundation::ResultCode::kNotFound,
+                                            "Render graph buffer view was not prepared before pass execution"), {}};
+    }
+
+    foundation::ResultValue<rhi::BufferViewHandle> RenderGraph::Impl::ensure_buffer_view(
+            RenderGraphBuffer handle, uint32_t frame_slot, rhi::BufferViewKind kind, uint64_t offset, uint64_t size,
             rhi::Format format, uint32_t structure_stride) {
+        const foundation::ResultValue<rhi::BufferViewHandle> resolved =
+                resolve_buffer_view(handle, frame_slot, kind, offset, size, format, structure_stride);
+        if (resolved || resolved.result.code != foundation::ResultCode::kNotFound) {
+            return resolved;
+        }
+
         BufferRecord* record = get_buffer(handle);
         if (record == nullptr) {
             return {foundation::Result::failure(foundation::ResultCode::kNotFound,
@@ -3015,11 +3064,6 @@ namespace aeg::render_graph {
         desc.size = size;
         desc.format = format;
         desc.structure_stride = structure_stride;
-        for (const BufferViewCacheEntry& view: physical->views) {
-            if (buffer_view_desc_equal(view.desc, desc)) {
-                return {foundation::Result::success(), view.handle};
-            }
-        }
 
         auto create_result = device.create_buffer_view(desc);
         if (!create_result) {
@@ -3037,8 +3081,8 @@ namespace aeg::render_graph {
 
     foundation::ResultValue<rhi::TextureViewHandle> RenderGraph::Impl::resolve_texture_view(
             RenderGraphTexture handle, uint32_t frame_slot, rhi::TextureViewKind kind,
-            rhi::SubresourceRange subresources, rhi::Format format, rhi::TextureViewDimension dimension) {
-        TextureRecord* record = get_texture(handle);
+            rhi::SubresourceRange subresources, rhi::Format format, rhi::TextureViewDimension dimension) const {
+        const TextureRecord* record = get_texture(handle);
         if (record == nullptr) {
             return {foundation::Result::failure(foundation::ResultCode::kNotFound,
                                          "Invalid render graph texture handle"), {}};
@@ -3047,7 +3091,7 @@ namespace aeg::render_graph {
         if (!range_result) {
             return {range_result, {}};
         }
-        PhysicalTexture* physical = physical_texture(*record, frame_slot);
+        const PhysicalTexture* physical = physical_texture(*record, frame_slot);
         if (physical == nullptr || !physical->handle.is_valid()) {
             return {foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                          "Render graph texture has no physical allocation"), {}};
@@ -3079,6 +3123,45 @@ namespace aeg::render_graph {
                 return {foundation::Result::success(), view.handle};
             }
         }
+        return {foundation::Result::failure(foundation::ResultCode::kNotFound,
+                                            "Render graph texture view was not prepared before pass execution"), {}};
+    }
+
+    foundation::ResultValue<rhi::TextureViewHandle> RenderGraph::Impl::ensure_texture_view(
+            RenderGraphTexture handle, uint32_t frame_slot, rhi::TextureViewKind kind,
+            rhi::SubresourceRange subresources, rhi::Format format, rhi::TextureViewDimension dimension) {
+        const foundation::ResultValue<rhi::TextureViewHandle> resolved =
+                resolve_texture_view(handle, frame_slot, kind, subresources, format, dimension);
+        if (resolved || resolved.result.code != foundation::ResultCode::kNotFound) {
+            return resolved;
+        }
+
+        TextureRecord* record = get_texture(handle);
+        if (record == nullptr) {
+            return {foundation::Result::failure(foundation::ResultCode::kNotFound,
+                                         "Invalid render graph texture handle"), {}};
+        }
+        const foundation::Result range_result = normalize_texture_range(record->desc.desc, subresources);
+        if (!range_result) {
+            return {range_result, {}};
+        }
+        PhysicalTexture* physical = physical_texture(*record, frame_slot);
+        if (physical == nullptr || !physical->handle.is_valid()) {
+            return {foundation::Result::failure(foundation::ResultCode::kInvalidState,
+                                         "Render graph texture has no physical allocation"), {}};
+        }
+
+        const rhi::Format view_format = format == rhi::Format::kUnknown ? record->desc.desc.format : format;
+        if (kind == rhi::TextureViewKind::kDepthStencil && subresources.aspects == rhi::Aspect::kColor) {
+            subresources.aspects = default_aspect(record->desc.desc.format);
+        }
+
+        rhi::TextureViewDesc desc{};
+        desc.texture = physical->handle;
+        desc.kind = kind;
+        desc.dimension = dimension;
+        desc.format = view_format;
+        desc.subresources = subresources;
 
         auto create_result = device.create_texture_view(desc);
         if (!create_result) {
@@ -3092,6 +3175,38 @@ namespace aeg::render_graph {
                                          "Render graph texture-view cache allocation failed"), {}};
         }
         return create_result;
+    }
+
+    foundation::Result RenderGraph::Impl::prepare_execution_views(const RenderGraphPlan& execution_plan,
+                                                                    uint32_t frame_slot) {
+        for (const RenderGraphPassPlan& pass_plan: execution_plan.pass_plans) {
+            if (!pass_plan.live) {
+                continue;
+            }
+            const PassRecord* pass = get_pass(pass_plan.pass);
+            if (pass == nullptr) {
+                return foundation::Result::failure(foundation::ResultCode::kInvalidState,
+                                                   "Render graph execution plan references an invalid pass");
+            }
+            for (const ColorAttachment& attachment: pass->color_attachments) {
+                const foundation::ResultValue<rhi::TextureViewHandle> view = ensure_texture_view(
+                        attachment.texture, frame_slot, rhi::TextureViewKind::kColorAttachment,
+                        attachment.subresources, rhi::Format::kUnknown, rhi::TextureViewDimension::kAuto);
+                if (!view) {
+                    return view.result;
+                }
+            }
+            if (pass->depth_stencil.has_value()) {
+                const DepthStencilAttachment& attachment = pass->depth_stencil.value();
+                const foundation::ResultValue<rhi::TextureViewHandle> view = ensure_texture_view(
+                        attachment.texture, frame_slot, rhi::TextureViewKind::kDepthStencil,
+                        attachment.subresources, rhi::Format::kUnknown, rhi::TextureViewDimension::kAuto);
+                if (!view) {
+                    return view.result;
+                }
+            }
+        }
+        return foundation::Result::success();
     }
 
     foundation::Result RenderGraph::Impl::initialize_runtime_states(
@@ -3400,34 +3515,36 @@ namespace aeg::render_graph {
         }
     }
 
-    PassExecutionContext::PassExecutionContext(RenderGraph& graph, rhi::Device& device, RenderGraphPass pass,
-                                               rhi::CommandListHandle command_list, uint32_t pass_index,
-                                               uint32_t frame_slot) noexcept
+    RenderPassCommandContext::RenderPassCommandContext(RenderGraph& graph, rhi::Device& device, RenderGraphPass pass,
+                                                       rhi::CommandListHandle command_list, uint32_t pass_index,
+                                                       uint32_t frame_slot) noexcept
         : graph_(graph), device_(device), pass_(pass), command_list_(command_list), pass_index_(pass_index),
           frame_slot_(frame_slot) {
     }
 
-    foundation::ResultValue<rhi::BufferHandle> PassExecutionContext::buffer(RenderGraphBuffer buffer) const {
+    foundation::ResultValue<rhi::BufferHandle> RenderPassCommandContext::resolve_buffer(
+            RenderGraphBuffer buffer) const {
         return graph_.impl_->resolve_buffer(buffer, frame_slot_);
     }
 
-    foundation::ResultValue<rhi::TextureHandle> PassExecutionContext::texture(RenderGraphTexture texture) const {
+    foundation::ResultValue<rhi::TextureHandle> RenderPassCommandContext::resolve_texture(
+            RenderGraphTexture texture) const {
         return graph_.impl_->resolve_texture(texture, frame_slot_);
     }
 
-    foundation::ResultValue<rhi::BufferViewHandle> PassExecutionContext::buffer_view(
+    foundation::ResultValue<rhi::BufferViewHandle> RenderPassCommandContext::resolve_buffer_view(
             RenderGraphBuffer buffer, rhi::BufferViewKind kind, uint64_t offset, uint64_t size,
-            rhi::Format format, uint32_t structure_stride) {
+            rhi::Format format, uint32_t structure_stride) const {
         return graph_.impl_->resolve_buffer_view(buffer, frame_slot_, kind, offset, size, format, structure_stride);
     }
 
-    foundation::ResultValue<rhi::TextureViewHandle> PassExecutionContext::texture_view(
+    foundation::ResultValue<rhi::TextureViewHandle> RenderPassCommandContext::resolve_texture_view(
             RenderGraphTexture texture, rhi::TextureViewKind kind, rhi::SubresourceRange subresources,
-            rhi::Format format, rhi::TextureViewDimension dimension) {
+            rhi::Format format, rhi::TextureViewDimension dimension) const {
         return graph_.impl_->resolve_texture_view(texture, frame_slot_, kind, subresources, format, dimension);
     }
 
-    foundation::Result PassExecutionContext::begin_rendering() {
+    foundation::Result RenderPassCommandContext::begin_rendering() {
         if (rendering_active_) {
             return foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                         "Render graph rendering scope is already active");
@@ -3487,7 +3604,7 @@ namespace aeg::render_graph {
         return result;
     }
 
-    foundation::Result PassExecutionContext::end_rendering() {
+    foundation::Result RenderPassCommandContext::end_rendering() {
         if (!rendering_active_) {
             return foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                         "Render graph rendering scope is not active");
@@ -3499,14 +3616,63 @@ namespace aeg::render_graph {
         return result;
     }
 
-    foundation::Result PassExecutionContext::copy_buffer(RenderGraphBuffer source, RenderGraphBuffer destination,
-                                                  uint64_t source_offset, uint64_t destination_offset,
-                                                  uint64_t size) {
-        auto source_result = buffer(source);
+    foundation::Result RenderPassCommandContext::set_viewport(const rhi::Viewport& viewport) {
+        return device_.set_viewport(command_list_, viewport);
+    }
+
+    foundation::Result RenderPassCommandContext::set_scissor(const rhi::ScissorRect& scissor) {
+        return device_.set_scissor(command_list_, scissor);
+    }
+
+    foundation::Result RenderPassCommandContext::bind_pipeline(rhi::PipelineHandle pipeline) {
+        return device_.bind_pipeline(command_list_, pipeline);
+    }
+
+    foundation::Result RenderPassCommandContext::bind_binding_set(uint32_t group, rhi::BindingSetHandle set,
+                                                                  std::span<const uint32_t> dynamic_offsets) {
+        return device_.bind_binding_set(command_list_, group, set, dynamic_offsets);
+    }
+
+    foundation::Result RenderPassCommandContext::set_inline_constants(uint32_t offset,
+                                                                       rhi::ShaderStageMask shader_stages,
+                                                                       std::span<const std::byte> data) {
+        return device_.set_inline_constants(command_list_, offset, shader_stages, data);
+    }
+
+    foundation::Result RenderPassCommandContext::bind_vertex_buffer(uint32_t binding, rhi::BufferHandle buffer,
+                                                                    uint64_t offset) {
+        return device_.bind_vertex_buffer(command_list_, binding, buffer, offset);
+    }
+
+    foundation::Result RenderPassCommandContext::bind_index_buffer(rhi::BufferHandle buffer, uint64_t offset,
+                                                                    rhi::IndexFormat format) {
+        return device_.bind_index_buffer(command_list_, buffer, offset, format);
+    }
+
+    foundation::Result RenderPassCommandContext::draw(const rhi::DrawDesc& desc) {
+        return device_.draw(command_list_, desc);
+    }
+
+    foundation::Result RenderPassCommandContext::draw_indexed(const rhi::DrawIndexedDesc& desc) {
+        return device_.draw_indexed(command_list_, desc);
+    }
+
+    foundation::Result RenderPassCommandContext::dispatch(const rhi::DispatchDesc& desc) {
+        return device_.dispatch(command_list_, desc);
+    }
+
+    foundation::Result RenderPassCommandContext::dispatch_indirect(const rhi::DispatchIndirectDesc& desc) {
+        return device_.dispatch_indirect(command_list_, desc);
+    }
+
+    foundation::Result RenderPassCommandContext::copy_buffer(RenderGraphBuffer source, RenderGraphBuffer destination,
+                                                             uint64_t source_offset, uint64_t destination_offset,
+                                                             uint64_t size) {
+        auto source_result = resolve_buffer(source);
         if (!source_result) {
             return source_result.result;
         }
-        auto destination_result = buffer(destination);
+        auto destination_result = resolve_buffer(destination);
         if (!destination_result) {
             return destination_result.result;
         }
@@ -3514,16 +3680,16 @@ namespace aeg::render_graph {
                                                                        source_offset, destination_offset, size});
     }
 
-    foundation::Result PassExecutionContext::copy_buffer_to_texture(
+    foundation::Result RenderPassCommandContext::copy_buffer_to_texture(
             RenderGraphBuffer source, uint64_t source_offset, uint32_t source_row_length,
             uint32_t source_image_height, RenderGraphTexture destination,
             rhi::TextureSubresourceLayers destination_subresources, rhi::Offset3D destination_offset,
             rhi::Extent3D extent) {
-        auto source_result = buffer(source);
+        auto source_result = resolve_buffer(source);
         if (!source_result) {
             return source_result.result;
         }
-        auto destination_result = texture(destination);
+        auto destination_result = resolve_texture(destination);
         if (!destination_result) {
             return destination_result.result;
         }
@@ -3533,15 +3699,15 @@ namespace aeg::render_graph {
                                                           destination_subresources, destination_offset, extent});
     }
 
-    foundation::Result PassExecutionContext::copy_texture_to_buffer(
+    foundation::Result RenderPassCommandContext::copy_texture_to_buffer(
             RenderGraphTexture source, rhi::TextureSubresourceLayers source_subresources,
             rhi::Offset3D source_offset, rhi::Extent3D extent, RenderGraphBuffer destination,
             uint64_t destination_offset, uint32_t destination_row_length, uint32_t destination_image_height) {
-        auto source_result = texture(source);
+        auto source_result = resolve_texture(source);
         if (!source_result) {
             return source_result.result;
         }
-        auto destination_result = buffer(destination);
+        auto destination_result = resolve_buffer(destination);
         if (!destination_result) {
             return destination_result.result;
         }
@@ -3551,16 +3717,16 @@ namespace aeg::render_graph {
                                                           destination_row_length, destination_image_height});
     }
 
-    foundation::Result PassExecutionContext::copy_texture(
+    foundation::Result RenderPassCommandContext::copy_texture(
             RenderGraphTexture source, rhi::TextureSubresourceLayers source_subresources,
             rhi::Offset3D source_offset, RenderGraphTexture destination,
             rhi::TextureSubresourceLayers destination_subresources, rhi::Offset3D destination_offset,
             rhi::Extent3D extent) {
-        auto source_result = texture(source);
+        auto source_result = resolve_texture(source);
         if (!source_result) {
             return source_result.result;
         }
-        auto destination_result = texture(destination);
+        auto destination_result = resolve_texture(destination);
         if (!destination_result) {
             return destination_result.result;
         }
@@ -3570,9 +3736,11 @@ namespace aeg::render_graph {
                                                     destination_offset, extent});
     }
 
-    foundation::Result PassExecutionContext::clear_texture(RenderGraphTexture texture, rhi::SubresourceRange subresources,
-                                                    rhi::ClearColorValue color, float depth, uint32_t stencil) {
-        auto texture_result = this->texture(texture);
+    foundation::Result RenderPassCommandContext::clear_texture(RenderGraphTexture texture,
+                                                               rhi::SubresourceRange subresources,
+                                                               rhi::ClearColorValue color, float depth,
+                                                               uint32_t stencil) {
+        auto texture_result = resolve_texture(texture);
         if (!texture_result) {
             return texture_result.result;
         }
@@ -3664,8 +3832,14 @@ namespace aeg::render_graph {
                     !record.physical.handle.is_valid()) {
                     return fail_execution(foundation::Result::failure(
                             foundation::ResultCode::kInvalidState,
-                            "Render graph imported texture has no current physical handle"));
+                        "Render graph imported texture has no current physical handle"));
                 }
+            }
+
+            const foundation::Result view_result = impl_->prepare_execution_views(
+                    impl_->plan, frame_slot);
+            if (!view_result) {
+                return fail_execution(view_result);
             }
 
             const rhi::FrameAcquireResult* acquired = frame_context.acquired_frame();

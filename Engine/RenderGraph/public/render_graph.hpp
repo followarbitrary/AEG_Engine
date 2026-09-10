@@ -224,13 +224,14 @@ namespace aeg::render_graph {
 
     class RenderGraph;
     class PassBuilder;
-    class PassExecutionContext;
+    class RenderPassCommandContext;
+    using PassExecutionContext = RenderPassCommandContext;
     class RenderGraphFeatureRuntime;
 
     /** @brief Callback that declares resource usage for a pass. */
     using PassSetupCallback = std::function<foundation::Result(PassBuilder&)>;
     /** @brief Callback that records commands for one compiled pass. */
-    using PassExecuteCallback = std::function<foundation::Result(PassExecutionContext&)>;
+    using PassExecuteCallback = std::function<foundation::Result(RenderPassCommandContext&)>;
 
     /**
      * @brief Declares the resource contract of one render-graph pass.
@@ -305,34 +306,30 @@ namespace aeg::render_graph {
     };
 
     /**
-     * @brief Provides resolved resources and command recording access to a pass.
+     * @brief Provides restricted resource resolution and command recording to a pass.
      *
-     * The context is valid only during its execute callback. Resource lookup
-     * returns physical handles selected by the graph compiler.
+     * The context is valid only during its execute callback. Resource and view
+     * lookup returns physical handles selected or prepared by the graph. The
+     * RHI device and command-list handle remain private to the graph.
      */
-    class PassExecutionContext final {
+    class RenderPassCommandContext final {
     public:
-        [[nodiscard]] rhi::Device& device() const noexcept { return device_; }
-        [[nodiscard]] rhi::CommandListHandle command_list() const noexcept { return command_list_; }
         [[nodiscard]] RenderGraphPass pass() const noexcept { return pass_; }
 
         /** @brief Resolves a logical buffer to its physical RHI handle. */
-        [[nodiscard]] foundation::ResultValue<rhi::BufferHandle> buffer(RenderGraphBuffer buffer) const;
+        [[nodiscard]] foundation::ResultValue<rhi::BufferHandle> resolve_buffer(RenderGraphBuffer buffer) const;
         /** @brief Resolves a logical texture to its physical RHI handle. */
-        [[nodiscard]] foundation::ResultValue<rhi::TextureHandle> texture(RenderGraphTexture texture) const;
-        /** @brief Creates or resolves a view for a logical buffer. */
-        [[nodiscard]] foundation::ResultValue<rhi::BufferViewHandle> buffer_view(RenderGraphBuffer buffer,
-                                                                            rhi::BufferViewKind kind,
-                                                                            uint64_t offset = 0,
-                                                                            uint64_t size =
-                                                                                std::numeric_limits<uint64_t>::max(),
-                                                                            rhi::Format format = rhi::Format::kUnknown,
-                                                                            uint32_t structure_stride = 0);
-        /** @brief Creates or resolves a view for a logical texture. */
-        [[nodiscard]] foundation::ResultValue<rhi::TextureViewHandle> texture_view(
+        [[nodiscard]] foundation::ResultValue<rhi::TextureHandle> resolve_texture(RenderGraphTexture texture) const;
+        /** @brief Resolves a previously prepared view for a logical buffer. */
+        [[nodiscard]] foundation::ResultValue<rhi::BufferViewHandle> resolve_buffer_view(
+                RenderGraphBuffer buffer, rhi::BufferViewKind kind, uint64_t offset = 0,
+                uint64_t size = std::numeric_limits<uint64_t>::max(), rhi::Format format = rhi::Format::kUnknown,
+                uint32_t structure_stride = 0) const;
+        /** @brief Resolves a previously prepared view for a logical texture. */
+        [[nodiscard]] foundation::ResultValue<rhi::TextureViewHandle> resolve_texture_view(
                 RenderGraphTexture texture, rhi::TextureViewKind kind = rhi::TextureViewKind::kSampled,
                 rhi::SubresourceRange subresources = {}, rhi::Format format = rhi::Format::kUnknown,
-                rhi::TextureViewDimension dimension = rhi::TextureViewDimension::kAuto);
+                rhi::TextureViewDimension dimension = rhi::TextureViewDimension::kAuto) const;
 
         /** @brief Begins dynamic rendering using this pass's declared attachments. */
         [[nodiscard]] foundation::Result begin_rendering();
@@ -340,6 +337,23 @@ namespace aeg::render_graph {
         [[nodiscard]] foundation::Result end_rendering();
         [[nodiscard]] bool rendering_active() const noexcept { return rendering_active_; }
         [[nodiscard]] bool rendering_started() const noexcept { return rendering_started_; }
+
+        /** @brief Records dynamic graphics state and resource bindings. */
+        [[nodiscard]] foundation::Result set_viewport(const rhi::Viewport& viewport);
+        [[nodiscard]] foundation::Result set_scissor(const rhi::ScissorRect& scissor);
+        [[nodiscard]] foundation::Result bind_pipeline(rhi::PipelineHandle pipeline);
+        [[nodiscard]] foundation::Result bind_binding_set(uint32_t group, rhi::BindingSetHandle set,
+                                                          std::span<const uint32_t> dynamic_offsets = {});
+        [[nodiscard]] foundation::Result set_inline_constants(uint32_t offset, rhi::ShaderStageMask shader_stages,
+                                                              std::span<const std::byte> data);
+        [[nodiscard]] foundation::Result bind_vertex_buffer(uint32_t binding, rhi::BufferHandle buffer,
+                                                            uint64_t offset = 0);
+        [[nodiscard]] foundation::Result bind_index_buffer(rhi::BufferHandle buffer, uint64_t offset,
+                                                           rhi::IndexFormat format);
+        [[nodiscard]] foundation::Result draw(const rhi::DrawDesc& desc);
+        [[nodiscard]] foundation::Result draw_indexed(const rhi::DrawIndexedDesc& desc);
+        [[nodiscard]] foundation::Result dispatch(const rhi::DispatchDesc& desc);
+        [[nodiscard]] foundation::Result dispatch_indirect(const rhi::DispatchIndirectDesc& desc);
 
         /** @brief Records a buffer-to-buffer copy between logical resources. */
         [[nodiscard]] foundation::Result copy_buffer(RenderGraphBuffer source, RenderGraphBuffer destination,
@@ -370,9 +384,9 @@ namespace aeg::render_graph {
     private:
         friend class RenderGraph;
 
-        PassExecutionContext(RenderGraph& graph, rhi::Device& device, RenderGraphPass pass,
-                             rhi::CommandListHandle command_list, uint32_t pass_index,
-                             uint32_t frame_slot) noexcept;
+        RenderPassCommandContext(RenderGraph& graph, rhi::Device& device, RenderGraphPass pass,
+                                 rhi::CommandListHandle command_list, uint32_t pass_index,
+                                 uint32_t frame_slot) noexcept;
 
         RenderGraph& graph_;
         rhi::Device& device_;
@@ -477,7 +491,7 @@ namespace aeg::render_graph {
 
     private:
         friend class PassBuilder;
-        friend class PassExecutionContext;
+        friend class RenderPassCommandContext;
         friend class RenderGraphFeatureRuntime;
 
         [[nodiscard]] foundation::Result begin_feature_build_transaction();

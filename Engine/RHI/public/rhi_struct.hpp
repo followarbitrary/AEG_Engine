@@ -1073,6 +1073,8 @@ namespace aeg::rhi {
     struct FrameAcquireResult {
         FrameToken frame{};
         SwapchainImage image{};
+        /** @brief Resource state the acquired image is in before this frame's commands. */
+        ResourceState initial_state{};
         bool suboptimal{false};
     };
 

@@ -710,7 +710,7 @@ foundation::ResultValue<rhi::BufferHandle> RenderPassExecutionContextBackendImpl
     if (!resolved) {
         return {resolved.result, {}};
     }
-    return context_.buffer(resolved.value);
+    return context_.resolve_buffer(resolved.value);
 }
 
 foundation::ResultValue<rhi::TextureHandle> RenderPassExecutionContextBackendImpl::texture(
@@ -719,7 +719,7 @@ foundation::ResultValue<rhi::TextureHandle> RenderPassExecutionContextBackendImp
     if (!resolved) {
         return {resolved.result, {}};
     }
-    return context_.texture(resolved.value);
+    return context_.resolve_texture(resolved.value);
 }
 
 foundation::ResultValue<rhi::BufferViewHandle> RenderPassExecutionContextBackendImpl::buffer_view(
@@ -729,7 +729,7 @@ foundation::ResultValue<rhi::BufferViewHandle> RenderPassExecutionContextBackend
     if (!resolved) {
         return {resolved.result, {}};
     }
-    return context_.buffer_view(resolved.value, kind, offset, size, format, structure_stride);
+    return context_.resolve_buffer_view(resolved.value, kind, offset, size, format, structure_stride);
 }
 
 foundation::ResultValue<rhi::TextureViewHandle> RenderPassExecutionContextBackendImpl::texture_view(
@@ -739,7 +739,7 @@ foundation::ResultValue<rhi::TextureViewHandle> RenderPassExecutionContextBacken
     if (!resolved) {
         return {resolved.result, {}};
     }
-    return context_.texture_view(resolved.value, kind, subresources, format, dimension);
+    return context_.resolve_texture_view(resolved.value, kind, subresources, format, dimension);
 }
 
 foundation::Result RenderPassExecutionContextBackendImpl::begin_rendering() {
@@ -759,52 +759,52 @@ bool RenderPassExecutionContextBackendImpl::rendering_started() const noexcept {
 }
 
 foundation::Result RenderPassExecutionContextBackendImpl::set_viewport(const rhi::Viewport& viewport) {
-    return context_.device().set_viewport(context_.command_list(), viewport);
+    return context_.set_viewport(viewport);
 }
 
 foundation::Result RenderPassExecutionContextBackendImpl::set_scissor(const rhi::ScissorRect& scissor) {
-    return context_.device().set_scissor(context_.command_list(), scissor);
+    return context_.set_scissor(scissor);
 }
 
 foundation::Result RenderPassExecutionContextBackendImpl::bind_pipeline(rhi::PipelineHandle pipeline) {
-    return context_.device().bind_pipeline(context_.command_list(), pipeline);
+    return context_.bind_pipeline(pipeline);
 }
 
 foundation::Result RenderPassExecutionContextBackendImpl::bind_binding_set(uint32_t group, rhi::BindingSetHandle set,
                                                                            std::span<const uint32_t> dynamic_offsets) {
-    return context_.device().bind_binding_set(context_.command_list(), group, set, dynamic_offsets);
+    return context_.bind_binding_set(group, set, dynamic_offsets);
 }
 
 foundation::Result RenderPassExecutionContextBackendImpl::set_inline_constants(uint32_t offset,
                                                                                rhi::ShaderStageMask shader_stages,
                                                                                std::span<const std::byte> data) {
-    return context_.device().set_inline_constants(context_.command_list(), offset, shader_stages, data);
+    return context_.set_inline_constants(offset, shader_stages, data);
 }
 
 foundation::Result RenderPassExecutionContextBackendImpl::bind_vertex_buffer(uint32_t binding, rhi::BufferHandle buffer,
                                                                              uint64_t offset) {
-    return context_.device().bind_vertex_buffer(context_.command_list(), binding, buffer, offset);
+    return context_.bind_vertex_buffer(binding, buffer, offset);
 }
 
 foundation::Result RenderPassExecutionContextBackendImpl::bind_index_buffer(rhi::BufferHandle buffer, uint64_t offset,
                                                                             rhi::IndexFormat format) {
-    return context_.device().bind_index_buffer(context_.command_list(), buffer, offset, format);
+    return context_.bind_index_buffer(buffer, offset, format);
 }
 
 foundation::Result RenderPassExecutionContextBackendImpl::draw(const rhi::DrawDesc& desc) {
-    return context_.device().draw(context_.command_list(), desc);
+    return context_.draw(desc);
 }
 
 foundation::Result RenderPassExecutionContextBackendImpl::draw_indexed(const rhi::DrawIndexedDesc& desc) {
-    return context_.device().draw_indexed(context_.command_list(), desc);
+    return context_.draw_indexed(desc);
 }
 
 foundation::Result RenderPassExecutionContextBackendImpl::dispatch(const rhi::DispatchDesc& desc) {
-    return context_.device().dispatch(context_.command_list(), desc);
+    return context_.dispatch(desc);
 }
 
 foundation::Result RenderPassExecutionContextBackendImpl::dispatch_indirect(const rhi::DispatchIndirectDesc& desc) {
-    return context_.device().dispatch_indirect(context_.command_list(), desc);
+    return context_.dispatch_indirect(desc);
 }
 
 foundation::Result RenderPassExecutionContextBackendImpl::copy_buffer(pipeline::RenderGraphBuffer source,

@@ -3965,10 +3965,7 @@ namespace aeg::rhi {
             TextureResource texture_resource{};
             texture_resource.image = vk_images[index];
             texture_resource.desc = texture_desc;
-            texture_resource.state.usage = ResourceUsage::kPresent;
-            texture_resource.state.shader_stages = ShaderStage::kAll;
-            texture_resource.state.queue = QueueClass::kGraphics;
-            texture_resource.state.pipeline_stages = PipelineStage::kAllCommands;
+            texture_resource.state = {};
             texture_resource.subresource_states.assign(kAspectPlaneCount, texture_resource.state);
             texture_resource.external = true;
             texture_resource.owner_swapchain = self;
@@ -4344,6 +4341,16 @@ namespace aeg::rhi {
         FrameAcquireResult acquire_result{};
         acquire_result.frame = FrameToken{swapchain, frame_index, image_index, resource->generation};
         acquire_result.image = resource->images[image_index];
+        const TextureResource* image_texture = textures_.get(acquire_result.image.texture);
+        if (image_texture == nullptr || image_texture->subresource_states.empty()) {
+            frame.image_index = kRemaining;
+            frame.acquired = false;
+            resource->image_in_flight_frame[image_index] = kRemaining;
+            (void) consume_acquire_semaphore(frame);
+            return {Result::failure(ResultCode::kInvalidState,
+                                    "Swapchain image resource state is unavailable after acquisition"), {}};
+        }
+        acquire_result.initial_state = image_texture->subresource_states.front();
         acquire_result.suboptimal = suboptimal;
         return {Result::success(), acquire_result};
     }
@@ -4419,7 +4426,9 @@ namespace aeg::rhi {
         wait_stages.reserve(desc.waits.size() + kQueueCount + 1);
         wait_values.reserve(desc.waits.size() + kQueueCount + 1);
         wait_semaphores.push_back(frame.image_available);
-        wait_stages.push_back(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+        // The first command may transition the acquired image before rendering begins.
+        // Wait at all commands so the acquire semaphore also protects that transition.
+        wait_stages.push_back(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
         wait_values.push_back(0);
 
         for (const GpuWait &wait: desc.waits) {
@@ -5850,6 +5859,37 @@ namespace aeg::rhi {
 
         if (mapped_for_operation) {
             vmaUnmapMemory(allocator_, resource->allocation.handle);
+        }
+
+        // A host write is an externally recorded state transition. Keep the
+        // tracked range in HostWrite so a later explicit command-list barrier
+        // starts from the state that actually precedes the GPU copy.
+        const uint64_t write_size = static_cast<uint64_t>(data.size());
+        const uint64_t write_end = offset + write_size;
+        try {
+            initialize_buffer_state_segments(resource->state_segments, resource->size, resource->state);
+            split_buffer_state_segment(resource->state_segments, offset);
+            split_buffer_state_segment(resource->state_segments, write_end);
+            for (BufferStateSegment &segment: resource->state_segments) {
+                const uint64_t segment_end = segment.offset + segment.size;
+                if (segment.offset < offset || segment_end > write_end) {
+                    continue;
+                }
+                segment.state.usage = ResourceUsage::kHostWrite;
+                segment.state.shader_stages = ShaderStage::kAll;
+                segment.state.pipeline_stages = PipelineStage::kHost;
+                segment.state.discard_contents = false;
+            }
+            merge_buffer_state_segments(resource->state_segments);
+            if (!resource->state_segments.empty()) {
+                const ResourceState state = resource->state_segments.front().state;
+                const bool uniform = std::all_of(
+                        resource->state_segments.begin(), resource->state_segments.end(),
+                        [state](const BufferStateSegment &segment) { return segment.state == state; });
+                resource->state = uniform ? state : ResourceState{};
+            }
+        } catch (const std::bad_alloc &) {
+            return Result::failure(ResultCode::kOutOfMemory, "Buffer host-write state tracking allocation failed");
         }
         return Result::success();
     }

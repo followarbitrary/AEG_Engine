@@ -10,6 +10,8 @@
 - `public/render_graph.hpp`：资源、Pass、Plan、Barrier 和执行接口。
 - `public/frame_context.hpp`：帧槽、命令提交、完成跟踪和延迟销毁。
 - `public/render_feature_runtime.hpp`：将 Pipeline Plan 中的 RenderFeature 展开到图。
+- `RenderPassCommandContext`：执行回调只能解析已准备资源并录制命令，不能取得 `Device`
+  或创建/销毁 RHI 资源；attachment view 在回调前由 Graph 准备。
 - `private`：图编译、运行时状态、帧上下文和 Feature Runtime 的实现。
 
 ## 依赖边界

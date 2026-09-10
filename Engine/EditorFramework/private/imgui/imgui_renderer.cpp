@@ -79,11 +79,11 @@ struct ImGuiTextureHandleHash final {
 
     math::Mat4 projection{};
     projection.at(0, 0) = 2.0f / (right - left);
-    projection.at(1, 1) = 2.0f / (top - bottom);
+    projection.at(1, 1) = 2.0f / (bottom - top);
     projection.at(2, 2) = 1.0f;
     projection.at(3, 3) = 1.0f;
     projection.at(0, 3) = (right + left) / (left - right);
-    projection.at(1, 3) = (top + bottom) / (bottom - top);
+    projection.at(1, 3) = (top + bottom) / (top - bottom);
     return projection;
 }
 
@@ -134,6 +134,34 @@ struct ImGuiTextureHandleHash final {
     }
     return foundation::Result::success();
 }
+
+[[nodiscard]] rhi::TextureDesc make_cached_texture_desc(const rhi::TextureDesc& desc) noexcept {
+    rhi::TextureDesc cached = desc;
+    cached.compatible_view_formats = {};
+    return cached;
+}
+
+[[nodiscard]] bool texture_desc_matches(const rhi::TextureDesc& lhs, const rhi::TextureDesc& rhs) noexcept {
+    if (lhs.dimension != rhs.dimension || lhs.extent.width != rhs.extent.width ||
+        lhs.extent.height != rhs.extent.height || lhs.extent.depth != rhs.extent.depth || lhs.format != rhs.format ||
+        lhs.mip_levels != rhs.mip_levels || lhs.array_layers != rhs.array_layers || lhs.samples != rhs.samples ||
+        lhs.capabilities != rhs.capabilities || lhs.memory != rhs.memory || lhs.flags != rhs.flags ||
+        lhs.initial_usage != rhs.initial_usage || lhs.initial_stages != rhs.initial_stages ||
+        lhs.initial_queue != rhs.initial_queue) {
+        return false;
+    }
+    return true;
+}
+
+[[nodiscard]] rhi::ResourceState make_imgui_sampled_state() noexcept {
+    return rhi::ResourceState{
+        rhi::ResourceUsage::kSampledRead,
+        rhi::ShaderStage::kFragment,
+        rhi::QueueClass::kGraphics,
+        false,
+        rhi::PipelineStage::kFragmentShader,
+    };
+}
 }  // namespace
 
 struct ImGuiRenderer::Impl final {
@@ -150,6 +178,15 @@ struct ImGuiRenderer::Impl final {
         uint32_t index_count{0};
         uint32_t first_index{0};
         int32_t vertex_offset{0};
+    };
+
+    struct ImportedTexture final {
+        render_graph::RenderGraphTexture resource{};
+        rhi::TextureHandle texture{};
+        rhi::TextureViewHandle sampled_view{};
+        rhi::TextureDesc desc{};
+        rhi::ResourceState state{};
+        bool state_initialized{false};
     };
 
     struct PreparedFrame final {
@@ -231,6 +268,7 @@ struct ImGuiRenderer::Impl final {
     shader::ShaderPipelineLayout shader_layout{};
     rhi::BindingLayoutHandle binding_layout{};
     std::unordered_map<uint16_t, rhi::PipelineHandle> pipelines{};
+    std::unordered_map<ImGuiTextureHandle, ImportedTexture, ImGuiTextureHandleHash> imported_textures{};
     std::shared_ptr<PreparedFrame> prepared_frame{};
     bool initialized{false};
 };
@@ -560,14 +598,64 @@ foundation::Result ImGuiRenderer::prepare_frame(render_graph::FrameContext& fram
     prepared->pipeline = pipeline_result.value;
 
     for (Impl::TextureEntry& texture : prepared->textures) {
-        const foundation::ResultValue<render_graph::RenderGraphTexture> resource_result =
-            graph.import_texture(texture.binding.texture, texture.binding.sampled_view, texture.binding.texture_desc,
-                                 texture.binding.initial_state);
-        if (!resource_result) {
-            cleanup();
-            return resource_result.result;
+        Impl::ImportedTexture* imported = nullptr;
+        const auto imported_iterator = impl_->imported_textures.find(texture.identity);
+        if (imported_iterator == impl_->imported_textures.end()) {
+            const foundation::ResultValue<render_graph::RenderGraphTexture> resource_result =
+                graph.import_texture(texture.binding.texture, texture.binding.sampled_view, texture.binding.texture_desc,
+                                     texture.binding.initial_state);
+            if (!resource_result) {
+                cleanup();
+                return resource_result.result;
+            }
+            try {
+                const auto inserted = impl_->imported_textures.emplace(
+                    texture.identity,
+                    Impl::ImportedTexture{resource_result.value, texture.binding.texture,
+                                          texture.binding.sampled_view, make_cached_texture_desc(texture.binding.texture_desc),
+                                          make_imgui_sampled_state(), true});
+                imported = &inserted.first->second;
+            } catch (const std::bad_alloc&) {
+                cleanup();
+                return foundation::out_of_memory("ImGui imported texture cache allocation failed");
+            }
+        } else {
+            imported = &imported_iterator->second;
+            const bool graph_resource_valid = graph.contains_texture(imported->resource);
+            const bool external_resource_matches = imported->texture == texture.binding.texture &&
+                                                    imported->sampled_view == texture.binding.sampled_view &&
+                                                    texture_desc_matches(imported->desc, texture.binding.texture_desc);
+            if (!graph_resource_valid) {
+                const rhi::ResourceState initial_state =
+                    external_resource_matches && imported->state_initialized
+                        ? imported->state
+                        : texture.binding.initial_state;
+                const foundation::ResultValue<render_graph::RenderGraphTexture> resource_result =
+                    graph.import_texture(texture.binding.texture, texture.binding.sampled_view,
+                                         texture.binding.texture_desc, initial_state);
+                if (!resource_result) {
+                    cleanup();
+                    return resource_result.result;
+                }
+                imported->resource = resource_result.value;
+            } else if (!external_resource_matches) {
+                const rhi::ResourceState initial_state = texture.binding.initial_state;
+                if (const foundation::Result result = graph.update_imported_texture(
+                        imported->resource, texture.binding.texture, texture.binding.sampled_view,
+                        texture.binding.texture_desc, initial_state);
+                    !result) {
+                    cleanup();
+                    return result;
+                }
+                imported->state_initialized = false;
+            }
+            imported->texture = texture.binding.texture;
+            imported->sampled_view = texture.binding.sampled_view;
+            imported->desc = make_cached_texture_desc(texture.binding.texture_desc);
+            imported->state = make_imgui_sampled_state();
+            imported->state_initialized = true;
         }
-        texture.resource = resource_result.value;
+        texture.resource = imported->resource;
 
         const foundation::ResultValue<rhi::BindingSetHandle> set_result = impl_->device.create_binding_set(
             rhi::BindingSetDesc{impl_->binding_layout, rhi::BindingSetLifetime::kFrameLocal,
@@ -611,9 +699,6 @@ foundation::Result ImGuiRenderer::build_render_graph(pipeline::RenderGraphBuilde
     if (prepared == nullptr) {
         return foundation::Result::success();
     }
-    if (prepared->draw_calls.empty()) {
-        return foundation::Result::success();
-    }
 
     const foundation::ResultValue<pipeline::RenderGraphTexture> target_result =
         builder.find_texture(prepared->target.resource_id);
@@ -621,6 +706,28 @@ foundation::Result ImGuiRenderer::build_render_graph(pipeline::RenderGraphBuilde
         return target_result.result;
     }
     const pipeline::RenderGraphTexture target = target_result.value;
+
+    if (prepared->draw_calls.empty()) {
+        const foundation::ResultValue<pipeline::RenderGraphPass> pass_result = builder.add_graphics_pass(
+            "Editor.ImGui.Draw",
+            [target, final_usage = prepared->target.final_usage](pipeline::RenderPassBuilder& pass_builder) {
+                if (const foundation::Result result = pass_builder.use_color_attachment(
+                        target, rhi::LoadOp::kLoad, rhi::StoreOp::kStore, {}, final_usage);
+                    !result) {
+                    return result;
+                }
+                pass_builder.set_side_effects();
+                return foundation::Result::success();
+            },
+            [](pipeline::RenderPassExecutionContext& context) {
+                if (const foundation::Result result = context.begin_rendering(); !result) {
+                    return result;
+                }
+                return context.end_rendering();
+            });
+        return pass_result ? foundation::Result::success() : pass_result.result;
+    }
+
     const pipeline::RenderGraphBuffer vertex_resource = to_pipeline_buffer(prepared->vertex_resource);
     const pipeline::RenderGraphBuffer index_resource = to_pipeline_buffer(prepared->index_resource);
     const pipeline::RenderGraphBuffer projection_resource = to_pipeline_buffer(prepared->projection_resource);
@@ -787,6 +894,7 @@ foundation::Result ImGuiRenderer::shutdown() {
     impl_->shader_layout = {};
     impl_->shader_program = {};
     impl_->shader_manager.reset();
+    impl_->imported_textures.clear();
     impl_->initialized = false;
     return foundation::Result::success();
 }

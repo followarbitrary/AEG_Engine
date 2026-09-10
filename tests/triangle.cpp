@@ -889,8 +889,15 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
             transform_desc.initial_stages = PipelineStage::kVertexShader;
             transform_desc.initial_queue = QueueClass::kGraphics;
             transform_desc.name = aeg::rhi::DebugName{"Triangle.TransformBuffer"};
+            const aeg::rhi::ResourceState transform_host_write_state{
+                ResourceUsage::kHostWrite,
+                ShaderStage::kAll,
+                QueueClass::kGraphics,
+                false,
+                PipelineStage::kHost
+            };
             auto transform_resource_result = render_graph_->import_buffer(
-                transform_buffer, transform_desc, transform_state_);
+                    transform_buffer, transform_desc, transform_host_write_state);
             if (!check_result(transform_resource_result, "import_transform_buffer")) {
                 return false;
             }
@@ -912,15 +919,8 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
             swapchain_desc.initial_stages = PipelineStage::kAllCommands;
             swapchain_desc.initial_queue = QueueClass::kGraphics;
             swapchain_desc.name = aeg::rhi::DebugName{"Triangle.SwapchainImage"};
-            const aeg::rhi::ResourceState present_state{
-                ResourceUsage::kPresent,
-                ShaderStage::kAll,
-                QueueClass::kGraphics,
-                false,
-                PipelineStage::kAllCommands
-            };
             auto swapchain_resource_result = render_graph_->import_swapchain_image(
-                    acquired, swapchain_desc, present_state);
+                    acquired, swapchain_desc, acquired.initial_state);
             if (!check_result(swapchain_resource_result, "import_swapchain_image")) {
                 return false;
             }
@@ -962,36 +962,32 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
                                 ResourceUsage::kSampledRead);
                     },
                     [this, vertex_resource, index_resource, transform_binding_set](PassExecutionContext &context) {
-                        auto vertex_buffer_result = context.buffer(vertex_resource);
+                        auto vertex_buffer_result = context.resolve_buffer(vertex_resource);
                         if (!vertex_buffer_result) {
                             return vertex_buffer_result.result;
                         }
-                        auto index_buffer_result = context.buffer(index_resource);
+                        auto index_buffer_result = context.resolve_buffer(index_resource);
                         if (!index_buffer_result) {
                             return index_buffer_result.result;
                         }
-                        if (const Result result = context.device().bind_pipeline(
-                                    context.command_list(), scene_pipeline_);
+                        if (const Result result = context.bind_pipeline(scene_pipeline_);
                             !result) {
                             return result;
                         }
-                        if (const Result result = context.device().bind_binding_set(
-                                    context.command_list(), 0, scene_material_.binding_set);
+                        if (const Result result = context.bind_binding_set(0, scene_material_.binding_set);
                             !result) {
                             return result;
                         }
-                        if (const Result result = context.device().bind_binding_set(
-                                    context.command_list(), 1, transform_binding_set);
+                        if (const Result result = context.bind_binding_set(1, transform_binding_set);
                             !result) {
                             return result;
                         }
-                        if (const Result result = context.device().bind_vertex_buffer(
-                                    context.command_list(), 0, vertex_buffer_result.value);
+                        if (const Result result = context.bind_vertex_buffer(0, vertex_buffer_result.value);
                             !result) {
                             return result;
                         }
-                        if (const Result result = context.device().bind_index_buffer(
-                                    context.command_list(), index_buffer_result.value, 0, mesh_.index_format);
+                        if (const Result result = context.bind_index_buffer(
+                                    index_buffer_result.value, 0, mesh_.index_format);
                             !result) {
                             return result;
                         }
@@ -1012,16 +1008,16 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
                             offscreen_target_.texture_desc.extent.width,
                             offscreen_target_.texture_desc.extent.height
                         };
-                        if (const Result result = context.device().set_viewport(context.command_list(), viewport);
+                        if (const Result result = context.set_viewport(viewport);
                             !result) {
                             return result;
                         }
-                        if (const Result result = context.device().set_scissor(context.command_list(), scissor);
+                        if (const Result result = context.set_scissor(scissor);
                             !result) {
                             return result;
                         }
-                        if (const Result result = context.device().draw_indexed(
-                                    context.command_list(), DrawIndexedDesc{mesh_.index_count, 1, 0, 0, 0});
+                        if (const Result result = context.draw_indexed(
+                                    DrawIndexedDesc{mesh_.index_count, 1, 0, 0, 0});
                             !result) {
                             return result;
                         }
@@ -1050,13 +1046,11 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
                         return Result::success();
                     },
                     [this](PassExecutionContext &context) {
-                        if (const Result result = context.device().bind_pipeline(
-                                    context.command_list(), composite_pipeline_);
+                        if (const Result result = context.bind_pipeline(composite_pipeline_);
                             !result) {
                             return result;
                         }
-                        if (const Result result = context.device().bind_binding_set(
-                                    context.command_list(), 0, composite_material_.binding_set);
+                        if (const Result result = context.bind_binding_set(0, composite_material_.binding_set);
                             !result) {
                             return result;
                         }
@@ -1077,16 +1071,15 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
                             swapchain_info_.extent.width,
                             swapchain_info_.extent.height
                         };
-                        if (const Result result = context.device().set_viewport(context.command_list(), viewport);
+                        if (const Result result = context.set_viewport(viewport);
                             !result) {
                             return result;
                         }
-                        if (const Result result = context.device().set_scissor(context.command_list(), scissor);
+                        if (const Result result = context.set_scissor(scissor);
                             !result) {
                             return result;
                         }
-                        if (const Result result = context.device().draw(
-                                    context.command_list(), DrawDesc{3, 1, 0, 0});
+                        if (const Result result = context.draw(DrawDesc{3, 1, 0, 0});
                             !result) {
                             return result;
                         }
