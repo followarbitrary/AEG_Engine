@@ -14,6 +14,10 @@
 `WindowSurfaceBinding` 中的句柄是不透明值，仅由 Application 平台实现填充；RHI 的
 Surface Bridge 负责将其转换为后端需要的 Surface 描述。
 
+`public/platform_services.hpp` 定义剪贴板、光标、IME 和窗口显示指标的后端无关服务。
+`IWindowSystem::platform_services()` 返回这些服务的实现；Engine 和 EditorFramework
+只能调用该接口，不得依赖操作系统头文件或原生句柄。
+
 ## 边界
 
 Platform 是 RHI、Runtime 和 Tooling 的适配基础，但不应包含渲染算法、游戏逻辑或

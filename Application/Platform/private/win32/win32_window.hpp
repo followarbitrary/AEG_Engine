@@ -36,6 +36,8 @@ public:
     void attach(HWND handle) noexcept { hwnd_ = handle; }
     void detach_owner() noexcept { owner_ = nullptr; }
     void destroy_native() noexcept;
+    [[nodiscard]] foundation::Result set_cursor(platform::CursorShape shape) noexcept;
+    [[nodiscard]] foundation::Result set_ime_state(const platform::ImeState& state) noexcept;
 
 private:
     friend class Win32WindowSystem;
@@ -49,12 +51,15 @@ private:
     [[nodiscard]] static platform::KeyCode translate_key(WPARAM w_param, LPARAM l_param) noexcept;
     [[nodiscard]] static platform::KeyModifiers current_modifiers(WPARAM w_param = 0) noexcept;
     [[nodiscard]] static platform::MouseButton translate_mouse_button(UINT message, WPARAM w_param) noexcept;
+    [[nodiscard]] static HCURSOR cursor_handle(platform::CursorShape shape) noexcept;
 
     platform::WindowId id_{};
     Win32WindowSystem* owner_{nullptr};
     HWND hwnd_{nullptr};
     platform::WindowDesc desc_{};
     platform::WindowState state_{};
+    platform::CursorShape cursor_shape_{platform::CursorShape::kArrow};
+    platform::ImeState ime_state_{};
     wchar_t pending_high_surrogate_{0};
 };
 }  // namespace aeg::application::win32

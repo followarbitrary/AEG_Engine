@@ -4,8 +4,10 @@
  */
 #include "win32_window.hpp"
 
+#include <imm.h>
 #include <windowsx.h>
 
+#include <cmath>
 #include <cstdint>
 #include <utility>
 
@@ -170,6 +172,49 @@ void Win32Window::destroy_native() noexcept {
     }
 }
 
+foundation::Result Win32Window::set_cursor(platform::CursorShape shape) noexcept {
+    if (hwnd_ == nullptr) {
+        return foundation::Result::failure(foundation::ResultCode::kInvalidState);
+    }
+    if (shape >= platform::CursorShape::kCount) {
+        return foundation::invalid_argument("Win32 cursor shape is invalid");
+    }
+    cursor_shape_ = shape;
+    SetCursor(cursor_handle(cursor_shape_));
+    return foundation::Result::success();
+}
+
+foundation::Result Win32Window::set_ime_state(const platform::ImeState& state) noexcept {
+    if (hwnd_ == nullptr) {
+        return foundation::Result::failure(foundation::ResultCode::kInvalidState);
+    }
+    ime_state_ = state;
+
+    HIMC context = ImmGetContext(hwnd_);
+    if (context == nullptr) {
+        return foundation::Result::success();
+    }
+
+    ImmSetOpenStatus(context, state.want_visible ? TRUE : FALSE);
+    if (state.want_visible || state.want_text_input) {
+        const POINT position{static_cast<LONG>(std::lround(state.input_x)),
+                             static_cast<LONG>(std::lround(state.input_y))};
+
+        COMPOSITIONFORM composition{};
+        composition.dwStyle = CFS_POINT;
+        composition.ptCurrentPos = position;
+        ImmSetCompositionWindow(context, &composition);
+
+        CANDIDATEFORM candidate{};
+        candidate.dwIndex = 0;
+        candidate.dwStyle = CFS_CANDIDATEPOS;
+        candidate.ptCurrentPos = position;
+        ImmSetCandidateWindow(context, &candidate);
+    }
+    ImmReleaseContext(hwnd_, context);
+    return foundation::Result::success();
+}
+
 LRESULT CALLBACK Win32Window::window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l_param) noexcept {
     auto* instance = reinterpret_cast<Win32Window*>(GetWindowLongPtrW(window, GWLP_USERDATA));
     if (message == WM_NCCREATE) {
@@ -193,6 +238,12 @@ LRESULT CALLBACK Win32Window::window_proc(HWND window, UINT message, WPARAM w_pa
 
 LRESULT Win32Window::handle_message(UINT message, WPARAM w_param, LPARAM l_param) noexcept {
     switch (message) {
+        case WM_SETCURSOR:
+            if (LOWORD(l_param) == HTCLIENT) {
+                SetCursor(cursor_handle(cursor_shape_));
+                return TRUE;
+            }
+            return DefWindowProcW(hwnd_, message, w_param, l_param);
         case WM_CLOSE:
             state_.close_requested = true;
             emit_event(WindowEvent{WindowEventType::kWindowCloseRequested});
@@ -346,5 +397,49 @@ platform::KeyModifiers Win32Window::current_modifiers(WPARAM w_param) noexcept {
 
 platform::MouseButton Win32Window::translate_mouse_button(UINT message, WPARAM w_param) noexcept {
     return mouse_button_from_message(message, w_param);
+}
+
+HCURSOR Win32Window::cursor_handle(platform::CursorShape shape) noexcept {
+    LPCWSTR resource = nullptr;
+    switch (shape) {
+        case platform::CursorShape::kNone:
+            return nullptr;
+        case platform::CursorShape::kArrow:
+            resource = IDC_ARROW;
+            break;
+        case platform::CursorShape::kTextInput:
+            resource = IDC_IBEAM;
+            break;
+        case platform::CursorShape::kResizeAll:
+            resource = IDC_SIZEALL;
+            break;
+        case platform::CursorShape::kResizeVertical:
+            resource = IDC_SIZENS;
+            break;
+        case platform::CursorShape::kResizeHorizontal:
+            resource = IDC_SIZEWE;
+            break;
+        case platform::CursorShape::kResizeDiagonalNortheastSouthwest:
+            resource = IDC_SIZENESW;
+            break;
+        case platform::CursorShape::kResizeDiagonalNorthwestSoutheast:
+            resource = IDC_SIZENWSE;
+            break;
+        case platform::CursorShape::kHand:
+            resource = IDC_HAND;
+            break;
+        case platform::CursorShape::kWait:
+            resource = IDC_WAIT;
+            break;
+        case platform::CursorShape::kProgress:
+            resource = IDC_APPSTARTING;
+            break;
+        case platform::CursorShape::kNotAllowed:
+            resource = IDC_NO;
+            break;
+        case platform::CursorShape::kCount:
+            return nullptr;
+    }
+    return LoadCursorW(nullptr, resource);
 }
 }  // namespace aeg::application::win32

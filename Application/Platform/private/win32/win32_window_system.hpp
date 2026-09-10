@@ -24,7 +24,7 @@
 namespace aeg::application::win32 {
 class Win32Window;
 
-class Win32WindowSystem final : public platform::IWindowSystem {
+class Win32WindowSystem final : public platform::IWindowSystem, public platform::IPlatformServices {
 public:
     Win32WindowSystem();
     ~Win32WindowSystem() override;
@@ -40,6 +40,16 @@ public:
     [[nodiscard]] foundation::Result poll_events(const platform::WindowEventSink& sink) override;
     [[nodiscard]] foundation::ResultValue<std::shared_ptr<platform::IWindow>> find_window(
         platform::WindowId window) const override;
+    [[nodiscard]] platform::IPlatformServices& platform_services() noexcept override { return *this; }
+
+    [[nodiscard]] foundation::ResultValue<std::string> get_clipboard_text() const override;
+    [[nodiscard]] foundation::Result set_clipboard_text(std::string_view text) override;
+    [[nodiscard]] foundation::Result set_cursor(platform::WindowId window,
+                                                platform::CursorShape shape) noexcept override;
+    [[nodiscard]] foundation::Result set_ime_state(platform::WindowId window,
+                                                   const platform::ImeState& state) noexcept override;
+    [[nodiscard]] foundation::ResultValue<platform::WindowMetrics> query_window_metrics(
+        platform::WindowId window) const override;
 
 private:
     friend class Win32Window;
@@ -51,6 +61,7 @@ private:
 
     [[nodiscard]] foundation::Result register_window_class();
     [[nodiscard]] foundation::ResultValue<std::wstring> to_wide_title(const platform::WindowDesc& desc) const;
+    [[nodiscard]] foundation::ResultValue<std::wstring> to_wide_string(std::string_view value) const;
     [[nodiscard]] std::size_t find_free_slot() const noexcept;
     [[nodiscard]] uint64_t next_sequence() noexcept;
     [[nodiscard]] double timestamp_seconds() const noexcept;

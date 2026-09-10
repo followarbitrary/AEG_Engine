@@ -26,6 +26,15 @@ int main() {
     if (!window->id().is_valid() || !window->surface_binding().is_valid() || window->state().extent != desc.extent) {
         return 3;
     }
+    aeg::platform::IPlatformServices& platform_services = system->platform_services();
+    const auto metrics_result = platform_services.query_window_metrics(window->id());
+    if (!metrics_result || !metrics_result.value.is_valid()) {
+        return 10;
+    }
+    if (!platform_services.set_cursor(window->id(), aeg::platform::CursorShape::kHand) ||
+        !platform_services.set_ime_state(window->id(), aeg::platform::ImeState{true, true, 10.0f, 12.0f, 16.0f})) {
+        return 11;
+    }
     const auto found_result = system->find_window(window->id());
     if (!found_result || found_result.value->id() != window->id()) {
         return 4;
@@ -51,6 +60,10 @@ int main() {
     const auto stale_result = system->find_window(window->id());
     if (stale_result || stale_result.result.code != aeg::foundation::ResultCode::kNotFound) {
         return 9;
+    }
+    const auto stale_metrics = platform_services.query_window_metrics(window->id());
+    if (stale_metrics || stale_metrics.result.code != aeg::foundation::ResultCode::kNotFound) {
+        return 12;
     }
     return 0;
 }

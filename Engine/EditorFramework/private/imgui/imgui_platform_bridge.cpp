@@ -3,6 +3,7 @@
 #include <imgui.h>
 
 #include <cfloat>
+#include <utility>
 
 namespace aeg::editor::detail {
 namespace {
@@ -144,7 +145,166 @@ void submit_modifiers(ImGuiIO& io, platform::KeyModifiers modifiers) noexcept {
     io.AddKeyEvent(ImGuiMod_Alt, platform::has_modifier(modifiers, platform::KeyModifiers::kAlt));
     io.AddKeyEvent(ImGuiMod_Super, platform::has_modifier(modifiers, platform::KeyModifiers::kSuper));
 }
+
+ImGuiPlatformBridgeContext* current_bridge_context() noexcept {
+    if (ImGui::GetCurrentContext() == nullptr) {
+        return nullptr;
+    }
+    ImGuiIO& io = ImGui::GetIO();
+    return static_cast<ImGuiPlatformBridgeContext*>(io.BackendPlatformUserData);
+}
+
+const char* get_clipboard_text(void* user_data) noexcept {
+    auto* context = static_cast<ImGuiPlatformBridgeContext*>(user_data);
+    if (context == nullptr || context->services == nullptr) {
+        return nullptr;
+    }
+    try {
+        foundation::ResultValue<std::string> result = context->services->get_clipboard_text();
+        if (!result) {
+            context->clipboard_text.clear();
+            return nullptr;
+        }
+        context->clipboard_text = std::move(result.value);
+        return context->clipboard_text.c_str();
+    } catch (...) {
+        context->clipboard_text.clear();
+        return nullptr;
+    }
+}
+
+void set_clipboard_text(void* user_data, const char* text) noexcept {
+    auto* context = static_cast<ImGuiPlatformBridgeContext*>(user_data);
+    if (context == nullptr || context->services == nullptr || text == nullptr) {
+        return;
+    }
+    try {
+        static_cast<void>(context->services->set_clipboard_text(text));
+    } catch (...) {}
+}
+
+const char* get_platform_clipboard_text(ImGuiContext*) noexcept {
+    ImGuiPlatformBridgeContext* context = current_bridge_context();
+    return get_clipboard_text(context);
+}
+
+void set_platform_clipboard_text(ImGuiContext*, const char* text) noexcept {
+    ImGuiPlatformBridgeContext* context = current_bridge_context();
+    set_clipboard_text(context, text);
+}
+
+void set_platform_ime_data(ImGuiContext*, ImGuiViewport*, ImGuiPlatformImeData* data) noexcept {
+    ImGuiPlatformBridgeContext* context = current_bridge_context();
+    if (context == nullptr || context->services == nullptr || !context->window.is_valid() || data == nullptr) {
+        return;
+    }
+    const platform::ImeState state{data->WantVisible, data->WantTextInput, data->InputPos.x, data->InputPos.y,
+                                   data->InputLineHeight};
+    try {
+        static_cast<void>(context->services->set_ime_state(context->window, state));
+    } catch (...) {}
+}
+
+platform::CursorShape translate_cursor(ImGuiMouseCursor cursor) noexcept {
+    using platform::CursorShape;
+    switch (cursor) {
+        case ImGuiMouseCursor_Arrow:
+            return CursorShape::kArrow;
+        case ImGuiMouseCursor_TextInput:
+            return CursorShape::kTextInput;
+        case ImGuiMouseCursor_ResizeAll:
+            return CursorShape::kResizeAll;
+        case ImGuiMouseCursor_ResizeNS:
+            return CursorShape::kResizeVertical;
+        case ImGuiMouseCursor_ResizeEW:
+            return CursorShape::kResizeHorizontal;
+        case ImGuiMouseCursor_ResizeNESW:
+            return CursorShape::kResizeDiagonalNortheastSouthwest;
+        case ImGuiMouseCursor_ResizeNWSE:
+            return CursorShape::kResizeDiagonalNorthwestSoutheast;
+        case ImGuiMouseCursor_Hand:
+            return CursorShape::kHand;
+        case ImGuiMouseCursor_Wait:
+            return CursorShape::kWait;
+        case ImGuiMouseCursor_Progress:
+            return CursorShape::kProgress;
+        case ImGuiMouseCursor_NotAllowed:
+            return CursorShape::kNotAllowed;
+        case ImGuiMouseCursor_None:
+        case ImGuiMouseCursor_COUNT:
+            return CursorShape::kNone;
+    }
+    return CursorShape::kArrow;
+}
 }  // namespace
+
+void ImGuiPlatformBridge::install(ImGuiIO& io, ImGuiPlatformBridgeContext& context,
+                                  platform::IPlatformServices* services) noexcept {
+    context.services = services;
+    context.window = {};
+    context.clipboard_text.clear();
+    io.BackendPlatformUserData = &context;
+
+    ImGuiPlatformIO& platform_io = ImGui::GetPlatformIO();
+    if (services == nullptr) {
+        return;
+    }
+
+    io.BackendFlags |= ImGuiBackendFlags_HasMouseCursors;
+    platform_io.Platform_GetClipboardTextFn = &get_platform_clipboard_text;
+    platform_io.Platform_SetClipboardTextFn = &set_platform_clipboard_text;
+    platform_io.Platform_ClipboardUserData = &context;
+    platform_io.Platform_SetImeDataFn = &set_platform_ime_data;
+    platform_io.Platform_ImeUserData = &context;
+#ifndef IMGUI_DISABLE_OBSOLETE_FUNCTIONS
+    io.GetClipboardTextFn = &get_clipboard_text;
+    io.SetClipboardTextFn = &set_clipboard_text;
+    io.ClipboardUserData = &context;
+#endif
+}
+
+void ImGuiPlatformBridge::shutdown(ImGuiIO& io, ImGuiPlatformBridgeContext& context) noexcept {
+    ImGuiPlatformIO& platform_io = ImGui::GetPlatformIO();
+    if (platform_io.Platform_ClipboardUserData == &context) {
+        platform_io.Platform_GetClipboardTextFn = nullptr;
+        platform_io.Platform_SetClipboardTextFn = nullptr;
+        platform_io.Platform_ClipboardUserData = nullptr;
+    }
+    if (platform_io.Platform_ImeUserData == &context) {
+        platform_io.Platform_SetImeDataFn = nullptr;
+        platform_io.Platform_ImeUserData = nullptr;
+    }
+    if (io.BackendPlatformUserData == &context) {
+        io.BackendPlatformUserData = nullptr;
+    }
+    io.BackendFlags &= ~ImGuiBackendFlags_HasMouseCursors;
+#ifndef IMGUI_DISABLE_OBSOLETE_FUNCTIONS
+    if (io.ClipboardUserData == &context) {
+        io.GetClipboardTextFn = nullptr;
+        io.SetClipboardTextFn = nullptr;
+        io.ClipboardUserData = nullptr;
+    }
+#endif
+    context.services = nullptr;
+    context.window = {};
+    context.clipboard_text.clear();
+}
+
+void ImGuiPlatformBridge::set_window(ImGuiPlatformBridgeContext& context, platform::WindowId window) noexcept {
+    context.window = window;
+}
+
+void ImGuiPlatformBridge::update_cursor(ImGuiIO& io, const ImGuiPlatformBridgeContext& context) noexcept {
+    if (context.services == nullptr || !context.window.is_valid() ||
+        (io.ConfigFlags & ImGuiConfigFlags_NoMouseCursorChange) != 0) {
+        return;
+    }
+    const platform::CursorShape shape =
+        io.MouseDrawCursor ? platform::CursorShape::kNone : translate_cursor(ImGui::GetMouseCursor());
+    try {
+        static_cast<void>(context.services->set_cursor(context.window, shape));
+    } catch (...) {}
+}
 
 void ImGuiPlatformBridge::submit_event(ImGuiIO& io, const platform::WindowEvent& event) noexcept {
     using platform::WindowEventType;

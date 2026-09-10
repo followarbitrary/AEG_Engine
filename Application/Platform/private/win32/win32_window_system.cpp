@@ -6,7 +6,10 @@
 
 #include <windows.h>
 
+#include <algorithm>
+#include <bit>
 #include <cstddef>
+#include <cstring>
 #include <exception>
 #include <limits>
 #include <new>
@@ -25,23 +28,44 @@ foundation::Result backend_error(const char* message) {
     return foundation::Result::failure(foundation::ResultCode::kBackendError, message);
 }
 
-foundation::ResultValue<std::wstring> convert_title(std::string_view title) {
-    if (title.empty()) {
-        return {foundation::invalid_argument("Window title must not be empty"), {}};
+foundation::ResultValue<std::wstring> convert_utf8_to_wide(std::string_view value) {
+    if (value.empty()) {
+        return {foundation::Result::success(), {}};
     }
-    if (title.find('\0') != std::string_view::npos ||
-        title.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
-        return {foundation::invalid_argument("Window title is invalid"), {}};
+    if (value.find('\0') != std::string_view::npos ||
+        value.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        return {foundation::invalid_argument("UTF-8 platform string is invalid"), {}};
     }
-    const int source_length = static_cast<int>(title.size());
-    const int required = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, title.data(), source_length, nullptr, 0);
+    const int source_length = static_cast<int>(value.size());
+    const int required = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(), source_length, nullptr, 0);
     if (required <= 0) {
-        return {backend_error("UTF-8 window title conversion failed"), {}};
+        return {backend_error("UTF-8 platform string conversion failed"), {}};
     }
     std::wstring result(static_cast<std::size_t>(required), L'\0');
-    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, title.data(), source_length, result.data(), required) !=
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(), source_length, result.data(), required) !=
         required) {
-        return {backend_error("UTF-8 window title conversion failed"), {}};
+        return {backend_error("UTF-8 platform string conversion failed"), {}};
+    }
+    return {foundation::Result::success(), std::move(result)};
+}
+
+foundation::ResultValue<std::string> convert_wide_to_utf8(std::wstring_view value) {
+    if (value.empty()) {
+        return {foundation::Result::success(), {}};
+    }
+    if (value.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        return {foundation::invalid_argument("UTF-16 clipboard text is too large"), {}};
+    }
+    const int source_length = static_cast<int>(value.size());
+    const int required =
+        WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value.data(), source_length, nullptr, 0, nullptr, nullptr);
+    if (required <= 0) {
+        return {backend_error("UTF-16 clipboard text conversion failed"), {}};
+    }
+    std::string result(static_cast<std::size_t>(required), '\0');
+    if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value.data(), source_length, result.data(), required,
+                            nullptr, nullptr) != required) {
+        return {backend_error("UTF-16 clipboard text conversion failed"), {}};
     }
     return {foundation::Result::success(), std::move(result)};
 }
@@ -52,6 +76,25 @@ DWORD window_style(const platform::WindowDesc& desc) noexcept {
         style &= ~(WS_THICKFRAME | WS_MAXIMIZEBOX);
     }
     return style;
+}
+
+UINT dpi_for_window(HWND window) noexcept {
+    using GetDpiForWindowFunction = UINT(WINAPI*)(HWND);
+    static const auto get_dpi_for_window =
+        std::bit_cast<GetDpiForWindowFunction>(GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetDpiForWindow"));
+    if (get_dpi_for_window != nullptr) {
+        if (const UINT dpi = get_dpi_for_window(window); dpi != 0) {
+            return dpi;
+        }
+    }
+
+    HDC device_context = GetDC(window);
+    if (device_context == nullptr) {
+        return USER_DEFAULT_SCREEN_DPI;
+    }
+    const int dpi = GetDeviceCaps(device_context, LOGPIXELSX);
+    ReleaseDC(window, device_context);
+    return dpi > 0 ? static_cast<UINT>(dpi) : USER_DEFAULT_SCREEN_DPI;
 }
 }  // namespace
 
@@ -187,6 +230,120 @@ foundation::ResultValue<std::shared_ptr<platform::IWindow>> Win32WindowSystem::f
     }
 }
 
+foundation::ResultValue<std::string> Win32WindowSystem::get_clipboard_text() const {
+    if (OpenClipboard(nullptr) == FALSE) {
+        return {backend_error("OpenClipboard failed"), {}};
+    }
+
+    const HANDLE data = GetClipboardData(CF_UNICODETEXT);
+    if (data == nullptr) {
+        CloseClipboard();
+        return {foundation::Result::success(), {}};
+    }
+
+    const auto* text = static_cast<const wchar_t*>(GlobalLock(data));
+    if (text == nullptr) {
+        CloseClipboard();
+        return {backend_error("GlobalLock for clipboard text failed"), {}};
+    }
+    const std::wstring_view value{text, static_cast<std::size_t>(lstrlenW(text))};
+    const foundation::ResultValue<std::string> result = convert_wide_to_utf8(value);
+    GlobalUnlock(data);
+    CloseClipboard();
+    return result;
+}
+
+foundation::Result Win32WindowSystem::set_clipboard_text(std::string_view text) {
+    if (text.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        return foundation::invalid_argument("Clipboard text is too large");
+    }
+    const foundation::ResultValue<std::wstring> wide_result = convert_utf8_to_wide(text);
+    if (!wide_result) {
+        return wide_result.result;
+    }
+    const std::wstring& wide_text = wide_result.value;
+    if (wide_text.size() > (std::numeric_limits<SIZE_T>::max() / sizeof(wchar_t)) - 1u) {
+        return foundation::out_of_memory("Clipboard text allocation size overflowed");
+    }
+
+    if (OpenClipboard(nullptr) == FALSE) {
+        return backend_error("OpenClipboard failed");
+    }
+    if (EmptyClipboard() == FALSE) {
+        CloseClipboard();
+        return backend_error("EmptyClipboard failed");
+    }
+
+    const SIZE_T allocation_size = (wide_text.size() + 1u) * sizeof(wchar_t);
+    HGLOBAL allocation = GlobalAlloc(GMEM_MOVEABLE, allocation_size);
+    if (allocation == nullptr) {
+        CloseClipboard();
+        return foundation::out_of_memory("Clipboard text allocation failed");
+    }
+    void* destination = GlobalLock(allocation);
+    if (destination == nullptr) {
+        GlobalFree(allocation);
+        CloseClipboard();
+        return backend_error("GlobalLock for clipboard text failed");
+    }
+    std::memcpy(destination, wide_text.c_str(), allocation_size);
+    GlobalUnlock(allocation);
+
+    if (SetClipboardData(CF_UNICODETEXT, allocation) == nullptr) {
+        GlobalFree(allocation);
+        CloseClipboard();
+        return backend_error("SetClipboardData failed");
+    }
+    CloseClipboard();
+    return foundation::Result::success();
+}
+
+foundation::Result Win32WindowSystem::set_cursor(platform::WindowId window, platform::CursorShape shape) noexcept {
+    if (!window.is_valid() || window.index >= windows_.size()) {
+        return foundation::not_found("Win32 window identity is not registered");
+    }
+    WindowSlot& slot = windows_[window.index];
+    if (slot.window == nullptr || slot.generation != window.generation) {
+        return foundation::not_found("Win32 window identity is stale");
+    }
+    return slot.window->set_cursor(shape);
+}
+
+foundation::Result Win32WindowSystem::set_ime_state(platform::WindowId window,
+                                                    const platform::ImeState& state) noexcept {
+    if (!window.is_valid() || window.index >= windows_.size()) {
+        return foundation::not_found("Win32 window identity is not registered");
+    }
+    WindowSlot& slot = windows_[window.index];
+    if (slot.window == nullptr || slot.generation != window.generation) {
+        return foundation::not_found("Win32 window identity is stale");
+    }
+    return slot.window->set_ime_state(state);
+}
+
+foundation::ResultValue<platform::WindowMetrics> Win32WindowSystem::query_window_metrics(
+    platform::WindowId window) const {
+    if (!window.is_valid() || window.index >= windows_.size()) {
+        return {foundation::not_found("Win32 window identity is not registered"), {}};
+    }
+    const WindowSlot& slot = windows_[window.index];
+    if (slot.window == nullptr || slot.generation != window.generation) {
+        return {foundation::not_found("Win32 window identity is stale"), {}};
+    }
+
+    RECT client_rect{};
+    if (GetClientRect(slot.window->hwnd_, &client_rect) == FALSE) {
+        return {backend_error("GetClientRect failed"), {}};
+    }
+    const LONG width = std::max<LONG>(client_rect.right - client_rect.left, 1);
+    const LONG height = std::max<LONG>(client_rect.bottom - client_rect.top, 1);
+    const UINT dpi = dpi_for_window(slot.window->hwnd_);
+    const float scale = static_cast<float>(dpi) / static_cast<float>(USER_DEFAULT_SCREEN_DPI);
+    return {foundation::Result::success(),
+            platform::WindowMetrics{platform::WindowExtent{static_cast<uint32_t>(width), static_cast<uint32_t>(height)},
+                                    scale, scale}};
+}
+
 foundation::Result Win32WindowSystem::register_window_class() {
     if (class_registered_) {
         return foundation::Result::success();
@@ -209,7 +366,14 @@ foundation::Result Win32WindowSystem::register_window_class() {
 }
 
 foundation::ResultValue<std::wstring> Win32WindowSystem::to_wide_title(const platform::WindowDesc& desc) const {
-    return convert_title(desc.title);
+    if (desc.title.empty()) {
+        return {foundation::invalid_argument("Window title must not be empty"), {}};
+    }
+    return to_wide_string(desc.title);
+}
+
+foundation::ResultValue<std::wstring> Win32WindowSystem::to_wide_string(std::string_view value) const {
+    return convert_utf8_to_wide(value);
 }
 
 std::size_t Win32WindowSystem::find_free_slot() const noexcept {

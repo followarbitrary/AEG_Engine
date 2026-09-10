@@ -3,6 +3,7 @@
 #include <functional>
 #include <memory>
 
+#include "platform_services.hpp"
 #include "result.hpp"
 #include "window_event.hpp"
 #include "window_types.hpp"
@@ -29,5 +30,6 @@ public:
     [[nodiscard]] virtual foundation::Result destroy_window(WindowId window) = 0;
     [[nodiscard]] virtual foundation::Result poll_events(const WindowEventSink& sink) = 0;
     [[nodiscard]] virtual foundation::ResultValue<std::shared_ptr<IWindow>> find_window(WindowId window) const = 0;
+    [[nodiscard]] virtual IPlatformServices& platform_services() noexcept = 0;
 };
 }  // namespace aeg::platform

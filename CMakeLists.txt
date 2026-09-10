@@ -236,7 +236,7 @@ if (WIN32)
             _UNICODE
             WIN32_LEAN_AND_MEAN
     )
-    target_link_libraries(aeg_application_platform_win32 PUBLIC aeg_platform aeg_input user32)
+    target_link_libraries(aeg_application_platform_win32 PUBLIC aeg_platform aeg_input user32 imm32)
 
     if (MSVC)
         target_compile_options(aeg_application_platform_win32 PRIVATE /W4 /permissive-)

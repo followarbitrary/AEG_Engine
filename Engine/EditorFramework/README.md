@@ -15,6 +15,10 @@ ImGui Core，不使用官方平台或渲染 Backend。编辑器 UI 的 GPU 资�
 `ImGuiTextureRegistry` 注册 RHI View/Sampler，注册表不拥有这些资源，也不接收 native
 图形 API 句柄。
 
+`EditorImGuiDesc::platform_services` 可绑定 `Engine/Platform` 提供的
+`IPlatformServices`。`ImGuiPlatformBridge` 通过该抽象接入剪贴板、光标、IME 和窗口
+显示指标；EditorFramework 不直接调用 Win32 或其他操作系统 API。
+
 初始化后可通过 `EditorImGuiHost::capture_font_atlas()` 获取引擎拥有的 RGBA8 字体图集
 快照；上层使用 `Resource::TextureUploader` 创建带 `Sampled` capability 的 RHI Texture、
 Sampled View 和 Sampler，再将这些句柄注册到 `ImGuiTextureRegistry`，最后调用

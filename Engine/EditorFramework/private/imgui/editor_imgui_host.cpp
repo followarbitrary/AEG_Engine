@@ -25,6 +25,7 @@ struct EditorImGuiHost::Impl final {
 
     ImGuiContext* context{nullptr};
     EditorImGuiDesc desc{};
+    detail::ImGuiPlatformBridgeContext platform_bridge{};
     std::mutex event_mutex{};
     std::vector<platform::WindowEvent> pending_events{};
     std::vector<platform::WindowEvent> frame_events{};
@@ -69,6 +70,7 @@ foundation::Result EditorImGuiHost::initialize(const EditorImGuiDesc& desc) {
     io.BackendPlatformName = "AEG.Editor.ImGuiPlatformBridge";
     io.BackendRendererName = nullptr;
     io.BackendFlags = ImGuiBackendFlags_None;
+    detail::ImGuiPlatformBridge::install(io, impl_->platform_bridge, desc.platform_services);
     unsigned char* font_pixels = nullptr;
     int font_width = 0;
     int font_height = 0;
@@ -115,6 +117,7 @@ foundation::Result EditorImGuiHost::shutdown() {
     }
 
     ImGui::SetCurrentContext(impl_->context);
+    detail::ImGuiPlatformBridge::shutdown(ImGui::GetIO(), impl_->platform_bridge);
     ImGui::DestroyContext(impl_->context);
     impl_->context = nullptr;
     impl_->pending_events.clear();
@@ -177,17 +180,30 @@ foundation::Result EditorImGuiHost::begin_frame(const EditorImGuiFrameDesc& desc
     if (impl_->frame_active) {
         return foundation::invalid_state("EditorImGuiHost frame is already active");
     }
-    if (!desc.display_extent.is_valid() || !std::isfinite(desc.delta_seconds) || desc.delta_seconds <= 0.0f ||
-        !std::isfinite(desc.framebuffer_scale_x) || !std::isfinite(desc.framebuffer_scale_y) ||
-        desc.framebuffer_scale_x <= 0.0f || desc.framebuffer_scale_y <= 0.0f) {
-        return foundation::invalid_argument("Editor ImGui frame description is invalid");
-    }
 
     ImGui::SetCurrentContext(impl_->context);
+    detail::ImGuiPlatformBridge::set_window(impl_->platform_bridge, desc.window);
+    platform::WindowExtent display_extent = desc.display_extent;
+    float framebuffer_scale_x = desc.framebuffer_scale_x;
+    float framebuffer_scale_y = desc.framebuffer_scale_y;
+    if (impl_->platform_bridge.services != nullptr) {
+        const foundation::ResultValue<platform::WindowMetrics> metrics_result =
+            impl_->platform_bridge.services->query_window_metrics(desc.window);
+        if (!metrics_result) {
+            return metrics_result.result;
+        }
+        display_extent = metrics_result.value.display_extent;
+        framebuffer_scale_x = metrics_result.value.framebuffer_scale_x;
+        framebuffer_scale_y = metrics_result.value.framebuffer_scale_y;
+    }
+    if (!display_extent.is_valid() || !std::isfinite(desc.delta_seconds) || desc.delta_seconds <= 0.0f ||
+        !std::isfinite(framebuffer_scale_x) || !std::isfinite(framebuffer_scale_y) || framebuffer_scale_x <= 0.0f ||
+        framebuffer_scale_y <= 0.0f) {
+        return foundation::invalid_argument("Editor ImGui frame description is invalid");
+    }
     ImGuiIO& io = ImGui::GetIO();
-    io.DisplaySize =
-        ImVec2(static_cast<float>(desc.display_extent.width), static_cast<float>(desc.display_extent.height));
-    io.DisplayFramebufferScale = ImVec2(desc.framebuffer_scale_x, desc.framebuffer_scale_y);
+    io.DisplaySize = ImVec2(static_cast<float>(display_extent.width), static_cast<float>(display_extent.height));
+    io.DisplayFramebufferScale = ImVec2(framebuffer_scale_x, framebuffer_scale_y);
     io.DeltaTime = desc.delta_seconds;
 
     {
@@ -227,6 +243,7 @@ foundation::Result EditorImGuiHost::end_frame() {
 
     ImGui::SetCurrentContext(impl_->context);
     ImGui::Render();
+    detail::ImGuiPlatformBridge::update_cursor(ImGui::GetIO(), impl_->platform_bridge);
     impl_->frame_active = false;
     return foundation::Result::success();
 }

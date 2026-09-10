@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "platform_services.hpp"
 #include "window_types.hpp"
 
 namespace aeg::editor {
@@ -15,6 +16,7 @@ struct EditorImGuiDesc final {
     bool enable_keyboard_navigation{true};
     bool enable_gamepad_navigation{false};
     float font_global_scale{1.0f};
+    platform::IPlatformServices* platform_services{nullptr};
 };
 
 struct EditorImGuiFrameDesc final {
