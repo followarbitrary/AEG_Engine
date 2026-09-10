@@ -981,7 +981,10 @@ if (BUILD_TESTING)
     add_test(NAME aeg_triangle COMMAND aeg_triangle --frames 1)
     if (WIN32)
         add_test(NAME aeg_editor_imgui_renderer_smoke COMMAND aeg_editor_imgui_renderer_smoke)
-        add_test(NAME aeg_editor_application COMMAND aeg_editor_application --frames 3)
+        add_test(NAME aeg_editor_application COMMAND aeg_editor_application --frames 60 --stress-resize)
+        set_tests_properties(aeg_editor_imgui_renderer_smoke aeg_editor_application PROPERTIES
+            FAIL_REGULAR_EXPRESSION "Vulkan validation \\[ERROR\\]"
+        )
     endif()
     if (MINGW)
         get_filename_component(AEG_MINGW_RUNTIME_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)

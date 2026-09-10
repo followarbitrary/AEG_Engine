@@ -155,6 +155,32 @@ platform::WindowSurfaceBinding Win32Window::surface_binding() const noexcept {
     };
 }
 
+foundation::Result Win32Window::set_extent(platform::WindowExtent extent) noexcept {
+    if (hwnd_ == nullptr) {
+        return foundation::Result::failure(foundation::ResultCode::kInvalidState);
+    }
+    if (!extent.is_valid()) {
+        return foundation::invalid_argument("Win32 window extent must be non-zero");
+    }
+
+    RECT window_rect{};
+    RECT client_rect{};
+    if (GetWindowRect(hwnd_, &window_rect) == FALSE || GetClientRect(hwnd_, &client_rect) == FALSE) {
+        return foundation::Result::failure(foundation::ResultCode::kBackendError,
+                                            "Win32 window extent query failed");
+    }
+    const int32_t frame_width = (window_rect.right - window_rect.left) - (client_rect.right - client_rect.left);
+    const int32_t frame_height = (window_rect.bottom - window_rect.top) - (client_rect.bottom - client_rect.top);
+    const int32_t width = static_cast<int32_t>(extent.width) + frame_width;
+    const int32_t height = static_cast<int32_t>(extent.height) + frame_height;
+    if (width <= 0 || height <= 0 || SetWindowPos(hwnd_, nullptr, 0, 0, width, height,
+                                                  SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE) == FALSE) {
+        return foundation::Result::failure(foundation::ResultCode::kBackendError,
+                                            "Win32 window extent update failed");
+    }
+    return foundation::Result::success();
+}
+
 foundation::Result Win32Window::request_close() noexcept {
     if (hwnd_ == nullptr) {
         return foundation::Result::failure(foundation::ResultCode::kInvalidState);

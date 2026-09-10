@@ -150,6 +150,7 @@ namespace aeg::render_graph {
             PhysicalTexture physical{};
             rhi::ResourceState imported_state{};
             rhi::GpuCompletionSet last_completions{};
+            bool is_swapchain_image{false};
             bool exported{false};
             bool has_use{false};
             uint32_t first_use{kInvalidHandleIndex};
@@ -197,6 +198,7 @@ namespace aeg::render_graph {
             std::vector<uint32_t> passes{};
             std::vector<BatchDependency> dependencies{};
             rhi::GpuSyncPoint completion{};
+            bool waits_for_acquire{false};
             bool submits_frame{false};
         };
 
@@ -1145,7 +1147,18 @@ namespace aeg::render_graph {
         if (resolved_initial_state.usage == rhi::ResourceUsage::kUndefined) {
             import_desc.initial_usage = rhi::ResourceUsage::kUndefined;
         }
-        return import_texture(acquired.image.texture, acquired.image.view, import_desc, resolved_initial_state);
+        const foundation::ResultValue<RenderGraphTexture> result =
+                import_texture(acquired.image.texture, acquired.image.view, import_desc, resolved_initial_state);
+        if (!result) {
+            return result;
+        }
+        TextureRecord* record = impl_->get_texture(result.value);
+        if (record == nullptr) {
+            return {foundation::Result::failure(foundation::ResultCode::kInvalidState,
+                                                "Imported swapchain texture record is unavailable"), {}};
+        }
+        record->is_swapchain_image = true;
+        return result;
     }
 
     foundation::Result RenderGraph::export_buffer(RenderGraphBuffer resource) {
@@ -1258,9 +1271,16 @@ namespace aeg::render_graph {
     }
 
     foundation::Result PassBuilder::write(RenderGraphBuffer buffer, rhi::ResourceUsage usage,
-                                   rhi::PipelineStageMask pipeline_stages,
-                                   rhi::ShaderStageMask shader_stages,
-                                   RenderGraphBufferRange range, bool discard_contents) {
+                                          rhi::PipelineStageMask pipeline_stages,
+                                          rhi::ShaderStageMask shader_stages,
+                                          RenderGraphBufferRange range, bool discard_contents) {
+        return write_to(buffer, usage, pipeline_stages, shader_stages, usage, range, discard_contents);
+    }
+
+    foundation::Result PassBuilder::write_to(RenderGraphBuffer buffer, rhi::ResourceUsage usage,
+                                             rhi::PipelineStageMask pipeline_stages,
+                                             rhi::ShaderStageMask shader_stages, rhi::ResourceUsage final_usage,
+                                             RenderGraphBufferRange range, bool discard_contents) {
         if (pass_index_ >= graph_.impl_->passes.size()) {
             return foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                         "Pass builder is no longer attached to a pass");
@@ -1277,7 +1297,14 @@ namespace aeg::render_graph {
         use.resource_generation = buffer.generation;
         use.access = ResourceAccess::kWrite;
         use.before_state = make_state(usage, pass->queue, pipeline_stages, shader_stages);
-        use.after_state = use.before_state;
+        use.after_state = final_usage == usage
+                                  ? use.before_state
+                                  : make_state(final_usage, pass->queue,
+                                               final_usage == rhi::ResourceUsage::kHostRead ||
+                                                               final_usage == rhi::ResourceUsage::kHostWrite
+                                                       ? rhi::PipelineStage::kHost
+                                                       : rhi::PipelineStage::kAllCommands,
+                                               rhi::ShaderStage::kAll);
         use.buffer_range = range;
         use.discard_on_first_use = discard_contents;
         return graph_.impl_->add_use(pass_index_, std::move(use));
@@ -1309,9 +1336,16 @@ namespace aeg::render_graph {
     }
 
     foundation::Result PassBuilder::read(RenderGraphTexture texture, rhi::ResourceUsage usage,
-                                  rhi::PipelineStageMask pipeline_stages,
-                                  rhi::ShaderStageMask shader_stages,
-                                  rhi::SubresourceRange subresources) {
+                                         rhi::PipelineStageMask pipeline_stages,
+                                         rhi::ShaderStageMask shader_stages,
+                                         rhi::SubresourceRange subresources) {
+        return read_to(texture, usage, pipeline_stages, shader_stages, usage, subresources);
+    }
+
+    foundation::Result PassBuilder::read_to(RenderGraphTexture texture, rhi::ResourceUsage usage,
+                                            rhi::PipelineStageMask pipeline_stages,
+                                            rhi::ShaderStageMask shader_stages, rhi::ResourceUsage final_usage,
+                                            rhi::SubresourceRange subresources) {
         if (pass_index_ >= graph_.impl_->passes.size()) {
             return foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                         "Pass builder is no longer attached to a pass");
@@ -1337,7 +1371,10 @@ namespace aeg::render_graph {
         use.resource_generation = texture.generation;
         use.access = ResourceAccess::kRead;
         use.before_state = make_state(usage, pass->queue, pipeline_stages, shader_stages);
-        use.after_state = use.before_state;
+        use.after_state = final_usage == usage
+                                  ? use.before_state
+                                  : make_state(final_usage, pass->queue, rhi::PipelineStage::kAllCommands,
+                                               rhi::ShaderStage::kAll);
         use.subresources = subresources;
         return graph_.impl_->add_use(pass_index_, std::move(use));
     }
@@ -2147,6 +2184,28 @@ namespace aeg::render_graph {
                 add_batch_dependency(batches[destination_batch], source_batch, dependency_stages(edge), hazard_count);
             }
 
+            bool acquire_batch_found = false;
+            for (Batch& batch: batches) {
+                bool touches_swapchain = false;
+                for (const uint32_t pass_index: batch.passes) {
+                    for (const ResourceUse& use: passes[pass_index].uses) {
+                        if (use.kind == ResourceKind::kTexture && use.resource_index < textures.size() &&
+                            textures[use.resource_index].generation == use.resource_generation &&
+                            textures[use.resource_index].is_swapchain_image) {
+                            touches_swapchain = true;
+                            break;
+                        }
+                    }
+                    if (touches_swapchain) {
+                        break;
+                    }
+                }
+                if (touches_swapchain && !acquire_batch_found) {
+                    batch.waits_for_acquire = true;
+                    acquire_batch_found = true;
+                }
+            }
+
             const foundation::Result audit_result = audit_cross_queue_dependencies();
             if (!audit_result) {
                 return audit_result;
@@ -2157,7 +2216,7 @@ namespace aeg::render_graph {
                 for (const uint32_t pass_index: batch.passes) {
                     const PassRecord& pass = passes[pass_index];
                     for (const ResourceUse& use: pass.uses) {
-                        if (use.after_state.usage == rhi::ResourceUsage::kPresent) {
+                        if (use.after_state.usage == rhi::ResourceUsage::kPresent && is_write_access(use.access)) {
                             batch.submits_frame = true;
                         }
                     }
@@ -2343,6 +2402,7 @@ namespace aeg::render_graph {
                 batch_plan.queue = batch.queue;
                 batch_plan.pass_indices = batch.passes;
                 batch_plan.submits_frame = batch.submits_frame;
+                batch_plan.waits_for_acquire = batch.waits_for_acquire;
                 batch_plan.dependencies.reserve(batch.dependencies.size());
                 for (const BatchDependency& dependency: batch.dependencies) {
                     if (dependency.source_batch >= batches.size()) {
@@ -3843,59 +3903,67 @@ namespace aeg::render_graph {
             }
 
             const rhi::FrameAcquireResult* acquired = frame_context.acquired_frame();
-            uint32_t frame_output_batch = kInvalidHandleIndex;
+            const bool signal_acquired_frame = desc.present_acquired_frame || desc.signal_present;
+            uint32_t acquire_batch = kInvalidHandleIndex;
+            uint32_t swapchain_texture_index = kInvalidHandleIndex;
+            uint32_t final_swapchain_batch = kInvalidHandleIndex;
             for (uint32_t batch_index = 0; batch_index < impl_->batches.size(); ++batch_index) {
-                if (!impl_->batches[batch_index].submits_frame) {
-                    continue;
+                if (impl_->batches[batch_index].waits_for_acquire) {
+                    if (acquire_batch != kInvalidHandleIndex) {
+                        return fail_execution(foundation::Result::failure(
+                                foundation::ResultCode::kInvalidState,
+                                "Render graph contains multiple acquire synchronization batches"));
+                    }
+                    acquire_batch = batch_index;
+                    if (impl_->batches[batch_index].queue != rhi::QueueClass::kGraphics) {
+                        return fail_execution(foundation::Result::failure(
+                                foundation::ResultCode::kInvalidArgument,
+                        "Swapchain acquire synchronization must start on the graphics queue"));
+                    }
                 }
-                frame_output_batch = batch_index;
-                if (impl_->batches[batch_index].queue != rhi::QueueClass::kGraphics) {
-                    return fail_execution(foundation::Result::failure(
-                            foundation::ResultCode::kInvalidArgument,
-                            "Present output must be produced by a graphics batch"));
+                for (const uint32_t pass_index: impl_->batches[batch_index].passes) {
+                    for (const ResourceUse& use: impl_->passes[pass_index].uses) {
+                        if (use.kind != ResourceKind::kTexture || use.resource_index >= impl_->textures.size() ||
+                            !impl_->textures[use.resource_index].is_swapchain_image ||
+                            impl_->textures[use.resource_index].generation != use.resource_generation) {
+                            continue;
+                        }
+                        if (swapchain_texture_index == kInvalidHandleIndex) {
+                            swapchain_texture_index = use.resource_index;
+                        } else if (swapchain_texture_index != use.resource_index) {
+                            return fail_execution(foundation::Result::failure(
+                                    foundation::ResultCode::kInvalidState,
+                                    "Render graph contains multiple imported swapchain images"));
+                        }
+                        final_swapchain_batch = batch_index;
+                    }
                 }
             }
-            if (desc.present_acquired_frame && acquired == nullptr) {
+            if (signal_acquired_frame && acquired == nullptr) {
                 return fail_execution(foundation::Result::failure(
                         foundation::ResultCode::kInvalidState,
                         "Present was requested without an acquired swapchain frame"));
             }
-            if (frame_output_batch != kInvalidHandleIndex && acquired == nullptr) {
-                return fail_execution(foundation::Result::failure(
-                        foundation::ResultCode::kInvalidState,
-                        "Render graph has a present output but no acquired swapchain frame"));
-            }
-            if (desc.present_acquired_frame && frame_output_batch == kInvalidHandleIndex) {
+            if (signal_acquired_frame && final_swapchain_batch == kInvalidHandleIndex) {
                 return fail_execution(foundation::Result::failure(
                         foundation::ResultCode::kInvalidArgument,
-                        "Present was requested but the graph has no kPresent output"));
+                        "Present was requested but the graph does not access a swapchain image"));
             }
-            if (acquired != nullptr && frame_output_batch != kInvalidHandleIndex) {
-                uint32_t present_output_count = 0;
-                bool present_output_matches = false;
-                for (const uint32_t pass_index: impl_->batches[frame_output_batch].passes) {
-                    for (const ResourceUse& use: impl_->passes[pass_index].uses) {
-                        if (use.after_state.usage != rhi::ResourceUsage::kPresent) {
-                            continue;
-                        }
-                        ++present_output_count;
-                        if (use.kind != ResourceKind::kTexture) {
-                            return fail_execution(foundation::Result::failure(
-                                    foundation::ResultCode::kInvalidArgument,
-                                    "Present output must reference a texture"));
-                        }
-                        const TextureRecord& record = impl_->textures[use.resource_index];
-                        if (record.lifetime == ResourceLifetime::kImported && record.has_use &&
-                            record.physical.handle == acquired->image.texture) {
-                            present_output_matches = true;
-                        }
-                    }
-                }
-                if (present_output_count != 1 || !present_output_matches) {
-                    return fail_execution(foundation::Result::failure(
-                            foundation::ResultCode::kInvalidArgument,
-                            "Present output must reference exactly the acquired swapchain image"));
-                }
+            if (acquire_batch != kInvalidHandleIndex && acquired == nullptr) {
+                return fail_execution(foundation::Result::failure(
+                        foundation::ResultCode::kInvalidState,
+                        "Render graph accesses a swapchain image without an acquired frame"));
+            }
+            if (acquired != nullptr && final_swapchain_batch != kInvalidHandleIndex && acquire_batch == kInvalidHandleIndex) {
+                return fail_execution(foundation::Result::failure(
+                        foundation::ResultCode::kInvalidState,
+                        "Render graph present output has no acquire synchronization batch"));
+            }
+            if (signal_acquired_frame && final_swapchain_batch != kInvalidHandleIndex &&
+                impl_->batches[final_swapchain_batch].queue != rhi::QueueClass::kGraphics) {
+                return fail_execution(foundation::Result::failure(
+                        foundation::ResultCode::kInvalidArgument,
+                        "The final swapchain output batch must run on the graphics queue"));
             }
 
             std::vector<RuntimeBufferState> buffer_states;
@@ -4096,20 +4164,61 @@ namespace aeg::render_graph {
                     }
                 }
 
+                const bool signal_present = signal_acquired_frame && batch_index == final_swapchain_batch;
+                if (signal_present) {
+                    if (swapchain_texture_index >= texture_states.size()) {
+                        return fail_execution(foundation::Result::failure(
+                                foundation::ResultCode::kInvalidState,
+                                "Final swapchain output has no runtime texture state"));
+                    }
+                    RuntimeTextureState& swapchain_state = texture_states[swapchain_texture_index];
+                    if (swapchain_state.physical == nullptr || swapchain_state.shared == nullptr ||
+                        swapchain_state.shared->states.empty()) {
+                        return fail_execution(foundation::Result::failure(
+                                foundation::ResultCode::kInvalidState,
+                                "Final swapchain output has no color subresource state"));
+                    }
+                    const rhi::ResourceState before = swapchain_state.shared->states.front();
+                    const rhi::ResourceState after{
+                            rhi::ResourceUsage::kPresent,
+                            rhi::ShaderStage::kAll,
+                            rhi::QueueClass::kGraphics,
+                            false,
+                            rhi::PipelineStage::kAllCommands
+                    };
+                    if (!state_matches(before, after)) {
+                        const rhi::TextureBarrier present_barrier{
+                                swapchain_state.physical->handle,
+                                rhi::SubresourceRange{rhi::Aspect::kColor, 0, 1, 0, 1},
+                                before,
+                                after,
+                                false
+                        };
+                        const std::array<rhi::TextureBarrier, 1> present_barriers{present_barrier};
+                        const foundation::Result present_barrier_result =
+                                device_.barrier(command_list, rhi::BarrierDesc{{}, present_barriers});
+                        if (!present_barrier_result) {
+                            return fail_execution(present_barrier_result);
+                        }
+                        swapchain_state.shared->states.front() = after;
+                    }
+                }
+
                 const foundation::Result end_result = frame_context.end_command_list(command_list);
                 if (!end_result) {
                     return fail_execution(end_result);
                 }
                 const std::array<rhi::CommandListHandle, 1> command_lists{command_list};
                 foundation::ResultValue<rhi::SubmitResult> submit_result{};
-                if (batch_plan.submits_frame) {
+                if (batch_plan.waits_for_acquire || signal_present) {
                     if (acquired == nullptr) {
                         return fail_execution(foundation::Result::failure(
                                 foundation::ResultCode::kInvalidState,
-                                "Present batch has no acquired frame token"));
+                                "Swapchain batch has no acquired frame token"));
                     }
                     submit_result = frame_context.submit_frame(rhi::FrameSubmitDesc{
-                            acquired->frame, batch_plan.queue, command_lists, persistent_waits
+                            acquired->frame, batch_plan.queue, command_lists, persistent_waits,
+                            batch_plan.waits_for_acquire, signal_present
                     });
                 } else {
                     submit_result = frame_context.submit(rhi::SubmitDesc{

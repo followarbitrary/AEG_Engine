@@ -161,6 +161,8 @@ namespace aeg::render_graph {
         frame_active_ = true;
         has_acquired_frame_ = false;
         acquired_frame_submitted_ = false;
+        acquired_frame_acquire_waited_ = false;
+        acquired_frame_present_signaled_ = false;
         acquired_frame_ = {};
         ++frame_number_;
         return foundation::Result::success();
@@ -213,14 +215,24 @@ namespace aeg::render_graph {
         }
 
         if (has_acquired_frame_ && acquired_frame_submitted_) {
-            const foundation::Result present_result = device_.present(rhi::PresentDesc{acquired_frame_.frame}).result;
+            if (!acquired_frame_present_signaled_) {
+                const auto signal_result = submit_frame(rhi::FrameSubmitDesc{
+                        acquired_frame_.frame,
+                        rhi::QueueClass::kGraphics,
+                        {},
+                        {},
+                        false,
+                        true
+                });
+                if (!signal_result) {
+                    return signal_result.result;
+                }
+            }
+            const foundation::Result present_result = present().result;
             if (!present_result && present_result.code != foundation::ResultCode::kOutOfDate &&
                 present_result.code != foundation::ResultCode::kSurfaceLost) {
                 return present_result;
             }
-            has_acquired_frame_ = false;
-            acquired_frame_submitted_ = false;
-            acquired_frame_ = {};
         } else if (has_acquired_frame_) {
             const foundation::Result cancel_result = device_.cancel_frame(acquired_frame_.frame);
             if (!cancel_result) {
@@ -228,6 +240,8 @@ namespace aeg::render_graph {
             }
             has_acquired_frame_ = false;
             acquired_frame_submitted_ = false;
+            acquired_frame_acquire_waited_ = false;
+            acquired_frame_present_signaled_ = false;
             acquired_frame_ = {};
         }
 
@@ -344,6 +358,8 @@ namespace aeg::render_graph {
         acquired_frame_ = result.value;
         has_acquired_frame_ = true;
         acquired_frame_submitted_ = false;
+        acquired_frame_acquire_waited_ = false;
+        acquired_frame_present_signaled_ = false;
         return result;
     }
 
@@ -365,6 +381,8 @@ namespace aeg::render_graph {
         if (result) {
             has_acquired_frame_ = false;
             acquired_frame_submitted_ = false;
+            acquired_frame_acquire_waited_ = false;
+            acquired_frame_present_signaled_ = false;
             acquired_frame_ = {};
         }
         return result;
@@ -375,9 +393,9 @@ namespace aeg::render_graph {
             return {foundation::Result::failure(foundation::ResultCode::kInvalidState,
                                          "No acquired swapchain frame is available to present"), {}};
         }
-        if (!acquired_frame_submitted_) {
+        if (!acquired_frame_submitted_ || !acquired_frame_present_signaled_) {
             return {foundation::Result::failure(foundation::ResultCode::kInvalidState,
-                                         "The acquired swapchain frame must be submitted before presentation"), {}};
+                                         "The acquired swapchain frame must have a present signal before presentation"), {}};
         }
 
         auto result = device_.present(rhi::PresentDesc{acquired_frame_.frame});
@@ -385,6 +403,8 @@ namespace aeg::render_graph {
             result.result.code == foundation::ResultCode::kSurfaceLost) {
             has_acquired_frame_ = false;
             acquired_frame_submitted_ = false;
+            acquired_frame_acquire_waited_ = false;
+            acquired_frame_present_signaled_ = false;
             acquired_frame_ = {};
         }
         return result;
@@ -660,9 +680,15 @@ namespace aeg::render_graph {
             return {foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                          "Frame submit token does not match the acquired image"), {}};
         }
-        if (acquired_frame_submitted_) {
+        if (acquired_frame_present_signaled_) {
             return {foundation::Result::failure(foundation::ResultCode::kInvalidState,
-                                         "The acquired swapchain frame has already been submitted"), {}};
+                                         "No submission is allowed after the present signal"), {}};
+        }
+        if (desc.wait_for_acquire == acquired_frame_acquire_waited_) {
+            return {foundation::Result::failure(foundation::ResultCode::kInvalidState,
+                                         desc.wait_for_acquire
+                                                 ? "The acquire semaphore has already been consumed"
+                                                 : "The first swapchain frame submit must wait for acquire"), {}};
         }
 
         rhi::FrameSubmitDesc normalized_desc = desc;
@@ -674,6 +700,8 @@ namespace aeg::render_graph {
 
         (void) slots_[current_slot_].completions.add(result.value.completion);
         acquired_frame_submitted_ = true;
+        acquired_frame_acquire_waited_ = acquired_frame_acquire_waited_ || desc.wait_for_acquire;
+        acquired_frame_present_signaled_ = acquired_frame_present_signaled_ || desc.signal_present;
         for (const rhi::CommandListHandle command_list: normalized_desc.command_lists) {
             if (CommandRecord* command = find_command(command_list); command != nullptr) {
                 command->submitted = true;

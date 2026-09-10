@@ -448,6 +448,16 @@ int main() {
         (void)frame_context.abort_frame();
         return 22;
     }
+    const auto& batches = graph.plan().batches;
+    const bool has_clear_upload_imgui_batches =
+            batches.size() >= 3 && batches[0].queue == QueueClass::kGraphics && batches[0].pass_indices.size() == 1 &&
+            batches[1].queue == QueueClass::kCopy && batches[1].pass_indices.size() >= 3 &&
+            batches[2].queue == QueueClass::kGraphics && !batches[2].pass_indices.empty() &&
+            !batches[2].dependencies.empty();
+    if (!has_clear_upload_imgui_batches) {
+        (void)frame_context.abort_frame();
+        return 22;
+    }
 
     const auto execution_result = graph.execute(frame_context);
     if (!check(execution_result, "execute_imgui_graph")) {

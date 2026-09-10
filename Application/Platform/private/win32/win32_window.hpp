@@ -31,6 +31,7 @@ public:
     [[nodiscard]] const platform::WindowDesc& desc() const noexcept override { return desc_; }
     [[nodiscard]] platform::WindowState state() const noexcept override { return state_; }
     [[nodiscard]] platform::WindowSurfaceBinding surface_binding() const noexcept override;
+    [[nodiscard]] foundation::Result set_extent(platform::WindowExtent extent) noexcept override;
     [[nodiscard]] foundation::Result request_close() noexcept override;
 
     void attach(HWND handle) noexcept { hwnd_ = handle; }

@@ -235,6 +235,8 @@ namespace aeg::render_graph {
         bool frame_active_{false};
         bool has_acquired_frame_{false};
         bool acquired_frame_submitted_{false};
+        bool acquired_frame_acquire_waited_{false};
+        bool acquired_frame_present_signaled_{false};
         rhi::FrameAcquireResult acquired_frame_{};
     };
 } // namespace aeg::render_graph

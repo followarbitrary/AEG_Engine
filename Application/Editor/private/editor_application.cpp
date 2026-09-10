@@ -16,6 +16,7 @@
 #include <string_view>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include "application_platform.hpp"
 #include "editor_imgui.hpp"
@@ -52,6 +53,7 @@ using aeg::platform::IWindow;
 using aeg::platform::IWindowSystem;
 using aeg::platform::WindowEvent;
 using aeg::platform::WindowEventType;
+using aeg::render_graph::FrameAllocation;
 using aeg::render_graph::FrameContext;
 using aeg::render_graph::RenderGraph;
 using aeg::resource::GpuTexture;
@@ -220,7 +222,8 @@ public:
         return true;
     }
 
-    [[nodiscard]] int run(uint32_t frame_limit) {
+    [[nodiscard]] int run(uint32_t frame_limit, bool regression_mode) {
+        regression_mode_ = regression_mode;
         while (!close_requested()) {
             if (frame_limit != 0 && frame_count_ >= frame_limit) {
                 break;
@@ -246,6 +249,18 @@ public:
             }
             if (close_requested()) {
                 break;
+            }
+
+            if (regression_mode_ &&
+                (frame_count_ == 10 || frame_count_ == 30 || frame_count_ == 50)) {
+                const aeg::platform::WindowExtent extent =
+                        frame_count_ == 10 ? aeg::platform::WindowExtent{1600, 900}
+                        : frame_count_ == 30 ? aeg::platform::WindowExtent{800, 600}
+                                              : aeg::platform::WindowExtent{1280, 720};
+                if (!report_result(window_->set_extent(extent), "resize_regression_window")) {
+                    return 1;
+                }
+                resize_pending_ = true;
             }
 
             if (resize_pending_ && !recreate_swapchain()) {
@@ -333,7 +348,7 @@ private:
         desc.present_mode = PresentMode::kVsync;
         desc.min_image_count = 2;
         desc.frames_in_flight = 2;
-        desc.image_capabilities = TextureCapability::kColorAttachment;
+        desc.image_capabilities = TextureCapability::kColorAttachment | TextureCapability::kTransferSource;
         desc.name = aeg::rhi::DebugName{"Editor.Swapchain"};
         const auto swapchain_result = device_->create_swapchain(desc);
         if (!report_result(swapchain_result, "create_swapchain")) {
@@ -367,7 +382,7 @@ private:
         desc.present_mode = PresentMode::kVsync;
         desc.min_image_count = 2;
         desc.frames_in_flight = 2;
-        desc.image_capabilities = TextureCapability::kColorAttachment;
+        desc.image_capabilities = TextureCapability::kColorAttachment | TextureCapability::kTransferSource;
         if (!report_result(device_->recreate_swapchain(swapchain_, desc), "recreate_swapchain")) {
             return false;
         }
@@ -385,7 +400,6 @@ private:
             std::fprintf(stderr, "captured ImGui font atlas is invalid\n");
             return false;
         }
-
         font_texture_desc_ = {};
         font_texture_desc_.extent = {atlas.width, atlas.height, 1};
         font_texture_desc_.format = Format::kRgba8Unorm;
@@ -488,7 +502,7 @@ private:
             aeg::engine::kSwapchainImageResourceId,
             swapchain_info_.format,
             swapchain_info_.extent,
-            ResourceUsage::kPresent,
+            regression_mode_ ? ResourceUsage::kCopySource : ResourceUsage::kPresent,
         };
         aeg::engine::EngineFrameDesc frame_desc{};
         frame_desc.fixed_tick = frame_count_;
@@ -497,7 +511,9 @@ private:
         frame_desc.swapchain_image_desc = make_swapchain_image_desc();
         frame_desc.present_acquired_frame = true;
         frame_desc.user_data = this;
-        frame_desc.render_feature_preparation = [this, &draw_packet, target](
+        FrameAllocation readback_allocation{};
+        bool has_readback = false;
+        frame_desc.render_feature_preparation = [this, &draw_packet, target, &readback_allocation, &has_readback](
                                                     const aeg::engine::EngineFramePreparationContext& context) {
             if (context.acquired_frame == nullptr) {
                 return aeg::foundation::invalid_state("ImGui preparation requires an acquired swapchain image");
@@ -505,15 +521,6 @@ private:
             if (!context.swapchain_resource.is_valid()) {
                 return aeg::foundation::invalid_state("ImGui preparation requires an imported swapchain resource");
             }
-            if (const Result result =
-                        imgui_renderer_->prepare_frame(context.frame_context, context.render_graph, draw_packet, target);
-                !result) {
-                return result;
-            }
-
-            // Keep all swapchain-image work in the final graphics batch. ImGui preparation may add
-            // copy-queue upload passes; placing the clear pass after those uploads prevents a prior
-            // ordinary submit from modifying the acquired image before the acquire semaphore is waited.
             const auto clear_result = context.render_graph.add_pass(
                     "Editor.ClearSwapchain", QueueClass::kGraphics,
                     [resource = context.swapchain_resource](aeg::render_graph::PassBuilder& builder) {
@@ -528,9 +535,129 @@ private:
                         }
                         return pass.end_rendering();
                     });
-            return clear_result ? Result::success() : clear_result.result;
+            if (!clear_result) {
+                return clear_result.result;
+            }
+            if (const Result result =
+                        imgui_renderer_->prepare_frame(context.frame_context, context.render_graph, draw_packet, target);
+                !result) {
+                return result;
+            }
+            if (!regression_mode_) {
+                return Result::success();
+            }
+
+            const uint64_t pixel_count = static_cast<uint64_t>(target.extent.width) * target.extent.height;
+            const auto allocation_result = context.frame_context.allocate_readback(pixel_count * 4u, 256);
+            if (!allocation_result) {
+                return allocation_result.result;
+            }
+            readback_allocation = allocation_result.value;
+            has_readback = true;
+
+            aeg::rhi::BufferDesc readback_desc{};
+            readback_desc.size = readback_allocation.buffer_size;
+            readback_desc.capabilities = aeg::rhi::BufferCapability::kTransferSource |
+                                         aeg::rhi::BufferCapability::kTransferDestination |
+                                         aeg::rhi::BufferCapability::kVertex |
+                                         aeg::rhi::BufferCapability::kIndex |
+                                         aeg::rhi::BufferCapability::kUniform;
+            readback_desc.memory = aeg::rhi::MemoryClass::kReadback;
+            readback_desc.initial_usage = ResourceUsage::kHostRead;
+            readback_desc.initial_stages = PipelineStage::kHost;
+            readback_desc.initial_queue = QueueClass::kCopy;
+            readback_desc.name = aeg::rhi::DebugName{"Editor.FramebufferReadback"};
+            const auto readback_resource_result = context.render_graph.import_buffer(
+                    readback_allocation.buffer, readback_desc,
+                    ResourceState{ResourceUsage::kHostRead, aeg::rhi::ShaderStage::kAll, QueueClass::kCopy, false,
+                                  PipelineStage::kHost});
+            if (!readback_resource_result) {
+                return readback_resource_result.result;
+            }
+            const auto readback_pass_result = context.render_graph.add_pass(
+                    "Editor.FramebufferReadback", QueueClass::kCopy,
+                    [swapchain_resource = context.swapchain_resource,
+                     readback_resource = readback_resource_result.value,
+                     readback_allocation, pixel_count](aeg::render_graph::PassBuilder& builder) {
+                        if (const Result result = builder.read_to(
+                                    swapchain_resource, ResourceUsage::kCopySource, PipelineStage::kCopy,
+                                    aeg::rhi::ShaderStage::kAll, ResourceUsage::kCopySource);
+                            !result) {
+                            return result;
+                        }
+                        if (const Result result = builder.write_to(
+                                    readback_resource, ResourceUsage::kCopyDestination, PipelineStage::kCopy,
+                                    aeg::rhi::ShaderStage::kAll,
+                                    ResourceUsage::kHostRead,
+                                    aeg::render_graph::RenderGraphBufferRange{readback_allocation.offset,
+                                                                              pixel_count * 4u},
+                                    true);
+                            !result) {
+                            return result;
+                        }
+                        builder.set_side_effects();
+                        return Result::success();
+                    },
+                    [swapchain_resource = context.swapchain_resource,
+                     readback_resource = readback_resource_result.value, readback_allocation, target](
+                            aeg::render_graph::PassExecutionContext& pass) {
+                        return pass.copy_texture_to_buffer(
+                                swapchain_resource,
+                                aeg::rhi::TextureSubresourceLayers{aeg::rhi::Aspect::kColor, 0, 0, 1},
+                                aeg::rhi::Offset3D{0, 0, 0},
+                                aeg::rhi::Extent3D{target.extent.width, target.extent.height, 1}, readback_resource,
+                                readback_allocation.offset, 0, 0);
+                    });
+            if (!readback_pass_result) {
+                return readback_pass_result.result;
+            }
+            const auto present_pass_result = context.render_graph.add_pass(
+                    "Editor.PresentSwapchain", QueueClass::kGraphics,
+                    [resource = context.swapchain_resource](aeg::render_graph::PassBuilder& builder) {
+                        return builder.use_color_attachment(resource, aeg::rhi::LoadOp::kLoad,
+                                                            aeg::rhi::StoreOp::kStore, ClearColorValue{},
+                                                            ResourceUsage::kPresent);
+                    },
+                    [](aeg::render_graph::PassExecutionContext& pass) {
+                        if (const Result result = pass.begin_rendering(); !result) {
+                            return result;
+                        }
+                        return pass.end_rendering();
+                    });
+            return present_pass_result ? Result::success() : present_pass_result.result;
         };
-        return orchestrator_->run_frame(frame_desc);
+        const Result frame_result = orchestrator_->run_frame(frame_desc);
+        if (!frame_result || !has_readback) {
+            return frame_result;
+        }
+        if (const Result wait_result = device_->wait_idle(); !wait_result) {
+            return wait_result;
+        }
+        std::vector<std::byte> pixels(static_cast<size_t>(readback_allocation.size));
+        if (const Result read_result = frame_context_->read_readback(readback_allocation, pixels); !read_result) {
+            return read_result;
+        }
+        constexpr uint32_t kClearProbeExtent = 8;
+        const auto pixel_is_clear = [&pixels, width = target.extent.width](uint32_t x, uint32_t y) {
+            const size_t offset = (static_cast<size_t>(y) * width + x) * 4u;
+            return pixels[offset] == std::byte{0} && pixels[offset + 1] == std::byte{0} &&
+                   pixels[offset + 2] == std::byte{0};
+        };
+        bool clear_probes_are_clean = true;
+        for (uint32_t y = 0; y < kClearProbeExtent; ++y) {
+            for (uint32_t x = 0; x < kClearProbeExtent; ++x) {
+                clear_probes_are_clean = clear_probes_are_clean &&
+                                         pixel_is_clear(x, y) &&
+                                         pixel_is_clear(target.extent.width - 1u - x, y) &&
+                                         pixel_is_clear(x, target.extent.height - 1u - y) &&
+                                         pixel_is_clear(target.extent.width - 1u - x,
+                                                        target.extent.height - 1u - y);
+            }
+        }
+        if (!clear_probes_are_clean) {
+            return aeg::foundation::invalid_state("editor framebuffer regression check failed");
+        }
+        return frame_result;
     }
 
     [[nodiscard]] TextureDesc make_swapchain_image_desc() const noexcept {
@@ -539,7 +666,7 @@ private:
         desc.format = swapchain_info_.format;
         desc.mip_levels = 1;
         desc.array_layers = 1;
-        desc.capabilities = TextureCapability::kColorAttachment;
+        desc.capabilities = TextureCapability::kColorAttachment | TextureCapability::kTransferSource;
         desc.memory = MemoryClass::kDeviceLocal;
         desc.initial_usage = ResourceUsage::kPresent;
         desc.initial_stages = PipelineStage::kAllCommands;
@@ -619,6 +746,7 @@ private:
     std::chrono::steady_clock::time_point last_frame_time_{};
     uint64_t frame_count_{0};
     bool resize_pending_{false};
+    bool regression_mode_{false};
     bool initialized_{false};
 };
 
@@ -632,6 +760,15 @@ uint32_t parse_frame_limit(int argc, char** argv) {
     }
     return 0;
 }
+
+bool has_argument(int argc, char** argv, std::string_view argument) {
+    for (int index = 1; index < argc; ++index) {
+        if (std::string_view{argv[index]} == argument) {
+            return true;
+        }
+    }
+    return false;
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -639,5 +776,5 @@ int main(int argc, char** argv) {
     if (!application.initialize()) {
         return 1;
     }
-    return application.run(parse_frame_limit(argc, argv));
+    return application.run(parse_frame_limit(argc, argv), has_argument(argc, argv, "--stress-resize"));
 }

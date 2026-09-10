@@ -17,6 +17,7 @@ public:
     [[nodiscard]] virtual const WindowDesc& desc() const noexcept = 0;
     [[nodiscard]] virtual WindowState state() const noexcept = 0;
     [[nodiscard]] virtual WindowSurfaceBinding surface_binding() const noexcept = 0;
+    [[nodiscard]] virtual foundation::Result set_extent(WindowExtent extent) noexcept = 0;
     [[nodiscard]] virtual foundation::Result request_close() noexcept = 0;
 };
 

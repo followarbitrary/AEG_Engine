@@ -2051,6 +2051,8 @@ namespace aeg::rhi {
             uint32_t image_index{kRemaining};
             bool acquired{false};
             bool submitted{false};
+            bool acquire_waited{false};
+            bool present_signaled{false};
             GpuSyncPoint completion{};
         };
 
@@ -3297,7 +3299,12 @@ namespace aeg::rhi {
                 ReleaseBatch &batch = batches[queue_value_index(source_queue->logical_class)];
                 batch.source_queue = source_queue;
                 append_texture_transfer(batch, transfer);
-                batch.destination_stages |= to_vk_resource_state(transfer.after, true).stages;
+                // Present is an external operation rather than a pipeline stage that can
+                // safely serve as the semaphore wait point.  The graphics queue must wait
+                // before it executes the acquire/layout transition for the image.
+                batch.destination_stages |= transfer.after.usage == ResourceUsage::kPresent
+                                                     ? static_cast<VkPipelineStageFlags>(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT)
+                                                     : to_vk_resource_state(transfer.after, true).stages;
             }
         }
 
@@ -3573,6 +3580,8 @@ namespace aeg::rhi {
         frame.image_index = kRemaining;
         frame.acquired = false;
         frame.submitted = false;
+        frame.acquire_waited = false;
+        frame.present_signaled = false;
         frame.completion = {};
     }
 
@@ -4333,6 +4342,8 @@ namespace aeg::rhi {
         frame.image_index = image_index;
         frame.acquired = true;
         frame.submitted = false;
+        frame.acquire_waited = false;
+        frame.present_signaled = false;
         frame.completion = {};
         if (suboptimal) {
             resource->needs_recreate = true;
@@ -4362,8 +4373,14 @@ namespace aeg::rhi {
             return {token_result, {}};
         }
         FrameSlot &frame = resource->frames[desc.frame.frame_slot];
-        if (frame.submitted) {
-            return {Result::failure(ResultCode::kInvalidState, "Frame has already been submitted"), {}};
+        if (frame.present_signaled) {
+            return {Result::failure(ResultCode::kInvalidState,
+                                    "No frame submission is allowed after the present signal"), {}};
+        }
+        if (desc.wait_for_acquire == frame.acquire_waited) {
+            return {Result::failure(ResultCode::kInvalidState,
+                                    desc.wait_for_acquire ? "Acquire semaphore has already been consumed"
+                                                           : "First frame submit must wait for acquire"), {}};
         }
         if (desc.queue == QueueClass::kPresent) {
             return {Result::failure(ResultCode::kInvalidArgument, "Present is not a command submission queue"), {}};
@@ -4422,14 +4439,16 @@ namespace aeg::rhi {
         std::vector<VkSemaphore> wait_semaphores;
         std::vector<VkPipelineStageFlags> wait_stages;
         std::vector<uint64_t> wait_values;
-        wait_semaphores.reserve(desc.waits.size() + kQueueCount + 1);
-        wait_stages.reserve(desc.waits.size() + kQueueCount + 1);
-        wait_values.reserve(desc.waits.size() + kQueueCount + 1);
-        wait_semaphores.push_back(frame.image_available);
-        // The first command may transition the acquired image before rendering begins.
-        // Wait at all commands so the acquire semaphore also protects that transition.
-        wait_stages.push_back(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
-        wait_values.push_back(0);
+        wait_semaphores.reserve(desc.waits.size() + kQueueCount + (desc.wait_for_acquire ? 1u : 0u));
+        wait_stages.reserve(desc.waits.size() + kQueueCount + (desc.wait_for_acquire ? 1u : 0u));
+        wait_values.reserve(desc.waits.size() + kQueueCount + (desc.wait_for_acquire ? 1u : 0u));
+        if (desc.wait_for_acquire) {
+            wait_semaphores.push_back(frame.image_available);
+            // The first command may transition the acquired image before rendering begins.
+            // Wait at all commands so the acquire semaphore also protects that transition.
+            wait_stages.push_back(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+            wait_values.push_back(0);
+        }
 
         for (const GpuWait &wait: desc.waits) {
             const QueueState *source_queue = timeline_queue(wait.point.timeline);
@@ -4464,16 +4483,26 @@ namespace aeg::rhi {
             return {ownership_result, {}};
         }
 
-        const VkResult reset_result = vkResetFences(device_, 1, &frame.in_flight);
-        if (reset_result != VK_SUCCESS) {
-            return {make_vulkan_result(reset_result, "vkResetFences(submitFrame)"), {}};
+        VkFence submit_fence = VK_NULL_HANDLE;
+        if (desc.signal_present) {
+            const VkResult reset_result = vkResetFences(device_, 1, &frame.in_flight);
+            if (reset_result != VK_SUCCESS) {
+                return {make_vulkan_result(reset_result, "vkResetFences(submitFrame)"), {}};
+            }
+            submit_fence = frame.in_flight;
         }
 
         const uint64_t signal_value = queue->next_signal_value;
-        const std::array<VkSemaphore, 2> signal_semaphores{
-            resource->render_finished[desc.frame.image_index], queue->timeline
-        };
-        const std::array<uint64_t, 2> signal_values{0, signal_value};
+        std::vector<VkSemaphore> signal_semaphores;
+        std::vector<uint64_t> signal_values;
+        signal_semaphores.reserve(desc.signal_present ? 2u : 1u);
+        signal_values.reserve(desc.signal_present ? 2u : 1u);
+        if (desc.signal_present) {
+            signal_semaphores.push_back(resource->render_finished[desc.frame.image_index]);
+            signal_values.push_back(0);
+        }
+        signal_semaphores.push_back(queue->timeline);
+        signal_values.push_back(signal_value);
 
         VkTimelineSemaphoreSubmitInfo timeline_info{};
         timeline_info.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
@@ -4493,7 +4522,7 @@ namespace aeg::rhi {
         submit_info.signalSemaphoreCount = static_cast<uint32_t>(signal_semaphores.size());
         submit_info.pSignalSemaphores = signal_semaphores.data();
 
-        const VkResult result = vkQueueSubmit(queue->queue, 1, &submit_info, frame.in_flight);
+        const VkResult result = vkQueueSubmit(queue->queue, 1, &submit_info, submit_fence);
         if (result != VK_SUCCESS) {
             return {make_vulkan_result(result, "vkQueueSubmit(submitFrame)"), {}};
         }
@@ -4501,6 +4530,8 @@ namespace aeg::rhi {
         ++queue->next_signal_value;
         const GpuSyncPoint completion{queue->timeline_handle, signal_value};
         frame.submitted = true;
+        frame.acquire_waited = frame.acquire_waited || desc.wait_for_acquire;
+        frame.present_signaled = frame.present_signaled || desc.signal_present;
         frame.completion = completion;
         for (const CommandListHandle command_list: desc.command_lists) {
             CommandListResource *command = command_lists_.get(command_list);
@@ -4521,6 +4552,11 @@ namespace aeg::rhi {
         FrameSlot &frame = resource->frames[desc.frame.frame_slot];
         if (!frame.submitted) {
             return {Result::failure(ResultCode::kInvalidState, "Frame must be submitted before presentation"), {}};
+        }
+
+        if (!frame.present_signaled) {
+            return {Result::failure(ResultCode::kInvalidState,
+                                    "Frame must signal the present semaphore before presentation"), {}};
         }
 
         SurfaceResource *surface = surfaces_.get(resource->surface);
@@ -4557,6 +4593,8 @@ namespace aeg::rhi {
 
         frame.acquired = false;
         frame.submitted = false;
+        frame.acquire_waited = false;
+        frame.present_signaled = false;
         frame.image_index = kRemaining;
         frame.completion = {};
         resource->current_frame = (desc.frame.frame_slot + 1) % static_cast<uint32_t>(resource->frames.size());
@@ -4593,6 +4631,8 @@ namespace aeg::rhi {
         }
         frame.acquired = false;
         frame.submitted = false;
+        frame.acquire_waited = false;
+        frame.present_signaled = false;
         frame.image_index = kRemaining;
         frame.completion = {};
         resource->current_frame = (frame_token.frame_slot + 1) % static_cast<uint32_t>(resource->frames.size());

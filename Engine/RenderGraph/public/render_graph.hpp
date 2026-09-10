@@ -143,6 +143,7 @@ namespace aeg::render_graph {
         std::vector<uint32_t> pass_indices{};
         std::vector<RenderGraphQueueDependency> dependencies{};
         bool submits_frame{false};
+        bool waits_for_acquire{false};
     };
 
     /**
@@ -210,6 +211,8 @@ namespace aeg::render_graph {
     struct RenderGraphExecuteDesc {
         bool present_acquired_frame{false};
         std::span<const RenderGraphExecutionLease> execution_leases{};
+        /** @brief Signals the acquired frame's present semaphore without presenting immediately; this is final. */
+        bool signal_present{false};
     };
 
     /** @brief Submission and presentation results from execute(). */
@@ -252,6 +255,11 @@ namespace aeg::render_graph {
                                         rhi::PipelineStageMask pipeline_stages = rhi::PipelineStage::kAllCommands,
                                         rhi::ShaderStageMask shader_stages = rhi::ShaderStage::kAll,
                                         RenderGraphBufferRange range = {}, bool discard_contents = true);
+        /** @brief Declares a write with an explicit post-write resource state. */
+        [[nodiscard]] foundation::Result write_to(RenderGraphBuffer buffer, rhi::ResourceUsage usage,
+                                           rhi::PipelineStageMask pipeline_stages,
+                                           rhi::ShaderStageMask shader_stages, rhi::ResourceUsage final_usage,
+                                           RenderGraphBufferRange range = {}, bool discard_contents = true);
 
         /** @brief Declares read and write access to a buffer range in one pass. */
         [[nodiscard]] foundation::Result read_write(RenderGraphBuffer buffer, rhi::ResourceUsage usage,
@@ -264,6 +272,11 @@ namespace aeg::render_graph {
                                        rhi::PipelineStageMask pipeline_stages = rhi::PipelineStage::kAllCommands,
                                        rhi::ShaderStageMask shader_stages = rhi::ShaderStage::kAll,
                                        rhi::SubresourceRange subresources = {});
+        /** @brief Declares a texture read with an explicit post-read resource state. */
+        [[nodiscard]] foundation::Result read_to(RenderGraphTexture texture, rhi::ResourceUsage usage,
+                                          rhi::PipelineStageMask pipeline_stages,
+                                          rhi::ShaderStageMask shader_stages, rhi::ResourceUsage final_usage,
+                                          rhi::SubresourceRange subresources = {});
 
         /** @brief Declares a write of texture subresources. */
         [[nodiscard]] foundation::Result write(RenderGraphTexture texture, rhi::ResourceUsage usage,

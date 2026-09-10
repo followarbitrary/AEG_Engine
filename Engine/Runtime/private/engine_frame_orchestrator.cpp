@@ -953,6 +953,7 @@ foundation::Result EngineFrameOrchestrator::execute_render_graph() {
     }
     render_graph::RenderGraphExecuteDesc desc{};
     desc.present_acquired_frame = false;
+    desc.signal_present = frame_desc_.present_acquired_frame;
     desc.execution_leases =
         std::span<const render_graph::RenderGraphExecutionLease>(execution_leases_.data(), execution_leases_.size());
     const foundation::ResultValue<render_graph::RenderGraphExecutionResult> execution =

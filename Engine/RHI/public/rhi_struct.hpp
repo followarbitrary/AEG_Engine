@@ -1107,6 +1107,10 @@ namespace aeg::rhi {
         QueueClass queue{QueueClass::kGraphics};
         std::span<const CommandListHandle> command_lists{};
         std::span<const GpuWait> waits{};
+        /** @brief Waits on the binary semaphore produced by acquire_next_image(). */
+        bool wait_for_acquire{true};
+        /** @brief Signals the binary semaphore consumed by present(); this must be the final frame submission. */
+        bool signal_present{true};
     };
 
     /** @brief Presentation request for an acquired frame. */
