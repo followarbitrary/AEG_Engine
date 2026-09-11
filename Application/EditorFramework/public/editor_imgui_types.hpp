@@ -11,27 +11,55 @@
 #include "platform_services.hpp"
 #include "window_types.hpp"
 
+namespace aeg::platform {
+class IWindowSystem;
+}
+
 namespace aeg::editor {
+/**
+ * @brief Configuration for one engine-owned Dear ImGui context.
+ *
+ * The context is thread-confined to the editor thread. Platform and viewport
+ * services are borrowed and must outlive the host while it is initialized.
+ */
 struct EditorImGuiDesc final {
+    /** @brief Enables Dear ImGui keyboard navigation. */
     bool enable_keyboard_navigation{true};
+    /** @brief Enables Dear ImGui gamepad navigation. */
     bool enable_gamepad_navigation{false};
+    /** @brief Global scale applied by Dear ImGui to its fonts and widgets. */
     float font_global_scale{1.0f};
+    /** @brief Borrowed platform services used for clipboard, cursor, and IME integration. */
     platform::IPlatformServices* platform_services{nullptr};
+    /** @brief Borrowed window system used to create engine-owned ImGui platform viewports. */
+    platform::IWindowSystem* window_system{nullptr};
+    /** @brief Enables docking platform viewports when a window system is available. */
+    bool enable_viewports{false};
 };
 
+/** @brief Engine-owned timing and display metrics for one ImGui frame. */
 struct EditorImGuiFrameDesc final {
+    /** @brief Semantic window identity receiving the frame's primary input. */
     platform::WindowId window{};
+    /** @brief Logical client-area extent in display coordinates. */
     platform::WindowExtent display_extent{};
+    /** @brief Positive elapsed time since the previous frame. */
     float delta_seconds{1.0f / 60.0f};
+    /** @brief Horizontal framebuffer density used by Dear ImGui. */
     float framebuffer_scale_x{1.0f};
+    /** @brief Vertical framebuffer density used by Dear ImGui. */
     float framebuffer_scale_y{1.0f};
 };
 
 /** @brief Engine-owned RGBA8 snapshot of the ImGui font atlas. */
 struct ImGuiFontAtlasData final {
+    /** @brief Atlas width in pixels. */
     uint32_t width{0};
+    /** @brief Atlas height in pixels. */
     uint32_t height{0};
+    /** @brief Number of bytes between adjacent atlas rows. */
     uint32_t row_pitch{0};
+    /** @brief RGBA8 pixel bytes borrowed by the caller after capture. */
     std::vector<std::byte> rgba8_pixels{};
 
     [[nodiscard]] bool is_valid() const noexcept {

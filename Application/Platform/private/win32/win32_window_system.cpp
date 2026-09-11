@@ -146,16 +146,20 @@ foundation::ResultValue<std::shared_ptr<platform::IWindow>> Win32WindowSystem::c
         if (AdjustWindowRectEx(&client_rect, window_style(desc), FALSE, 0) == FALSE) {
             return {backend_error("AdjustWindowRectEx failed"), {}};
         }
-        HWND handle = CreateWindowExW(0, kWindowClassName, title_result.value.c_str(), window_style(desc),
-                                      CW_USEDEFAULT, CW_USEDEFAULT, client_rect.right - client_rect.left,
+        const int x = desc.position_specified ? desc.position.x : CW_USEDEFAULT;
+        const int y = desc.position_specified ? desc.position.y : CW_USEDEFAULT;
+        HWND handle = CreateWindowExW(0, kWindowClassName, title_result.value.c_str(), window_style(desc), x, y,
+                                      client_rect.right - client_rect.left,
                                       client_rect.bottom - client_rect.top, nullptr, nullptr, instance_, window.get());
         if (handle == nullptr) {
             return {backend_error("CreateWindowExW failed"), {}};
         }
         window->attach(handle);
+        window->sync_state_from_native();
         if (desc.visible) {
             ShowWindow(handle, SW_SHOWNORMAL);
             UpdateWindow(handle);
+            window->sync_state_from_native();
         }
         slot.window = std::move(window);
         return {foundation::Result::success(), std::static_pointer_cast<platform::IWindow>(slot.window)};

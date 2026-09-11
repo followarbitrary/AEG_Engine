@@ -26,6 +26,23 @@ int main() {
     if (!window->id().is_valid() || !window->surface_binding().is_valid() || window->state().extent != desc.extent) {
         return 3;
     }
+    const aeg::platform::WindowPosition position{96, 144};
+    if (!window->set_position(position) || window->state().position != position) {
+        return 13;
+    }
+    if (!window->set_extent(aeg::platform::WindowExtent{360, 240}) ||
+        window->state().extent != aeg::platform::WindowExtent{360, 240}) {
+        return 14;
+    }
+    if (!window->set_visible(true) || !window->state().visible) {
+        return 15;
+    }
+    if (!window->focus() || !window->state().focused) {
+        return 16;
+    }
+    if (!window->set_visible(false) || window->state().visible) {
+        return 17;
+    }
     aeg::platform::IPlatformServices& platform_services = system->platform_services();
     const auto metrics_result = platform_services.query_window_metrics(window->id());
     if (!metrics_result || !metrics_result.value.is_valid()) {

@@ -280,14 +280,16 @@ else()
 endif()
 
 add_library(aeg_editor_framework STATIC
-    Engine/EditorFramework/private/imgui/editor_imgui_host.cpp
-    Engine/EditorFramework/private/imgui/imgui_platform_bridge.cpp
-    Engine/EditorFramework/private/imgui/imgui_texture_registry.cpp
+    Application/EditorFramework/private/imgui/editor_imgui_host.cpp
+    Application/EditorFramework/private/imgui/imgui_platform_bridge.cpp
+    Application/EditorFramework/private/imgui/imgui_texture_registry.cpp
+    Application/EditorFramework/private/workspace/editor_layout.cpp
+    Application/EditorFramework/private/workspace/editor_workspace.cpp
 )
 target_compile_features(aeg_editor_framework PUBLIC cxx_std_20)
 target_include_directories(aeg_editor_framework
     PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/EditorFramework/public
+        ${CMAKE_CURRENT_SOURCE_DIR}/Application/EditorFramework/public
         ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Input/public
         ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Platform/public
         ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RHI/public
@@ -309,6 +311,38 @@ add_executable(aeg_editor_imgui_smoke
 target_link_libraries(aeg_editor_imgui_smoke PRIVATE aeg_editor_framework)
 if (WIN32)
     target_compile_definitions(aeg_editor_imgui_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
+add_executable(aeg_editor_imgui_docking_smoke
+    tests/editor_imgui_docking_smoke.cpp
+)
+target_link_libraries(aeg_editor_imgui_docking_smoke PRIVATE aeg_imgui_core)
+if (WIN32)
+    target_compile_definitions(aeg_editor_imgui_docking_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
+add_executable(aeg_editor_imgui_viewport_smoke
+    tests/editor_imgui_viewport_smoke.cpp
+)
+target_link_libraries(aeg_editor_imgui_viewport_smoke PRIVATE aeg_editor_framework)
+if (WIN32)
+    target_compile_definitions(aeg_editor_imgui_viewport_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
+add_executable(aeg_editor_layout_smoke
+    tests/editor_layout_smoke.cpp
+)
+target_link_libraries(aeg_editor_layout_smoke PRIVATE aeg_editor_framework)
+if (WIN32)
+    target_compile_definitions(aeg_editor_layout_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
+add_executable(aeg_editor_workspace_smoke
+    tests/editor_workspace_smoke.cpp
+)
+target_link_libraries(aeg_editor_workspace_smoke PRIVATE aeg_editor_framework)
+if (WIN32)
+    target_compile_definitions(aeg_editor_workspace_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
 add_executable(aeg_result_smoke
@@ -795,7 +829,7 @@ else()
 endif()
 
 target_sources(aeg_editor_framework PRIVATE
-    Engine/EditorFramework/private/imgui/imgui_renderer.cpp
+    Application/EditorFramework/private/imgui/imgui_renderer.cpp
 )
 target_include_directories(aeg_editor_framework PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Math/public
@@ -953,6 +987,10 @@ if (BUILD_TESTING)
     add_test(NAME aeg_math_smoke COMMAND aeg_math_smoke)
     add_test(NAME aeg_result_smoke COMMAND aeg_result_smoke)
     add_test(NAME aeg_editor_imgui_smoke COMMAND aeg_editor_imgui_smoke)
+    add_test(NAME aeg_editor_imgui_docking_smoke COMMAND aeg_editor_imgui_docking_smoke)
+    add_test(NAME aeg_editor_imgui_viewport_smoke COMMAND aeg_editor_imgui_viewport_smoke)
+    add_test(NAME aeg_editor_layout_smoke COMMAND aeg_editor_layout_smoke)
+    add_test(NAME aeg_editor_workspace_smoke COMMAND aeg_editor_workspace_smoke)
     if (WIN32)
         add_test(NAME aeg_application_platform_win32_smoke COMMAND aeg_application_platform_win32_smoke)
     endif()
@@ -988,7 +1026,7 @@ if (BUILD_TESTING)
     endif()
     if (MINGW)
         get_filename_component(AEG_MINGW_RUNTIME_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
-        set_tests_properties(aeg_application_platform_win32_smoke aeg_editor_imgui_smoke aeg_editor_imgui_renderer_smoke aeg_math_smoke aeg_result_smoke aeg_reflection_smoke aeg_serialization_smoke
+        set_tests_properties(aeg_application_platform_win32_smoke aeg_editor_imgui_smoke aeg_editor_imgui_docking_smoke aeg_editor_imgui_viewport_smoke aeg_editor_layout_smoke aeg_editor_workspace_smoke aeg_editor_imgui_renderer_smoke aeg_math_smoke aeg_result_smoke aeg_reflection_smoke aeg_serialization_smoke
                 aeg_concurrency_smoke aeg_ecs_smoke aeg_pipeline_smoke aeg_pipeline_extension_smoke
                 aeg_pipeline_conformance_smoke aeg_pipeline_runtime_smoke aeg_pipeline_hot_swap_smoke
                 aeg_pipeline_phase_scheduler_smoke aeg_module_smoke aeg_world_scope_smoke aeg_world_serialization_smoke

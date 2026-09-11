@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <vector>
 
 #include "editor_imgui_types.hpp"
 #include "editor_panel.hpp"
@@ -45,11 +46,15 @@ public:
     [[nodiscard]] foundation::Result end_frame();
     /** @brief Copies the finalized ImGui draw lists into engine-owned storage. */
     [[nodiscard]] foundation::Result capture_draw_packet(ImGuiDrawPacket& packet) const;
+    /** @brief Copies every active ImGui viewport into engine-owned draw packets. */
+    [[nodiscard]] foundation::Result capture_draw_packets(std::vector<ImGuiDrawPacket>& packets) const;
 
     /** @brief Takes ownership of one panel and returns its generation-checked identity. */
     [[nodiscard]] foundation::ResultValue<EditorPanelId> register_panel(std::unique_ptr<EditorPanel> panel);
     /** @brief Removes a previously registered panel. */
     [[nodiscard]] foundation::Result unregister_panel(EditorPanelId panel);
+    /** @brief Enables or suppresses one registered panel without releasing its ownership. */
+    [[nodiscard]] foundation::Result set_panel_visible(EditorPanelId panel, bool visible);
 
     [[nodiscard]] bool is_initialized() const noexcept;
     [[nodiscard]] bool is_frame_active() const noexcept;

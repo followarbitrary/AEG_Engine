@@ -20,6 +20,7 @@
 
 #include "application_platform.hpp"
 #include "editor_imgui.hpp"
+#include "editor_workspace.hpp"
 #include "engine_frame_orchestrator.hpp"
 #include "frame_context.hpp"
 #include "imgui_renderer.hpp"
@@ -35,6 +36,8 @@
 namespace {
 using aeg::editor::EditorImGuiFrameDesc;
 using aeg::editor::EditorImGuiHost;
+using aeg::editor::EditorDockRegion;
+using aeg::editor::EditorPanelDescriptor;
 using aeg::editor::ImGuiDrawPacket;
 using aeg::editor::ImGuiFontAtlasData;
 using aeg::editor::ImGuiRenderTargetDesc;
@@ -42,6 +45,7 @@ using aeg::editor::ImGuiRenderer;
 using aeg::editor::ImGuiTextureBinding;
 using aeg::editor::ImGuiTextureHandle;
 using aeg::editor::ImGuiTextureRegistry;
+using aeg::editor::EditorWorkspace;
 using aeg::foundation::Result;
 using aeg::foundation::ResultCode;
 using aeg::input::InputSystem;
@@ -93,15 +97,60 @@ bool report_result(const aeg::foundation::ResultValue<T>& result, std::string_vi
     return report_result(result.result, operation);
 }
 
-class MainEditorPanel final : public aeg::editor::EditorPanel {
+class SceneViewportPanel final : public aeg::editor::EditorPanel {
 public:
-    explicit MainEditorPanel(const uint64_t& frame_count) noexcept : frame_count_(frame_count) {}
+    void build_ui() override {
+        ImGui::Begin("Scene Viewport");
+        ImGui::TextUnformatted("Central workspace for the active scene and engine-rendered preview.");
+        ImGui::Separator();
+        ImGui::TextUnformatted("The viewport is reserved for Renderer and RenderGraph output.");
+        ImGui::End();
+    }
+};
+
+class HierarchyPanel final : public aeg::editor::EditorPanel {
+public:
+    void build_ui() override {
+        ImGui::Begin("Hierarchy");
+        ImGui::TextUnformatted("Scene entities and parent-child relationships.");
+        ImGui::Separator();
+        ImGui::TextUnformatted("Selection changes will feed the editor selection bridge.");
+        ImGui::End();
+    }
+};
+
+class InspectorPanel final : public aeg::editor::EditorPanel {
+public:
+    void build_ui() override {
+        ImGui::Begin("Inspector");
+        ImGui::TextUnformatted("Properties and components for the current selection.");
+        ImGui::Separator();
+        ImGui::TextUnformatted("Component editing belongs to Application and Reflection bridges.");
+        ImGui::End();
+    }
+};
+
+class AssetsPanel final : public aeg::editor::EditorPanel {
+public:
+    void build_ui() override {
+        ImGui::Begin("Assets");
+        ImGui::TextUnformatted("Project assets, source files, and import status.");
+        ImGui::Separator();
+        ImGui::TextUnformatted("Resource lifetime remains owned by Engine Resource APIs.");
+        ImGui::End();
+    }
+};
+
+class ConsolePanel final : public aeg::editor::EditorPanel {
+public:
+    explicit ConsolePanel(const uint64_t& frame_count) noexcept : frame_count_(frame_count) {}
 
     void build_ui() override {
-        ImGui::Begin("AEG Editor");
-        ImGui::TextUnformatted("AEG Engine Editor");
-        ImGui::Text("Frame: %llu", static_cast<unsigned long long>(frame_count_));
-        ImGui::TextUnformatted("ImGui is rendered through RHI and RenderGraph.");
+        ImGui::Begin("Console");
+        ImGui::TextUnformatted("Runtime diagnostics, logs, and validation output.");
+        ImGui::Separator();
+        ImGui::Text("Editor frame: %llu", static_cast<unsigned long long>(frame_count_));
+        ImGui::TextUnformatted("ImGui is rendered through Engine RHI and RenderGraph.");
         ImGui::End();
     }
 
@@ -111,7 +160,7 @@ private:
 
 class EditorApplication final {
 public:
-    EditorApplication() = default;
+    EditorApplication() : workspace_(imgui_host_) {}
     ~EditorApplication() { cleanup(); }
 
     EditorApplication(const EditorApplication&) = delete;
@@ -213,8 +262,29 @@ public:
             return false;
         }
 
-        auto panel = std::make_unique<MainEditorPanel>(frame_count_);
-        if (!report_result(imgui_host_.register_panel(std::move(panel)), "register_main_editor_panel")) {
+        if (!report_result(workspace_.register_panel(
+                              EditorPanelDescriptor{"scene_viewport", "Scene Viewport", EditorDockRegion::kCenter,
+                                                    true, false, true},
+                              std::make_unique<SceneViewportPanel>()),
+                          "register_scene_viewport_panel") ||
+            !report_result(workspace_.register_panel(
+                               EditorPanelDescriptor{"hierarchy", "Hierarchy", EditorDockRegion::kLeft, true, true,
+                                                     true},
+                               std::make_unique<HierarchyPanel>()),
+                           "register_hierarchy_panel") ||
+            !report_result(workspace_.register_panel(
+                               EditorPanelDescriptor{"inspector", "Inspector", EditorDockRegion::kRight, true, true,
+                                                     true},
+                               std::make_unique<InspectorPanel>()),
+                           "register_inspector_panel") ||
+            !report_result(workspace_.register_panel(
+                               EditorPanelDescriptor{"assets", "Assets", EditorDockRegion::kBottom, true, true, true},
+                               std::make_unique<AssetsPanel>()),
+                           "register_assets_panel") ||
+            !report_result(workspace_.register_panel(
+                               EditorPanelDescriptor{"console", "Console", EditorDockRegion::kBottom, true, true, true},
+                               std::make_unique<ConsolePanel>(frame_count_)),
+                           "register_console_panel")) {
             return false;
         }
         last_frame_time_ = std::chrono::steady_clock::now();
@@ -299,7 +369,7 @@ public:
                 return 1;
             }
             imgui_frame_active = true;
-            if (!report_result(imgui_host_.build_panels(), "build_editor_panels")) {
+            if (!report_result(workspace_.build_ui(), "build_editor_workspace")) {
                 static_cast<void>(imgui_host_.end_frame());
                 finish_input_frame();
                 return 1;
@@ -736,6 +806,8 @@ private:
     ImGuiTextureRegistry texture_registry_{};
     ImGuiTextureHandle font_texture_handle_{};
     EditorImGuiHost imgui_host_{};
+    /** @brief Application-owned five-panel editor workspace. */
+    EditorWorkspace workspace_;
     std::unique_ptr<ImGuiRenderer> imgui_renderer_{};
     PipelineRegistry registry_{};
     PipelineScheduler scheduler_{{1, 1, 1, 1}};

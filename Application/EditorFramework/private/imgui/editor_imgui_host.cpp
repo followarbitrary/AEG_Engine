@@ -17,23 +17,121 @@
 #include "imgui_platform_bridge.hpp"
 
 namespace aeg::editor {
+namespace {
+foundation::Result capture_draw_data(const ImDrawData* draw_data, platform::WindowId window, uint64_t frame_number,
+                                     ImGuiDrawPacket& packet) {
+    if (draw_data == nullptr || !draw_data->Valid || !window.is_valid()) {
+        return foundation::invalid_state("Dear ImGui viewport has no valid draw data or window identity");
+    }
+
+    try {
+        ImGuiDrawPacket captured;
+        captured.window = window;
+        captured.display_pos_x = draw_data->DisplayPos.x;
+        captured.display_pos_y = draw_data->DisplayPos.y;
+        captured.display_width = draw_data->DisplaySize.x;
+        captured.display_height = draw_data->DisplaySize.y;
+        captured.framebuffer_scale_x = draw_data->FramebufferScale.x;
+        captured.framebuffer_scale_y = draw_data->FramebufferScale.y;
+        captured.frame_number = frame_number;
+        if (draw_data->TotalVtxCount > 0) {
+            captured.vertices.reserve(static_cast<std::size_t>(draw_data->TotalVtxCount));
+        }
+        if (draw_data->TotalIdxCount > 0) {
+            captured.indices.reserve(static_cast<std::size_t>(draw_data->TotalIdxCount));
+        }
+
+        for (int list_index = 0; list_index < draw_data->CmdLists.Size; ++list_index) {
+            const ImDrawList* list = draw_data->CmdLists[list_index];
+            if (list == nullptr) {
+                continue;
+            }
+            const uint32_t vertex_base = static_cast<uint32_t>(captured.vertices.size());
+            const uint32_t index_base = static_cast<uint32_t>(captured.indices.size());
+            for (const ImDrawVert& vertex : list->VtxBuffer) {
+                captured.vertices.push_back(ImGuiDrawVertex{
+                    vertex.pos.x,
+                    vertex.pos.y,
+                    vertex.uv.x,
+                    vertex.uv.y,
+                    vertex.col,
+                });
+            }
+            for (const ImDrawIdx index : list->IdxBuffer) {
+                captured.indices.push_back(static_cast<uint32_t>(index));
+            }
+            for (const ImDrawCmd& command : list->CmdBuffer) {
+                if (command.UserCallback != nullptr) {
+                    return foundation::unsupported("ImGui user draw callbacks are not supported by ImGuiDrawPacket");
+                }
+                const uint64_t texture_id = static_cast<uint64_t>(command.GetTexID());
+                const ImGuiTextureHandle texture = decode_imgui_texture_id(texture_id);
+                if (!texture.is_valid()) {
+                    return foundation::invalid_argument("ImGui draw command contains an invalid texture ID");
+                }
+                captured.commands.push_back(ImGuiDrawCommand{
+                    texture,
+                    command.ClipRect.x,
+                    command.ClipRect.y,
+                    command.ClipRect.z,
+                    command.ClipRect.w,
+                    command.ElemCount,
+                    index_base + command.IdxOffset,
+                    static_cast<int32_t>(vertex_base) + static_cast<int32_t>(command.VtxOffset),
+                });
+            }
+        }
+
+        packet = std::move(captured);
+        return foundation::Result::success();
+    } catch (const std::bad_alloc&) {
+        return foundation::out_of_memory("ImGui draw packet allocation failed");
+    } catch (const std::exception& exception) {
+        return foundation::unknown_exception(exception);
+    } catch (...) {
+        return foundation::Result::failure(foundation::ResultCode::kUnknown,
+                                           "ImGui draw packet capture threw an unknown exception");
+    }
+}
+
+[[nodiscard]] platform::WindowId viewport_window_id(const detail::ImGuiPlatformBridgeContext& context,
+                                                    const ImGuiViewport* viewport) noexcept {
+    if (viewport == nullptr) {
+        return {};
+    }
+    if (viewport == ImGui::GetMainViewport()) {
+        return context.window;
+    }
+    const auto* data = static_cast<const detail::ImGuiPlatformViewportData*>(viewport->PlatformUserData);
+    return data != nullptr ? data->window : platform::WindowId{};
+}
+}  // namespace
+
 struct EditorImGuiHost::Impl final {
     struct PanelSlot final {
         uint32_t generation{1};
         std::unique_ptr<EditorPanel> panel{};
+        bool visible{true};
     };
 
+    /** @brief Dear ImGui context owned by this host. */
     ImGuiContext* context{nullptr};
+    /** @brief Immutable initialization settings retained for the host lifetime. */
     EditorImGuiDesc desc{};
+    /** @brief Engine-owned bridge for platform services and viewport callbacks. */
     detail::ImGuiPlatformBridgeContext platform_bridge{};
+    /** @brief Protects events submitted by the platform pump before the frame boundary. */
     std::mutex event_mutex{};
     std::vector<platform::WindowEvent> pending_events{};
     std::vector<platform::WindowEvent> frame_events{};
     std::vector<PanelSlot> panels{};
     ImGuiFontAtlasData font_atlas{};
     ImGuiTextureHandle font_texture{};
+    /** @brief Monotonic frame identity copied into every captured viewport packet. */
     uint64_t frame_number{0};
+    /** @brief True after initialization has installed the ImGui context and bridge. */
     bool initialized{false};
+    /** @brief True between begin_frame() and end_frame(). */
     bool frame_active{false};
 };
 
@@ -61,16 +159,21 @@ foundation::Result EditorImGuiHost::initialize(const EditorImGuiDesc& desc) {
 
     ImGui::SetCurrentContext(impl_->context);
     ImGuiIO& io = ImGui::GetIO();
-    io.ConfigFlags = ImGuiConfigFlags_NavEnableKeyboard;
+    io.ConfigFlags = desc.enable_keyboard_navigation ? ImGuiConfigFlags_NavEnableKeyboard : ImGuiConfigFlags_None;
+    io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
     if (desc.enable_gamepad_navigation) {
         io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
+    }
+    if (desc.enable_viewports && desc.window_system != nullptr) {
+        io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
     }
     io.FontGlobalScale = desc.font_global_scale;
     io.IniFilename = nullptr;
     io.BackendPlatformName = "AEG.Editor.ImGuiPlatformBridge";
     io.BackendRendererName = nullptr;
     io.BackendFlags = ImGuiBackendFlags_None;
-    detail::ImGuiPlatformBridge::install(io, impl_->platform_bridge, desc.platform_services);
+    detail::ImGuiPlatformBridge::install(io, impl_->platform_bridge, desc.platform_services, desc.window_system,
+                                         desc.enable_viewports);
     unsigned char* font_pixels = nullptr;
     int font_width = 0;
     int font_height = 0;
@@ -117,6 +220,9 @@ foundation::Result EditorImGuiHost::shutdown() {
     }
 
     ImGui::SetCurrentContext(impl_->context);
+    if (impl_->platform_bridge.viewports_enabled) {
+        ImGui::DestroyPlatformWindows();
+    }
     detail::ImGuiPlatformBridge::shutdown(ImGui::GetIO(), impl_->platform_bridge);
     ImGui::DestroyContext(impl_->context);
     impl_->context = nullptr;
@@ -212,9 +318,10 @@ foundation::Result EditorImGuiHost::begin_frame(const EditorImGuiFrameDesc& desc
         impl_->frame_events.swap(impl_->pending_events);
     }
     for (const platform::WindowEvent& event : impl_->frame_events) {
-        if (event.window == desc.window) {
-            detail::ImGuiPlatformBridge::submit_event(io, event);
+        if (!impl_->platform_bridge.viewports_enabled && event.window != desc.window) {
+            continue;
         }
+        detail::ImGuiPlatformBridge::submit_event(io, event, impl_->platform_bridge);
     }
     ImGui::NewFrame();
     ++impl_->frame_number;
@@ -229,7 +336,7 @@ foundation::Result EditorImGuiHost::build_panels() {
 
     ImGui::SetCurrentContext(impl_->context);
     for (const Impl::PanelSlot& slot : impl_->panels) {
-        if (slot.panel != nullptr) {
+        if (slot.panel != nullptr && slot.visible) {
             slot.panel->build_ui();
         }
     }
@@ -243,6 +350,9 @@ foundation::Result EditorImGuiHost::end_frame() {
 
     ImGui::SetCurrentContext(impl_->context);
     ImGui::Render();
+    if (impl_->platform_bridge.viewports_enabled) {
+        ImGui::UpdatePlatformWindows();
+    }
     detail::ImGuiPlatformBridge::update_cursor(ImGui::GetIO(), impl_->platform_bridge);
     impl_->frame_active = false;
     return foundation::Result::success();
@@ -253,78 +363,45 @@ foundation::Result EditorImGuiHost::capture_draw_packet(ImGuiDrawPacket& packet)
         return foundation::invalid_state("ImGui draw data requires a finalized frame");
     }
 
+    ImGui::SetCurrentContext(impl_->context);
+    const ImGuiViewport* main_viewport = ImGui::GetMainViewport();
+    const ImDrawData* draw_data = main_viewport != nullptr ? main_viewport->DrawData : ImGui::GetDrawData();
+    return capture_draw_data(draw_data, impl_->platform_bridge.window, impl_->frame_number, packet);
+}
+
+foundation::Result EditorImGuiHost::capture_draw_packets(std::vector<ImGuiDrawPacket>& packets) const {
+    if (!impl_->initialized || impl_->frame_active) {
+        return foundation::invalid_state("ImGui draw data requires a finalized frame");
+    }
+
     try {
         ImGui::SetCurrentContext(impl_->context);
-        const ImDrawData* draw_data = ImGui::GetDrawData();
-        if (draw_data == nullptr || !draw_data->Valid) {
-            return foundation::invalid_state("Dear ImGui has no valid draw data");
-        }
-
-        ImGuiDrawPacket captured;
-        captured.display_pos_x = draw_data->DisplayPos.x;
-        captured.display_pos_y = draw_data->DisplayPos.y;
-        captured.display_width = draw_data->DisplaySize.x;
-        captured.display_height = draw_data->DisplaySize.y;
-        captured.framebuffer_scale_x = draw_data->FramebufferScale.x;
-        captured.framebuffer_scale_y = draw_data->FramebufferScale.y;
-        captured.frame_number = impl_->frame_number;
-        if (draw_data->TotalVtxCount > 0) {
-            captured.vertices.reserve(static_cast<std::size_t>(draw_data->TotalVtxCount));
-        }
-        if (draw_data->TotalIdxCount > 0) {
-            captured.indices.reserve(static_cast<std::size_t>(draw_data->TotalIdxCount));
-        }
-
-        for (int list_index = 0; list_index < draw_data->CmdLists.Size; ++list_index) {
-            const ImDrawList* list = draw_data->CmdLists[list_index];
-            if (list == nullptr) {
+        std::vector<ImGuiDrawPacket> captured_packets;
+        const ImGuiPlatformIO& platform_io = ImGui::GetPlatformIO();
+        captured_packets.reserve(static_cast<std::size_t>(platform_io.Viewports.Size));
+        for (int index = 0; index < platform_io.Viewports.Size; ++index) {
+            const ImGuiViewport* viewport = platform_io.Viewports[index];
+            const platform::WindowId window = viewport_window_id(impl_->platform_bridge, viewport);
+            if (viewport == nullptr || !window.is_valid() || viewport->DrawData == nullptr || !viewport->DrawData->Valid) {
                 continue;
             }
-            const uint32_t vertex_base = static_cast<uint32_t>(captured.vertices.size());
-            const uint32_t index_base = static_cast<uint32_t>(captured.indices.size());
-            for (const ImDrawVert& vertex : list->VtxBuffer) {
-                captured.vertices.push_back(ImGuiDrawVertex{
-                    vertex.pos.x,
-                    vertex.pos.y,
-                    vertex.uv.x,
-                    vertex.uv.y,
-                    vertex.col,
-                });
+            ImGuiDrawPacket packet;
+            if (const foundation::Result result =
+                    capture_draw_data(viewport->DrawData, window, impl_->frame_number, packet);
+                !result) {
+                return result;
             }
-            for (const ImDrawIdx index : list->IdxBuffer) {
-                captured.indices.push_back(static_cast<uint32_t>(index));
-            }
-            for (const ImDrawCmd& command : list->CmdBuffer) {
-                if (command.UserCallback != nullptr) {
-                    return foundation::unsupported("ImGui user draw callbacks are not supported by ImGuiDrawPacket");
-                }
-                const uint64_t texture_id = static_cast<uint64_t>(command.GetTexID());
-                const ImGuiTextureHandle texture = decode_imgui_texture_id(texture_id);
-                if (!texture.is_valid()) {
-                    return foundation::invalid_argument("ImGui draw command contains an invalid texture ID");
-                }
-                captured.commands.push_back(ImGuiDrawCommand{
-                    texture,
-                    command.ClipRect.x,
-                    command.ClipRect.y,
-                    command.ClipRect.z,
-                    command.ClipRect.w,
-                    command.ElemCount,
-                    index_base + command.IdxOffset,
-                    static_cast<int32_t>(vertex_base) + static_cast<int32_t>(command.VtxOffset),
-                });
-            }
+            captured_packets.push_back(std::move(packet));
         }
-
-        packet = std::move(captured);
+        packets = std::move(captured_packets);
         return foundation::Result::success();
     } catch (const std::bad_alloc&) {
-        return foundation::out_of_memory("ImGui draw packet allocation failed");
+        return foundation::out_of_memory("ImGui viewport draw packet allocation failed");
     } catch (const std::exception& exception) {
         return foundation::unknown_exception(exception);
     } catch (...) {
         return foundation::Result::failure(foundation::ResultCode::kUnknown,
-                                           "ImGui draw packet capture threw an unknown exception");
+                                           "ImGui viewport draw packet capture threw an unknown exception");
     }
 }
 
@@ -340,6 +417,7 @@ foundation::ResultValue<EditorPanelId> EditorImGuiHost::register_panel(std::uniq
         Impl::PanelSlot& slot = impl_->panels[index];
         if (slot.panel == nullptr) {
             slot.panel = std::move(panel);
+            slot.visible = true;
             return {foundation::Result::success(), EditorPanelId{index, slot.generation}};
         }
     }
@@ -365,10 +443,27 @@ foundation::Result EditorImGuiHost::unregister_panel(EditorPanelId panel) {
         return foundation::not_found("Editor panel identity is stale");
     }
     slot.panel.reset();
+    slot.visible = true;
     ++slot.generation;
     if (slot.generation == 0) {
         slot.generation = 1;
     }
+    return foundation::Result::success();
+}
+
+foundation::Result EditorImGuiHost::set_panel_visible(EditorPanelId panel, bool visible) {
+    if (!impl_->initialized) {
+        return foundation::invalid_state("EditorImGuiHost is not initialized");
+    }
+    if (panel.index >= impl_->panels.size()) {
+        return foundation::not_found("Editor panel identity is not registered");
+    }
+
+    Impl::PanelSlot& slot = impl_->panels[panel.index];
+    if (slot.panel == nullptr || slot.generation != panel.generation) {
+        return foundation::not_found("Editor panel identity is stale");
+    }
+    slot.visible = visible;
     return foundation::Result::success();
 }
 

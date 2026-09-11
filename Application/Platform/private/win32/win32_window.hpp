@@ -31,7 +31,10 @@ public:
     [[nodiscard]] const platform::WindowDesc& desc() const noexcept override { return desc_; }
     [[nodiscard]] platform::WindowState state() const noexcept override { return state_; }
     [[nodiscard]] platform::WindowSurfaceBinding surface_binding() const noexcept override;
+    [[nodiscard]] foundation::Result set_position(platform::WindowPosition position) noexcept override;
     [[nodiscard]] foundation::Result set_extent(platform::WindowExtent extent) noexcept override;
+    [[nodiscard]] foundation::Result set_visible(bool visible) noexcept override;
+    [[nodiscard]] foundation::Result focus() noexcept override;
     [[nodiscard]] foundation::Result request_close() noexcept override;
 
     void attach(HWND handle) noexcept { hwnd_ = handle; }
@@ -46,6 +49,7 @@ private:
     static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l_param) noexcept;
 
     [[nodiscard]] LRESULT handle_message(UINT message, WPARAM w_param, LPARAM l_param) noexcept;
+    void sync_state_from_native() noexcept;
     void emit_event(platform::WindowEvent event) noexcept;
     void emit_text_codepoint(char32_t codepoint) noexcept;
 
@@ -54,13 +58,21 @@ private:
     [[nodiscard]] static platform::MouseButton translate_mouse_button(UINT message, WPARAM w_param) noexcept;
     [[nodiscard]] static HCURSOR cursor_handle(platform::CursorShape shape) noexcept;
 
+    /** @brief Generation-checked identity exposed through the platform contract. */
     platform::WindowId id_{};
+    /** @brief Non-owning owner used for event delivery and slot lifecycle. */
     Win32WindowSystem* owner_{nullptr};
+    /** @brief Native window handle kept private to the Application adapter. */
     HWND hwnd_{nullptr};
+    /** @brief Immutable semantic creation description. */
     platform::WindowDesc desc_{};
+    /** @brief Cached semantic state synchronized from Win32 messages. */
     platform::WindowState state_{};
+    /** @brief Cursor shape requested through the backend-neutral service. */
     platform::CursorShape cursor_shape_{platform::CursorShape::kArrow};
+    /** @brief Last IME state requested by the editor bridge. */
     platform::ImeState ime_state_{};
+    /** @brief Pending high UTF-16 surrogate awaiting a matching low surrogate. */
     wchar_t pending_high_surrogate_{0};
 };
 }  // namespace aeg::application::win32

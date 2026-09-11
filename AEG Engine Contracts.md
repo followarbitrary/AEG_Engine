@@ -21,37 +21,53 @@
 
 ### 2.1 `Engine` 一级目录
 
-| 目录              | 职责                                                                            |
-|-------------------|---------------------------------------------------------------------------------|
-| `Foundation`      | 最低层通用基础类型，统一 `Result`、错误码和跨模块错误构造函数                   |
-| `Logging`         | 统一日志门面、日志级别、日志分类、输出配置和 Quill 适配                         |
-| `Math`            | 向量、矩阵、四元数、变换、投影、视锥体和 SIMD 数学实现                          |
-| `Concurrency`     | `jthread`、协程、Executor、Completion、取消、TaskGroup 和 TaskGraph             |
-| `Reflection`      | 类型、字段元数据和受控成员访问，为序列化与编辑器提供反射能力                    |
-| `Serialization`   | 基于 Reflection 的通用二进制对象编码与解码                                      |
-| `ECS`             | Entity、Component、World 可变状态、查询、命令缓冲和不可变快照                   |
-| `Pipeline`        | Pipeline、Stage、Task、Feature、Artifact、Compiler 和 Scheduler                 |
-| `Module`          | C++ 模块生命周期、依赖检查和注册产物所有权                                      |
-| `World`           | ECS 与 World Scope Pipeline 的绑定、快照发布和 World Archive                    |
-| `Scene`           | 稳定场景文档、Scene GUID、实体层级、组件载荷和 World 实例化                     |
-| `RHI`             | 后端无关的 GPU 资源、View、Binding、Command、Queue 和同步抽象                   |
-| `RenderGraph`     | 帧内资源图、Pass、资源生命周期、显式 Barrier 和队列同步                         |
-| `Resource`        | Mesh、Texture、Material、Render Target、资源上传和延迟销毁                      |
-| `Shader`          | Shader Asset、Reflection、Shader Contract、Pipeline Layout 和运行时加载         |
-| `Renderer`        | RenderView、World-to-Render 提取、可见性、RenderSceneSnapshot 和 RenderPipeline |
-| `Runtime`         | Engine 生命周期、Scope 注册、Pipeline 执行和 RenderGraph 帧编排                 |
-| `Platform`        | 窗口、Surface、文件系统、动态库和操作系统适配；当前为预留目录                   |
-| `Diagnostics`     | 断言、验证、性能分析、崩溃上下文和运行时诊断；当前为预留目录                    |
-| `EditorFramework` | 编辑器状态、工具窗口、选择集、属性面板和预览；当前提供 Experimental 编辑器接口  |
-| `Tooling`         | Shader、资产、代码生成和格式验证工具；当前为预留目录                            |
+| 目录            | 职责                                                                            |
+|-----------------|---------------------------------------------------------------------------------|
+| `Foundation`    | 最低层通用基础类型，统一 `Result`、错误码和跨模块错误构造函数                   |
+| `Logging`       | 统一日志门面、日志级别、日志分类、输出配置和 Quill 适配                         |
+| `Math`          | 向量、矩阵、四元数、变换、投影、视锥体和 SIMD 数学实现                          |
+| `Concurrency`   | `jthread`、协程、Executor、Completion、取消、TaskGroup 和 TaskGraph             |
+| `Reflection`    | 类型、字段元数据和受控成员访问，为序列化与编辑器提供反射能力                    |
+| `Serialization` | 基于 Reflection 的通用二进制对象编码与解码                                      |
+| `ECS`           | Entity、Component、World 可变状态、查询、命令缓冲和不可变快照                   |
+| `Pipeline`      | Pipeline、Stage、Task、Feature、Artifact、Compiler 和 Scheduler                 |
+| `Module`        | C++ 模块生命周期、依赖检查和注册产物所有权                                      |
+| `World`         | ECS 与 World Scope Pipeline 的绑定、快照发布和 World Archive                    |
+| `Scene`         | 稳定场景文档、Scene GUID、实体层级、组件载荷和 World 实例化                     |
+| `RHI`           | 后端无关的 GPU 资源、View、Binding、Command、Queue 和同步抽象                   |
+| `RenderGraph`   | 帧内资源图、Pass、资源生命周期、显式 Barrier 和队列同步                         |
+| `Resource`      | Mesh、Texture、Material、Render Target、资源上传和延迟销毁                      |
+| `Shader`        | Shader Asset、Reflection、Shader Contract、Pipeline Layout 和运行时加载         |
+| `Renderer`      | RenderView、World-to-Render 提取、可见性、RenderSceneSnapshot 和 RenderPipeline |
+| `Runtime`       | Engine 生命周期、Scope 注册、Pipeline 执行和 RenderGraph 帧编排                 |
+| `Platform`      | 窗口、Surface、文件系统、动态库和操作系统适配；公共窗口契约为 Experimental      |
+| `Diagnostics`   | 断言、验证、性能分析、崩溃上下文和运行时诊断；当前为预留目录                    |
+| `Tooling`       | Shader、资产、代码生成和格式验证工具；当前为预留目录                            |
 
-### 2.2 `RHI` 后端目录
+### 2.2 `Application` 一级目录
+
+| 目录              | 职责                                                                               |
+|-------------------|------------------------------------------------------------------------------------|
+| `Editor`          | 编辑器应用入口、真实编辑器面板、编辑器数据桥接和应用侧帧编排                       |
+| `EditorFramework` | 编辑器状态、工具窗口、选择集、属性面板、场景预览和编辑器扩展生命周期；Experimental |
+| `Platform`        | 操作系统窗口、Surface 和平台事件的具体实现；公共语义来自 `Engine/Platform/public`  |
+
+`Application/EditorFramework` 可以依赖 Engine 的公共接口，但 Engine 的任何模块不得依赖
+Application 或编辑器业务数据。编辑器框架不得直接包含 Application/Platform 的 private
+头文件，也不得直接调用 Win32、Vulkan、D3D12 或其他 native API。
+
+`Engine/Platform/public` 只表达后端无关的窗口身份、状态、Surface 绑定和平台服务。窗口
+位置、尺寸、显示、聚焦和关闭请求可以由编辑器多视口使用，但不得把 HWND、X11 Window 或
+其他 native 类型加入 Engine 公共头文件。具体窗口实现必须位于
+`Application/Platform/private/<platform>`。
+
+### 2.3 `RHI` 后端目录
 
 `Engine/RHI/private/vulkan` 只存放 Vulkan 实现、VMA 集成和 Vulkan 专用配置。未来新增
 D3D12、Metal 或其他后端时，必须在 `private` 下建立独立后端目录，并通过通用 RHI 工厂
 接入。后端目录不得修改通用公共接口来暴露 native API 类型。
 
-### 2.3 其他特殊目录
+### 2.4 其他特殊目录
 
 | 目录              | 职责                                        |
 |-------------------|---------------------------------------------|

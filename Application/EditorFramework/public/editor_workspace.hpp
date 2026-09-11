@@ -1,0 +1,71 @@
+/**
+ * @file editor_workspace.hpp
+ * @brief Application-owned customizable editor workspace orchestration.
+ */
+#pragma once
+
+#include <cstddef>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include "editor_imgui.hpp"
+#include "editor_layout.hpp"
+#include "editor_panel_descriptor.hpp"
+#include "result.hpp"
+
+namespace aeg::editor {
+/** @brief Coordinates panel registration, semantic layout state, and ImGui docking. */
+class EditorWorkspace final {
+public:
+    /** @brief Creates a workspace that borrows one initialized ImGui host. */
+    explicit EditorWorkspace(EditorImGuiHost& imgui_host) noexcept;
+
+    EditorWorkspace(const EditorWorkspace&) = delete;
+    EditorWorkspace& operator=(const EditorWorkspace&) = delete;
+    EditorWorkspace(EditorWorkspace&&) = delete;
+    EditorWorkspace& operator=(EditorWorkspace&&) = delete;
+
+    /** @brief Registers one panel and adds its descriptor to layout persistence. */
+    [[nodiscard]] foundation::Result register_panel(EditorPanelDescriptor descriptor,
+                                                    std::unique_ptr<EditorPanel> panel);
+    /** @brief Removes one panel from the host and semantic layout. */
+    [[nodiscard]] foundation::Result unregister_panel(std::string_view panel_key);
+    /** @brief Changes visibility while preserving the panel's dock or floating placement. */
+    [[nodiscard]] foundation::Result set_panel_visible(std::string_view panel_key, bool visible);
+    /** @brief Builds the dockspace, workspace menu, and currently visible panels. */
+    [[nodiscard]] foundation::Result build_ui();
+    /** @brief Serializes the current semantic layout for an Application-owned store. */
+    [[nodiscard]] foundation::Result serialize_layout(std::string& serialized) const;
+    /** @brief Replaces the semantic layout from a previously serialized snapshot. */
+    [[nodiscard]] foundation::Result deserialize_layout(std::string_view serialized);
+
+    /** @brief Returns the current semantic layout when at least one panel is registered. */
+    [[nodiscard]] const EditorLayoutModel* layout() const noexcept;
+    /** @brief Returns the number of registered panels. */
+    [[nodiscard]] std::size_t panel_count() const noexcept;
+
+private:
+    struct PanelEntry final {
+        /** @brief Stable semantic metadata used to map the panel to an ImGui window. */
+        EditorPanelDescriptor descriptor{};
+        /** @brief Generation-checked identity owned by the ImGui host. */
+        EditorPanelId panel_id{};
+    };
+
+    [[nodiscard]] PanelEntry* find_panel(std::string_view panel_key) noexcept;
+    [[nodiscard]] const PanelEntry* find_panel(std::string_view panel_key) const noexcept;
+    [[nodiscard]] foundation::Result initialize_dockspace();
+    [[nodiscard]] foundation::Result sync_host_visibility();
+
+    /** @brief Borrowed ImGui host that owns panel instances and the active context. */
+    EditorImGuiHost* imgui_host_{nullptr};
+    /** @brief Application-owned semantic layout state. */
+    std::unique_ptr<EditorLayoutModel> layout_{};
+    /** @brief Registered panels in deterministic application order. */
+    std::vector<PanelEntry> panels_{};
+    /** @brief True after the current layout has been applied to the ImGui dockspace. */
+    bool dockspace_initialized_{false};
+};
+}  // namespace aeg::editor

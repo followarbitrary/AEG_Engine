@@ -7,6 +7,7 @@
 #include <imm.h>
 #include <windowsx.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <utility>
@@ -142,7 +143,10 @@ MouseButton mouse_button_from_message(UINT message, WPARAM w_param) noexcept {
 }  // namespace
 
 Win32Window::Win32Window(platform::WindowId id, Win32WindowSystem* owner, platform::WindowDesc desc) noexcept
-    : id_(id), owner_(owner), desc_(std::move(desc)), state_{desc_.extent, false, false, false} {}
+    : id_(id),
+      owner_(owner),
+      desc_(std::move(desc)),
+      state_{desc_.position, desc_.extent, desc_.visible, false, false, false} {}
 
 Win32Window::~Win32Window() {
     destroy_native();
@@ -153,6 +157,19 @@ platform::WindowSurfaceBinding Win32Window::surface_binding() const noexcept {
         owner_ != nullptr ? reinterpret_cast<void*>(owner_->instance()) : nullptr,
         reinterpret_cast<void*>(hwnd_),
     };
+}
+
+foundation::Result Win32Window::set_position(platform::WindowPosition position) noexcept {
+    if (hwnd_ == nullptr) {
+        return foundation::Result::failure(foundation::ResultCode::kInvalidState);
+    }
+    if (SetWindowPos(hwnd_, nullptr, position.x, position.y, 0, 0,
+                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE) == FALSE) {
+        return foundation::Result::failure(foundation::ResultCode::kBackendError,
+                                            "Win32 window position update failed");
+    }
+    state_.position = position;
+    return foundation::Result::success();
 }
 
 foundation::Result Win32Window::set_extent(platform::WindowExtent extent) noexcept {
@@ -178,6 +195,32 @@ foundation::Result Win32Window::set_extent(platform::WindowExtent extent) noexce
         return foundation::Result::failure(foundation::ResultCode::kBackendError,
                                             "Win32 window extent update failed");
     }
+    sync_state_from_native();
+    return foundation::Result::success();
+}
+
+foundation::Result Win32Window::set_visible(bool visible) noexcept {
+    if (hwnd_ == nullptr) {
+        return foundation::Result::failure(foundation::ResultCode::kInvalidState);
+    }
+    ShowWindow(hwnd_, visible ? SW_SHOWNOACTIVATE : SW_HIDE);
+    state_.visible = visible;
+    if (visible) {
+        UpdateWindow(hwnd_);
+    }
+    return foundation::Result::success();
+}
+
+foundation::Result Win32Window::focus() noexcept {
+    if (hwnd_ == nullptr) {
+        return foundation::Result::failure(foundation::ResultCode::kInvalidState);
+    }
+    if (SetForegroundWindow(hwnd_) == FALSE) {
+        return foundation::Result::failure(foundation::ResultCode::kBackendError,
+                                            "Win32 window focus update failed");
+    }
+    SetFocus(hwnd_);
+    state_.focused = true;
     return foundation::Result::success();
 }
 
@@ -196,6 +239,25 @@ void Win32Window::destroy_native() noexcept {
         DestroyWindow(hwnd_);
         hwnd_ = nullptr;
     }
+    state_.visible = false;
+    state_.focused = false;
+}
+
+void Win32Window::sync_state_from_native() noexcept {
+    if (hwnd_ == nullptr) {
+        return;
+    }
+    RECT window_rect{};
+    RECT client_rect{};
+    if (GetWindowRect(hwnd_, &window_rect) != FALSE) {
+        state_.position = platform::WindowPosition{window_rect.left, window_rect.top};
+    }
+    if (GetClientRect(hwnd_, &client_rect) != FALSE) {
+        const LONG width = std::max<LONG>(client_rect.right - client_rect.left, 1);
+        const LONG height = std::max<LONG>(client_rect.bottom - client_rect.top, 1);
+        state_.extent = platform::WindowExtent{static_cast<uint32_t>(width), static_cast<uint32_t>(height)};
+    }
+    state_.visible = IsWindowVisible(hwnd_) != FALSE;
 }
 
 foundation::Result Win32Window::set_cursor(platform::CursorShape shape) noexcept {
@@ -277,6 +339,7 @@ LRESULT Win32Window::handle_message(UINT message, WPARAM w_param, LPARAM l_param
             return 0;
         case WM_DESTROY:
             state_.close_requested = true;
+            state_.visible = false;
             return 0;
         case WM_NCDESTROY: {
             const HWND current_window = hwnd_;
@@ -293,6 +356,12 @@ LRESULT Win32Window::handle_message(UINT message, WPARAM w_param, LPARAM l_param
             emit_event(event);
             return 0;
         }
+        case WM_MOVE:
+            sync_state_from_native();
+            return 0;
+        case WM_SHOWWINDOW:
+            state_.visible = w_param != FALSE;
+            return 0;
         case WM_SETFOCUS:
         case WM_KILLFOCUS: {
             state_.focused = message == WM_SETFOCUS;
