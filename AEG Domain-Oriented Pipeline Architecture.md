@@ -2,7 +2,7 @@
 
 > 文档性质：架构说明、公共 API 和 ABI 使用手册
 >
-> 更新时间：2026-09-08
+> 更新时间：2026-09-12
 >
 > 适用范围：Pipeline、PipelineFeature、Scope、Artifact、Domain Graph、RenderGraph、RHI
 
@@ -50,7 +50,17 @@ Orchestrator 通过非拥有的 Host 注册表统一驱动这些实例。
 `ModuleRegistry` 负责依赖版本校验、注册事务回滚和 Pipeline、Feature、Phase、Reflection
 Type 的注册产物所有权；动态 DLL Loader 与固定布局 C ABI 仍属于目标层设计。
 
-下文的专用 Engine/World/Frame/Editor Host、
+当前还实现了 Application 侧的 Editor Host：`Application/Editor` 负责编辑器主窗口、
+Surface、Swapchain、帧编排和 Application-owned native error dialog；
+`Application/EditorFramework` 提供 Engine-owned `EditorImGuiHost`、`ImGuiRenderer`、
+Editor Workspace、Preferences 状态模型、字体目录数据和编辑器错误状态；系统字体枚举
+和文件读取由 `Application/Editor` 的平台适配负责。Editor UI 的
+绘制资源通过 Engine 的 Resource/RHI/RenderGraph 路径创建、上传、绑定和退休；
+EditorFramework 不直接调用 Vulkan、D3D12、Win32 或其他 native 图形 API。Preferences
+使用独立的 Application 窗口和独立的 Engine 帧资源；字体预览只作用于 Preferences 的
+预览 Host，Apply/Save 才改变编辑器已应用字体，游戏运行时字体与编辑器字体完全隔离。
+
+下文的专用 Engine/World/Frame Host、
 `FeatureExecutionContext`、动态模块 Loader/C ABI，以及 Simulation/Render
 参考 Stage 编排属于架构约定，不表示当前已有同名公共实现。`WorldPipelineHost` 和
 `FramePipelineHost` 当前由通用 `PipelineScopeHost` 分别承担，专用类型仍属于文档层抽象。
@@ -425,6 +435,18 @@ Frame RenderGraph
 Editor 默认不得删除基础 Pass、重排 RenderGraph、替换主 Render Target 或直接访问 World
 可变状态。需要修改 World 时，Editor 发布 `EditorCommandBuffer`，由 World 在下一次
 `Input` 或 `PreUpdate` 阶段消费。
+
+当前仓库中的编辑器实现分为两个 Application 侧角色：
+
+- `Application/Editor` 是应用组合层，拥有主窗口、独立 Preferences 窗口、Surface、
+  Swapchain、FrameContext 和 Orchestrator，并把窗口事件和错误诊断转换为编辑器服务。
+- `Application/EditorFramework` 是后端无关的编辑器框架层，拥有 ImGui Context、Panel、
+  Workspace、Preferences draft/applied state、字体元数据和绘制包；它只能依赖 Engine
+  public API，不能依赖 Application/Platform private 或任何 native 图形 API。
+
+Preferences 的预览字体是独立 Host 内的暂态状态，不得修改主编辑器的 applied font；
+编辑器字体设置只影响编辑器自身，不得改变游戏运行时的字体资源或字体状态。错误通知
+由 Application/Platform 提供 native dialog，native dialog 不得再次嵌套 ImGui 窗口。
 
 ## 6. Pipeline 的三层对象
 
@@ -2371,10 +2393,19 @@ Graphics Queue 共享，也不能绕过这一权限检查。
 该权限目前不等同于对某个指定最终输出纹理的所有写操作进行对象级授权。
 
 这些接口只声明逻辑资源和访问关系，不返回 `VkImage`、`VkBuffer` 或
-`ID3D12Resource*`。Execute 回调使用 `RenderPassExecutionContext` 解析 RHI Buffer、Texture
-及 View，通过 `device()` 和 `command_list()` 录制后端无关命令。该 Context 不提供
-`bind_shader(path)` 或直接的 `dispatch()` 便利接口；Shader/布局须由 Shader Contract
-及 RHI Pipeline 绑定流程提供。
+`ID3D12Resource*`。Execute 回调使用受限的 `RenderPassExecutionContext` 解析 RHI Buffer、
+Texture 及 View，并通过受限操作录制命令；执行上下文不得暴露 `rhi::Device&`、Command
+List、后端 native handle 或资源创建/销毁能力。当前允许的操作包括：
+
+- `buffer()` / `texture()` / `buffer_view()` / `texture_view()` 解析 Graph 资源和 View；
+- `begin_rendering()` / `end_rendering()`、viewport/scissor、pipeline 和 binding set 绑定；
+- inline constants、vertex/index buffer 绑定，以及 draw、draw indexed、dispatch 和 indirect；
+- Buffer/Texture copy 和 `clear_texture()`。
+
+这里有两个不同层次的类型：`render_graph::RenderPassCommandContext` 是 Graph 内部的
+受限命令实现，`pipeline::RenderPassExecutionContext` 是 Pipeline public facade；二者
+均不向 Feature 暴露 `device()` 或 `command_list()`。`bind_shader(path)` 仍不是执行上下文
+能力；Shader/布局必须由 Shader Contract 和 RHI Pipeline 绑定流程提供。
 
 当前仓库的 `RenderGraph`、`PassBuilder`、`PassExecutionContext`、`FrameContext` 和
 `RenderGraphPlan` 已经提供了这类适配器所需的底层能力：
@@ -2976,11 +3007,22 @@ return orchestrator.shutdown();
 5. 在 `RenderExecute` 阶段自动编译并执行 RenderGraph，提交 Queue Batch 和 GPU Completion。
 6. 在 `Present` 或 `FrameEnd` 处理 acquired frame，并结束 FrameContext 生命周期。
 
+当 `EngineFrameDesc::acquire_swapchain_image` 为真时，Orchestrator 负责获取当前
+Swapchain image，并将 acquired image 自动导入 RenderGraph。RenderGraph 根据图中实际的
+资源访问批次自动保证：首个访问 Swapchain image 的 batch 等待 acquire，最终输出 batch
+在 Graphics Queue 上 signal present；`FrameContext::present()` 使用该完成依赖执行呈现。
+该同步语义不依赖 Feature、Pass 或面板注册顺序，调用方不得通过调整注册顺序修复或
+表达 acquire/present 依赖。
+
 `present_acquired_frame == true` 时，Orchestrator 在 `Present` Phase 尝试呈现；为 `false`
 时则将呈现或取消处理延迟到 `FrameEnd`。如果图已经以 `submits_frame` Batch 提交了
 acquired frame，Orchestrator 会确保该帧最终被解析；没有 Present 输出时则允许取消未提交
 的 acquired frame。`reset_render_graph` 为真会重置逻辑资源和 Pass；为假只清除 Pass，
 适合保留 Persistent/Imported 资源记录并更新当前 Swapchain Image。
+
+若 acquire 或 present 返回 `kOutOfDate` / `kSurfaceLost`，Orchestrator 不把它们降级为
+普通参数错误；上层 Application 必须停止当前帧并进入 Surface/Swapchain 重建流程。重建
+完成前不得继续使用旧的 Swapchain image、View 或依赖其代际的 Graph Handle。
 
 需要逐阶段插入调试、工具或自定义控制时，可以使用活动帧区间的低层入口：
 
@@ -3049,8 +3091,9 @@ aeg::foundation::Result build_and_execute(
 ```
 
 Feature 只声明资源使用和绘制行为；资源状态转换、Barrier、跨队列等待和物理句柄解析
-由 RenderGraph/RHI 完成。本例不自动呈现，也不等待 GPU 完成。生产调用方应保留
-`execute()` 返回的完成点，按 FrameContext 规则退休资源。该函数用于一次构图执行；
+由 RenderGraph/RHI 完成。本例没有请求 `present_acquired_frame`，因此不主动调用呈现；
+它仍会返回提交和完成信息。生产调用方应保留 `execute()` 返回的完成点，按 FrameContext
+规则退休资源。该函数用于一次构图执行；
 重复构图前须由宿主管理既有声明，不能逐帧向同一图无限追加 Feature 资源和 Pass。
 
 当 RenderGraph 的构图来源是 `PipelineScopeHost::active_plan_snapshot()` 时，应优先使用
@@ -3160,6 +3203,14 @@ Plan 锁协调 Host 的计划切换与 CPU 执行，引用计数负责对象生�
 RenderGraph、资源、模块代码和完成点，再释放相关持有者。Registry 变更不会自动通知
 Host；调用方必须显式调用 `PipelineScopeHost::rebuild(registry)`。通用 CPU/GPU 完成
 门控与动态库卸载管理仍属于架构约定。
+
+临时 RenderPipeline 或 Editor RenderFeature 注册后，拥有该注册的 owner 必须在关闭时
+执行反向注销。标准顺序为：先停止并关闭对应 `EngineFrameOrchestrator`，再解除 Feature
+binding，随后注销 Feature/Pipeline，最后释放 RenderGraph、FrameContext、窗口和外部
+GPU 资源。注销前必须确保相关帧、RenderGraph Execute 回调和 GPU Completion 已经收敛。
+Preferences 的独立窗口按该顺序关闭：停止其 Orchestrator，解除 ImGui RenderFeature
+binding，注销临时 Registry 内容，释放 ImGui/RenderGraph/RHI 资源，最后销毁 native
+窗口；这样同一 Preferences 窗口可以安全地再次打开。
 
 ### 20.2 卸载模块
 
@@ -3541,6 +3592,12 @@ Pipeline Cache。
 | `Engine/World`         | WorldHandle、WorldScope、ECS 快照、命令和 World Archive       | World Scope 数据所有者；不持有稳定场景身份 |
 | `Engine/Scene`         | SceneAsset、稳定实体层级、反射组件载荷和运行时实例化         | 当前提供版本化 Scene Asset；Prefab 继承、资源解析和迁移回调仍未实现 |
 
+Application 侧的编辑器实现不属于 Engine 运行时依赖：`Application/Editor` 负责窗口、
+Surface、Swapchain、FrameContext、Orchestrator 和 native 错误通知；
+`Application/EditorFramework` 负责后端无关的 ImGui Host、RenderFeature 适配、Workspace、
+Preferences 和字体状态。EditorFramework 的 UI GPU 资源仍通过 Engine 的 Resource、RHI
+和 RenderGraph public API 完成，Engine 不反向依赖这些编辑器业务。
+
 当前专用 Scope Host、动态模块 Loader 和部分模块化运行时仍属于架构目标；Renderer 已作为当前实现的
 独立模块提供 World-to-Render 提取、RenderSceneSnapshot 和标准 RenderPipeline。
 `WorldScope` 已提供 World/ECS 与通用 `PipelineScopeHost` 的基础适配，但尚未引入独立的
@@ -3614,7 +3671,13 @@ WorkerExecutor 视为真实 GPU 执行线程。
     RHI 生命周期管理。
 18. RenderGraph 负责资源生命周期、Barrier 和 Queue Sync；RHI 负责后端无关 GPU 接口。
 19. 公共 Pipeline/RHI/Shader API 不得暴露 Vulkan、D3D12 或其他后端专属类型。
-20. 诊断必须能够定位到 Pipeline、Feature、Part、Stage 和 Artifact 来源路径。
+20. RenderGraph 执行上下文只允许资源解析、绑定、绘制、复制、清屏和受控渲染状态操作，
+    不得暴露 `Device`、Command List 或 native handle。
+21. 已导入的 Swapchain image 必须由首个访问 batch 等待 acquire，并由最终输出 batch
+    signal present；该语义不得依赖 Feature 或 Pass 注册顺序。
+22. 诊断必须能够定位到 Pipeline、Feature、Part、Stage 和 Artifact 来源路径。
+23. EditorFramework 只能通过 Engine public API 使用 GPU 资源和 RenderGraph；编辑器
+    字体预览、应用字体与游戏运行时字体必须保持独立。
 
 这套架构的使用关系可以概括为：
 

@@ -2,7 +2,7 @@
 
 > 文档性质：项目级目录、模块边界、命名和扩展约定
 >
-> 维护日期：2026-09-10
+> 维护日期：2026-09-12
 >
 > 详细 API 语义以各模块 `public` 头文件为准；AEG Domain-Oriented Pipeline Architecture
 > 文档负责说明完整的 Pipeline 架构。本文件只保留所有开发者都必须遵守的项目级规则。
@@ -46,15 +46,27 @@
 
 ### 2.2 `Application` 一级目录
 
-| 目录              | 职责                                                                               |
-|-------------------|------------------------------------------------------------------------------------|
-| `Editor`          | 编辑器应用入口、真实编辑器面板、编辑器数据桥接和应用侧帧编排                       |
-| `EditorFramework` | 编辑器状态、工具窗口、选择集、属性面板、场景预览和编辑器扩展生命周期；Experimental |
-| `Platform`        | 操作系统窗口、Surface 和平台事件的具体实现；公共语义来自 `Engine/Platform/public`  |
+| 目录              | 职责                                                                                                                |
+|-------------------|---------------------------------------------------------------------------------------------------------------------|
+| `Editor`          | 编辑器应用入口、主窗口和独立工具窗口、Surface/Swapchain、FrameContext、Orchestrator、错误通知和应用侧帧编排         |
+| `EditorFramework` | Engine-owned ImGui Host、工具窗口、Workspace、Preferences、字体目录状态、场景预览和编辑器扩展生命周期；Experimental |
+| `Platform`        | 操作系统窗口、Surface 和平台事件的具体实现；公共语义来自 `Engine/Platform/public`                                   |
+
+`Application/Editor` 是应用组合层，负责创建和销毁窗口、Surface、Swapchain、FrameContext
+和 `EngineFrameOrchestrator`，并将 Engine 错误转换为 Application-owned native dialog。
+主编辑器和 Preferences 使用各自的窗口及帧资源；Preferences 关闭时必须先停止其
+Orchestrator、解除临时 RenderFeature binding，再释放 Graph/RHI 资源和窗口，才能再次打开。
 
 `Application/EditorFramework` 可以依赖 Engine 的公共接口，但 Engine 的任何模块不得依赖
-Application 或编辑器业务数据。编辑器框架不得直接包含 Application/Platform 的 private
-头文件，也不得直接调用 Win32、Vulkan、D3D12 或其他 native API。
+Application 或编辑器业务数据。EditorFramework 只负责后端无关的 ImGui Context、Panel、
+Workspace、Preferences draft/applied state、字体元数据和 Draw Packet；它不得直接包含
+Application/Platform 的 private 头文件，也不得直接调用 Win32、Vulkan、D3D12 或其他
+native API。ImGui 只能作为 CPU UI construction layer 使用，UI GPU 资源必须通过 Engine
+Resource/RHI/RenderGraph 创建、绑定、上传和退休。
+
+编辑器字体设置只影响编辑器自身；Preferences 的 preview font 是独立 Host 内的暂态状态，
+不得修改主编辑器的 applied font，也不得影响正在开发的游戏运行时字体资源。native 错误
+dialog 不得使用 ImGui 组件嵌套显示。
 
 `Engine/Platform/public` 只表达后端无关的窗口身份、状态、Surface 绑定和平台服务。窗口
 位置、尺寸、显示、聚焦和关闭请求可以由编辑器多视口使用，但不得把 HWND、X11 Window 或
@@ -266,23 +278,54 @@ Shader 名称另遵守 `shaders/SHADER_NAMING.md`。
 
 - `rhi.hpp`、`rhi_struct.hpp`、`rhi_config.hpp` 必须保持后端无关。
 - Vulkan、D3D12、VMA 和平台窗口类型只能出现在 RHI private 后端或适配实现中。
+- RHI public 只能暴露后端无关语义、固定宽度描述和 opaque Handle；不得暴露 native 对象、
+  后端 Command List 或隐含后端所有权的指针。
 - RHI Handle 只能交给创建它的 Device 使用和销毁；0 表示无效 Handle。
 - Buffer/Texture 创建时必须声明整个生命周期需要的 Capability，不能依赖后续隐式补能力。
 - Physical Device 选择必须综合评估可用性、能力、队列、Swapchain、内存和设备特征，不得
   只按“独立显卡”分类选择。
 - GPU 同步必须通过 `GpuSyncPoint`、Queue Submission 和明确的等待关系表达。
+- `RenderPassCommandContext` 和 Pipeline 的 `RenderPassExecutionContext` 均不得暴露
+  `rhi::Device&`、Command List、native handle、资源创建或资源销毁能力；Device 只能由
+  拥有对应 Runtime/Application/Resource 生命周期的上层对象管理。
+- 所有 UI 和编辑器 GPU 资源同样必须经由 Resource/RHI/RenderGraph 创建、上传、绑定和
+  延迟销毁；EditorFramework 不得绕过这些路径。
 
 ### 7.2 RenderGraph
 
 - RenderGraph 必须先声明资源和 Pass，再 Compile，最后 Execute。
 - Pass Setup 负责声明资源访问；Pass Execute 负责录制命令，二者不能混用生命周期。
+- Pass Execute 只能使用受限 execution context：资源/View 解析、Rendering begin/end、
+  viewport/scissor、Pipeline/Binding 绑定、常量、顶点/索引、绘制、Dispatch、复制和清屏。
+  不得通过 context 取得 Device、Command List 或后端 native handle。
 - RenderGraph 使用显式 Barrier；不得让后端通过隐式状态猜测替代图声明。
 - 跨 Queue 的资源依赖必须同时表达资源状态、内存可见性和 Queue Transfer。
 - Imported 资源由外部 Owner 管理，Graph 不负责销毁；Transient 资源由 Graph 管理其图内
   生命周期。
 - Graph Handle 不能跨 Graph、跨 generation 或跨 reset 使用。
+- Swapchain acquire/present 同步由 `EngineFrameOrchestrator` 与 RenderGraph/RHI 共同维护，
+  不得依赖 Feature、Pass 或面板注册顺序。首个访问 Swapchain image 的 batch 必须等待
+  acquire，最终输出 batch 必须 signal present；`present()` 使用该完成依赖。
+- Imported Swapchain image 的 Owner 是 Swapchain/FrameContext/Runtime；RenderGraph 只借用
+  其当前帧记录，不得销毁 Swapchain image、View 或外部 Surface。
 
-### 7.3 Shader
+### 7.3 Editor Framework 与 UI 资源约定
+
+- `Application/EditorFramework` 是 Application 层的 `Experimental` 模块，不是 Engine Runtime
+  的必要依赖；Engine 不得 include 或链接其实现。
+- EditorFramework public/private 均不得直接 include `Application/Platform/private`，不得
+  直接调用 Win32、Vulkan、D3D12 或其他 native API。
+- Dear ImGui 只负责 CPU 侧 UI 构建、输入和 Draw Packet 捕获；不得自行拥有 Swapchain、
+  Device、Command、RenderGraph Pass 或 native 图形句柄。
+- `ImGuiTextureRegistry` 只保存借用的 RHI texture/view/sampler binding，不拥有底层资源。
+  绑定替换或注销必须发生在提交中的 UI 绘制完成之后。
+- Preferences 的 preview font 只改变独立 Preferences Host 的暂态预览；Apply/Save 才能
+  修改主编辑器的 applied font。编辑器字体设置不得改变游戏运行时字体。
+- 编辑器运行时错误必须转换为可恢复的错误状态或 Application-owned native dialog；
+  Editor 不得因普通 Engine `Result` 直接触发无条件进程退出。native error dialog 不得
+  嵌套 ImGui 组件。
+
+### 7.4 Shader
 
 - Shader 使用原生、平台无关的 HLSL，不写入 Vulkan、D3D12 或平台专属语法。
 - Shader 文件名使用 `<functional_name>.<stage>.hlsl`，功能名和目录使用小写 snake_case。
@@ -361,6 +404,29 @@ Shader 名称另遵守 `shaders/SHADER_NAMING.md`。
 
 测试必须验证可观察契约，而不是 private 实现细节。无法在当前平台自动测试的后端或窗口行为，
 应保留最小 smoke 覆盖，并在模块 README 中说明人工验证前提。
+
+### 11.1 编辑器与 RHI/RenderGraph 回归
+
+编辑器窗口和 Engine-owned UI 的渲染回归必须覆盖以下可观察行为：
+
+- 至少覆盖 `Graphics(clear) -> Copy(upload) -> Graphics(ImGui)` 的多 batch 帧，验证
+  Clear、上传和 ImGui 绘制之间的资源状态、Queue Dependency 和提交顺序。
+- 自动执行窗口放大、缩小和恢复到原始显示尺寸，连续运行 30 至 60 帧；测试不得依赖
+  人工拖动窗口完成验证。
+- 任何 `Vulkan validation [ERROR]` 都必须使测试失败，不能只记录日志后继续通过。
+- 必须通过 framebuffer/readback 像素检查确认清屏区域没有上一帧或旧 Swapchain image
+  残留；检查应覆盖边缘探针和 UI 绘制区域。
+- Preferences 回归必须覆盖打开、关闭、再次打开和再次关闭；独立窗口关闭后不得保留
+  已注销的 ImGui binding、RenderGraph、BindingSet 或旧 Texture View 引用。
+- 修改 Preferences 字体或字号时，只允许改变独立 preview Host；主编辑器的 applied font
+  和游戏运行时字体必须保持不变，Apply/Save 后才允许更新编辑器 applied state。
+- 字体/纹理切换不得出现 `Texture view is still referenced`、`stbtt_InitFont` 解析失败、
+  进程级 assertion 或无故退出；普通 Engine `Result` 必须转为编辑器错误状态或 native
+  error dialog。
+
+当前 Windows 编辑器测试应至少注册主编辑器 60 帧 resize 回归和 Preferences 生命周期回归，
+并为这两个测试设置 `Vulkan validation \\[ERROR\\]` 失败正则；无法启动图形环境时，测试
+必须明确报告环境前置失败，而不是静默跳过。
 
 ## 12. 变更兼容性规则
 
