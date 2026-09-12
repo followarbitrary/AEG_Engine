@@ -199,10 +199,10 @@ void EditorPreferencePanel::build_ui() {
                             const bool selected = font.key == state.active_font_key;
                             if (ImGui::Selectable(font.display_name.c_str(), selected)) {
                                 if (const foundation::Result result = model_->select_font(font.key); !result) {
-                                    static_cast<void>(model_->set_error(result.message));
+                                    static_cast<void>(model_->set_error("The editor preference could not be updated. Please try again."));
                                 } else if (const foundation::Result preview_result = actions_->preview(model_->state());
                                            !preview_result) {
-                                    static_cast<void>(model_->set_error(preview_result.message));
+                                    static_cast<void>(model_->set_error("The editor font preview could not be updated. Please try again."));
                                 }
                             }
                             if (selected) {
@@ -220,10 +220,10 @@ void EditorPreferencePanel::build_ui() {
                     if (ImGui::DragFloat("##FontSize", &font_size, 0.1f, kMinimumEditorFontSizePixels,
                                          kMaximumEditorFontSizePixels, "%.1f")) {
                         if (const foundation::Result result = model_->set_font_size(font_size); !result) {
-                            static_cast<void>(model_->set_error(result.message));
+                            static_cast<void>(model_->set_error("The editor preference could not be updated. Please try again."));
                         } else if (const foundation::Result preview_result = actions_->preview(model_->state());
                                    !preview_result) {
-                            static_cast<void>(model_->set_error(preview_result.message));
+                            static_cast<void>(model_->set_error("The editor font preview could not be updated. Please try again."));
                         }
                     }
 
@@ -296,15 +296,15 @@ void EditorPreferencePanel::build_ui() {
     ImGui::SameLine(footer_start_x);
     if (ImGui::Button("Reset Defaults")) {
         if (const foundation::Result result = model_->reset_defaults(); !result) {
-            static_cast<void>(model_->set_error(result.message));
+            static_cast<void>(model_->set_error("The editor preference could not be updated. Please try again."));
         } else if (const foundation::Result preview_result = actions_->preview(model_->state()); !preview_result) {
-            static_cast<void>(model_->set_error(preview_result.message));
+            static_cast<void>(model_->set_error("The editor font preview could not be updated. Please try again."));
         }
     }
     ImGui::SameLine();
     if (ImGui::Button("Cancel")) {
         if (const foundation::Result result = actions_->cancel(model_->applied_state()); !result) {
-            static_cast<void>(model_->set_error(result.message));
+            static_cast<void>(model_->set_error("The editor preference could not be updated. Please try again."));
         }
     }
     ImGui::SameLine();
@@ -313,7 +313,7 @@ void EditorPreferencePanel::build_ui() {
     }
     if (ImGui::Button("Apply")) {
         if (const foundation::Result result = actions_->apply(state); !result) {
-            static_cast<void>(model_->set_error(result.message));
+            static_cast<void>(model_->set_error("The editor preference could not be updated. Please try again."));
         }
     }
     if (!state.dirty) {
@@ -326,7 +326,7 @@ void EditorPreferencePanel::build_ui() {
     }
     if (ImGui::Button("Save")) {
         if (const foundation::Result result = actions_->save(state); !result) {
-            static_cast<void>(model_->set_error(result.message));
+            static_cast<void>(model_->set_error("The editor preference could not be updated. Please try again."));
         }
     }
     if (!state.dirty) {

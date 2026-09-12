@@ -30,6 +30,7 @@
 #include "imgui_renderer.hpp"
 #include "imgui_texture_registry.hpp"
 #include "input_system.hpp"
+#include "logging.hpp"
 #include "pipeline.hpp"
 #include "render_graph.hpp"
 #include "renderer.hpp"
@@ -101,15 +102,11 @@ bool report_result(const Result& result, std::string_view operation) {
     if (result) {
         return true;
     }
+    AEG_LOG_ERROR(aeg::logging::Category::kApplication, "Editor operation {} failed [{}]: {}", operation,
+                  aeg::foundation::result_code_name(result.code), result.message);
     try {
-        std::string message;
-        message.reserve(operation.size() + result.message.size() + 32u);
-        message.append(operation);
-        message.append(" failed [");
-        message.append(aeg::foundation::result_code_name(result.code));
-        message.append("]: ");
-        message.append(result.message.empty() ? "No diagnostic was provided." : result.message);
-        static_cast<void>(aeg::application::show_error_dialog("AEG Editor Error", message));
+        static_cast<void>(aeg::application::show_error_dialog(
+            "AEG Editor Error", "The editor could not complete an initialization step."));
     } catch (...) {
         static_cast<void>(aeg::application::show_error_dialog("AEG Editor Error",
                                                                "The editor could not complete an initialization step."));
@@ -700,6 +697,8 @@ private:
         if (result) {
             return;
         }
+        AEG_LOG_ERROR(aeg::logging::Category::kApplication, "Editor operation {} failed [{}]: {}", operation,
+                      aeg::foundation::result_code_name(result.code), result.message);
         const EditorErrorSeverity severity = is_fatal_runtime_error(result.code)
                                                  ? EditorErrorSeverity::kFatal
                                                  : EditorErrorSeverity::kRecoverable;
@@ -724,11 +723,7 @@ private:
         try {
             std::string message;
             message.reserve(notice->operation.size() + notice->message.size() + 96u);
-            message.append(notice->operation);
-            message.append(" failed [");
-            message.append(aeg::foundation::result_code_name(notice->code));
-            message.append("]: ");
-            message.append(notice->message.empty() ? "No diagnostic was provided." : notice->message);
+            message.append("The editor could not complete the requested operation.");
             if (notice->occurrence_count > 1) {
                 message.append("\nOccurrences: ");
                 message.append(std::to_string(notice->occurrence_count));
@@ -1273,7 +1268,7 @@ private:
             if (!preview_result) {
                 notify_runtime_result(preview_result, "preview_editor_font");
                 if (preference_model_ != nullptr) {
-                    static_cast<void>(preference_model_->set_error(preview_result.message));
+                    static_cast<void>(preference_model_->set_error("The font preview could not be updated. Please try again."));
                 }
                 return !fatal_runtime_error_;
             }
@@ -1304,7 +1299,7 @@ private:
                 return false;
             }
             if (preference_model_ != nullptr) {
-                static_cast<void>(preference_model_->set_error(set_font_result.message));
+                static_cast<void>(preference_model_->set_error("The selected editor font could not be loaded."));
             }
             return true;
         }
@@ -1319,7 +1314,7 @@ private:
                 return false;
             }
             if (preference_model_ != nullptr) {
-                static_cast<void>(preference_model_->set_error(refresh_result.message));
+                static_cast<void>(preference_model_->set_error("The editor font could not be applied. Please try again."));
             }
             return true;
         }
