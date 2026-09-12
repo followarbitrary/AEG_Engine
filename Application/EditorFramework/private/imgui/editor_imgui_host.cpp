@@ -4,12 +4,15 @@
  */
 #include <imgui.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <exception>
 #include <limits>
 #include <mutex>
 #include <new>
+#include <span>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -125,14 +128,149 @@ struct EditorImGuiHost::Impl final {
     std::vector<platform::WindowEvent> pending_events{};
     std::vector<platform::WindowEvent> frame_events{};
     std::vector<PanelSlot> panels{};
+    /** @brief Font assets copied from the application catalog at initialization. */
+    std::vector<EditorFontAsset> fonts{};
+    /** @brief CPU snapshot of the current atlas awaiting an application upload. */
     ImGuiFontAtlasData font_atlas{};
+    /** @brief Engine-managed texture identity currently bound to the atlas. */
     ImGuiTextureHandle font_texture{};
+    /** @brief Stable preference key of the active font. */
+    std::string active_font_key{};
+    /** @brief Base pixel size used to build the active font atlas. */
+    float active_font_size_pixels{16.0f};
+    /** @brief Stable preference key of the isolated preview font. */
+    std::string preview_font_key{};
+    /** @brief Base pixel size used to build the isolated preview font. */
+    float preview_font_size_pixels{0.0f};
+    /** @brief Font object used only by the Preferences preview sample. */
+    ImFont* preview_font{nullptr};
     /** @brief Monotonic frame identity copied into every captured viewport packet. */
     uint64_t frame_number{0};
     /** @brief True after initialization has installed the ImGui context and bridge. */
     bool initialized{false};
     /** @brief True between begin_frame() and end_frame(). */
     bool frame_active{false};
+
+    [[nodiscard]] const EditorFontAsset* find_font(std::string_view font_key) const noexcept {
+        const auto iterator = std::find_if(fonts.begin(), fonts.end(), [font_key](const EditorFontAsset& asset) {
+            return asset.descriptor.key == font_key;
+        });
+        return iterator == fonts.end() ? nullptr : &*iterator;
+    }
+
+    [[nodiscard]] const EditorFontAsset* find_chinese_fallback() const noexcept {
+        const auto iterator = std::find_if(fonts.begin(), fonts.end(), [](const EditorFontAsset& asset) {
+            return asset.descriptor.kind == EditorFontKind::kInterface && asset.descriptor.supports_chinese;
+        });
+        return iterator == fonts.end() ? nullptr : &*iterator;
+    }
+
+    [[nodiscard]] foundation::Result add_font(std::string_view font_key, float size_pixels, ImFont*& output_font) {
+        ImGuiIO& io = ImGui::GetIO();
+        if (font_key.empty()) {
+            ImFontConfig config{};
+            config.SizePixels = size_pixels;
+            output_font = io.Fonts->AddFontDefault(&config);
+            return output_font != nullptr ? foundation::Result::success()
+                                          : foundation::invalid_state("Editor primary font could not be created");
+        }
+
+        const EditorFontAsset* asset = find_font(font_key);
+        if (asset == nullptr) {
+            return foundation::not_found("Editor font key is not registered");
+        }
+        ImFontConfig config{};
+        config.FontDataOwnedByAtlas = false;
+        config.FontNo = static_cast<int>(asset->face_index);
+        config.SizePixels = size_pixels;
+        output_font = io.Fonts->AddFontFromMemoryTTF(
+            const_cast<std::byte*>(asset->font_data.data()), static_cast<int>(asset->font_data.size()), size_pixels, &config);
+        if (output_font == nullptr) {
+            return foundation::invalid_argument("Editor font TTF data could not be loaded");
+        }
+
+        if (!asset->descriptor.supports_chinese) {
+            const EditorFontAsset* fallback = find_chinese_fallback();
+            if (fallback != nullptr && fallback != asset) {
+                ImFontConfig fallback_config{};
+                fallback_config.FontDataOwnedByAtlas = false;
+                fallback_config.MergeMode = true;
+                fallback_config.FontNo = static_cast<int>(fallback->face_index);
+                fallback_config.SizePixels = size_pixels;
+                if (io.Fonts->AddFontFromMemoryTTF(
+                        const_cast<std::byte*>(fallback->font_data.data()), static_cast<int>(fallback->font_data.size()),
+                        size_pixels, &fallback_config, io.Fonts->GetGlyphRangesChineseSimplifiedCommon()) == nullptr) {
+                    return foundation::invalid_argument("Editor Chinese fallback font could not be loaded");
+                }
+            }
+        }
+        return foundation::Result::success();
+    }
+
+    [[nodiscard]] foundation::Result rebuild_font_atlas(std::string_view font_key, float size_pixels,
+                                                        std::string_view next_preview_font_key = {},
+                                                        float next_preview_font_size_pixels = 0.0f) {
+        ImGuiIO& io = ImGui::GetIO();
+        font_texture = {};
+        io.Fonts->Clear();
+
+        ImFont* primary_font = nullptr;
+        if (const foundation::Result result = add_font(font_key, size_pixels, primary_font); !result) {
+            return result;
+        }
+
+        ImFont* next_preview_font = nullptr;
+        if (!next_preview_font_key.empty()) {
+            if (next_preview_font_key == font_key && next_preview_font_size_pixels == size_pixels) {
+                next_preview_font = primary_font;
+            } else if (const foundation::Result result =
+                           add_font(next_preview_font_key, next_preview_font_size_pixels, next_preview_font);
+                       !result) {
+                return result;
+            }
+        }
+
+        if (primary_font == nullptr) {
+            return foundation::invalid_state("Editor primary font could not be created");
+        }
+        io.FontDefault = primary_font;
+
+        unsigned char* font_pixels = nullptr;
+        int font_width = 0;
+        int font_height = 0;
+        io.Fonts->GetTexDataAsRGBA32(&font_pixels, &font_width, &font_height);
+        if (font_pixels == nullptr || font_width <= 0 || font_height <= 0) {
+            return foundation::invalid_state("Dear ImGui font atlas construction failed");
+        }
+        const uint64_t row_pitch = static_cast<uint64_t>(font_width) * 4u;
+        const uint64_t pixel_size = row_pitch * static_cast<uint64_t>(font_height);
+        if (static_cast<uint64_t>(font_width) > std::numeric_limits<uint32_t>::max() ||
+            static_cast<uint64_t>(font_height) > std::numeric_limits<uint32_t>::max() ||
+            row_pitch > std::numeric_limits<uint32_t>::max() ||
+            pixel_size > std::numeric_limits<std::size_t>::max()) {
+            return foundation::invalid_state("Dear ImGui font atlas size exceeds engine limits");
+        }
+
+        try {
+            ImGuiFontAtlasData captured{};
+            captured.width = static_cast<uint32_t>(font_width);
+            captured.height = static_cast<uint32_t>(font_height);
+            captured.row_pitch = static_cast<uint32_t>(row_pitch);
+            const auto* begin = reinterpret_cast<const std::byte*>(font_pixels);
+            captured.rgba8_pixels.assign(begin, begin + static_cast<std::size_t>(pixel_size));
+            font_atlas = std::move(captured);
+            active_font_key = font_key;
+            active_font_size_pixels = size_pixels;
+            preview_font_key = next_preview_font_key;
+            preview_font_size_pixels = next_preview_font == nullptr ? 0.0f : next_preview_font_size_pixels;
+            preview_font = next_preview_font;
+            font_texture = {};
+            io.Fonts->SetTexID(ImTextureRef(static_cast<ImTextureID>(0)));
+            return foundation::Result::success();
+        } catch (const std::bad_alloc&) {
+            return foundation::out_of_memory("Dear ImGui font atlas snapshot allocation failed");
+        }
+    }
 };
 
 EditorImGuiHost::EditorImGuiHost() : impl_(std::make_unique<Impl>()) {}
@@ -151,7 +289,29 @@ foundation::Result EditorImGuiHost::initialize(const EditorImGuiDesc& desc) {
         return foundation::invalid_argument("EditorImGui font_global_scale must be finite and positive");
     }
 
+    if (!std::isfinite(desc.font_size_pixels) || desc.font_size_pixels <= 0.0f) {
+        return foundation::invalid_argument("Editor ImGui font_size_pixels must be finite and positive");
+    }
+
+    try {
+        impl_->fonts.clear();
+        if (desc.font_catalog != nullptr) {
+            const std::span<const EditorFontAsset> assets = desc.font_catalog->assets();
+            impl_->fonts.assign(assets.begin(), assets.end());
+        }
+    } catch (const std::bad_alloc&) {
+        return foundation::out_of_memory("Editor font catalog copy allocation failed");
+    }
+
     impl_->desc = desc;
+    impl_->desc.font_catalog = nullptr;
+    impl_->font_atlas.clear();
+    impl_->font_texture = {};
+    impl_->active_font_key.clear();
+    impl_->active_font_size_pixels = desc.font_size_pixels;
+    impl_->preview_font_key.clear();
+    impl_->preview_font_size_pixels = 0.0f;
+    impl_->preview_font = nullptr;
     impl_->context = ImGui::CreateContext();
     if (impl_->context == nullptr) {
         return foundation::out_of_memory("Dear ImGui context creation failed");
@@ -168,45 +328,23 @@ foundation::Result EditorImGuiHost::initialize(const EditorImGuiDesc& desc) {
         io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
     }
     io.FontGlobalScale = desc.font_global_scale;
+    // Treat user-provided font data errors as Result failures instead of process-level assertions.
+    io.ConfigErrorRecoveryEnableAssert = false;
     io.IniFilename = nullptr;
     io.BackendPlatformName = "AEG.Editor.ImGuiPlatformBridge";
     io.BackendRendererName = nullptr;
     io.BackendFlags = ImGuiBackendFlags_None;
     detail::ImGuiPlatformBridge::install(io, impl_->platform_bridge, desc.platform_services, desc.window_system,
                                          desc.enable_viewports);
-    unsigned char* font_pixels = nullptr;
-    int font_width = 0;
-    int font_height = 0;
-    io.Fonts->GetTexDataAsRGBA32(&font_pixels, &font_width, &font_height);
-    if (font_pixels == nullptr || font_width <= 0 || font_height <= 0) {
+    if (const foundation::Result result = impl_->rebuild_font_atlas(desc.default_font_key, desc.font_size_pixels);
+        !result) {
         ImGui::DestroyContext(impl_->context);
         impl_->context = nullptr;
-        return foundation::invalid_state("Dear ImGui font atlas construction failed");
+        impl_->fonts.clear();
+        impl_->font_atlas.clear();
+        return result;
     }
-    if (static_cast<uint64_t>(font_width) > std::numeric_limits<uint32_t>::max() ||
-        static_cast<uint64_t>(font_height) > std::numeric_limits<uint32_t>::max()) {
-        ImGui::DestroyContext(impl_->context);
-        impl_->context = nullptr;
-        return foundation::invalid_state("Dear ImGui font atlas dimensions exceed engine limits");
-    }
-    const uint64_t row_pitch = static_cast<uint64_t>(font_width) * 4u;
-    const uint64_t pixel_size = row_pitch * static_cast<uint64_t>(font_height);
-    if (row_pitch > std::numeric_limits<uint32_t>::max() || pixel_size > std::numeric_limits<std::size_t>::max()) {
-        ImGui::DestroyContext(impl_->context);
-        impl_->context = nullptr;
-        return foundation::invalid_state("Dear ImGui font atlas size exceeds engine limits");
-    }
-    try {
-        impl_->font_atlas.width = static_cast<uint32_t>(font_width);
-        impl_->font_atlas.height = static_cast<uint32_t>(font_height);
-        impl_->font_atlas.row_pitch = static_cast<uint32_t>(row_pitch);
-        const auto* begin = reinterpret_cast<const std::byte*>(font_pixels);
-        impl_->font_atlas.rgba8_pixels.assign(begin, begin + static_cast<std::size_t>(pixel_size));
-    } catch (const std::bad_alloc&) {
-        ImGui::DestroyContext(impl_->context);
-        impl_->context = nullptr;
-        return foundation::out_of_memory("Dear ImGui font atlas snapshot allocation failed");
-    }
+    impl_->desc.default_font_key = {};
     impl_->initialized = true;
     return foundation::Result::success();
 }
@@ -229,8 +367,15 @@ foundation::Result EditorImGuiHost::shutdown() {
     impl_->pending_events.clear();
     impl_->frame_events.clear();
     impl_->panels.clear();
+    impl_->fonts.clear();
     impl_->font_atlas.clear();
     impl_->font_texture = {};
+    impl_->active_font_key.clear();
+    impl_->active_font_size_pixels = 16.0f;
+    impl_->preview_font_key.clear();
+    impl_->preview_font_size_pixels = 0.0f;
+    impl_->preview_font = nullptr;
+    impl_->desc = {};
     impl_->initialized = false;
     return foundation::Result::success();
 }
@@ -277,6 +422,71 @@ foundation::Result EditorImGuiHost::capture_font_atlas(ImGuiFontAtlasData& atlas
     } catch (const std::bad_alloc&) {
         return foundation::out_of_memory("Dear ImGui font atlas copy allocation failed");
     }
+}
+
+foundation::Result EditorImGuiHost::set_font(std::string_view font_key, float size_pixels) {
+    if (!impl_->initialized) {
+        return foundation::invalid_state("EditorImGuiHost is not initialized");
+    }
+    if (impl_->frame_active) {
+        return foundation::invalid_state("Editor font cannot change during an active frame");
+    }
+    if (!std::isfinite(size_pixels) || size_pixels <= 0.0f) {
+        return foundation::invalid_argument("Editor font size must be finite and positive");
+    }
+    if (!font_key.empty() && impl_->find_font(font_key) == nullptr) {
+        return foundation::not_found("Editor font key is not registered");
+    }
+
+    ImGui::SetCurrentContext(impl_->context);
+    return impl_->rebuild_font_atlas(font_key, size_pixels);
+}
+
+foundation::Result EditorImGuiHost::set_preview_font(std::string_view font_key, float size_pixels) {
+    if (!impl_->initialized) {
+        return foundation::invalid_state("EditorImGuiHost is not initialized");
+    }
+    if (impl_->frame_active) {
+        return foundation::invalid_state("Editor preview font cannot change during an active frame");
+    }
+    if (font_key.empty()) {
+        return foundation::invalid_argument("Editor preview font key is empty");
+    }
+    if (!std::isfinite(size_pixels) || size_pixels <= 0.0f) {
+        return foundation::invalid_argument("Editor preview font size must be finite and positive");
+    }
+    if (impl_->find_font(font_key) == nullptr) {
+        return foundation::not_found("Editor preview font key is not registered");
+    }
+
+    ImGui::SetCurrentContext(impl_->context);
+    return impl_->rebuild_font_atlas(impl_->active_font_key, impl_->active_font_size_pixels, font_key, size_pixels);
+}
+
+std::string_view EditorImGuiHost::active_font_key() const noexcept {
+    if (impl_ == nullptr) {
+        return {};
+    }
+    return impl_->active_font_key;
+}
+
+float EditorImGuiHost::active_font_size_pixels() const noexcept {
+    return impl_ != nullptr ? impl_->active_font_size_pixels : 0.0f;
+}
+
+std::string_view EditorImGuiHost::preview_font_key() const noexcept {
+    if (impl_ == nullptr) {
+        return {};
+    }
+    return impl_->preview_font_key;
+}
+
+float EditorImGuiHost::preview_font_size_pixels() const noexcept {
+    return impl_ != nullptr ? impl_->preview_font_size_pixels : 0.0f;
+}
+
+const void* EditorImGuiHost::preview_font() const noexcept {
+    return impl_ != nullptr ? impl_->preview_font : nullptr;
 }
 
 foundation::Result EditorImGuiHost::begin_frame(const EditorImGuiFrameDesc& desc) {

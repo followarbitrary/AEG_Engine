@@ -157,7 +157,7 @@ foundation::ResultValue<std::shared_ptr<platform::IWindow>> Win32WindowSystem::c
         window->attach(handle);
         window->sync_state_from_native();
         if (desc.visible) {
-            ShowWindow(handle, SW_SHOWNORMAL);
+            ShowWindow(handle, desc.start_maximized ? SW_MAXIMIZE : SW_SHOWNORMAL);
             UpdateWindow(handle);
             window->sync_state_from_native();
         }
@@ -348,6 +348,34 @@ foundation::ResultValue<platform::WindowMetrics> Win32WindowSystem::query_window
                                     scale, scale}};
 }
 
+foundation::ResultValue<platform::DisplayWorkArea> Win32WindowSystem::query_display_work_area(
+    platform::WindowId window) const {
+    if (!window.is_valid() || window.index >= windows_.size()) {
+        return {foundation::not_found("Win32 window identity is not registered"), {}};
+    }
+    const WindowSlot& slot = windows_[window.index];
+    if (slot.window == nullptr || slot.generation != window.generation || slot.window->hwnd_ == nullptr) {
+        return {foundation::not_found("Win32 window identity is stale"), {}};
+    }
+
+    const HMONITOR monitor = MonitorFromWindow(slot.window->hwnd_, MONITOR_DEFAULTTONEAREST);
+    if (monitor == nullptr) {
+        return {backend_error("MonitorFromWindow failed"), {}};
+    }
+    MONITORINFO monitor_info{};
+    monitor_info.cbSize = sizeof(monitor_info);
+    if (GetMonitorInfoW(monitor, &monitor_info) == FALSE) {
+        return {backend_error("GetMonitorInfoW failed"), {}};
+    }
+    const RECT& work = monitor_info.rcWork;
+    const LONG width = std::max<LONG>(work.right - work.left, 1);
+    const LONG height = std::max<LONG>(work.bottom - work.top, 1);
+    return {foundation::Result::success(),
+            platform::DisplayWorkArea{platform::WindowPosition{work.left, work.top},
+                                      platform::WindowExtent{static_cast<uint32_t>(width),
+                                                             static_cast<uint32_t>(height)}}};
+}
+
 foundation::Result Win32WindowSystem::register_window_class() {
     if (class_registered_) {
         return foundation::Result::success();
@@ -420,6 +448,50 @@ foundation::ResultValue<std::unique_ptr<platform::IWindowSystem>> create_win32_w
         return {foundation::out_of_memory("Win32 window system allocation failed"), {}};
     } catch (const std::exception& exception) {
         return {foundation::unknown_exception(exception), {}};
+    }
+}
+
+foundation::Result show_error_dialog(std::string_view title, std::string_view message) {
+    if (title.empty() || message.empty() || title.find('\0') != std::string_view::npos ||
+        message.find('\0') != std::string_view::npos ||
+        title.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+        message.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        return foundation::Result::failure(foundation::ResultCode::kInvalidArgument);
+    }
+
+    try {
+        const auto to_wide = [](std::string_view value) -> foundation::ResultValue<std::wstring> {
+            const int source_length = static_cast<int>(value.size());
+            const int required =
+                MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(), source_length, nullptr, 0);
+            if (required <= 0) {
+                return {foundation::Result::failure(foundation::ResultCode::kBackendError), {}};
+            }
+            std::wstring converted(static_cast<std::size_t>(required), L'\0');
+            if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(), source_length, converted.data(),
+                                    required) != required) {
+                return {foundation::Result::failure(foundation::ResultCode::kBackendError), {}};
+            }
+            return {foundation::Result::success(), std::move(converted)};
+        };
+
+        const foundation::ResultValue<std::wstring> title_result = to_wide(title);
+        if (!title_result) {
+            return title_result.result;
+        }
+        const foundation::ResultValue<std::wstring> message_result = to_wide(message);
+        if (!message_result) {
+            return message_result.result;
+        }
+        if (MessageBoxW(nullptr, message_result.value.c_str(), title_result.value.c_str(),
+                        MB_OK | MB_ICONERROR | MB_TASKMODAL) == 0) {
+            return foundation::Result::failure(foundation::ResultCode::kBackendError);
+        }
+        return foundation::Result::success();
+    } catch (const std::bad_alloc&) {
+        return foundation::Result::failure(foundation::ResultCode::kOutOfMemory);
+    } catch (...) {
+        return foundation::Result::failure(foundation::ResultCode::kUnknown);
     }
 }
 }  // namespace aeg::application

@@ -1905,6 +1905,12 @@ namespace aeg::render_graph {
             std::sort(edges.begin(), edges.end());
             edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
 
+            const auto is_swapchain_texture = [this](RenderGraphTexture texture) noexcept {
+                return texture.graph_id == graph_id && texture.index < textures.size() &&
+                       textures[texture.index].generation == texture.generation &&
+                       textures[texture.index].is_swapchain_image;
+            };
+
             std::vector<uint32_t> roots;
             roots.reserve(passes.size());
             for (uint32_t pass_index = 0; pass_index < passes.size(); ++pass_index) {
@@ -1917,7 +1923,9 @@ namespace aeg::render_graph {
                                                       : textures[use.resource_index].exported;
                         root = root || exported;
                     }
-                    if (use.after_state.usage == rhi::ResourceUsage::kPresent) {
+                    if (use.after_state.usage == rhi::ResourceUsage::kPresent &&
+                        use.kind == ResourceKind::kTexture &&
+                        is_swapchain_texture(RenderGraphTexture{use.resource_index, use.resource_generation, graph_id})) {
                         root = true;
                     }
                 }
@@ -1925,12 +1933,14 @@ namespace aeg::render_graph {
                     roots.push_back(pass_index);
                 }
                 for (const ColorAttachment& attachment: pass.color_attachments) {
-                    if (attachment.final_usage == rhi::ResourceUsage::kPresent) {
+                    if (attachment.final_usage == rhi::ResourceUsage::kPresent &&
+                        is_swapchain_texture(attachment.texture)) {
                         root = true;
                     }
                 }
                 if (pass.depth_stencil.has_value() &&
-                    pass.depth_stencil->final_usage == rhi::ResourceUsage::kPresent) {
+                    pass.depth_stencil->final_usage == rhi::ResourceUsage::kPresent &&
+                    is_swapchain_texture(pass.depth_stencil->texture)) {
                     root = true;
                 }
                 if (root && std::find(roots.begin(), roots.end(), pass_index) == roots.end()) {
@@ -2213,20 +2223,26 @@ namespace aeg::render_graph {
 
             uint32_t frame_output_batches = 0;
             for (Batch& batch: batches) {
+                batch.submits_frame = false;
                 for (const uint32_t pass_index: batch.passes) {
                     const PassRecord& pass = passes[pass_index];
                     for (const ResourceUse& use: pass.uses) {
-                        if (use.after_state.usage == rhi::ResourceUsage::kPresent && is_write_access(use.access)) {
+                        if (use.after_state.usage == rhi::ResourceUsage::kPresent && is_write_access(use.access) &&
+                            use.kind == ResourceKind::kTexture &&
+                            is_swapchain_texture(RenderGraphTexture{use.resource_index, use.resource_generation,
+                                                                    graph_id})) {
                             batch.submits_frame = true;
                         }
                     }
                     for (const ColorAttachment& attachment: pass.color_attachments) {
                         batch.submits_frame = batch.submits_frame ||
-                                              attachment.final_usage == rhi::ResourceUsage::kPresent;
+                                              (attachment.final_usage == rhi::ResourceUsage::kPresent &&
+                                               is_swapchain_texture(attachment.texture));
                     }
                     if (pass.depth_stencil.has_value()) {
                         batch.submits_frame = batch.submits_frame ||
-                                              pass.depth_stencil->final_usage == rhi::ResourceUsage::kPresent;
+                                              (pass.depth_stencil->final_usage == rhi::ResourceUsage::kPresent &&
+                                               is_swapchain_texture(pass.depth_stencil->texture));
                     }
                 }
                 frame_output_batches += batch.submits_frame ? 1u : 0u;
@@ -3272,6 +3288,18 @@ namespace aeg::render_graph {
     foundation::Result RenderGraph::Impl::initialize_runtime_states(
             uint32_t frame_slot, std::vector<RuntimeBufferState>& buffer_states,
             std::vector<RuntimeTextureState>& texture_states) {
+        const auto merge_completions = [](rhi::GpuCompletionSet& destination,
+                                          const rhi::GpuCompletionSet& source) -> foundation::Result {
+            for (const rhi::GpuSyncPoint point: source.points()) {
+                if (!destination.add(point)) {
+                    return foundation::Result::failure(
+                            foundation::ResultCode::kInvalidState,
+                            "Render graph imported resource completion set is full");
+                }
+            }
+            return foundation::Result::success();
+        };
+
         try {
             buffer_states.resize(buffers.size());
             texture_states.resize(textures.size());
@@ -3295,6 +3323,22 @@ namespace aeg::render_graph {
                 if (physical == nullptr) {
                     continue;
                 }
+
+                rhi::BufferStateSnapshot imported_snapshot{};
+                if (record.lifetime == ResourceLifetime::kImported) {
+                    const foundation::ResultValue<rhi::BufferStateSnapshot> snapshot_result =
+                            device.query_buffer_state(physical->handle);
+                    if (!snapshot_result) {
+                        return snapshot_result.result;
+                    }
+                    if (const foundation::Result completion_result =
+                                merge_completions(record.last_completions, snapshot_result.value.last_use);
+                        !completion_result) {
+                        return completion_result;
+                    }
+                    imported_snapshot = snapshot_result.value;
+                }
+
                 for (uint32_t previous = 0; previous < index; ++previous) {
                     if (buffer_states[previous].physical == physical && buffer_states[previous].shared != nullptr) {
                         runtime.shared = buffer_states[previous].shared;
@@ -3302,8 +3346,38 @@ namespace aeg::render_graph {
                     }
                 }
                 if (runtime.shared == &runtime) {
-                    runtime.states = physical->states;
-                    initialize_buffer_state_segments(runtime.states, physical->desc.desc.size, physical->state);
+                    if (record.lifetime == ResourceLifetime::kImported) {
+                        if (imported_snapshot.segments.empty()) {
+                            return foundation::Result::failure(
+                                    foundation::ResultCode::kInvalidState,
+                                    "Render graph imported buffer state snapshot is empty");
+                        }
+                        uint64_t covered_size = 0;
+                        runtime.states.reserve(imported_snapshot.segments.size());
+                        for (const rhi::BufferStateSegment& segment: imported_snapshot.segments) {
+                            if (segment.size == 0 || segment.offset != covered_size ||
+                                segment.offset > physical->desc.desc.size ||
+                                segment.size > physical->desc.desc.size - segment.offset) {
+                                return foundation::Result::failure(
+                                        foundation::ResultCode::kInvalidState,
+                                        "Render graph imported buffer state snapshot is invalid");
+                            }
+                            runtime.states.push_back(BufferStateSegment{
+                                    segment.offset,
+                                    segment.size,
+                                    segment.state
+                            });
+                            covered_size += segment.size;
+                        }
+                        if (covered_size != physical->desc.desc.size) {
+                            return foundation::Result::failure(
+                                    foundation::ResultCode::kInvalidState,
+                                    "Render graph imported buffer state snapshot does not cover the resource");
+                        }
+                    } else {
+                        runtime.states = physical->states;
+                        initialize_buffer_state_segments(runtime.states, physical->desc.desc.size, physical->state);
+                    }
                 }
             }
             for (uint32_t index = 0; index < textures.size(); ++index) {
@@ -3321,6 +3395,22 @@ namespace aeg::render_graph {
                 if (physical == nullptr) {
                     continue;
                 }
+
+                rhi::TextureStateSnapshot imported_snapshot{};
+                if (record.lifetime == ResourceLifetime::kImported) {
+                    const foundation::ResultValue<rhi::TextureStateSnapshot> snapshot_result =
+                            device.query_texture_state(physical->handle);
+                    if (!snapshot_result) {
+                        return snapshot_result.result;
+                    }
+                    if (const foundation::Result completion_result =
+                                merge_completions(record.last_completions, snapshot_result.value.last_use);
+                        !completion_result) {
+                        return completion_result;
+                    }
+                    imported_snapshot = snapshot_result.value;
+                }
+
                 for (uint32_t previous = 0; previous < index; ++previous) {
                     if (texture_states[previous].physical == physical && texture_states[previous].shared != nullptr) {
                         runtime.shared = texture_states[previous].shared;
@@ -3328,7 +3418,20 @@ namespace aeg::render_graph {
                     }
                 }
                 if (runtime.shared == &runtime) {
-                    runtime.states = physical->states;
+                    if (record.lifetime == ResourceLifetime::kImported) {
+                        const size_t expected_state_count =
+                                static_cast<size_t>(physical->desc.desc.mip_levels) *
+                                physical->desc.desc.array_layers * kAspectPlaneCount;
+                        if (imported_snapshot.subresource_states.size() != expected_state_count ||
+                            expected_state_count == 0) {
+                            return foundation::Result::failure(
+                                    foundation::ResultCode::kInvalidState,
+                                    "Render graph imported texture state snapshot is invalid");
+                        }
+                        runtime.states = imported_snapshot.subresource_states;
+                    } else {
+                        runtime.states = physical->states;
+                    }
                 }
             }
         } catch (const std::bad_alloc&) {
@@ -3903,7 +4006,6 @@ namespace aeg::render_graph {
             }
 
             const rhi::FrameAcquireResult* acquired = frame_context.acquired_frame();
-            const bool signal_acquired_frame = desc.present_acquired_frame || desc.signal_present;
             uint32_t acquire_batch = kInvalidHandleIndex;
             uint32_t swapchain_texture_index = kInvalidHandleIndex;
             uint32_t final_swapchain_batch = kInvalidHandleIndex;
@@ -3939,12 +4041,12 @@ namespace aeg::render_graph {
                     }
                 }
             }
-            if (signal_acquired_frame && acquired == nullptr) {
+            if (desc.present_acquired_frame && acquired == nullptr) {
                 return fail_execution(foundation::Result::failure(
                         foundation::ResultCode::kInvalidState,
                         "Present was requested without an acquired swapchain frame"));
             }
-            if (signal_acquired_frame && final_swapchain_batch == kInvalidHandleIndex) {
+            if (desc.present_acquired_frame && final_swapchain_batch == kInvalidHandleIndex) {
                 return fail_execution(foundation::Result::failure(
                         foundation::ResultCode::kInvalidArgument,
                         "Present was requested but the graph does not access a swapchain image"));
@@ -3959,7 +4061,7 @@ namespace aeg::render_graph {
                         foundation::ResultCode::kInvalidState,
                         "Render graph present output has no acquire synchronization batch"));
             }
-            if (signal_acquired_frame && final_swapchain_batch != kInvalidHandleIndex &&
+            if (desc.present_acquired_frame && final_swapchain_batch != kInvalidHandleIndex &&
                 impl_->batches[final_swapchain_batch].queue != rhi::QueueClass::kGraphics) {
                 return fail_execution(foundation::Result::failure(
                         foundation::ResultCode::kInvalidArgument,
@@ -4164,7 +4266,7 @@ namespace aeg::render_graph {
                     }
                 }
 
-                const bool signal_present = signal_acquired_frame && batch_index == final_swapchain_batch;
+                const bool signal_present = batch_index == final_swapchain_batch;
                 if (signal_present) {
                     if (swapchain_texture_index >= texture_states.size()) {
                         return fail_execution(foundation::Result::failure(

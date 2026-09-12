@@ -146,7 +146,7 @@ Win32Window::Win32Window(platform::WindowId id, Win32WindowSystem* owner, platfo
     : id_(id),
       owner_(owner),
       desc_(std::move(desc)),
-      state_{desc_.position, desc_.extent, desc_.visible, false, false, false} {}
+      state_{desc_.position, desc_.extent, desc_.visible, false, false, false, true, false} {}
 
 Win32Window::~Win32Window() {
     destroy_native();
@@ -224,6 +224,34 @@ foundation::Result Win32Window::focus() noexcept {
     return foundation::Result::success();
 }
 
+foundation::Result Win32Window::set_maximized(bool maximized) noexcept {
+    if (hwnd_ == nullptr) {
+        return foundation::Result::failure(foundation::ResultCode::kInvalidState);
+    }
+    if (!desc_.resizable) {
+        return foundation::unsupported("Win32 window is not resizable");
+    }
+    ShowWindow(hwnd_, maximized ? SW_MAXIMIZE : SW_RESTORE);
+    sync_state_from_native();
+    if (state_.maximized != maximized) {
+        return foundation::Result::failure(foundation::ResultCode::kBackendError,
+                                            "Win32 window maximization update failed");
+    }
+    return foundation::Result::success();
+}
+
+foundation::Result Win32Window::set_input_enabled(bool enabled) noexcept {
+    if (hwnd_ == nullptr || IsWindow(hwnd_) == FALSE) {
+        return foundation::Result::failure(foundation::ResultCode::kInvalidState);
+    }
+    EnableWindow(hwnd_, enabled ? TRUE : FALSE);
+    state_.input_enabled = enabled;
+    if (!enabled) {
+        state_.focused = false;
+    }
+    return foundation::Result::success();
+}
+
 foundation::Result Win32Window::request_close() noexcept {
     if (hwnd_ == nullptr) {
         return foundation::Result::failure(foundation::ResultCode::kInvalidState);
@@ -258,6 +286,8 @@ void Win32Window::sync_state_from_native() noexcept {
         state_.extent = platform::WindowExtent{static_cast<uint32_t>(width), static_cast<uint32_t>(height)};
     }
     state_.visible = IsWindowVisible(hwnd_) != FALSE;
+    state_.maximized = IsZoomed(hwnd_) != FALSE;
+    state_.input_enabled = IsWindowEnabled(hwnd_) != FALSE;
 }
 
 foundation::Result Win32Window::set_cursor(platform::CursorShape shape) noexcept {
@@ -350,6 +380,7 @@ LRESULT Win32Window::handle_message(UINT message, WPARAM w_param, LPARAM l_param
             const uint32_t width = static_cast<uint32_t>(LOWORD(l_param));
             const uint32_t height = static_cast<uint32_t>(HIWORD(l_param));
             state_.minimized = w_param == SIZE_MINIMIZED;
+            state_.maximized = w_param == SIZE_MAXIMIZED;
             state_.extent = platform::WindowExtent{width == 0 ? 1u : width, height == 0 ? 1u : height};
             WindowEvent event{WindowEventType::kWindowResized};
             event.extent = state_.extent;
@@ -361,6 +392,12 @@ LRESULT Win32Window::handle_message(UINT message, WPARAM w_param, LPARAM l_param
             return 0;
         case WM_SHOWWINDOW:
             state_.visible = w_param != FALSE;
+            return 0;
+        case WM_ENABLE:
+            state_.input_enabled = w_param != FALSE;
+            if (!state_.input_enabled) {
+                state_.focused = false;
+            }
             return 0;
         case WM_SETFOCUS:
         case WM_KILLFOCUS: {

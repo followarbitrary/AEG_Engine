@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <string_view>
 #include <vector>
 
 #include "editor_imgui_types.hpp"
@@ -37,6 +38,20 @@ public:
     [[nodiscard]] foundation::Result set_font_texture(ImGuiTextureHandle texture);
     /** @brief Copies the engine-owned RGBA8 font atlas for upload through Resource/RHI APIs. */
     [[nodiscard]] foundation::Result capture_font_atlas(ImGuiFontAtlasData& atlas) const;
+    /** @brief Rebuilds the CPU font atlas for a registered font before the next frame. */
+    [[nodiscard]] foundation::Result set_font(std::string_view font_key, float size_pixels);
+    /** @brief Rebuilds the atlas while keeping the active UI font and changing only the preview font. */
+    [[nodiscard]] foundation::Result set_preview_font(std::string_view font_key, float size_pixels);
+    /** @brief Returns the stable key of the currently selected font. */
+    [[nodiscard]] std::string_view active_font_key() const noexcept;
+    /** @brief Returns the base pixel size used by the currently selected font. */
+    [[nodiscard]] float active_font_size_pixels() const noexcept;
+    /** @brief Returns the stable key of the font used by the preview scope. */
+    [[nodiscard]] std::string_view preview_font_key() const noexcept;
+    /** @brief Returns the base pixel size used by the preview font. */
+    [[nodiscard]] float preview_font_size_pixels() const noexcept;
+    /** @brief Returns an opaque ImGui font pointer for the current preview scope. */
+    [[nodiscard]] const void* preview_font() const noexcept;
 
     /** @brief Starts one ImGui frame using engine-owned display timing. */
     [[nodiscard]] foundation::Result begin_frame(const EditorImGuiFrameDesc& desc);

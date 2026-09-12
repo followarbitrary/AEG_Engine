@@ -35,6 +35,8 @@ public:
     [[nodiscard]] foundation::Result set_extent(platform::WindowExtent extent) noexcept override;
     [[nodiscard]] foundation::Result set_visible(bool visible) noexcept override;
     [[nodiscard]] foundation::Result focus() noexcept override;
+    [[nodiscard]] foundation::Result set_maximized(bool maximized) noexcept override;
+    [[nodiscard]] foundation::Result set_input_enabled(bool enabled) noexcept override;
     [[nodiscard]] foundation::Result request_close() noexcept override;
 
     void attach(HWND handle) noexcept { hwnd_ = handle; }

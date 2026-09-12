@@ -260,6 +260,24 @@ struct ImGuiRenderer::Impl final {
     Impl(rhi::Device& device_reference, ImGuiTextureRegistry& registry_reference)
         : device(device_reference), texture_registry(registry_reference), resource_uploader(device_reference) {}
 
+    /** @brief Stores a prepared frame while its FrameContext may still retain GPU references. */
+    [[nodiscard]] foundation::Result store_prepared_frame(std::shared_ptr<PreparedFrame> prepared) {
+        if (prepared == nullptr) {
+            return foundation::invalid_argument("ImGui prepared frame cannot be empty");
+        }
+        prepared_frame_history.erase(
+            std::remove_if(prepared_frame_history.begin(), prepared_frame_history.end(),
+                           [](const std::weak_ptr<PreparedFrame>& frame) { return frame.expired(); }),
+            prepared_frame_history.end());
+        try {
+            prepared_frame_history.emplace_back(prepared);
+        } catch (const std::bad_alloc&) {
+            return foundation::out_of_memory("ImGui prepared frame history allocation failed");
+        }
+        prepared_frame = std::move(prepared);
+        return foundation::Result::success();
+    }
+
     rhi::Device& device;
     ImGuiTextureRegistry& texture_registry;
     resource::ResourceUploader resource_uploader;
@@ -270,6 +288,7 @@ struct ImGuiRenderer::Impl final {
     std::unordered_map<uint16_t, rhi::PipelineHandle> pipelines{};
     std::unordered_map<ImGuiTextureHandle, ImportedTexture, ImGuiTextureHandleHash> imported_textures{};
     std::shared_ptr<PreparedFrame> prepared_frame{};
+    std::vector<std::weak_ptr<PreparedFrame>> prepared_frame_history{};
     bool initialized{false};
 };
 
@@ -280,10 +299,7 @@ ImGuiRenderer::~ImGuiRenderer() {
     if (impl_ == nullptr) {
         return;
     }
-    if (impl_->prepared_frame != nullptr) {
-        static_cast<void>(impl_->device.wait_idle());
-        impl_->prepared_frame.reset();
-    }
+    static_cast<void>(release_prepared_frame());
     if (impl_->initialized) {
         static_cast<void>(shutdown());
     }
@@ -420,8 +436,6 @@ foundation::Result ImGuiRenderer::prepare_frame(render_graph::FrameContext& fram
     if (impl_->prepared_frame != nullptr && impl_->prepared_frame->frame_number == active_frame_number) {
         return foundation::invalid_state("ImGui renderer already prepared the active frame");
     }
-    impl_->prepared_frame.reset();
-
     std::shared_ptr<Impl::PreparedFrame> prepared;
     try {
         prepared = std::make_shared<Impl::PreparedFrame>(impl_->device);
@@ -450,8 +464,7 @@ foundation::Result ImGuiRenderer::prepare_frame(render_graph::FrameContext& fram
     };
 
     if (packet.empty()) {
-        impl_->prepared_frame = std::move(prepared);
-        return foundation::Result::success();
+        return impl_->store_prepared_frame(std::move(prepared));
     }
     if (packet.display_width <= 0.0f || packet.display_height <= 0.0f || packet.vertices.empty() ||
         packet.indices.empty()) {
@@ -530,8 +543,7 @@ foundation::Result ImGuiRenderer::prepare_frame(render_graph::FrameContext& fram
     }
 
     if (prepared->draw_calls.empty()) {
-        impl_->prepared_frame = std::move(prepared);
-        return foundation::Result::success();
+        return impl_->store_prepared_frame(std::move(prepared));
     }
 
     const math::Mat4 projection = make_imgui_projection(packet);
@@ -687,8 +699,7 @@ foundation::Result ImGuiRenderer::prepare_frame(render_graph::FrameContext& fram
         cleanup();
         return result;
     }
-    impl_->prepared_frame = std::move(prepared);
-    return foundation::Result::success();
+    return impl_->store_prepared_frame(std::move(prepared));
 }
 
 foundation::Result ImGuiRenderer::build_render_graph(pipeline::RenderGraphBuilder& builder) const {
@@ -861,15 +872,8 @@ foundation::Result ImGuiRenderer::shutdown() {
     if (impl_ == nullptr || !impl_->initialized) {
         return foundation::Result::success();
     }
-    if (const foundation::Result result = impl_->device.wait_idle(); !result) {
+    if (const foundation::Result result = release_prepared_frame(); !result) {
         return result;
-    }
-
-    if (impl_->prepared_frame != nullptr) {
-        if (const foundation::Result result = impl_->prepared_frame->release_rhi_resources(); !result) {
-            return result;
-        }
-        impl_->prepared_frame.reset();
     }
 
     foundation::Result first_result = foundation::Result::success();
@@ -896,6 +900,35 @@ foundation::Result ImGuiRenderer::shutdown() {
     impl_->shader_manager.reset();
     impl_->imported_textures.clear();
     impl_->initialized = false;
+    return foundation::Result::success();
+}
+
+foundation::Result ImGuiRenderer::release_prepared_frame() {
+    if (impl_ == nullptr || !impl_->initialized) {
+        return foundation::Result::success();
+    }
+    if (const foundation::Result result = impl_->device.wait_idle(); !result) {
+        return result;
+    }
+    if (impl_->prepared_frame == nullptr && impl_->prepared_frame_history.empty()) {
+        return foundation::Result::success();
+    }
+    foundation::Result first_result = foundation::Result::success();
+    for (const std::weak_ptr<Impl::PreparedFrame>& frame_weak : impl_->prepared_frame_history) {
+        const std::shared_ptr<Impl::PreparedFrame> frame = frame_weak.lock();
+        if (frame == nullptr) {
+            continue;
+        }
+        const foundation::Result result = frame->release_rhi_resources();
+        if (!result && first_result) {
+            first_result = result;
+        }
+    }
+    if (!first_result) {
+        return first_result;
+    }
+    impl_->prepared_frame.reset();
+    impl_->prepared_frame_history.clear();
     return foundation::Result::success();
 }
 
@@ -960,5 +993,29 @@ foundation::Result register_imgui_render_feature(pipeline::PipelineRegistry& reg
         return binding_result;
     }
     return foundation::Result::success();
+}
+
+foundation::Result unregister_imgui_render_feature(pipeline::PipelineRegistry& registry) {
+    const pipeline::FeatureInstanceId instance = pipeline::make_feature_instance_id(
+        kImGuiRenderFeatureId, pipeline::PipelineId("RenderPipeline"), pipeline::PipelineScope::kFrame,
+        kImGuiFeaturePointId);
+    foundation::Result first_result = registry.unbind_feature(instance);
+    if (!first_result && first_result.code == foundation::ResultCode::kNotFound) {
+        first_result = foundation::Result::success();
+    }
+
+    const foundation::Result unregister_pipeline_result =
+        registry.unregister_pipeline(pipeline::PipelineId("RenderPipeline"));
+    if (!unregister_pipeline_result && unregister_pipeline_result.code != foundation::ResultCode::kNotFound &&
+        first_result) {
+        first_result = unregister_pipeline_result;
+    }
+
+    const foundation::Result unregister_feature_result = registry.unregister_feature(kImGuiRenderFeatureId);
+    if (!unregister_feature_result && unregister_feature_result.code != foundation::ResultCode::kNotFound &&
+        first_result) {
+        first_result = unregister_feature_result;
+    }
+    return first_result;
 }
 }  // namespace aeg::editor

@@ -147,6 +147,38 @@ foundation::Result EditorWorkspace::set_panel_visible(std::string_view panel_key
     return foundation::Result::success();
 }
 
+foundation::Result EditorWorkspace::register_view_action(EditorWorkspaceActionDescriptor descriptor) {
+    if (!descriptor.is_valid()) {
+        return foundation::invalid_argument("Editor workspace action descriptor is incomplete");
+    }
+    if (find_view_action(descriptor.key) != nullptr) {
+        return foundation::invalid_argument("Editor workspace View action key is already registered");
+    }
+    try {
+        view_actions_.push_back(std::move(descriptor));
+        return foundation::Result::success();
+    } catch (const std::bad_alloc&) {
+        return foundation::out_of_memory("Editor workspace action registration allocation failed");
+    }
+}
+
+foundation::Result EditorWorkspace::invoke_view_action(std::string_view action_key) {
+    EditorWorkspaceActionDescriptor* action = find_view_action(action_key);
+    if (action == nullptr) {
+        return foundation::not_found("Editor workspace View action key is not registered");
+    }
+    try {
+        return action->callback();
+    } catch (const std::bad_alloc&) {
+        return foundation::out_of_memory("Editor workspace action callback allocation failed");
+    } catch (const std::exception& exception) {
+        return foundation::unknown_exception(exception);
+    } catch (...) {
+        return foundation::Result::failure(foundation::ResultCode::kUnknown,
+                                            "Editor workspace action callback threw an unknown exception");
+    }
+}
+
 foundation::Result EditorWorkspace::build_ui() {
     if (imgui_host_ == nullptr || !imgui_host_->is_initialized() || !imgui_host_->is_frame_active()) {
         return foundation::invalid_state("Editor workspace UI requires an active ImGui frame");
@@ -177,6 +209,15 @@ foundation::Result EditorWorkspace::build_ui() {
                 }
                 if (!entry.descriptor.closable) {
                     ImGui::EndDisabled();
+                }
+            }
+            for (const EditorWorkspaceActionDescriptor& action : view_actions_) {
+                if (ImGui::MenuItem(action.title.c_str())) {
+                    if (const foundation::Result result = invoke_view_action(action.key); !result) {
+                        ImGui::EndMenu();
+                        ImGui::EndMainMenuBar();
+                        return result;
+                    }
                 }
             }
             ImGui::EndMenu();
@@ -231,6 +272,10 @@ std::size_t EditorWorkspace::panel_count() const noexcept {
     return panels_.size();
 }
 
+std::size_t EditorWorkspace::view_action_count() const noexcept {
+    return view_actions_.size();
+}
+
 EditorWorkspace::PanelEntry* EditorWorkspace::find_panel(std::string_view panel_key) noexcept {
     const auto iterator = std::find_if(panels_.begin(), panels_.end(), [panel_key](const PanelEntry& entry) {
         return entry.descriptor.key == panel_key;
@@ -243,6 +288,20 @@ const EditorWorkspace::PanelEntry* EditorWorkspace::find_panel(std::string_view 
         return entry.descriptor.key == panel_key;
     });
     return iterator == panels_.end() ? nullptr : &*iterator;
+}
+
+EditorWorkspaceActionDescriptor* EditorWorkspace::find_view_action(std::string_view action_key) noexcept {
+    const auto iterator = std::find_if(view_actions_.begin(), view_actions_.end(), [action_key](const auto& action) {
+        return action.key == action_key;
+    });
+    return iterator == view_actions_.end() ? nullptr : &*iterator;
+}
+
+const EditorWorkspaceActionDescriptor* EditorWorkspace::find_view_action(std::string_view action_key) const noexcept {
+    const auto iterator = std::find_if(view_actions_.begin(), view_actions_.end(), [action_key](const auto& action) {
+        return action.key == action_key;
+    });
+    return iterator == view_actions_.end() ? nullptr : &*iterator;
 }
 
 foundation::Result EditorWorkspace::initialize_dockspace() {

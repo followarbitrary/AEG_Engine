@@ -30,6 +30,16 @@ public:
     [[nodiscard]] virtual foundation::Result set_visible(bool visible) noexcept = 0;
     /** @brief Requests platform focus for the window. */
     [[nodiscard]] virtual foundation::Result focus() noexcept = 0;
+    /** @brief Requests maximized or restored presentation state. */
+    [[nodiscard]] virtual foundation::Result set_maximized(bool maximized) noexcept {
+        static_cast<void>(maximized);
+        return foundation::unsupported("Window maximization is not supported by this platform adapter");
+    }
+    /** @brief Enables or disables user input delivery for the window. */
+    [[nodiscard]] virtual foundation::Result set_input_enabled(bool enabled) noexcept {
+        static_cast<void>(enabled);
+        return foundation::unsupported("Window input control is not supported by this platform adapter");
+    }
     /** @brief Posts a semantic close request to the platform window. */
     [[nodiscard]] virtual foundation::Result request_close() noexcept = 0;
 };

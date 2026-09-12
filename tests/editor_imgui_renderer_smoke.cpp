@@ -491,8 +491,16 @@ int main() {
     if (!check(frame_context.end_frame(), "end_imgui_frame")) {
         return 27;
     }
-    if (!check(imgui_renderer.shutdown(), "shutdown_imgui_renderer")) {
+    if (!check(imgui_renderer.release_prepared_frame(), "release_prepared_imgui_frame") ||
+        !check(device->wait_idle(), "wait_before_imgui_resource_replacement") ||
+        !check(texture_uploader.destroy_texture(ui_texture), "destroy_ui_texture_before_renderer_shutdown")) {
         return 28;
+    }
+    if (!check(imgui_renderer.shutdown(), "shutdown_imgui_renderer")) {
+        return 29;
+    }
+    if (!check(aeg::editor::unregister_imgui_render_feature(registry), "unregister_imgui_render_feature")) {
+        return 29;
     }
     graph.reset();
     if (!check(texture_registry.unregister_texture(texture_handle_result.value), "unregister_texture")) {
@@ -500,8 +508,7 @@ int main() {
     }
     if (!check(device->wait_idle(), "wait_idle_cleanup") ||
         !check(destroy_target(*device, target_view, target_texture), "destroy_target") ||
-        !check(device->destroy_sampler(sampler), "destroy_sampler") ||
-        !check(texture_uploader.destroy_texture(ui_texture), "destroy_ui_texture")) {
+        !check(device->destroy_sampler(sampler), "destroy_sampler")) {
         return 30;
     }
     return 0;

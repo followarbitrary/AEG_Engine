@@ -50,6 +50,17 @@ struct WindowPosition final {
     friend constexpr bool operator==(WindowPosition, WindowPosition) = default;
 };
 
+/** @brief Work area of the display containing a platform window. */
+struct DisplayWorkArea final {
+    /** @brief Screen-space origin of the usable display area. */
+    WindowPosition position{};
+    /** @brief Usable display extent excluding taskbars and reserved edges. */
+    WindowExtent extent{};
+
+    /** @brief Returns whether the display work area contains usable dimensions. */
+    [[nodiscard]] constexpr bool is_valid() const noexcept { return extent.is_valid(); }
+};
+
 /** @brief Opaque display and window handles used only by Application RHI setup. */
 struct WindowSurfaceBinding final {
     /** @brief Opaque display or instance handle supplied by the platform adapter. */
@@ -79,6 +90,8 @@ struct WindowDesc final {
     bool visible{true};
     /** @brief Requests platform-managed high-DPI behavior when supported. */
     bool high_dpi{true};
+    /** @brief Requests that the platform starts the window maximized when visible. */
+    bool start_maximized{false};
 };
 
 /** @brief Observable semantic state of a live platform window. */
@@ -93,6 +106,10 @@ struct WindowState final {
     bool focused{false};
     /** @brief Whether the platform reports the window as minimized. */
     bool minimized{false};
+    /** @brief Whether the platform reports the window as maximized. */
+    bool maximized{false};
+    /** @brief Whether user input is currently enabled for the window. */
+    bool input_enabled{true};
     /** @brief Whether a close request has been received for the window. */
     bool close_requested{false};
 };

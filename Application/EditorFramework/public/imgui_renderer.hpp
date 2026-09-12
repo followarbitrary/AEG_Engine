@@ -43,6 +43,8 @@ public:
     [[nodiscard]] foundation::Result prepare_frame(render_graph::FrameContext& frame_context,
                                                    render_graph::RenderGraph& graph, const ImGuiDrawPacket& packet,
                                                    const ImGuiRenderTargetDesc& target);
+    /** @brief Releases the current frame's transient RHI references after GPU work has stopped. */
+    [[nodiscard]] foundation::Result release_prepared_frame();
     /** @brief Releases persistent ImGui RHI objects after GPU work has stopped. */
     [[nodiscard]] foundation::Result shutdown();
 
@@ -78,4 +80,6 @@ private:
 /** @brief Registers and binds the standard ImGui RenderFeature. */
 [[nodiscard]] foundation::Result register_imgui_render_feature(pipeline::PipelineRegistry& registry,
                                                                ImGuiRenderer& renderer);
+/** @brief Unbinds and removes the standard ImGui RenderFeature from a registry. */
+[[nodiscard]] foundation::Result unregister_imgui_render_feature(pipeline::PipelineRegistry& registry);
 }  // namespace aeg::editor

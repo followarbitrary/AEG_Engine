@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "editor_font.hpp"
 #include "platform_services.hpp"
 #include "window_types.hpp"
 
@@ -35,6 +36,12 @@ struct EditorImGuiDesc final {
     platform::IWindowSystem* window_system{nullptr};
     /** @brief Enables docking platform viewports when a window system is available. */
     bool enable_viewports{false};
+    /** @brief Borrowed font catalog copied while the ImGui host initializes. */
+    const EditorFontCatalog* font_catalog{nullptr};
+    /** @brief Stable key of the initial font selected from the catalog. */
+    std::string_view default_font_key{};
+    /** @brief Base font size in pixels used to build the initial atlas. */
+    float font_size_pixels{16.0f};
 };
 
 /** @brief Engine-owned timing and display metrics for one ImGui frame. */

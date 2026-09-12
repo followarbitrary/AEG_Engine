@@ -2113,6 +2113,8 @@ namespace aeg::rhi {
 
             [[nodiscard]] Result destroy_buffer(BufferHandle buffer) override;
 
+            [[nodiscard]] ResultValue<BufferStateSnapshot> query_buffer_state(BufferHandle buffer) const override;
+
             [[nodiscard]] Result
             write_buffer(BufferHandle buffer, uint64_t offset, std::span<const std::byte> data) override;
 
@@ -2126,6 +2128,8 @@ namespace aeg::rhi {
             [[nodiscard]] ResultValue<TextureHandle> create_texture(const TextureDesc &desc) override;
 
             [[nodiscard]] Result destroy_texture(TextureHandle texture) override;
+
+            [[nodiscard]] ResultValue<TextureStateSnapshot> query_texture_state(TextureHandle texture) const override;
 
             [[nodiscard]] ResultValue<BufferViewHandle> create_buffer_view(const BufferViewDesc &desc) override;
 
@@ -5860,6 +5864,54 @@ namespace aeg::rhi {
         return Result::success();
     }
 
+    ResultValue<BufferStateSnapshot> VulkanDevice::query_buffer_state(BufferHandle buffer) const {
+        const BufferResource *resource = buffers_.get(buffer);
+        if (resource == nullptr) {
+            return {Result::failure(ResultCode::kNotFound, "Invalid buffer handle"), {}};
+        }
+        if (resource->size == 0) {
+            return {Result::failure(ResultCode::kInvalidState, "Buffer state has no resource size"), {}};
+        }
+
+        BufferStateSnapshot snapshot{};
+        try {
+            if (resource->state_segments.empty()) {
+                snapshot.segments.push_back({0, resource->size, resource->state});
+            } else {
+                uint64_t expected_offset = 0;
+                snapshot.segments.reserve(resource->state_segments.size());
+                for (const BufferStateSegment &segment: resource->state_segments) {
+                    if (segment.size == 0 || segment.offset != expected_offset ||
+                        segment.offset > resource->size || segment.size > resource->size - segment.offset) {
+                        return {Result::failure(ResultCode::kInvalidState,
+                                                "Buffer state segments do not cover the resource"), {}};
+                    }
+                    snapshot.segments.push_back({segment.offset, segment.size, segment.state});
+                    expected_offset += segment.size;
+                }
+                if (expected_offset != resource->size) {
+                    return {Result::failure(ResultCode::kInvalidState,
+                                            "Buffer state segments do not cover the resource"), {}};
+                }
+            }
+
+            for (uint32_t index = 0; index < kQueueCount; ++index) {
+                const uint64_t value = resource->last_use[index];
+                if (value == 0) {
+                    continue;
+                }
+                const TimelineHandle timeline = queues_[index].timeline_handle;
+                if (!timeline.is_valid() || !snapshot.last_use.add(GpuSyncPoint{timeline, value})) {
+                    return {Result::failure(ResultCode::kInvalidState,
+                                            "Buffer state completion timeline is unavailable"), {}};
+                }
+            }
+        } catch (const std::bad_alloc&) {
+            return {Result::failure(ResultCode::kOutOfMemory, "Buffer state snapshot allocation failed"), {}};
+        }
+        return {Result::success(), std::move(snapshot)};
+    }
+
     Result VulkanDevice::write_buffer(BufferHandle buffer, uint64_t offset, std::span<const std::byte> data) {
         BufferResource *resource = buffers_.get(buffer);
         if (resource == nullptr) {
@@ -6562,6 +6614,38 @@ namespace aeg::rhi {
         (void) textures_.erase(texture);
         enqueue_retire(std::move(retire));
         return Result::success();
+    }
+
+    ResultValue<TextureStateSnapshot> VulkanDevice::query_texture_state(TextureHandle texture) const {
+        const TextureResource *resource = textures_.get(texture);
+        if (resource == nullptr) {
+            return {Result::failure(ResultCode::kNotFound, "Invalid texture handle"), {}};
+        }
+        const size_t expected_state_count = static_cast<size_t>(resource->desc.mip_levels) *
+                                            resource->desc.array_layers * kAspectPlaneCount;
+        if (resource->subresource_states.size() != expected_state_count || expected_state_count == 0) {
+            return {Result::failure(ResultCode::kInvalidState,
+                                    "Texture state does not cover all subresources"), {}};
+        }
+
+        TextureStateSnapshot snapshot{};
+        try {
+            snapshot.subresource_states = resource->subresource_states;
+            for (uint32_t index = 0; index < kQueueCount; ++index) {
+                const uint64_t value = resource->last_use[index];
+                if (value == 0) {
+                    continue;
+                }
+                const TimelineHandle timeline = queues_[index].timeline_handle;
+                if (!timeline.is_valid() || !snapshot.last_use.add(GpuSyncPoint{timeline, value})) {
+                    return {Result::failure(ResultCode::kInvalidState,
+                                            "Texture state completion timeline is unavailable"), {}};
+                }
+            }
+        } catch (const std::bad_alloc&) {
+            return {Result::failure(ResultCode::kOutOfMemory, "Texture state snapshot allocation failed"), {}};
+        }
+        return {Result::success(), std::move(snapshot)};
     }
 
     ResultValue<BufferViewHandle> VulkanDevice::create_buffer_view(const BufferViewDesc &desc) {

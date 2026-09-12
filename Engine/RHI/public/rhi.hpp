@@ -68,6 +68,10 @@ namespace aeg::rhi {
         /** @brief Destroys a buffer after all GPU uses have completed. */
         [[nodiscard]] virtual foundation::Result destroy_buffer(BufferHandle buffer) = 0;
 
+        /** @brief Reads the current backend-neutral state and GPU use of a buffer. */
+        [[nodiscard]] virtual foundation::ResultValue<BufferStateSnapshot> query_buffer_state(
+                BufferHandle buffer) const = 0;
+
         /** @brief Writes CPU data into a host-visible buffer range. */
         [[nodiscard]] virtual foundation::Result write_buffer(BufferHandle buffer, uint64_t offset,
                                                   std::span<const std::byte> data) = 0;
@@ -87,6 +91,10 @@ namespace aeg::rhi {
 
         /** @brief Destroys a texture after all views and GPU uses are released. */
         [[nodiscard]] virtual foundation::Result destroy_texture(TextureHandle texture) = 0;
+
+        /** @brief Reads the current backend-neutral subresource state and GPU use of a texture. */
+        [[nodiscard]] virtual foundation::ResultValue<TextureStateSnapshot> query_texture_state(
+                TextureHandle texture) const = 0;
 
         /** @brief Creates a typed or structured view into a buffer. */
         [[nodiscard]] virtual foundation::ResultValue<BufferViewHandle> create_buffer_view(

@@ -5,6 +5,7 @@
 #pragma once
 
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -16,6 +17,19 @@
 #include "result.hpp"
 
 namespace aeg::editor {
+/** @brief Describes one command exposed in the workspace View menu. */
+struct EditorWorkspaceActionDescriptor final {
+    /** @brief Stable machine-readable action key. */
+    std::string key{};
+    /** @brief User-visible menu title. */
+    std::string title{};
+    /** @brief Application callback invoked after the menu item is selected. */
+    std::function<foundation::Result()> callback{};
+
+    /** @brief Returns whether the action can be registered. */
+    [[nodiscard]] bool is_valid() const noexcept { return !key.empty() && !title.empty() && callback != nullptr; }
+};
+
 /** @brief Coordinates panel registration, semantic layout state, and ImGui docking. */
 class EditorWorkspace final {
 public:
@@ -34,6 +48,10 @@ public:
     [[nodiscard]] foundation::Result unregister_panel(std::string_view panel_key);
     /** @brief Changes visibility while preserving the panel's dock or floating placement. */
     [[nodiscard]] foundation::Result set_panel_visible(std::string_view panel_key, bool visible);
+    /** @brief Registers one application command without adding a workspace panel. */
+    [[nodiscard]] foundation::Result register_view_action(EditorWorkspaceActionDescriptor descriptor);
+    /** @brief Invokes one registered View-menu command by stable key. */
+    [[nodiscard]] foundation::Result invoke_view_action(std::string_view action_key);
     /** @brief Builds the dockspace, workspace menu, and currently visible panels. */
     [[nodiscard]] foundation::Result build_ui();
     /** @brief Serializes the current semantic layout for an Application-owned store. */
@@ -45,6 +63,8 @@ public:
     [[nodiscard]] const EditorLayoutModel* layout() const noexcept;
     /** @brief Returns the number of registered panels. */
     [[nodiscard]] std::size_t panel_count() const noexcept;
+    /** @brief Returns the number of registered View-menu commands. */
+    [[nodiscard]] std::size_t view_action_count() const noexcept;
 
 private:
     struct PanelEntry final {
@@ -56,6 +76,8 @@ private:
 
     [[nodiscard]] PanelEntry* find_panel(std::string_view panel_key) noexcept;
     [[nodiscard]] const PanelEntry* find_panel(std::string_view panel_key) const noexcept;
+    [[nodiscard]] EditorWorkspaceActionDescriptor* find_view_action(std::string_view action_key) noexcept;
+    [[nodiscard]] const EditorWorkspaceActionDescriptor* find_view_action(std::string_view action_key) const noexcept;
     [[nodiscard]] foundation::Result initialize_dockspace();
     [[nodiscard]] foundation::Result sync_host_visibility();
 
@@ -65,6 +87,8 @@ private:
     std::unique_ptr<EditorLayoutModel> layout_{};
     /** @brief Registered panels in deterministic application order. */
     std::vector<PanelEntry> panels_{};
+    /** @brief Application commands shown in the workspace View menu. */
+    std::vector<EditorWorkspaceActionDescriptor> view_actions_{};
     /** @brief True after the current layout has been applied to the ImGui dockspace. */
     bool dockspace_initialized_{false};
 };

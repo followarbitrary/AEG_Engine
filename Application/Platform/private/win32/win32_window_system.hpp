@@ -50,6 +50,8 @@ public:
                                                    const platform::ImeState& state) noexcept override;
     [[nodiscard]] foundation::ResultValue<platform::WindowMetrics> query_window_metrics(
         platform::WindowId window) const override;
+    [[nodiscard]] foundation::ResultValue<platform::DisplayWorkArea> query_display_work_area(
+        platform::WindowId window) const override;
 
 private:
     friend class Win32Window;

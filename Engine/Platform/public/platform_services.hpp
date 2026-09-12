@@ -59,5 +59,10 @@ public:
     [[nodiscard]] virtual foundation::Result set_cursor(WindowId window, CursorShape shape) noexcept = 0;
     [[nodiscard]] virtual foundation::Result set_ime_state(WindowId window, const ImeState& state) noexcept = 0;
     [[nodiscard]] virtual foundation::ResultValue<WindowMetrics> query_window_metrics(WindowId window) const = 0;
+    /** @brief Returns the usable work area of the display containing a window. */
+    [[nodiscard]] virtual foundation::ResultValue<DisplayWorkArea> query_display_work_area(WindowId window) const {
+        static_cast<void>(window);
+        return {foundation::unsupported("Display work-area queries are not supported by this platform adapter"), {}};
+    }
 };
 }  // namespace aeg::platform

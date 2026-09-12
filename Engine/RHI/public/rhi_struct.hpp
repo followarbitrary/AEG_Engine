@@ -16,6 +16,7 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <vector>
 
 #include "rhi_config.hpp"
 
@@ -1044,6 +1045,35 @@ namespace aeg::rhi {
     private:
         std::array<GpuSyncPoint, kCapacity> values_{};
         uint32_t count_{0};
+    };
+
+    /** @brief One tracked state segment covering a byte range of a buffer. */
+    struct BufferStateSegment {
+        uint64_t offset{0};
+        uint64_t size{0};
+        ResourceState state{};
+    };
+
+    /**
+     * @brief Backend-neutral snapshot of a buffer's current state and GPU use.
+     *
+     * The segments and completion points are owned by the snapshot. They are
+     * intended for synchronization between independent graph executions.
+     */
+    struct BufferStateSnapshot {
+        std::vector<BufferStateSegment> segments{};
+        GpuCompletionSet last_use{};
+    };
+
+    /**
+     * @brief Backend-neutral snapshot of a texture's subresource states and GPU use.
+     *
+     * Subresources use the backend-neutral aspect, mip, and array-layer order
+     * defined by the RHI texture state contract.
+     */
+    struct TextureStateSnapshot {
+        std::vector<ResourceState> subresource_states{};
+        GpuCompletionSet last_use{};
     };
 
     /** @brief One GPU wait and the first pipeline stages that depend on it. */

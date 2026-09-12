@@ -205,14 +205,17 @@ namespace aeg::render_graph {
     /**
      * @brief Options controlling execution of a compiled graph.
      *
+     * When an acquired swapchain image is part of the graph, RenderGraph
+     * automatically waits on acquire for the first access batch and signals
+     * present from the final access batch. present_acquired_frame only selects
+     * whether present() is called before execute() returns.
+     *
      * execution_leases must remain valid until execute() returns. They are
      * not retained by the descriptor after the call.
      */
     struct RenderGraphExecuteDesc {
         bool present_acquired_frame{false};
         std::span<const RenderGraphExecutionLease> execution_leases{};
-        /** @brief Signals the acquired frame's present semaphore without presenting immediately; this is final. */
-        bool signal_present{false};
     };
 
     /** @brief Submission and presentation results from execute(). */

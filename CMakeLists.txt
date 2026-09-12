@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 if (MSVC)
-    add_compile_options(/Zc:preprocessor)
+    add_compile_options(/Zc:preprocessor /utf-8)
 endif()
 
 option(AEG_RHI_ENABLE_VALIDATION "Compile RHI validation support" ON)
@@ -218,6 +218,7 @@ endif()
 
 if (WIN32)
     add_library(aeg_application_platform_win32 STATIC
+        Application/Platform/private/win32/win32_system_fonts.cpp
         Application/Platform/private/win32/win32_window.cpp
         Application/Platform/private/win32/win32_window_system.cpp
     )
@@ -236,7 +237,7 @@ if (WIN32)
             _UNICODE
             WIN32_LEAN_AND_MEAN
     )
-    target_link_libraries(aeg_application_platform_win32 PUBLIC aeg_platform aeg_input user32 imm32)
+    target_link_libraries(aeg_application_platform_win32 PUBLIC aeg_platform aeg_input user32 imm32 dwrite ole32)
 
     if (MSVC)
         target_compile_options(aeg_application_platform_win32 PRIVATE /W4 /permissive-)
@@ -280,6 +281,9 @@ else()
 endif()
 
 add_library(aeg_editor_framework STATIC
+    Application/EditorFramework/private/error/editor_error.cpp
+    Application/EditorFramework/private/font/editor_font.cpp
+    Application/EditorFramework/private/preferences/editor_preferences.cpp
     Application/EditorFramework/private/imgui/editor_imgui_host.cpp
     Application/EditorFramework/private/imgui/imgui_platform_bridge.cpp
     Application/EditorFramework/private/imgui/imgui_texture_registry.cpp
@@ -343,6 +347,30 @@ add_executable(aeg_editor_workspace_smoke
 target_link_libraries(aeg_editor_workspace_smoke PRIVATE aeg_editor_framework)
 if (WIN32)
     target_compile_definitions(aeg_editor_workspace_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
+if (WIN32)
+    add_executable(aeg_editor_font_smoke
+        tests/editor_font_smoke.cpp
+    )
+    target_link_libraries(aeg_editor_font_smoke PRIVATE aeg_editor_framework aeg_application_platform_win32)
+    target_compile_definitions(aeg_editor_font_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
+add_executable(aeg_editor_preferences_smoke
+    tests/editor_preferences_smoke.cpp
+)
+target_link_libraries(aeg_editor_preferences_smoke PRIVATE aeg_editor_framework)
+if (WIN32)
+    target_compile_definitions(aeg_editor_preferences_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
+add_executable(aeg_editor_error_smoke
+    tests/editor_error_smoke.cpp
+)
+target_link_libraries(aeg_editor_error_smoke PRIVATE aeg_editor_framework)
+if (WIN32)
+    target_compile_definitions(aeg_editor_error_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
 add_executable(aeg_result_smoke
@@ -799,6 +827,14 @@ add_executable(aeg_render_feature_runtime_smoke
 )
 add_executable(aeg_frame_retention_smoke tests/frame_retention_smoke.cpp)
 target_link_libraries(aeg_frame_retention_smoke PRIVATE aeg_render_graph aeg_rhi)
+add_executable(aeg_render_graph_context_contract_smoke
+    tests/render_graph_context_contract_smoke.cpp
+)
+target_link_libraries(aeg_render_graph_context_contract_smoke PRIVATE aeg_render_graph)
+add_executable(aeg_render_graph_imported_texture_state_smoke
+    tests/render_graph_imported_texture_state_smoke.cpp
+)
+target_link_libraries(aeg_render_graph_imported_texture_state_smoke PRIVATE aeg_render_graph aeg_rhi)
 target_link_libraries(aeg_render_feature_runtime_smoke PRIVATE aeg_render_graph aeg_rhi)
 if (WIN32)
     target_compile_definitions(aeg_render_feature_runtime_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
@@ -937,6 +973,7 @@ if (WIN32)
 
     add_executable(aeg_editor_application
         Application/Editor/private/editor_application.cpp
+        Application/Editor/private/font/editor_system_font_catalog.cpp
     )
     target_link_libraries(aeg_editor_application PRIVATE
         aeg_application_platform_win32
@@ -991,7 +1028,10 @@ if (BUILD_TESTING)
     add_test(NAME aeg_editor_imgui_viewport_smoke COMMAND aeg_editor_imgui_viewport_smoke)
     add_test(NAME aeg_editor_layout_smoke COMMAND aeg_editor_layout_smoke)
     add_test(NAME aeg_editor_workspace_smoke COMMAND aeg_editor_workspace_smoke)
+    add_test(NAME aeg_editor_preferences_smoke COMMAND aeg_editor_preferences_smoke)
+    add_test(NAME aeg_editor_error_smoke COMMAND aeg_editor_error_smoke)
     if (WIN32)
+        add_test(NAME aeg_editor_font_smoke COMMAND aeg_editor_font_smoke)
         add_test(NAME aeg_application_platform_win32_smoke COMMAND aeg_application_platform_win32_smoke)
     endif()
     add_test(NAME aeg_reflection_smoke COMMAND aeg_reflection_smoke)
@@ -1014,25 +1054,31 @@ if (BUILD_TESTING)
     add_test(NAME aeg_renderer_smoke COMMAND aeg_renderer_smoke)
     add_test(NAME aeg_render_feature_runtime_smoke COMMAND aeg_render_feature_runtime_smoke)
     add_test(NAME aeg_frame_retention_smoke COMMAND aeg_frame_retention_smoke)
+    add_test(NAME aeg_render_graph_context_contract_smoke COMMAND aeg_render_graph_context_contract_smoke)
+    add_test(NAME aeg_render_graph_imported_texture_state_smoke COMMAND aeg_render_graph_imported_texture_state_smoke)
     add_test(NAME aeg_rhi_smoke COMMAND aeg_rhi_smoke)
     add_test(NAME aeg_logging_smoke COMMAND aeg_logging_smoke)
     add_test(NAME aeg_triangle COMMAND aeg_triangle --frames 1)
     if (WIN32)
         add_test(NAME aeg_editor_imgui_renderer_smoke COMMAND aeg_editor_imgui_renderer_smoke)
         add_test(NAME aeg_editor_application COMMAND aeg_editor_application --frames 60 --stress-resize)
-        set_tests_properties(aeg_editor_imgui_renderer_smoke aeg_editor_application PROPERTIES
+        add_test(NAME aeg_editor_application_preferences
+                 COMMAND aeg_editor_application --frames 60 --stress-resize --open-preferences)
+        set_tests_properties(aeg_editor_imgui_renderer_smoke aeg_editor_application aeg_editor_application_preferences
+            PROPERTIES
             FAIL_REGULAR_EXPRESSION "Vulkan validation \\[ERROR\\]"
         )
     endif()
     if (MINGW)
         get_filename_component(AEG_MINGW_RUNTIME_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
-        set_tests_properties(aeg_application_platform_win32_smoke aeg_editor_imgui_smoke aeg_editor_imgui_docking_smoke aeg_editor_imgui_viewport_smoke aeg_editor_layout_smoke aeg_editor_workspace_smoke aeg_editor_imgui_renderer_smoke aeg_math_smoke aeg_result_smoke aeg_reflection_smoke aeg_serialization_smoke
+        set_tests_properties(aeg_application_platform_win32_smoke aeg_editor_imgui_smoke aeg_editor_imgui_docking_smoke aeg_editor_imgui_viewport_smoke aeg_editor_layout_smoke aeg_editor_workspace_smoke aeg_editor_font_smoke aeg_editor_preferences_smoke aeg_editor_imgui_renderer_smoke aeg_math_smoke aeg_result_smoke aeg_reflection_smoke aeg_serialization_smoke
                 aeg_concurrency_smoke aeg_ecs_smoke aeg_pipeline_smoke aeg_pipeline_extension_smoke
                 aeg_pipeline_conformance_smoke aeg_pipeline_runtime_smoke aeg_pipeline_hot_swap_smoke
                 aeg_pipeline_phase_scheduler_smoke aeg_module_smoke aeg_world_scope_smoke aeg_world_serialization_smoke
                 aeg_scene_asset_smoke aeg_world_frame_orchestrator_smoke aeg_world_multi_view_smoke
                 aeg_engine_frame_orchestrator_smoke aeg_renderer_smoke aeg_render_feature_runtime_smoke
-                aeg_frame_retention_smoke aeg_rhi_smoke aeg_logging_smoke aeg_triangle aeg_editor_application PROPERTIES
+                aeg_frame_retention_smoke aeg_rhi_smoke aeg_logging_smoke aeg_triangle aeg_editor_application
+                aeg_editor_application_preferences aeg_editor_error_smoke aeg_render_graph_imported_texture_state_smoke PROPERTIES
             ENVIRONMENT "PATH=${AEG_MINGW_RUNTIME_DIR};$ENV{PATH}"
         )
     endif()

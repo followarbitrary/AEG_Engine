@@ -14,6 +14,21 @@ int main() {
     }
     std::unique_ptr<aeg::platform::IWindowSystem> system = std::move(system_result.value);
 
+    const aeg::foundation::Result invalid_dialog = aeg::application::show_error_dialog("", "invalid");
+    if (invalid_dialog || invalid_dialog.code != aeg::foundation::ResultCode::kInvalidArgument) {
+        return 20;
+    }
+
+    const auto font_result = aeg::application::enumerate_system_fonts();
+    if (!font_result || font_result.value.empty()) {
+        return 18;
+    }
+    for (const aeg::application::SystemFontRecord& font : font_result.value) {
+        if (font.family_name.empty() || font.file_path.empty()) {
+            return 19;
+        }
+    }
+
     aeg::platform::WindowDesc desc{};
     desc.title = "AEG Application Platform Smoke";
     desc.extent = {320, 200};
@@ -47,6 +62,22 @@ int main() {
     const auto metrics_result = platform_services.query_window_metrics(window->id());
     if (!metrics_result || !metrics_result.value.is_valid()) {
         return 10;
+    }
+    const auto work_area_result = platform_services.query_display_work_area(window->id());
+    if (!work_area_result || !work_area_result.value.is_valid()) {
+        return 21;
+    }
+    if (!window->set_input_enabled(false) || window->state().input_enabled) {
+        return 22;
+    }
+    if (!window->set_input_enabled(true) || !window->state().input_enabled) {
+        return 23;
+    }
+    if (!window->set_maximized(true) || !window->state().maximized) {
+        return 24;
+    }
+    if (!window->set_maximized(false) || window->state().maximized) {
+        return 25;
     }
     if (!platform_services.set_cursor(window->id(), aeg::platform::CursorShape::kHand) ||
         !platform_services.set_ime_state(window->id(), aeg::platform::ImeState{true, true, 10.0f, 12.0f, 16.0f})) {

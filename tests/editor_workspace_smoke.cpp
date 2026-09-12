@@ -41,6 +41,19 @@ int main() {
     assert(workspace.panel_count() == 1);
     assert(workspace.layout() != nullptr);
 
+    uint32_t preferences_action_count = 0;
+    assert(workspace.register_view_action(
+        aeg::editor::EditorWorkspaceActionDescriptor{
+            "preferences",
+            "Preferences",
+            [&preferences_action_count]() {
+                ++preferences_action_count;
+                return aeg::foundation::Result::success();
+            }}));
+    assert(workspace.view_action_count() == 1);
+    assert(workspace.invoke_view_action("preferences"));
+    assert(preferences_action_count == 1);
+
     const aeg::platform::WindowId window{0, 1};
     aeg::editor::EditorImGuiFrameDesc frame_desc{};
     frame_desc.window = window;
