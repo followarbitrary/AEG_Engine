@@ -640,6 +640,7 @@ if (WIN32)
 endif()
 
 add_library(aeg_renderer STATIC
+    Engine/Renderer/private/opaque_render_feature.cpp
     Engine/Renderer/private/renderer.cpp
 )
 target_compile_features(aeg_renderer PUBLIC cxx_std_20)
@@ -792,6 +793,8 @@ endif()
 
 add_library(aeg_engine STATIC
     Engine/Runtime/private/engine_frame_orchestrator.cpp
+    Engine/Runtime/private/runtime_components.cpp
+    Engine/Runtime/private/runtime_session.cpp
 )
 target_compile_features(aeg_engine PUBLIC cxx_std_20)
 target_include_directories(aeg_engine
@@ -812,6 +815,20 @@ add_executable(aeg_engine_frame_orchestrator_smoke
 target_link_libraries(aeg_engine_frame_orchestrator_smoke PRIVATE aeg_engine aeg_rhi)
 if (WIN32)
     target_compile_definitions(aeg_engine_frame_orchestrator_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+add_executable(aeg_runtime_components_scene_smoke
+    tests/runtime_components_scene_smoke.cpp
+)
+target_link_libraries(aeg_runtime_components_scene_smoke PRIVATE aeg_engine aeg_scene)
+if (WIN32)
+    target_compile_definitions(aeg_runtime_components_scene_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+add_executable(aeg_runtime_component_orchestrator_smoke
+    tests/runtime_component_orchestrator_smoke.cpp
+)
+target_link_libraries(aeg_runtime_component_orchestrator_smoke PRIVATE aeg_engine aeg_renderer aeg_rhi)
+if (WIN32)
+    target_compile_definitions(aeg_runtime_component_orchestrator_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
 add_executable(aeg_renderer_smoke
@@ -954,6 +971,18 @@ if (WIN32)
             "fragment|ps_6_0|${CMAKE_CURRENT_SOURCE_DIR}/shaders/core/editor/imgui/draw_mesh.frag.hlsl"
         PACKAGE_OUTPUT_VARIABLE AEG_EDITOR_IMGUI_SHADER_PACKAGE
     )
+    set(AEG_OPAQUE_UNLIT_SHADER_PACKAGE
+        "${AEG_SHADER_OUTPUT_DIR}/core_contract/opaque_unlit_mesh.aegshader")
+    aeg_add_hlsl_gameplay_shader_program(
+        TARGET aeg_core_shaders
+        NAME opaque_unlit_mesh
+        OUTPUT_DIRECTORY "${AEG_SHADER_OUTPUT_DIR}/core_contract"
+        CONTRACT_TOOL aeg_shader_contract_tool
+        STAGES
+            "vertex|vs_6_0|${CMAKE_CURRENT_SOURCE_DIR}/shaders/core/opaque/unlit_mesh.vert.hlsl"
+            "fragment|ps_6_0|${CMAKE_CURRENT_SOURCE_DIR}/shaders/core/opaque/unlit_mesh.frag.hlsl"
+        PACKAGE_OUTPUT_VARIABLE AEG_OPAQUE_UNLIT_SHADER_PACKAGE
+    )
     target_compile_definitions(aeg_editor_framework PRIVATE
         AEG_EDITOR_IMGUI_SHADER_PACKAGE_PATH="${AEG_EDITOR_IMGUI_SHADER_PACKAGE}"
     )
@@ -970,6 +999,40 @@ if (WIN32)
     target_compile_definitions(aeg_editor_imgui_renderer_smoke PRIVATE
         _CRT_SECURE_NO_WARNINGS
     )
+
+    add_executable(aeg_opaque_render_feature_smoke
+        tests/opaque_render_feature_smoke.cpp
+    )
+    target_link_libraries(aeg_opaque_render_feature_smoke PRIVATE
+        aeg_engine
+        aeg_renderer
+        aeg_resource
+        aeg_rhi
+        aeg_shader
+        aeg_core_shaders
+    )
+    target_compile_definitions(aeg_opaque_render_feature_smoke PRIVATE
+        _CRT_SECURE_NO_WARNINGS
+        AEG_OPAQUE_UNLIT_SHADER_PACKAGE_PATH="${AEG_OPAQUE_UNLIT_SHADER_PACKAGE}"
+    )
+    add_dependencies(aeg_opaque_render_feature_smoke aeg_core_shaders)
+
+    add_executable(aeg_opaque_render_feature_multiframe_smoke
+        tests/opaque_render_feature_multiframe_smoke.cpp
+    )
+    target_link_libraries(aeg_opaque_render_feature_multiframe_smoke PRIVATE
+        aeg_engine
+        aeg_renderer
+        aeg_resource
+        aeg_rhi
+        aeg_shader
+        aeg_core_shaders
+    )
+    target_compile_definitions(aeg_opaque_render_feature_multiframe_smoke PRIVATE
+        _CRT_SECURE_NO_WARNINGS
+        AEG_OPAQUE_UNLIT_SHADER_PACKAGE_PATH="${AEG_OPAQUE_UNLIT_SHADER_PACKAGE}"
+    )
+    add_dependencies(aeg_opaque_render_feature_multiframe_smoke aeg_core_shaders)
 
     add_executable(aeg_editor_application
         Application/Editor/private/editor_application.cpp
@@ -1051,6 +1114,8 @@ if (BUILD_TESTING)
     add_test(NAME aeg_world_frame_orchestrator_smoke COMMAND aeg_world_frame_orchestrator_smoke)
     add_test(NAME aeg_world_multi_view_smoke COMMAND aeg_world_multi_view_smoke)
     add_test(NAME aeg_engine_frame_orchestrator_smoke COMMAND aeg_engine_frame_orchestrator_smoke)
+    add_test(NAME aeg_runtime_components_scene_smoke COMMAND aeg_runtime_components_scene_smoke)
+    add_test(NAME aeg_runtime_component_orchestrator_smoke COMMAND aeg_runtime_component_orchestrator_smoke)
     add_test(NAME aeg_renderer_smoke COMMAND aeg_renderer_smoke)
     add_test(NAME aeg_render_feature_runtime_smoke COMMAND aeg_render_feature_runtime_smoke)
     add_test(NAME aeg_frame_retention_smoke COMMAND aeg_frame_retention_smoke)
@@ -1061,10 +1126,12 @@ if (BUILD_TESTING)
     add_test(NAME aeg_triangle COMMAND aeg_triangle --frames 1)
     if (WIN32)
         add_test(NAME aeg_editor_imgui_renderer_smoke COMMAND aeg_editor_imgui_renderer_smoke)
+        add_test(NAME aeg_opaque_render_feature_smoke COMMAND aeg_opaque_render_feature_smoke)
+        add_test(NAME aeg_opaque_render_feature_multiframe_smoke COMMAND aeg_opaque_render_feature_multiframe_smoke)
         add_test(NAME aeg_editor_application COMMAND aeg_editor_application --frames 60 --stress-resize)
         add_test(NAME aeg_editor_application_preferences
                  COMMAND aeg_editor_application --frames 60 --stress-resize --open-preferences)
-        set_tests_properties(aeg_editor_imgui_renderer_smoke aeg_editor_application aeg_editor_application_preferences
+        set_tests_properties(aeg_editor_imgui_renderer_smoke aeg_opaque_render_feature_smoke aeg_opaque_render_feature_multiframe_smoke aeg_editor_application aeg_editor_application_preferences
             PROPERTIES
             FAIL_REGULAR_EXPRESSION "Vulkan validation \\[ERROR\\]"
         )
@@ -1076,7 +1143,7 @@ if (BUILD_TESTING)
                 aeg_pipeline_conformance_smoke aeg_pipeline_runtime_smoke aeg_pipeline_hot_swap_smoke
                 aeg_pipeline_phase_scheduler_smoke aeg_module_smoke aeg_world_scope_smoke aeg_world_serialization_smoke
                 aeg_scene_asset_smoke aeg_world_frame_orchestrator_smoke aeg_world_multi_view_smoke
-                aeg_engine_frame_orchestrator_smoke aeg_renderer_smoke aeg_render_feature_runtime_smoke
+                aeg_engine_frame_orchestrator_smoke aeg_runtime_components_scene_smoke aeg_runtime_component_orchestrator_smoke aeg_renderer_smoke aeg_opaque_render_feature_smoke aeg_opaque_render_feature_multiframe_smoke aeg_render_feature_runtime_smoke
                 aeg_frame_retention_smoke aeg_rhi_smoke aeg_logging_smoke aeg_triangle aeg_editor_application
                 aeg_editor_application_preferences aeg_editor_error_smoke aeg_render_graph_imported_texture_state_smoke PROPERTIES
             ENVIRONMENT "PATH=${AEG_MINGW_RUNTIME_DIR};$ENV{PATH}"

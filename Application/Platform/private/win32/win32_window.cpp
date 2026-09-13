@@ -143,10 +143,8 @@ MouseButton mouse_button_from_message(UINT message, WPARAM w_param) noexcept {
 }  // namespace
 
 Win32Window::Win32Window(platform::WindowId id, Win32WindowSystem* owner, platform::WindowDesc desc) noexcept
-    : id_(id),
-      owner_(owner),
-      desc_(std::move(desc)),
-      state_{desc_.position, desc_.extent, desc_.visible, false, false, false, true, false} {}
+    : id_(id), owner_(owner), desc_(std::move(desc)), state_{desc_.position, desc_.extent, desc_.visible, false,
+                                                             false,          false,        true,          false} {}
 
 Win32Window::~Win32Window() {
     destroy_native();
@@ -163,10 +161,10 @@ foundation::Result Win32Window::set_position(platform::WindowPosition position) 
     if (hwnd_ == nullptr) {
         return foundation::Result::failure(foundation::ResultCode::kInvalidState);
     }
-    if (SetWindowPos(hwnd_, nullptr, position.x, position.y, 0, 0,
-                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE) == FALSE) {
+    if (SetWindowPos(hwnd_, nullptr, position.x, position.y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE) ==
+        FALSE) {
         return foundation::Result::failure(foundation::ResultCode::kBackendError,
-                                            "Win32 window position update failed");
+                                           "Win32 window position update failed");
     }
     state_.position = position;
     return foundation::Result::success();
@@ -183,17 +181,15 @@ foundation::Result Win32Window::set_extent(platform::WindowExtent extent) noexce
     RECT window_rect{};
     RECT client_rect{};
     if (GetWindowRect(hwnd_, &window_rect) == FALSE || GetClientRect(hwnd_, &client_rect) == FALSE) {
-        return foundation::Result::failure(foundation::ResultCode::kBackendError,
-                                            "Win32 window extent query failed");
+        return foundation::Result::failure(foundation::ResultCode::kBackendError, "Win32 window extent query failed");
     }
     const int32_t frame_width = (window_rect.right - window_rect.left) - (client_rect.right - client_rect.left);
     const int32_t frame_height = (window_rect.bottom - window_rect.top) - (client_rect.bottom - client_rect.top);
     const int32_t width = static_cast<int32_t>(extent.width) + frame_width;
     const int32_t height = static_cast<int32_t>(extent.height) + frame_height;
-    if (width <= 0 || height <= 0 || SetWindowPos(hwnd_, nullptr, 0, 0, width, height,
-                                                  SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE) == FALSE) {
-        return foundation::Result::failure(foundation::ResultCode::kBackendError,
-                                            "Win32 window extent update failed");
+    if (width <= 0 || height <= 0 ||
+        SetWindowPos(hwnd_, nullptr, 0, 0, width, height, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE) == FALSE) {
+        return foundation::Result::failure(foundation::ResultCode::kBackendError, "Win32 window extent update failed");
     }
     sync_state_from_native();
     return foundation::Result::success();
@@ -215,12 +211,26 @@ foundation::Result Win32Window::focus() noexcept {
     if (hwnd_ == nullptr) {
         return foundation::Result::failure(foundation::ResultCode::kInvalidState);
     }
-    if (SetForegroundWindow(hwnd_) == FALSE) {
-        return foundation::Result::failure(foundation::ResultCode::kBackendError,
-                                            "Win32 window focus update failed");
-    }
+
+    const DWORD current_thread = GetCurrentThreadId();
+    const HWND foreground_window = GetForegroundWindow();
+    const DWORD foreground_thread =
+        foreground_window == nullptr ? 0 : GetWindowThreadProcessId(foreground_window, nullptr);
+    const bool attached_to_foreground = foreground_thread != 0 && foreground_thread != current_thread &&
+                                        AttachThreadInput(foreground_thread, current_thread, TRUE) != FALSE;
+
+    SetActiveWindow(hwnd_);
+    SetForegroundWindow(hwnd_);
     SetFocus(hwnd_);
-    state_.focused = true;
+
+    if (attached_to_foreground) {
+        AttachThreadInput(foreground_thread, current_thread, FALSE);
+    }
+
+    state_.focused = GetForegroundWindow() == hwnd_ || GetActiveWindow() == hwnd_ || GetFocus() == hwnd_;
+    if (!state_.focused) {
+        return foundation::Result::failure(foundation::ResultCode::kBackendError, "Win32 window focus update failed");
+    }
     return foundation::Result::success();
 }
 
@@ -235,7 +245,7 @@ foundation::Result Win32Window::set_maximized(bool maximized) noexcept {
     sync_state_from_native();
     if (state_.maximized != maximized) {
         return foundation::Result::failure(foundation::ResultCode::kBackendError,
-                                            "Win32 window maximization update failed");
+                                           "Win32 window maximization update failed");
     }
     return foundation::Result::success();
 }

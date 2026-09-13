@@ -183,6 +183,33 @@ void increment(uint32_t& value) noexcept {
 }
 }  // namespace
 
+bool RenderMeshResource::is_valid() const noexcept {
+    if (!vertex_buffer.is_valid() || !index_buffer.is_valid() || vertex_stride == 0 || vertex_count == 0 ||
+        index_count == 0 || vertex_buffer_desc.size == 0 || index_buffer_desc.size == 0 ||
+        !rhi::has_flag(vertex_buffer_desc.capabilities, rhi::BufferCapability::kVertex) ||
+        !rhi::has_flag(index_buffer_desc.capabilities, rhi::BufferCapability::kIndex)) {
+        return false;
+    }
+    const uint64_t vertex_bytes = static_cast<uint64_t>(vertex_stride) * vertex_count;
+    const uint64_t index_stride = index_format == rhi::IndexFormat::kUint16 ? sizeof(uint16_t) : sizeof(uint32_t);
+    const uint64_t index_bytes = index_stride * index_count;
+    return vertex_bytes <= vertex_buffer_desc.size && index_bytes <= index_buffer_desc.size;
+}
+
+bool RenderMaterialResource::is_valid() const noexcept {
+    return pipeline.is_valid();
+}
+
+bool RenderObjectResource::is_valid() const noexcept {
+    if (!transform_buffer.is_valid() || !binding_layout.is_valid() || !binding_set.is_valid() ||
+        transform_buffer_desc.size == 0 || transform_size == 0 ||
+        !rhi::has_flag(transform_buffer_desc.capabilities, rhi::BufferCapability::kUniform)) {
+        return false;
+    }
+    return transform_offset <= transform_buffer_desc.size &&
+           transform_size <= transform_buffer_desc.size - transform_offset;
+}
+
 RenderSceneSnapshotBuilder::RenderSceneSnapshotBuilder(const ecs::WorldSnapshot& world_snapshot, const RenderView& view,
                                                        const RenderExtractionDesc& desc)
     : snapshot_{

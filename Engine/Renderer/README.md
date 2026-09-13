@@ -20,8 +20,10 @@ Scope 的 `RenderSceneSnapshot` Artifact。`EngineFrameOrchestrator` 在
 `RenderExtract` Phase 自动执行该发布流程；没有配置 Renderer 时不会改变原有帧流程。
 
 `RenderPipeline` 提供 Visibility、Shadow、Depth、Opaque、Lighting、Transparent、
-PostProcess 和 BeforePresent 的标准 Stage/FeaturePoint 拓扑。具体绘制和计算仍由
-RenderFeature 通过 RenderGraph 声明和执行。
+PostProcess 和 BeforePresent 的标准 Stage/FeaturePoint 拓扑。具体绘制和计算由
+RenderFeature 通过 RenderGraph 声明和执行；当前还提供 Experimental 的
+`OpaqueRenderFeature`，用于把已提取的 MeshRenderer 实例发出为最小的 indexed
+opaque draw。
 
 ## 边界
 
@@ -85,17 +87,21 @@ GPU 资源生命周期。
 
 ### `RenderResourceResolver`
 
-`RenderResourceResolver` 将 `MeshAssetId`、`MaterialInstanceId` 解析为后端无关的
-`RenderMeshResource` 和 `RenderMaterialResource`。返回值中的 Buffer、Binding Layout
-和 Binding Set 均为公共 RHI Handle；实现可以由 Resource 系统、Asset 系统或宿主应用
-提供。
+`RenderResourceResolver` 将 `MeshAssetId`、`MaterialInstanceId` 和视图内
+`RenderInstance` 解析为后端无关的 `RenderMeshResource`、`RenderMaterialResource` 与
+`RenderObjectResource`。Mesh 资源包含 Vertex/Index Buffer 及其不可变创建描述；Material
+资源选择 Graphics Pipeline；Object 资源提供当前 View 所需的 Transform Uniform Buffer、
+Binding Layout 和 Binding Set。所有返回值均是公共 RHI Handle；实现可以由 Resource 系统、
+Asset 系统或宿主应用提供。
 
 解析策略由 `RenderExtractionDesc::require_resolved_resources` 控制：
 
 - `false`：提取阶段只保留资产身份，适合资源异步加载或 CPU-only 场景提取；
-- `true`：每个通过视图过滤的实例都必须能解析出有效 Mesh 和 Material，否则提取失败。
+- `true`：每个通过视图过滤的实例都必须能解析出有效 Mesh 和 Material，否则提取失败；
+  Object Binding 会在具体 RenderFeature 构图时按 View 解析。
 
 解析器指针只在提取和当前帧 RenderFeature 构建期间借用，Orchestrator 不取得其所有权。
+实现必须让返回的 RHI 资源至少存活到该帧 RenderGraph 执行结束。
 
 ### `RenderExtractContext` 与 `RenderSceneSnapshotBuilder`
 
@@ -127,6 +133,28 @@ const RenderSceneSnapshot& scene = *context->scene_snapshot;
 期间解析 GPU 资源，`user_data` 是宿主透传指针。上下文由
 `EngineFrameOrchestrator` 持有到当前 RenderGraph 完成执行之后；Feature 不得延长或
 释放这些指针的生命周期。
+
+### `OpaqueRenderFeature`
+
+`opaque_render_feature.hpp` 提供 `register_opaque_render_feature()` 和
+`bind_opaque_render_feature()`，后者把该 Experimental Feature 绑定到标准
+`RenderPipeline.Opaque` 扩展点。它读取当前 `RenderSceneSnapshot`，逐个解析 Mesh、
+Material 和 View-local Object Binding，并声明 `DrawOpaque` Graphics Pass。Pass 会显式
+读取 Vertex/Index/Uniform Buffer，并向 `RenderView::color_target` 写入 Color Attachment；
+当 `RenderView::depth_target` 有效时，还会声明并清除 Depth/Stencil Attachment。因此
+Resource Resolver 提供的 Buffer 描述必须包含相应的 RHI capability，调用方提供的 Depth
+Texture 必须声明 `kDepthStencil` capability。
+
+调用方必须先将 `RenderView::color_target` 对应的外部或图内 Texture 绑定到
+RenderGraphFeatureRuntime。使用 `EngineFrameOrchestrator` 时，应在
+`EngineFramePreparationContext` 中导入目标并以同一稳定 `RenderResourceId` 绑定。当前
+最小 Shader Contract 位于 `shaders/core/opaque/unlit_mesh.vert.hlsl` 与
+`shaders/core/opaque/unlit_mesh.frag.hlsl`，仅覆盖 Transform Uniform 和单色不透明输出；
+材质绑定集由 Resource 层创建，Renderer 只消费 BindingSet、绑定组和对应的 RenderGraph
+纹理、材质参数 Buffer 声明；排序和光照仍由后续 RenderFeature 扩展。当前材质参数块
+提供一个稳定的 `float4` Tint，用于验证纹理采样结果与材质参数组合。材质纹理必须是
+当前 RenderGraph 中声明的有效资源；缺失声明、过期 Graph Handle 或不完整参数 Buffer
+会在构图阶段失败，而不是让 Feature 继续提交不完整的 BindingSet。
 
 ## 标准 RenderPipeline
 

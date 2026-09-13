@@ -45,6 +45,25 @@ using foundation::unsupported;
 }
 }  // namespace
 
+EngineFramePreparationContext::EngineFramePreparationContext(render_graph::FrameContext& frame_context,
+                                                             render_graph::RenderGraph& render_graph,
+                                                             const rhi::FrameAcquireResult* acquired_frame,
+                                                             render_graph::RenderGraphTexture swapchain_resource,
+                                                             EngineFrameOrchestrator& owner) noexcept
+    : frame_context(frame_context),
+      render_graph(render_graph),
+      acquired_frame(acquired_frame),
+      swapchain_resource(swapchain_resource),
+      owner_(&owner) {}
+
+foundation::Result EngineFramePreparationContext::bind_feature_texture(pipeline::RenderResourceId id,
+                                                                       render_graph::RenderGraphTexture texture) const {
+    if (owner_ == nullptr) {
+        return invalid_state("render feature preparation context is no longer active");
+    }
+    return owner_->bind_feature_texture(id, texture);
+}
+
 EngineFrameOrchestrator::EngineFrameOrchestrator(pipeline::PipelineRegistry& registry,
                                                  pipeline::PipelineScheduler& scheduler,
                                                  render_graph::FrameContext& frame_context,
@@ -290,6 +309,15 @@ foundation::Result EngineFrameOrchestrator::unregister_world(ecs::WorldHandle wo
 }
 
 foundation::Result EngineFrameOrchestrator::validate_frame_desc(const EngineFrameDesc& desc) const {
+    if (!desc.render_output_extent.is_valid()) {
+        return invalid_argument("render output extent is invalid");
+    }
+    if (desc.render_view_resolver && desc.renderer == nullptr) {
+        return invalid_argument("render view resolver requires a Renderer instance");
+    }
+    if (desc.render_view_resolver && !desc.render_views.empty()) {
+        return invalid_argument("render view resolver cannot be combined with explicit render views");
+    }
     if (desc.present_acquired_frame && !desc.acquire_swapchain_image) {
         return invalid_argument("present_acquired_frame requires acquire_swapchain_image");
     }
@@ -781,16 +809,39 @@ foundation::Result EngineFrameOrchestrator::extract_render_scenes() {
         if (render_views_.empty()) {
             render_views_.reserve(active_world_frames_.size());
             for (const ActiveWorldFrame& active : active_world_frames_) {
-                if (active.binding.world == nullptr) {
+                if (active.binding.world == nullptr || active.scope == nullptr) {
                     return invalid_state("active World Frame binding has no World Scope");
                 }
                 renderer::RenderView view{};
-                view.id = renderer::make_render_view_id(active.binding.world->handle(), active.binding.view_id);
-                view.world = active.binding.world->handle();
-                view.view_id = active.binding.view_id;
-                if (frame_desc_.acquire_swapchain_image) {
-                    view.output_extent = {frame_desc_.swapchain_image_desc.extent.width,
-                                          frame_desc_.swapchain_image_desc.extent.height};
+                const renderer::RenderExtent output_extent =
+                    frame_desc_.acquire_swapchain_image
+                        ? renderer::RenderExtent{frame_desc_.swapchain_image_desc.extent.width,
+                                                 frame_desc_.swapchain_image_desc.extent.height}
+                        : frame_desc_.render_output_extent;
+                if (frame_desc_.render_view_resolver) {
+                    const auto snapshot_artifact = active.scope->read_snapshot();
+                    if (!snapshot_artifact) {
+                        return snapshot_artifact.result;
+                    }
+                    const auto* snapshot =
+                        snapshot_artifact.value.as<ecs::WorldSnapshot>(world::kWorldSnapshotArtifactTypeId);
+                    if (snapshot == nullptr || snapshot->world() != active.binding.world->handle()) {
+                        return invalid_state("render view resolver received an invalid World snapshot");
+                    }
+                    const auto resolved = frame_desc_.render_view_resolver(
+                        EngineFrameRenderViewContext{*snapshot, active.binding.view_id, output_extent});
+                    if (!resolved) {
+                        return resolved.result;
+                    }
+                    view = std::move(resolved.value);
+                    if (view.world != active.binding.world->handle() || view.view_id != active.binding.view_id) {
+                        return invalid_state("render view resolver returned a mismatched World view");
+                    }
+                } else {
+                    view.id = renderer::make_render_view_id(active.binding.world->handle(), active.binding.view_id);
+                    view.world = active.binding.world->handle();
+                    view.view_id = active.binding.view_id;
+                    view.output_extent = output_extent;
                 }
                 render_views_.push_back(view);
             }
@@ -878,6 +929,41 @@ foundation::Result EngineFrameOrchestrator::release_frame_artifacts() {
         }
     }
     return first_error;
+}
+
+foundation::Result EngineFrameOrchestrator::bind_feature_texture(pipeline::RenderResourceId id,
+                                                                 render_graph::RenderGraphTexture texture) {
+    if (!frame_active_ || !frame_context_.is_frame_active()) {
+        return invalid_state("feature texture binding requires an active frame");
+    }
+    if (render_feature_prepared_ || render_features_built_) {
+        return invalid_state("feature texture binding must finish before RenderFeature construction");
+    }
+    if (!id.is_valid() || !texture.is_valid()) {
+        return invalid_argument("feature texture binding is invalid");
+    }
+    if (!render_graph_.contains_texture(texture)) {
+        return not_found("feature texture does not belong to the active RenderGraph");
+    }
+
+    const auto existing =
+        std::find_if(feature_textures_.begin(), feature_textures_.end(),
+                     [id](const render_graph::RenderGraphFeatureTextureBinding& binding) { return binding.id == id; });
+    if (existing != feature_textures_.end()) {
+        if (existing->texture == texture) {
+            return foundation::Result::success();
+        }
+        return invalid_state("feature texture resource id is already bound to another texture");
+    }
+
+    try {
+        feature_textures_.push_back({id, texture});
+    } catch (const std::bad_alloc&) {
+        return out_of_memory("feature texture binding allocation failed");
+    }
+    frame_desc_.render_feature_textures = std::span<const render_graph::RenderGraphFeatureTextureBinding>(
+        feature_textures_.data(), feature_textures_.size());
+    return foundation::Result::success();
 }
 
 void EngineFrameOrchestrator::clear_world_frames() noexcept {
@@ -1111,10 +1197,7 @@ foundation::Result EngineFrameOrchestrator::execute_registered_phase(pipeline::P
         !render_feature_prepared_) {
         if (frame_desc_.render_feature_preparation) {
             const EngineFramePreparationContext preparation_context{
-                frame_context_,
-                render_graph_,
-                frame_context_.acquired_frame(),
-                swapchain_resource_,
+                frame_context_, render_graph_, frame_context_.acquired_frame(), swapchain_resource_, *this,
             };
             try {
                 if (const foundation::Result result = frame_desc_.render_feature_preparation(preparation_context);
@@ -1126,9 +1209,8 @@ foundation::Result EngineFrameOrchestrator::execute_registered_phase(pipeline::P
             } catch (const std::exception& exception) {
                 return foundation::unknown_exception(exception);
             } catch (...) {
-                return foundation::Result::failure(
-                    foundation::ResultCode::kUnknown,
-                    "render feature preparation threw an unknown exception");
+                return foundation::Result::failure(foundation::ResultCode::kUnknown,
+                                                   "render feature preparation threw an unknown exception");
             }
         }
         render_feature_prepared_ = true;

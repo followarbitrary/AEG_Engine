@@ -84,6 +84,8 @@ enum class FieldValueKind : uint8_t {
     kString = 7,
     kObject = 8,
     kOpaque = 9,
+    kVec3 = 10,
+    kQuat = 11,
 };
 
 /** @brief Editor and persistence policy attached to a reflected field. */

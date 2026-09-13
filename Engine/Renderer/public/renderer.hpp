@@ -179,27 +179,71 @@ struct RenderLightComponent final {
 
 /** @brief GPU resources resolved for one mesh asset without exposing backend types. */
 struct RenderMeshResource final {
+    /** @brief Vertex buffer containing the mesh's interleaved vertex records. */
     rhi::BufferHandle vertex_buffer{};
+    /** @brief Immutable creation contract for vertex_buffer. */
     rhi::BufferDesc vertex_buffer_desc{};
+    /** @brief Index buffer containing the mesh's primitive indices. */
     rhi::BufferHandle index_buffer{};
+    /** @brief Immutable creation contract for index_buffer. */
     rhi::BufferDesc index_buffer_desc{};
+    /** @brief Byte stride of each vertex record. */
     uint32_t vertex_stride{0};
+    /** @brief Number of vertices available in vertex_buffer. */
     uint32_t vertex_count{0};
+    /** @brief Number of indices consumed by an indexed draw. */
     uint32_t index_count{0};
+    /** @brief Element width used by index_buffer. */
     rhi::IndexFormat index_format{rhi::IndexFormat::kUint16};
 
-    [[nodiscard]] bool is_valid() const noexcept {
-        return vertex_buffer.is_valid() && index_buffer.is_valid() && vertex_stride != 0 && vertex_count != 0 &&
-               index_count != 0;
-    }
+    /** @brief Reports whether this resource can be consumed by an indexed graphics draw. */
+    [[nodiscard]] bool is_valid() const noexcept;
 };
 
 /** @brief GPU resources resolved for one material instance. */
 struct RenderMaterialResource final {
-    rhi::BindingLayoutHandle binding_layout{};
+    /** @brief Graphics pipeline selected by this material instance. */
+    rhi::PipelineHandle pipeline{};
+    /** @brief Descriptor set exposing material textures and samplers. */
     rhi::BindingSetHandle binding_set{};
+    /** @brief Pipeline layout group used when binding binding_set. */
+    uint32_t binding_group{1};
+    /** @brief Graph texture sampled by the material binding set. */
+    pipeline::RenderGraphTexture material_texture{};
+    /** @brief Uniform buffer containing material parameters. */
+    rhi::BufferHandle material_parameter_buffer{};
+    /** @brief Immutable creation contract for material_parameter_buffer. */
+    rhi::BufferDesc material_parameter_buffer_desc{};
+    /** @brief Graph buffer used to declare material parameter reads. */
+    pipeline::RenderGraphBuffer material_parameter_resource{};
+    /** @brief Byte offset of the material parameter range. */
+    uint64_t material_parameter_offset{0};
+    /** @brief Byte size of the material parameter range. */
+    uint64_t material_parameter_size{0};
 
-    [[nodiscard]] bool is_valid() const noexcept { return binding_layout.is_valid() && binding_set.is_valid(); }
+    /** @brief Reports whether this material can issue a graphics draw. */
+    [[nodiscard]] bool is_valid() const noexcept;
+};
+
+/** @brief View-local object bindings consumed by the standard opaque shader contract. */
+struct RenderObjectResource final {
+    /** @brief Uniform buffer containing the object's transform constants. */
+    rhi::BufferHandle transform_buffer{};
+    /** @brief Immutable creation contract for transform_buffer. */
+    rhi::BufferDesc transform_buffer_desc{};
+    /** @brief Layout used to allocate binding_set. */
+    rhi::BindingLayoutHandle binding_layout{};
+    /** @brief Descriptor set exposing transform_buffer to the material pipeline. */
+    rhi::BindingSetHandle binding_set{};
+    /** @brief Pipeline layout group used when binding binding_set. */
+    uint32_t binding_group{0};
+    /** @brief Byte offset of the transform range declared to RenderGraph. */
+    uint64_t transform_offset{0};
+    /** @brief Byte size of the transform range declared to RenderGraph. */
+    uint64_t transform_size{0};
+
+    /** @brief Reports whether this object exposes a complete transform uniform binding. */
+    [[nodiscard]] bool is_valid() const noexcept;
 };
 
 /** @brief Resolves renderer asset identities to backend-neutral RHI resources. */
@@ -210,6 +254,9 @@ public:
     [[nodiscard]] virtual foundation::ResultValue<RenderMeshResource> resolve_mesh(MeshAssetId mesh) const = 0;
     [[nodiscard]] virtual foundation::ResultValue<RenderMaterialResource> resolve_material(
         MaterialInstanceId material) const = 0;
+    /** @brief Resolves the view-local transform binding required for one opaque render object. */
+    [[nodiscard]] virtual foundation::ResultValue<RenderObjectResource> resolve_object(
+        const RenderInstance& instance, const RenderView& view) const = 0;
 };
 
 /** @brief Immutable frame-local rendering input produced by RenderExtract. */

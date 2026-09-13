@@ -21,6 +21,7 @@ struct ExtractorState final {
 struct ResolverState final {
     uint32_t mesh_resolve_count{0};
     uint32_t material_resolve_count{0};
+    uint32_t object_resolve_count{0};
 };
 
 struct RenderFeatureState final {
@@ -38,9 +39,17 @@ public:
         ++state_->mesh_resolve_count;
         return {aeg::foundation::Result::success(), aeg::renderer::RenderMeshResource{
                                                         .vertex_buffer = aeg::rhi::BufferHandle{1},
-                                                        .vertex_buffer_desc = {.size = 64},
+                                                        .vertex_buffer_desc =
+                                                            {
+                                                                .size = 64,
+                                                                .capabilities = aeg::rhi::BufferCapability::kVertex,
+                                                            },
                                                         .index_buffer = aeg::rhi::BufferHandle{2},
-                                                        .index_buffer_desc = {.size = 12},
+                                                        .index_buffer_desc =
+                                                            {
+                                                                .size = 12,
+                                                                .capabilities = aeg::rhi::BufferCapability::kIndex,
+                                                            },
                                                         .vertex_stride = 16,
                                                         .vertex_count = 4,
                                                         .index_count = 6,
@@ -52,8 +61,27 @@ public:
         aeg::renderer::MaterialInstanceId) const override {
         ++state_->material_resolve_count;
         return {aeg::foundation::Result::success(), aeg::renderer::RenderMaterialResource{
-                                                        .binding_layout = aeg::rhi::BindingLayoutHandle{3},
-                                                        .binding_set = aeg::rhi::BindingSetHandle{4},
+                                                        .pipeline = aeg::rhi::PipelineHandle{3},
+                                                        .binding_set = aeg::rhi::BindingSetHandle{7},
+                                                        .binding_group = 1,
+                                                    }};
+    }
+
+    [[nodiscard]] aeg::foundation::ResultValue<aeg::renderer::RenderObjectResource> resolve_object(
+        const aeg::renderer::RenderInstance&, const aeg::renderer::RenderView&) const override {
+        ++state_->object_resolve_count;
+        return {aeg::foundation::Result::success(), aeg::renderer::RenderObjectResource{
+                                                        .transform_buffer = aeg::rhi::BufferHandle{4},
+                                                        .transform_buffer_desc =
+                                                            {
+                                                                .size = sizeof(aeg::math::Mat4),
+                                                                .capabilities = aeg::rhi::BufferCapability::kUniform,
+                                                            },
+                                                        .binding_layout = aeg::rhi::BindingLayoutHandle{5},
+                                                        .binding_set = aeg::rhi::BindingSetHandle{6},
+                                                        .binding_group = 0,
+                                                        .transform_offset = 0,
+                                                        .transform_size = sizeof(aeg::math::Mat4),
                                                     }};
     }
 

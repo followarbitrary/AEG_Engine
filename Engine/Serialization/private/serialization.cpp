@@ -5,6 +5,7 @@
 #include "../public/serialization.hpp"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cstring>
 #include <limits>
@@ -36,6 +37,25 @@ constexpr std::size_t kMaxFieldBytes = 64u * 1024u * 1024u;
     return foundation::Result::success();
 }
 
+[[nodiscard]] foundation::Result validate_four_float_storage(const reflection::FieldDescriptor& field) {
+    if (field.accessor.value_size != sizeof(float) * 4 || field.accessor.value_alignment < sizeof(float) * 4) {
+        return invalid_state("reflected four-float field storage is invalid");
+    }
+    return foundation::Result::success();
+}
+
+[[nodiscard]] foundation::Result write_float(BinaryWriter& writer, float value) {
+    return writer.write_u32(std::bit_cast<uint32_t>(value));
+}
+
+[[nodiscard]] foundation::ResultValue<float> read_float(BinaryReader& reader) {
+    const auto bits = reader.read_u32();
+    if (!bits) {
+        return {bits.result, 0.0f};
+    }
+    return {foundation::Result::success(), std::bit_cast<float>(bits.value)};
+}
+
 [[nodiscard]] foundation::Result write_scalar(const reflection::FieldDescriptor& field, const void* value,
                                               BinaryWriter& writer) {
     if (value == nullptr) {
@@ -65,8 +85,7 @@ constexpr std::size_t kMaxFieldBytes = 64u * 1024u * 1024u;
             return writer.write_u64(value_copy);
         }
         case reflection::FieldValueKind::kFloat: {
-            uint32_t bits = std::bit_cast<uint32_t>(*static_cast<const float*>(value));
-            return writer.write_u32(bits);
+            return write_float(writer, *static_cast<const float*>(value));
         }
         case reflection::FieldValueKind::kDouble: {
             uint64_t bits = std::bit_cast<uint64_t>(*static_cast<const double*>(value));
@@ -75,6 +94,33 @@ constexpr std::size_t kMaxFieldBytes = 64u * 1024u * 1024u;
         case reflection::FieldValueKind::kString: {
             const auto& string = *static_cast<const std::string*>(value);
             return writer.write_bytes({reinterpret_cast<const uint8_t*>(string.data()), string.size()});
+        }
+        case reflection::FieldValueKind::kVec3: {
+            if (const foundation::Result result = validate_four_float_storage(field); !result) {
+                return result;
+            }
+            std::array<float, 3> values{};
+            std::memcpy(values.data(), value, sizeof(values));
+            for (const float component : values) {
+                if (const foundation::Result result = write_float(writer, component); !result) {
+                    return result;
+                }
+            }
+            // Vec3's fourth storage slot is non-semantic but remains present in its wire layout.
+            return write_float(writer, 0.0f);
+        }
+        case reflection::FieldValueKind::kQuat: {
+            if (const foundation::Result result = validate_four_float_storage(field); !result) {
+                return result;
+            }
+            std::array<float, 4> values{};
+            std::memcpy(values.data(), value, sizeof(values));
+            for (const float component : values) {
+                if (const foundation::Result result = write_float(writer, component); !result) {
+                    return result;
+                }
+            }
+            return foundation::Result::success();
         }
         case reflection::FieldValueKind::kObject:
         case reflection::FieldValueKind::kOpaque:
@@ -130,11 +176,11 @@ constexpr std::size_t kMaxFieldBytes = 64u * 1024u * 1024u;
             return foundation::Result::success();
         }
         case reflection::FieldValueKind::kFloat: {
-            const auto bits = reader.read_u32();
-            if (!bits) {
-                return bits.result;
+            const auto value_result = read_float(reader);
+            if (!value_result) {
+                return value_result.result;
             }
-            *static_cast<float*>(value) = std::bit_cast<float>(bits.value);
+            *static_cast<float*>(value) = value_result.value;
             return foundation::Result::success();
         }
         case reflection::FieldValueKind::kDouble: {
@@ -156,6 +202,37 @@ constexpr std::size_t kMaxFieldBytes = 64u * 1024u * 1024u;
             } catch (const std::bad_alloc&) {
                 return out_of_memory("deserialized string allocation failed");
             }
+            return foundation::Result::success();
+        }
+        case reflection::FieldValueKind::kVec3: {
+            if (const foundation::Result result = validate_four_float_storage(field); !result) {
+                return result;
+            }
+            std::array<float, 4> values{};
+            for (float& component : values) {
+                const auto value_result = read_float(reader);
+                if (!value_result) {
+                    return value_result.result;
+                }
+                component = value_result.value;
+            }
+            values[3] = 0.0f;
+            std::memcpy(value, values.data(), sizeof(values));
+            return foundation::Result::success();
+        }
+        case reflection::FieldValueKind::kQuat: {
+            if (const foundation::Result result = validate_four_float_storage(field); !result) {
+                return result;
+            }
+            std::array<float, 4> values{};
+            for (float& component : values) {
+                const auto value_result = read_float(reader);
+                if (!value_result) {
+                    return value_result.result;
+                }
+                component = value_result.value;
+            }
+            std::memcpy(value, values.data(), sizeof(values));
             return foundation::Result::success();
         }
         case reflection::FieldValueKind::kObject:

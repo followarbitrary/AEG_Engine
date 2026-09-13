@@ -19,17 +19,23 @@
 #include "world_scope.hpp"
 
 namespace aeg::engine {
+class EngineFrameOrchestrator;
+
 /** @brief Conventional RenderGraph resource identity for the acquired swapchain image. */
 inline constexpr pipeline::RenderResourceId kSwapchainImageResourceId{"SwapchainImage"};
 
 /**
  * @brief Context supplied to a frame-local render-feature preparation callback.
  *
- * The callback runs after FrameContext has begun and, when requested, after a
- * swapchain image has been acquired and imported into the RenderGraph. It is a
+ * The callback runs after
+ * FrameContext has begun and, when requested, after a
+ * swapchain image has been acquired and imported into the
+ * RenderGraph. It is a
  * controlled RenderBuild hook for producers that must upload or prepare
- * frame-local resources before RenderFeature graph construction. The callback
- * must not retain the context or its acquired-frame pointer.
+ * frame-local
+ * resources before RenderFeature graph construction. The callback
+ * must not retain the context or its acquired-frame
+ * pointer.
  */
 struct EngineFramePreparationContext final {
     render_graph::FrameContext& frame_context;
@@ -37,10 +43,44 @@ struct EngineFramePreparationContext final {
     const rhi::FrameAcquireResult* acquired_frame{nullptr};
     /** @brief Logical RenderGraph texture for the acquired swapchain image. */
     render_graph::RenderGraphTexture swapchain_resource{};
+
+    /** @brief Registers an imported preparation texture for later RenderFeature lookup by stable resource id. */
+    [[nodiscard]] foundation::Result bind_feature_texture(pipeline::RenderResourceId id,
+                                                          render_graph::RenderGraphTexture texture) const;
+
+private:
+    EngineFramePreparationContext(render_graph::FrameContext& frame_context, render_graph::RenderGraph& render_graph,
+                                  const rhi::FrameAcquireResult* acquired_frame,
+                                  render_graph::RenderGraphTexture swapchain_resource,
+                                  EngineFrameOrchestrator& owner) noexcept;
+
+    EngineFrameOrchestrator* owner_{nullptr};
+
+    friend class EngineFrameOrchestrator;
 };
 
-using EngineFramePreparationFunction =
-    std::function<foundation::Result(const EngineFramePreparationContext& context)>;
+using EngineFramePreparationFunction = std::function<foundation::Result(const EngineFramePreparationContext& context)>;
+
+/**
+ * @brief Immutable World input supplied while resolving one generated RenderView.
+ *
+ * The snapshot is borrowed
+ * and is valid only for the resolver invocation. The
+ * view_id identifies the registered World/Frame binding being
+ * resolved.
+ */
+struct EngineFrameRenderViewContext final {
+    /** @brief Committed immutable World state captured for this resolver call. */
+    const ecs::WorldSnapshot& world_snapshot;
+    /** @brief Registered World/Frame view slot being resolved. */
+    uint32_t view_id{0};
+    /** @brief Output pixel extent selected for the generated RenderView. */
+    renderer::RenderExtent output_extent{};
+};
+
+/** @brief Produces one RenderView from the committed snapshot of a registered World view. */
+using EngineFrameRenderViewResolver =
+    std::function<foundation::ResultValue<renderer::RenderView>(const EngineFrameRenderViewContext& context)>;
 
 /** @brief Per-frame inputs consumed by EngineFrameOrchestrator. */
 struct EngineFrameDesc final {
@@ -49,6 +89,8 @@ struct EngineFrameDesc final {
     bool acquire_swapchain_image{false};
     rhi::SwapchainHandle swapchain{};
     rhi::TextureDesc swapchain_image_desc{};
+    /** @brief Output extent supplied to generated offscreen RenderViews when no swapchain image is acquired. */
+    renderer::RenderExtent render_output_extent{};
     /** @brief Optional override; undefined uses the state reported by image acquisition. */
     rhi::ResourceState swapchain_image_initial_state{};
     pipeline::RenderResourceId swapchain_resource_id{kSwapchainImageResourceId};
@@ -58,6 +100,16 @@ struct EngineFrameDesc final {
     std::span<const render_graph::RenderGraphExecutionLease> render_graph_execution_leases{};
     renderer::Renderer* renderer{nullptr};
     std::span<const renderer::RenderView> render_views{};
+    /**
+     * @brief Optional snapshot-only RenderView resolver used when render_views is empty.
+     *
+     * It runs
+     * once for each registered World view during RenderExtract and must
+     * return a view for the context's World
+     * and view_id. It must not retain the
+     * borrowed snapshot reference.
+     */
+    EngineFrameRenderViewResolver render_view_resolver{};
     void* user_data{nullptr};
     const renderer::RenderResourceResolver* render_resource_resolver{nullptr};
     bool require_resolved_render_resources{false};
@@ -119,6 +171,8 @@ public:
     [[nodiscard]] std::size_t world_frame_count() const noexcept { return world_frames_.size(); }
 
 private:
+    friend struct EngineFramePreparationContext;
+
     enum class PhaseExecutionMode : uint8_t {
         kStartup,
         kPreFrame,
@@ -149,6 +203,8 @@ private:
     [[nodiscard]] foundation::Result apply_world_commands();
     [[nodiscard]] foundation::Result commit_worlds();
     [[nodiscard]] foundation::Result extract_render_scenes();
+    [[nodiscard]] foundation::Result bind_feature_texture(pipeline::RenderResourceId id,
+                                                          render_graph::RenderGraphTexture texture);
     [[nodiscard]] foundation::Result build_render_features();
     [[nodiscard]] foundation::Result execute_render_graph();
     [[nodiscard]] foundation::Result release_frame_artifacts();
