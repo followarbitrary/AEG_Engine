@@ -9,6 +9,6 @@ cbuffer TextureMaterialConstants : register(b2, space1) {
     float4 material_tint;
 };
 
-float4 main() : SV_Target0 {
-    return material_color.Sample(material_sampler, float2(0.5f, 0.5f)) * material_tint;
+float4 main(float2 uv : TEXCOORD0) : SV_Target0 {
+    return material_color.Sample(material_sampler, uv) * material_tint;
 }

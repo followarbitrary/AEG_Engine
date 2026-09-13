@@ -21,6 +21,8 @@ inline constexpr pipeline::StageId kOpaqueRenderFeatureStageId{"Renderer.OpaqueR
 inline constexpr uint64_t kVertexResourceNamespace = 0x5a5e8f641b8d37c1ull;
 inline constexpr uint64_t kIndexResourceNamespace = 0x7f6c2b94d8a513e9ull;
 inline constexpr uint64_t kObjectResourceNamespace = 0x1ec7d5a2b9364f0bull;
+inline constexpr uint32_t kPositionAttributeSize = sizeof(float) * 4u;
+inline constexpr uint32_t kUvAttributeSize = sizeof(float) * 2u;
 
 [[nodiscard]] pipeline::RenderResourceId make_resource_id(uint64_t resource_namespace, uint64_t identity) noexcept {
     uint64_t value = resource_namespace;
@@ -92,7 +94,7 @@ public:
             .domain = pipeline::FeatureDomain::kRender,
             .domain_mask = pipeline::to_mask(pipeline::FeatureDomain::kRender),
             .supported_scopes = pipeline::to_mask(pipeline::PipelineScope::kFrame),
-            .version = {1, 0, 0},
+            .version = {1, 1, 0},
         };
         return kDescriptor;
     }
@@ -145,6 +147,17 @@ public:
             }
             if (!mesh.value.is_valid()) {
                 return invalid_state("opaque render feature received an invalid mesh resource");
+            }
+            const RenderMeshVertexLayout& vertex_layout = mesh.value.vertex_layout;
+            if (vertex_layout.position_format != rhi::Format::kRgba32Float ||
+                vertex_layout.position_offset > mesh.value.vertex_stride ||
+                kPositionAttributeSize > mesh.value.vertex_stride - vertex_layout.position_offset) {
+                return invalid_state("opaque render feature received an incompatible position vertex layout");
+            }
+            if (vertex_layout.uv_format != rhi::Format::kRg32Float ||
+                vertex_layout.uv_offset > mesh.value.vertex_stride ||
+                kUvAttributeSize > mesh.value.vertex_stride - vertex_layout.uv_offset) {
+                return invalid_state("opaque render feature requires a float2 UV vertex attribute");
             }
 
             const foundation::ResultValue<RenderMaterialResource> material =

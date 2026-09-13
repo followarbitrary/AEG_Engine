@@ -177,6 +177,18 @@ struct RenderLightComponent final {
     bool enabled{true};
 };
 
+/** @brief Interleaved vertex attribute offsets and formats consumed by Opaque. */
+struct RenderMeshVertexLayout final {
+    /** @brief Byte offset of the float4 position within one interleaved vertex. */
+    uint32_t position_offset{0};
+    /** @brief Shader-facing format of the position attribute. */
+    rhi::Format position_format{rhi::Format::kRgba32Float};
+    /** @brief Byte offset of the float2 UV within one interleaved vertex. */
+    uint32_t uv_offset{sizeof(float) * 4u};
+    /** @brief Shader-facing format of the UV attribute. */
+    rhi::Format uv_format{rhi::Format::kRg32Float};
+};
+
 /** @brief GPU resources resolved for one mesh asset without exposing backend types. */
 struct RenderMeshResource final {
     /** @brief Vertex buffer containing the mesh's interleaved vertex records. */
@@ -195,6 +207,8 @@ struct RenderMeshResource final {
     uint32_t index_count{0};
     /** @brief Element width used by index_buffer. */
     rhi::IndexFormat index_format{rhi::IndexFormat::kUint16};
+    /** @brief Interleaved vertex attribute offsets and formats consumed by Opaque. */
+    RenderMeshVertexLayout vertex_layout{};
 
     /** @brief Reports whether this resource can be consumed by an indexed graphics draw. */
     [[nodiscard]] bool is_valid() const noexcept;

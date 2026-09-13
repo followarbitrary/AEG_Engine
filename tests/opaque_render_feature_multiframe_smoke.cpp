@@ -85,12 +85,14 @@ struct Vertex final {
     float y{0.0f};
     float z{0.0f};
     float w{1.0f};
+    float u{0.0f};
+    float v{0.0f};
 };
 
 constexpr std::array<Vertex, 3> kTriangleVertices{{
-    {-0.75f, -0.75f, 0.0f, 1.0f},
-    {0.75f, -0.75f, 0.0f, 1.0f},
-    {0.0f, 0.75f, 0.0f, 1.0f},
+    {-0.75f, -0.75f, 0.0f, 1.0f, 0.0f, 1.0f},
+    {0.75f, -0.75f, 0.0f, 1.0f, 1.0f, 1.0f},
+    {0.0f, 0.75f, 0.0f, 1.0f, 0.5f, 0.0f},
 }};
 constexpr std::array<uint16_t, 3> kTriangleIndices{{0, 1, 2}};
 
@@ -562,7 +564,9 @@ int main() {
 
     const std::array<VertexBindingDesc, 1> vertex_bindings{
         VertexBindingDesc{0, sizeof(Vertex), VertexInputRate::kVertex}};
-    const std::array<VertexAttributeDesc, 1> vertex_attributes{{VertexAttributeDesc{0, 0, Format::kRgba32Float, 0}}};
+    const std::array<VertexAttributeDesc, 2> vertex_attributes{
+        VertexAttributeDesc{0, 0, Format::kRgba32Float, 0},
+        VertexAttributeDesc{1, 0, Format::kRg32Float, sizeof(float) * 4u}};
     const std::array<Format, 1> color_formats{{target_desc.format}};
     GraphicsPipelineState graphics_state{};
     graphics_state.vertex_bindings = vertex_bindings;
@@ -582,7 +586,11 @@ int main() {
     aeg::renderer::RenderMeshResource mesh_resource{
         vertex_buffer, vertex_desc, index_buffer, index_desc, sizeof(Vertex),
         static_cast<uint32_t>(kTriangleVertices.size()), static_cast<uint32_t>(kTriangleIndices.size()),
-        aeg::rhi::IndexFormat::kUint16};
+        aeg::rhi::IndexFormat::kUint16,
+        {.position_offset = 0,
+         .position_format = Format::kRgba32Float,
+         .uv_offset = sizeof(float) * 4u,
+         .uv_format = Format::kRg32Float}};
     MultiMaterialResolver resolver(*device, mesh_id, material_ids, object_ids, mesh_resource, object_resources);
     resolver.set_pipeline(graphics_pipeline);
 

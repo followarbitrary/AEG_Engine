@@ -70,6 +70,11 @@ Runtime 组件只通过该公共 Snapshot 回调适配相机，Engine 编排器�
 RenderFeature。该绑定只在当前活跃帧且 Feature 构图前有效；重复身份必须指向同一 Texture，
 Context、FrameAllocation 和 RenderGraph Handle 都不得跨帧保存。
 
+Opaque RenderFeature 的网格资源还必须声明 `RenderMeshVertexLayout`：interleaved Vertex
+Buffer 至少包含 Position `float4` 和 UV `float2`，并且 stride、offset、format 必须与当前
+Shader Contract 一致。缺失 UV、顶点格式不匹配或越过 Vertex Buffer 范围时，RenderBuild
+应返回失败；该失败不得继续提交不完整的绘制。
+
 ## 依赖边界
 
 Runtime 可以依赖 Foundation、Math、ECS、Reflection、Serialization、Pipeline、World、

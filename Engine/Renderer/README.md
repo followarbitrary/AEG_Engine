@@ -89,7 +89,9 @@ GPU 资源生命周期。
 
 `RenderResourceResolver` 将 `MeshAssetId`、`MaterialInstanceId` 和视图内
 `RenderInstance` 解析为后端无关的 `RenderMeshResource`、`RenderMaterialResource` 与
-`RenderObjectResource`。Mesh 资源包含 Vertex/Index Buffer 及其不可变创建描述；Material
+`RenderObjectResource`。Mesh 资源包含 Vertex/Index Buffer 及其不可变创建描述，并通过
+`RenderMeshVertexLayout` 明确标准 Opaque 顶点的 Position/UV 格式和 interleaved byte
+offset；Material
 资源选择 Graphics Pipeline；Object 资源提供当前 View 所需的 Transform Uniform Buffer、
 Binding Layout 和 Binding Set。所有返回值均是公共 RHI Handle；实现可以由 Resource 系统、
 Asset 系统或宿主应用提供。
@@ -151,8 +153,11 @@ RenderGraphFeatureRuntime。使用 `EngineFrameOrchestrator` 时，应在
 最小 Shader Contract 位于 `shaders/core/opaque/unlit_mesh.vert.hlsl` 与
 `shaders/core/opaque/unlit_mesh.frag.hlsl`，仅覆盖 Transform Uniform 和单色不透明输出；
 材质绑定集由 Resource 层创建，Renderer 只消费 BindingSet、绑定组和对应的 RenderGraph
-纹理、材质参数 Buffer 声明；排序和光照仍由后续 RenderFeature 扩展。当前材质参数块
-提供一个稳定的 `float4` Tint，用于验证纹理采样结果与材质参数组合。材质纹理必须是
+纹理、材质参数 Buffer 声明；排序和光照仍由后续 RenderFeature 扩展。当前 Shader Contract
+覆盖 Transform Uniform、插值 UV 和单色不透明输出，材质参数块
+提供一个稳定的 `float4` Tint，用于验证纹理采样结果与材质参数组合。Opaque Shader 使用
+顶点插值 UV 采样纹理，Position 为 `float4`，UV 为 `float2`；缺失 UV 或布局格式/范围
+不匹配会在构图阶段失败。材质纹理必须是
 当前 RenderGraph 中声明的有效资源；缺失声明、过期 Graph Handle 或不完整参数 Buffer
 会在构图阶段失败，而不是让 Feature 继续提交不完整的 BindingSet。
 

@@ -90,13 +90,15 @@ struct Vertex final {
     float y{0.0f};
     float z{0.0f};
     float w{1.0f};
+    float u{0.0f};
+    float v{0.0f};
 };
 
 /** @brief The clip-space triangle rendered by the built-in opaque feature. */
 constexpr std::array<Vertex, 3> kTriangleVertices{{
-    {-0.75f, -0.75f, 0.0f, 1.0f},
-    {0.75f, -0.75f, 0.0f, 1.0f},
-    {0.0f, 0.75f, 0.0f, 1.0f},
+    {-0.75f, -0.75f, 0.0f, 1.0f, 0.0f, 1.0f},
+    {0.75f, -0.75f, 0.0f, 1.0f, 1.0f, 1.0f},
+    {0.0f, 0.75f, 0.0f, 1.0f, 0.5f, 0.0f},
 }};
 /** @brief Indexed topology consumed by the opaque RenderFeature. */
 constexpr std::array<uint16_t, 3> kTriangleIndices{{0, 1, 2}};
@@ -282,7 +284,7 @@ private:
 }  // namespace
 
 int main() {
-    static_assert(sizeof(Vertex) == sizeof(float) * 4u);
+    static_assert(sizeof(Vertex) == sizeof(float) * 6u);
 
     constexpr uint32_t kViewId = 3;
     const aeg::renderer::MeshAssetId mesh_id{0x1111ull};
@@ -500,7 +502,9 @@ int main() {
 
     const std::array<VertexBindingDesc, 1> vertex_bindings{
         {VertexBindingDesc{0, sizeof(Vertex), VertexInputRate::kVertex}}};
-    const std::array<VertexAttributeDesc, 1> vertex_attributes{{VertexAttributeDesc{0, 0, Format::kRgba32Float, 0}}};
+    const std::array<VertexAttributeDesc, 2> vertex_attributes{
+        VertexAttributeDesc{0, 0, Format::kRgba32Float, 0},
+        VertexAttributeDesc{1, 0, Format::kRg32Float, sizeof(float) * 4u}};
     const std::array<Format, 1> color_formats{{target_desc.format}};
     GraphicsPipelineState graphics_state{};
     graphics_state.vertex_bindings = vertex_bindings;
@@ -533,6 +537,12 @@ int main() {
                                      .vertex_count = static_cast<uint32_t>(kTriangleVertices.size()),
                                      .index_count = static_cast<uint32_t>(kTriangleIndices.size()),
                                      .index_format = aeg::rhi::IndexFormat::kUint16,
+                                     .vertex_layout = {
+                                         .position_offset = 0,
+                                         .position_format = Format::kRgba32Float,
+                                         .uv_offset = sizeof(float) * 4u,
+                                         .uv_format = Format::kRg32Float,
+                                     },
                                  },
                                  aeg::renderer::RenderMaterialResource{.pipeline = graphics_pipeline},
                                  aeg::renderer::RenderObjectResource{

@@ -1034,6 +1034,23 @@ if (WIN32)
     )
     add_dependencies(aeg_opaque_render_feature_multiframe_smoke aeg_core_shaders)
 
+    add_executable(aeg_opaque_render_feature_uv_depth_smoke
+        tests/opaque_render_feature_uv_depth_smoke.cpp
+    )
+    target_link_libraries(aeg_opaque_render_feature_uv_depth_smoke PRIVATE
+        aeg_engine
+        aeg_renderer
+        aeg_resource
+        aeg_rhi
+        aeg_shader
+        aeg_core_shaders
+    )
+    target_compile_definitions(aeg_opaque_render_feature_uv_depth_smoke PRIVATE
+        _CRT_SECURE_NO_WARNINGS
+        AEG_OPAQUE_UNLIT_SHADER_PACKAGE_PATH="${AEG_OPAQUE_UNLIT_SHADER_PACKAGE}"
+    )
+    add_dependencies(aeg_opaque_render_feature_uv_depth_smoke aeg_core_shaders)
+
     add_executable(aeg_editor_application
         Application/Editor/private/editor_application.cpp
         Application/Editor/private/font/editor_system_font_catalog.cpp
@@ -1128,10 +1145,11 @@ if (BUILD_TESTING)
         add_test(NAME aeg_editor_imgui_renderer_smoke COMMAND aeg_editor_imgui_renderer_smoke)
         add_test(NAME aeg_opaque_render_feature_smoke COMMAND aeg_opaque_render_feature_smoke)
         add_test(NAME aeg_opaque_render_feature_multiframe_smoke COMMAND aeg_opaque_render_feature_multiframe_smoke)
+        add_test(NAME aeg_opaque_render_feature_uv_depth_smoke COMMAND aeg_opaque_render_feature_uv_depth_smoke)
         add_test(NAME aeg_editor_application COMMAND aeg_editor_application --frames 60 --stress-resize)
         add_test(NAME aeg_editor_application_preferences
                  COMMAND aeg_editor_application --frames 60 --stress-resize --open-preferences)
-        set_tests_properties(aeg_editor_imgui_renderer_smoke aeg_opaque_render_feature_smoke aeg_opaque_render_feature_multiframe_smoke aeg_editor_application aeg_editor_application_preferences
+        set_tests_properties(aeg_editor_imgui_renderer_smoke aeg_opaque_render_feature_smoke aeg_opaque_render_feature_multiframe_smoke aeg_opaque_render_feature_uv_depth_smoke aeg_editor_application aeg_editor_application_preferences
             PROPERTIES
             FAIL_REGULAR_EXPRESSION "Vulkan validation \\[ERROR\\]"
         )
@@ -1143,7 +1161,7 @@ if (BUILD_TESTING)
                 aeg_pipeline_conformance_smoke aeg_pipeline_runtime_smoke aeg_pipeline_hot_swap_smoke
                 aeg_pipeline_phase_scheduler_smoke aeg_module_smoke aeg_world_scope_smoke aeg_world_serialization_smoke
                 aeg_scene_asset_smoke aeg_world_frame_orchestrator_smoke aeg_world_multi_view_smoke
-                aeg_engine_frame_orchestrator_smoke aeg_runtime_components_scene_smoke aeg_runtime_component_orchestrator_smoke aeg_renderer_smoke aeg_opaque_render_feature_smoke aeg_opaque_render_feature_multiframe_smoke aeg_render_feature_runtime_smoke
+                aeg_engine_frame_orchestrator_smoke aeg_runtime_components_scene_smoke aeg_runtime_component_orchestrator_smoke aeg_renderer_smoke aeg_opaque_render_feature_smoke aeg_opaque_render_feature_multiframe_smoke aeg_opaque_render_feature_uv_depth_smoke aeg_render_feature_runtime_smoke
                 aeg_frame_retention_smoke aeg_rhi_smoke aeg_logging_smoke aeg_triangle aeg_editor_application
                 aeg_editor_application_preferences aeg_editor_error_smoke aeg_render_graph_imported_texture_state_smoke PROPERTIES
             ENVIRONMENT "PATH=${AEG_MINGW_RUNTIME_DIR};$ENV{PATH}"
