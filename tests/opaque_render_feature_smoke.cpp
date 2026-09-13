@@ -92,13 +92,16 @@ struct Vertex final {
     float w{1.0f};
     float u{0.0f};
     float v{0.0f};
+    float nx{0.0f};
+    float ny{0.0f};
+    float nz{1.0f};
 };
 
 /** @brief The clip-space triangle rendered by the built-in opaque feature. */
 constexpr std::array<Vertex, 3> kTriangleVertices{{
-    {-0.75f, -0.75f, 0.0f, 1.0f, 0.0f, 1.0f},
-    {0.75f, -0.75f, 0.0f, 1.0f, 1.0f, 1.0f},
-    {0.0f, 0.75f, 0.0f, 1.0f, 0.5f, 0.0f},
+    {-0.75f, -0.75f, 0.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f},
+    {0.75f, -0.75f, 0.0f, 1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 1.0f},
+    {0.0f, 0.75f, 0.0f, 1.0f, 0.5f, 0.0f, 0.0f, 0.0f, 1.0f},
 }};
 /** @brief Indexed topology consumed by the opaque RenderFeature. */
 constexpr std::array<uint16_t, 3> kTriangleIndices{{0, 1, 2}};
@@ -145,6 +148,8 @@ struct OpaqueSmokeState final {
     BufferHandle material_parameter_buffer{};
     BufferDesc material_parameter_buffer_desc{};
     RenderGraphBuffer material_parameter_resource{};
+    BufferHandle lighting_buffer{};
+    BindingSetHandle lighting_binding_set{};
 };
 
 /** @brief Adds a graph-ordered readback pass immediately after the opaque graphics feature. */
@@ -217,7 +222,7 @@ protected:
     }
 };
 
-/** @brief Resolves the fixed test mesh, material pipeline, and per-view transform uniform. */
+/** @brief Resolves the fixed test mesh, material pipeline, object constants, and frame lighting. */
 class OpaqueSmokeResolver final : public aeg::renderer::RenderResourceResolver {
 public:
     OpaqueSmokeResolver(Device& device, aeg::renderer::MeshAssetId mesh_id,
@@ -231,6 +236,7 @@ public:
           object_(object) {}
 
     void set_material(aeg::renderer::RenderMaterialResource material) const noexcept { material_ = material; }
+    void set_lighting(aeg::renderer::RenderLightingResource lighting) const noexcept { lighting_ = lighting; }
 
     [[nodiscard]] aeg::foundation::ResultValue<aeg::renderer::RenderMeshResource> resolve_mesh(
         aeg::renderer::MeshAssetId mesh) const override {
@@ -258,15 +264,21 @@ public:
                     {}};
         }
 
-        const aeg::math::Mat4 model_view_projection = view.camera.view_projection() * instance.world_transform;
+        const aeg::renderer::RenderObjectConstants constants{
+            view.camera.view_projection() * instance.world_transform, aeg::math::identity()};
         const Result upload_result =
             device_.write_buffer(object_.transform_buffer, object_.transform_offset,
-                                 std::as_bytes(std::span<const aeg::math::Mat4>{&model_view_projection, 1}));
+                                 std::as_bytes(std::span{&constants, 1}));
         if (!upload_result) {
             return {upload_result, {}};
         }
         ++object_resolve_count;
         return {Result::success(), object_};
+    }
+
+    [[nodiscard]] aeg::foundation::ResultValue<aeg::renderer::RenderLightingResource> resolve_lighting(
+        const aeg::renderer::RenderSceneSnapshot&, const aeg::renderer::RenderView&) const override {
+        return {Result::success(), lighting_};
     }
 
     mutable uint32_t mesh_resolve_count{0};
@@ -280,11 +292,12 @@ private:
     aeg::renderer::RenderMeshResource mesh_{};
     mutable aeg::renderer::RenderMaterialResource material_{};
     aeg::renderer::RenderObjectResource object_{};
+    mutable aeg::renderer::RenderLightingResource lighting_{};
 };
 }  // namespace
 
 int main() {
-    static_assert(sizeof(Vertex) == sizeof(float) * 6u);
+    static_assert(sizeof(Vertex) == sizeof(float) * 9u);
 
     constexpr uint32_t kViewId = 3;
     const aeg::renderer::MeshAssetId mesh_id{0x1111ull};
@@ -383,6 +396,11 @@ int main() {
         return 12;
     }
     const BindingLayoutHandle material_binding_layout = material_binding_layout_result.value;
+    const auto lighting_binding_layout_result = shader_manager.binding_layout(shader_layout, 2);
+    if (!require(lighting_binding_layout_result, "opaque smoke lighting binding layout lookup failed")) {
+        return 13;
+    }
+    const BindingLayoutHandle lighting_binding_layout = lighting_binding_layout_result.value;
 
     TextureDesc target_desc{};
     target_desc.extent = {kTargetWidth, kTargetHeight, 1};
@@ -472,7 +490,7 @@ int main() {
     }
 
     BufferDesc transform_desc{};
-    transform_desc.size = sizeof(aeg::math::Mat4);
+    transform_desc.size = sizeof(aeg::renderer::RenderObjectConstants);
     transform_desc.capabilities = BufferCapability::kUniform;
     transform_desc.memory = MemoryClass::kUpload;
     transform_desc.initial_usage = ResourceUsage::kUniformRead;
@@ -494,7 +512,8 @@ int main() {
     transform_write.location = aeg::rhi::BindingLocation{0, 0};
     transform_write.resource = BindingResource{};
     transform_write.resource.type = BindingType::kUniformBuffer;
-    transform_write.resource.buffer_range = BufferRange{transform_buffer, 0, sizeof(aeg::math::Mat4)};
+    transform_write.resource.buffer_range =
+        BufferRange{transform_buffer, 0, sizeof(aeg::renderer::RenderObjectConstants)};
     if (!require(device->update_binding_set(binding_set, std::span{&transform_write, 1}),
                  "opaque smoke binding set update failed")) {
         return 20;
@@ -502,9 +521,10 @@ int main() {
 
     const std::array<VertexBindingDesc, 1> vertex_bindings{
         {VertexBindingDesc{0, sizeof(Vertex), VertexInputRate::kVertex}}};
-    const std::array<VertexAttributeDesc, 2> vertex_attributes{
+    const std::array<VertexAttributeDesc, 3> vertex_attributes{
         VertexAttributeDesc{0, 0, Format::kRgba32Float, 0},
-        VertexAttributeDesc{1, 0, Format::kRg32Float, sizeof(float) * 4u}};
+        VertexAttributeDesc{1, 0, Format::kRg32Float, sizeof(float) * 4u},
+        VertexAttributeDesc{2, 0, Format::kRgb32Float, sizeof(float) * 6u}};
     const std::array<Format, 1> color_formats{{target_desc.format}};
     GraphicsPipelineState graphics_state{};
     graphics_state.vertex_bindings = vertex_bindings;
@@ -542,6 +562,8 @@ int main() {
                                          .position_format = Format::kRgba32Float,
                                          .uv_offset = sizeof(float) * 4u,
                                          .uv_format = Format::kRg32Float,
+                                         .normal_offset = sizeof(float) * 6u,
+                                         .normal_format = Format::kRgb32Float,
                                      },
                                  },
                                  aeg::renderer::RenderMaterialResource{.pipeline = graphics_pipeline},
@@ -552,7 +574,7 @@ int main() {
                                      .binding_set = binding_set,
                                      .binding_group = 0,
                                      .transform_offset = 0,
-                                     .transform_size = sizeof(aeg::math::Mat4),
+                                     .transform_size = sizeof(aeg::renderer::RenderObjectConstants),
                                  });
 
     aeg::pipeline::PipelineScheduler scheduler({1, 1, 1, 1});
@@ -587,8 +609,8 @@ int main() {
         return {Result::success(), view};
     };
     frame_desc.render_feature_preparation = [&smoke_state, &resolver, device_ptr = device.get(),
-                                             material_binding_layout, graphics_pipeline, target_texture, target_view,
-                                             target_desc, depth_texture, depth_view,
+                                             material_binding_layout, lighting_binding_layout, graphics_pipeline,
+                                             target_texture, target_view, target_desc, depth_texture, depth_view,
                                              depth_desc](const aeg::engine::EngineFramePreparationContext& context) {
         const Result invalid_binding = context.bind_feature_texture(kOpaqueSceneColor, {});
         if (invalid_binding || invalid_binding.code != ResultCode::kInvalidArgument) {
@@ -732,6 +754,55 @@ int main() {
         material_resource.material_parameter_size = sizeof(material_parameters);
         resolver.set_material(material_resource);
 
+        const aeg::renderer::RenderLightingConstants lighting_constants{
+            .directional_direction_intensity = {0.0f, 0.0f, -1.0f, 0.0f},
+            .directional_color = {0.0f, 0.0f, 0.0f, 1.0f},
+            .ambient_color = {1.0f, 1.0f, 1.0f, 1.0f},
+        };
+        BufferDesc lighting_desc{};
+        lighting_desc.size = sizeof(lighting_constants);
+        lighting_desc.capabilities = BufferCapability::kTransferDestination | BufferCapability::kUniform;
+        lighting_desc.memory = MemoryClass::kDeviceLocal;
+        lighting_desc.initial_usage = ResourceUsage::kUndefined;
+        lighting_desc.initial_stages = PipelineStage::kAllCommands;
+        lighting_desc.initial_queue = QueueClass::kAuto;
+        lighting_desc.name = DebugName{"Renderer.OpaqueSmoke.Lighting"};
+        const auto lighting_upload = resource_uploader.upload_buffer(
+            context.frame_context, context.render_graph,
+            aeg::resource::BufferUploadDesc{std::as_bytes(std::span{&lighting_constants, 1}), lighting_desc, 0, 16});
+        if (!lighting_upload) {
+            return lighting_upload.result;
+        }
+        const auto lighting_set_result = device_ptr->create_binding_set(
+            BindingSetDesc{lighting_binding_layout, BindingSetLifetime::kPersistent,
+                           DebugName{"Renderer.OpaqueSmoke.LightingSet"}});
+        if (!lighting_set_result) {
+            return lighting_set_result.result;
+        }
+        BindingResource lighting_resource{};
+        lighting_resource.type = BindingType::kUniformBuffer;
+        lighting_resource.buffer_range =
+            BufferRange{lighting_upload.value.destination, 0, sizeof(lighting_constants)};
+        const BindingWrite lighting_write{{2, 0}, 0, lighting_resource};
+        if (const Result result = device_ptr->update_binding_set(
+                lighting_set_result.value, std::span{&lighting_write, 1});
+            !result) {
+            (void)device_ptr->destroy_binding_set(lighting_set_result.value);
+            return result;
+        }
+        smoke_state.lighting_buffer = lighting_upload.value.destination;
+        smoke_state.lighting_binding_set = lighting_set_result.value;
+        resolver.set_lighting(aeg::renderer::RenderLightingResource{
+            .binding_set = lighting_set_result.value,
+            .binding_group = 2,
+            .lighting_buffer = lighting_upload.value.destination,
+            .lighting_buffer_desc = lighting_desc,
+            .lighting_resource = {lighting_upload.value.target.index, lighting_upload.value.target.generation,
+                                   lighting_upload.value.target.graph_id},
+            .lighting_offset = 0,
+            .lighting_size = sizeof(lighting_constants),
+        });
+
         const auto readback_allocation = context.frame_context.allocate_readback(kReadbackSize, 256);
         if (!readback_allocation) {
             return readback_allocation.result;
@@ -818,6 +889,10 @@ int main() {
                  "opaque smoke replacement texture destruction failed") ||
         !require(device->destroy_buffer(smoke_state.material_parameter_buffer),
                  "opaque smoke material parameter buffer destruction failed") ||
+        !require(device->destroy_binding_set(smoke_state.lighting_binding_set),
+                 "opaque smoke lighting binding set destruction failed") ||
+        !require(device->destroy_buffer(smoke_state.lighting_buffer),
+                 "opaque smoke lighting buffer destruction failed") ||
         !require(device->destroy_binding_set(binding_set), "opaque smoke binding set destruction failed") ||
         !require(device->destroy_pipeline(graphics_pipeline), "opaque smoke pipeline destruction failed") ||
         !require(device->destroy_buffer(transform_buffer), "opaque smoke transform buffer destruction failed") ||

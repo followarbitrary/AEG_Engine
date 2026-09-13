@@ -71,9 +71,23 @@ RenderFeature。该绑定只在当前活跃帧且 Feature 构图前有效；重�
 Context、FrameAllocation 和 RenderGraph Handle 都不得跨帧保存。
 
 Opaque RenderFeature 的网格资源还必须声明 `RenderMeshVertexLayout`：interleaved Vertex
-Buffer 至少包含 Position `float4` 和 UV `float2`，并且 stride、offset、format 必须与当前
-Shader Contract 一致。缺失 UV、顶点格式不匹配或越过 Vertex Buffer 范围时，RenderBuild
-应返回失败；该失败不得继续提交不完整的绘制。
+Buffer 至少包含 Position `float4`、UV `float2` 和 Normal `float3`，并且 stride、offset、
+format 必须与当前 Shader Contract 一致。Object Uniform 使用 `RenderObjectConstants`，
+包含 Clip-space MVP 和用于法线变换的 inverse-transpose Matrix，Buffer 范围必须覆盖完整
+常量块。缺失 UV/Normal、顶点格式不匹配或越过 Vertex Buffer 范围时，RenderBuild 应返回
+失败；该失败不得继续提交不完整的绘制。
+
+Opaque 的帧内光照资源属于独立的 group 2，不得与 Object group 0 或 Material group 1
+混用。`RenderResourceResolver::resolve_lighting()` 返回的 `RenderLightingResource` 必须
+提供有效的 Uniform Buffer、BindingSet、group 2 和当前 RenderGraph Buffer Handle；Opaque
+Pass 会显式声明其 Fragment `kUniformRead`。`RenderLightingConstants` 目前只表达一个
+Directional Light 的方向、颜色、强度和环境光，使用 Lambert 项
+`max(dot(normal, -light_direction), 0)`。没有 Directional Light 时必须回退到环境光；
+多个 Directional Light、越界颜色/环境光、零方向或非法 Buffer 范围都属于失败输入。
+
+光照常量和 BindingSet 按帧生成。更新材质或光照时，调用方应通过 `FrameContext` 的上传
+与延迟销毁接口保留旧资源直到提交完成，不得依赖每帧 `wait_idle()`，也不得修改 GPU 仍
+在使用的持久 Descriptor。RenderFeature 只借用当前帧资源，不取得其所有权。
 
 ## 依赖边界
 

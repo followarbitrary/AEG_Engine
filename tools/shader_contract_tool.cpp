@@ -170,6 +170,8 @@ namespace {
                 return Format::kR32Float;
             case SPV_REFLECT_FORMAT_R32G32_SFLOAT:
                 return Format::kRg32Float;
+            case SPV_REFLECT_FORMAT_R32G32B32_SFLOAT:
+                return Format::kRgb32Float;
             case SPV_REFLECT_FORMAT_R32G32B32A32_SFLOAT:
                 return Format::kRgba32Float;
             default:

@@ -53,6 +53,8 @@ namespace aeg::resource {
                 case rhi::Format::kRgba16Float:
                 case rhi::Format::kRg32Float:
                     return TextureFormatInfo{8, 1, 1, 1};
+                case rhi::Format::kRgb32Float:
+                    return TextureFormatInfo{12, 1, 1, 1};
                 case rhi::Format::kRgba32Float:
                     return TextureFormatInfo{16, 1, 1, 1};
                 case rhi::Format::kBc1RgbaUnorm:

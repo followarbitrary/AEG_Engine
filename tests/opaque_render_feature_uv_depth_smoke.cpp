@@ -38,6 +38,7 @@ using aeg::rhi::BindingSetDesc;
 using aeg::rhi::BindingSetHandle;
 using aeg::rhi::BindingSetLifetime;
 using aeg::rhi::BindingType;
+using aeg::rhi::BindingWrite;
 using aeg::rhi::BufferCapability;
 using aeg::rhi::BufferDesc;
 using aeg::rhi::BufferHandle;
@@ -77,9 +78,10 @@ constexpr uint32_t kWidth = 96;
 constexpr uint32_t kHeight = 96;
 constexpr std::size_t kReadbackSize = static_cast<std::size_t>(kWidth) * kHeight * 4u;
 constexpr uint32_t kMaterialCount = 3;
-constexpr uint32_t kMeshCount = 2;
+constexpr uint32_t kMeshCount = 3;
 constexpr uint32_t kObjectCount = 4;
-constexpr uint32_t kNormalFrameCount = 3;
+constexpr uint32_t kBaseFrameCount = 3;
+constexpr uint32_t kNormalFrameCount = 8;
 
 using ObjectResourceFrames =
     std::array<std::array<aeg::renderer::RenderObjectResource, kObjectCount>, kNormalFrameCount>;
@@ -91,20 +93,30 @@ struct Vertex final {
     float w{1.0f};
     float u{0.0f};
     float v{0.0f};
+    float nx{0.0f};
+    float ny{0.0f};
+    float nz{1.0f};
 };
 
 constexpr std::array<Vertex, 4> kNormalQuadVertices{{
-    {-1.0f, -1.0f, 0.0f, 1.0f, 0.0f, 1.0f},
-    {1.0f, -1.0f, 0.0f, 1.0f, 1.0f, 1.0f},
-    {1.0f, 1.0f, 0.0f, 1.0f, 1.0f, 0.0f},
-    {-1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f},
+    {-1.0f, -1.0f, 0.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f},
+    {1.0f, -1.0f, 0.0f, 1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 1.0f},
+    {1.0f, 1.0f, 0.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f},
+    {-1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f},
 }};
 
 constexpr std::array<Vertex, 4> kMirroredQuadVertices{{
-    {-1.0f, -1.0f, 0.0f, 1.0f, 1.0f, 1.0f},
-    {1.0f, -1.0f, 0.0f, 1.0f, 0.0f, 1.0f},
-    {1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f},
-    {-1.0f, 1.0f, 0.0f, 1.0f, 1.0f, 0.0f},
+    {-1.0f, -1.0f, 0.0f, 1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 1.0f},
+    {1.0f, -1.0f, 0.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f},
+    {1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f},
+    {-1.0f, 1.0f, 0.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f},
+}};
+
+constexpr std::array<Vertex, 4> kReverseNormalQuadVertices{{
+    {-1.0f, -1.0f, 0.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f, -1.0f},
+    {1.0f, -1.0f, 0.0f, 1.0f, 1.0f, 1.0f, 0.0f, 0.0f, -1.0f},
+    {1.0f, 1.0f, 0.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f, -1.0f},
+    {-1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, -1.0f},
 }};
 
 constexpr std::array<uint16_t, 6> kQuadIndices{{0, 1, 2, 0, 2, 3}};
@@ -136,7 +148,8 @@ using MeshId = aeg::renderer::MeshAssetId;
 using MaterialId = aeg::renderer::MaterialInstanceId;
 using ObjectId = aeg::renderer::RenderObjectId;
 
-constexpr MeshId kMeshIds[kMeshCount]{MeshId{"OpaqueUvDepth.MeshA"}, MeshId{"OpaqueUvDepth.MeshB"}};
+constexpr MeshId kMeshIds[kMeshCount]{MeshId{"OpaqueUvDepth.MeshA"}, MeshId{"OpaqueUvDepth.MeshB"},
+                                      MeshId{"OpaqueUvDepth.MeshReverseNormal"}};
 constexpr MaterialId kMaterialIds[kMaterialCount]{
     MaterialId{"OpaqueUvDepth.MaterialRed"}, MaterialId{"OpaqueUvDepth.MaterialGreen"},
     MaterialId{"OpaqueUvDepth.MaterialUv"}};
@@ -159,7 +172,13 @@ struct SmokeState final {
     bool resources_ready{false};
     bool invalid_uv{false};
     bool missing_uv{false};
+    bool invalid_normal{false};
+    bool missing_normal{false};
     bool invalid_parameters{false};
+    bool invalid_lighting{false};
+    uint32_t lighting_mode{0};
+    BufferHandle lighting_buffer{};
+    BindingSetHandle lighting_binding_set{};
 };
 
 template <typename Value>
@@ -286,7 +305,10 @@ public:
 
     void set_invalid_uv(bool invalid) const noexcept { invalid_uv_ = invalid; }
     void set_missing_uv(bool missing) const noexcept { missing_uv_ = missing; }
+    void set_invalid_normal(bool invalid) const noexcept { invalid_normal_ = invalid; }
+    void set_missing_normal(bool missing) const noexcept { missing_normal_ = missing; }
     void set_invalid_parameters(bool invalid) const noexcept { invalid_parameters_ = invalid; }
+    void set_lighting(aeg::renderer::RenderLightingResource resource) const noexcept { lighting_ = resource; }
 
     [[nodiscard]] aeg::foundation::ResultValue<aeg::renderer::RenderMeshResource> resolve_mesh(
         MeshId mesh) const override {
@@ -300,6 +322,12 @@ public:
             }
             if (missing_uv_) {
                 resource.vertex_layout.uv_offset = resource.vertex_stride;
+            }
+            if (invalid_normal_) {
+                resource.vertex_layout.normal_format = Format::kRgba32Float;
+            }
+            if (missing_normal_) {
+                resource.vertex_layout.normal_offset = resource.vertex_stride;
             }
             ++mesh_resolve_count;
             return {Result::success(), resource};
@@ -329,12 +357,13 @@ public:
             if (instance.object != kObjectIds[index]) {
                 continue;
             }
-            const aeg::math::Mat4 mvp = view.camera.view_projection() * instance.world_transform;
+            const aeg::renderer::RenderObjectConstants constants{
+                view.camera.view_projection() * instance.world_transform, aeg::math::identity()};
             const uint32_t frame = frame_index_ != nullptr ? *frame_index_ % kNormalFrameCount : 0;
             const auto& object = objects_[frame][index];
             if (const Result result = device_->write_buffer(
                     object.transform_buffer, object.transform_offset,
-                    std::as_bytes(std::span<const aeg::math::Mat4>{&mvp, 1}));
+                    std::as_bytes(std::span{&constants, 1}));
                 !result) {
                 return {result, {}};
             }
@@ -342,6 +371,11 @@ public:
             return {Result::success(), object};
         }
         return {aeg::foundation::not_found("UV/depth object id is unknown"), {}};
+    }
+
+    [[nodiscard]] aeg::foundation::ResultValue<aeg::renderer::RenderLightingResource> resolve_lighting(
+        const aeg::renderer::RenderSceneSnapshot&, const aeg::renderer::RenderView&) const override {
+        return {Result::success(), lighting_};
     }
 
     mutable uint32_t mesh_resolve_count{0};
@@ -356,10 +390,14 @@ private:
     const uint32_t* frame_index_{nullptr};
     mutable bool invalid_uv_{false};
     mutable bool missing_uv_{false};
+    mutable bool invalid_normal_{false};
+    mutable bool missing_normal_{false};
     mutable bool invalid_parameters_{false};
+    mutable aeg::renderer::RenderLightingResource lighting_{};
 };
 
-[[nodiscard]] Result add_instances(const aeg::renderer::RenderExtractContext& context, uint32_t frame_index) {
+[[nodiscard]] Result add_instances(const aeg::renderer::RenderExtractContext& context, uint32_t frame_index,
+                                   uint32_t lighting_mode) {
     const auto add = [&context](ObjectId object, MeshId mesh, MaterialId material, aeg::math::Vec3 position,
                                 float depth, float scale) {
         const aeg::math::Mat4 transform = aeg::math::trs(
@@ -367,6 +405,32 @@ private:
             aeg::math::Vec3{scale, scale, 1.0f});
         return context.builder.add_instance({object, mesh, material, transform, transform, {}, 1.0f, 0xffffffffu});
     };
+
+    if (lighting_mode != 0) {
+        if (const Result result = add(kObjectIds[0], kMeshIds[0], kMaterialIds[0], {-0.5f, 0.0f, 0.0f}, 0.5f,
+                                      0.35f);
+            !result) {
+            return result;
+        }
+        if (const Result result = add(kObjectIds[1], kMeshIds[2], kMaterialIds[0], {0.5f, 0.0f, 0.0f}, 0.5f,
+                                      0.35f);
+            !result) {
+            return result;
+        }
+        if (lighting_mode == 1) {
+            return Result::success();
+        }
+        const aeg::math::Vec3 light_color = lighting_mode == 4 ? aeg::math::Vec3{1.0f, 0.0f, 0.0f}
+                                        : lighting_mode == 5 ? aeg::math::Vec3{1.5f, 1.0f, 1.0f}
+                                                             : aeg::math::Vec3{1.0f, 1.0f, 1.0f};
+        return context.builder.add_light({
+            .light = aeg::renderer::RenderLightId{"OpaqueUvDepth.Directional"},
+            .type = aeg::renderer::RenderLightType::kDirectional,
+            .direction = {0.0f, 0.0f, -1.0f},
+            .color = light_color,
+            .intensity = lighting_mode == 3 ? 0.5f : 1.0f,
+        });
+    }
 
     if (frame_index == 0) {
         if (const Result result = add(kObjectIds[0], kMeshIds[0], kMaterialIds[0], {-0.5f, 0.45f, 0.0f}, 0.5f,
@@ -395,6 +459,26 @@ private:
         return result;
     }
     return add(kObjectIds[1], kMeshIds[1], kMaterialIds[1], {0.0f, 0.0f, 0.0f}, second_depth, 0.7f);
+}
+
+[[nodiscard]] aeg::foundation::ResultValue<aeg::renderer::RenderLightingConstants>
+make_lighting_constants(uint32_t lighting_mode) {
+    const aeg::math::Vec3 ambient = lighting_mode == 0 ? aeg::math::Vec3{1.0f, 1.0f, 1.0f}
+                                                        : aeg::math::Vec3{0.1f, 0.1f, 0.1f};
+    if (lighting_mode == 0 || lighting_mode == 1) {
+        return aeg::renderer::make_render_lighting_constants({}, ambient);
+    }
+    const aeg::math::Vec3 color = lighting_mode == 4 ? aeg::math::Vec3{1.0f, 0.0f, 0.0f}
+                                                     : lighting_mode == 5 ? aeg::math::Vec3{1.5f, 1.0f, 1.0f}
+                                                                          : aeg::math::Vec3{1.0f, 1.0f, 1.0f};
+    const aeg::renderer::RenderLight light{
+        .light = aeg::renderer::RenderLightId{"OpaqueUvDepth.Directional"},
+        .type = aeg::renderer::RenderLightType::kDirectional,
+        .direction = {0.0f, 0.0f, -1.0f},
+        .color = color,
+        .intensity = lighting_mode == 3 ? 0.5f : 1.0f,
+    };
+    return aeg::renderer::make_render_lighting_constants(std::span{&light, 1}, ambient);
 }
 
 [[nodiscard]] std::array<unsigned, 3> pixel_rgb(const std::array<std::byte, kReadbackSize>& pixels, uint32_t x,
@@ -438,7 +522,7 @@ private:
 }  // namespace
 
 int main() {
-    static_assert(sizeof(Vertex) == sizeof(float) * 6u);
+    static_assert(sizeof(Vertex) == sizeof(float) * 9u);
 
     PipelineRegistry registry;
     if (!require(aeg::renderer::register_render_pipeline(registry), "UV/depth RenderPipeline registration failed") ||
@@ -483,7 +567,7 @@ int main() {
     SmokeState smoke_state{};
     aeg::renderer::Renderer renderer;
     const auto extractor = renderer.register_extractor([&smoke_state](const aeg::renderer::RenderExtractContext& context) {
-        return add_instances(context, smoke_state.frame_index);
+        return add_instances(context, smoke_state.frame_index, smoke_state.lighting_mode);
     });
     if (!require(extractor, "UV/depth extractor registration failed")) {
         return 6;
@@ -512,12 +596,15 @@ int main() {
     aeg::shader::ShaderPipelineLayout shader_layout = std::move(shader_layout_result.value);
     const auto object_layout_result = shader_manager.binding_layout(shader_layout, 0);
     const auto material_layout_result = shader_manager.binding_layout(shader_layout, 1);
+    const auto lighting_layout_result = shader_manager.binding_layout(shader_layout, 2);
     if (!require(object_layout_result, "UV/depth object layout lookup failed") ||
-        !require(material_layout_result, "UV/depth material layout lookup failed")) {
+        !require(material_layout_result, "UV/depth material layout lookup failed") ||
+        !require(lighting_layout_result, "UV/depth lighting layout lookup failed")) {
         return 10;
     }
     const BindingLayoutHandle object_layout = object_layout_result.value;
     const BindingLayoutHandle material_layout = material_layout_result.value;
+    const BindingLayoutHandle lighting_layout = lighting_layout_result.value;
 
     TextureDesc target_desc{};
     target_desc.extent = {kWidth, kHeight, 1};
@@ -573,7 +660,8 @@ int main() {
     std::array<BufferHandle, kMeshCount> vertex_buffers{};
     std::array<BufferDesc, kMeshCount> vertex_descs{};
     const std::array<std::span<const std::byte>, kMeshCount> vertex_data{
-        std::as_bytes(std::span{kNormalQuadVertices}), std::as_bytes(std::span{kMirroredQuadVertices})};
+        std::as_bytes(std::span{kNormalQuadVertices}), std::as_bytes(std::span{kMirroredQuadVertices}),
+        std::as_bytes(std::span{kReverseNormalQuadVertices})};
     for (uint32_t index = 0; index < kMeshCount; ++index) {
         BufferDesc desc{};
         desc.size = vertex_data[index].size();
@@ -614,7 +702,7 @@ int main() {
     for (uint32_t frame = 0; frame < kNormalFrameCount; ++frame) {
         for (uint32_t index = 0; index < kObjectCount; ++index) {
             BufferDesc desc{};
-            desc.size = sizeof(aeg::math::Mat4);
+            desc.size = sizeof(aeg::renderer::RenderObjectConstants);
             desc.capabilities = BufferCapability::kUniform;
             desc.memory = MemoryClass::kUpload;
             desc.initial_usage = ResourceUsage::kUniformRead;
@@ -634,22 +722,24 @@ int main() {
             }
             BindingResource resource{};
             resource.type = BindingType::kUniformBuffer;
-            resource.buffer_range = BufferRange{transform_buffers[frame][index], 0, sizeof(aeg::math::Mat4)};
+            resource.buffer_range =
+                BufferRange{transform_buffers[frame][index], 0, sizeof(aeg::renderer::RenderObjectConstants)};
             const aeg::rhi::BindingWrite write{{0, 0}, 0, resource};
             if (!require(device->update_binding_set(set_result.value, std::span{&write, 1}),
                          "UV/depth object binding set update failed")) {
                 return 19;
             }
-            object_resources[frame][index] = {
-                transform_buffers[frame][index], desc, object_layout, set_result.value, 0, 0, sizeof(aeg::math::Mat4)};
+            object_resources[frame][index] = {transform_buffers[frame][index], desc, object_layout, set_result.value,
+                                              0, 0, sizeof(aeg::renderer::RenderObjectConstants)};
         }
     }
 
     const std::array<VertexBindingDesc, 1> vertex_bindings{
         VertexBindingDesc{0, sizeof(Vertex), VertexInputRate::kVertex}};
-    const std::array<VertexAttributeDesc, 2> vertex_attributes{
+    const std::array<VertexAttributeDesc, 3> vertex_attributes{
         VertexAttributeDesc{0, 0, Format::kRgba32Float, 0},
-        VertexAttributeDesc{1, 0, Format::kRg32Float, sizeof(float) * 4u}};
+        VertexAttributeDesc{1, 0, Format::kRg32Float, sizeof(float) * 4u},
+        VertexAttributeDesc{2, 0, Format::kRgb32Float, sizeof(float) * 6u}};
     const std::array<Format, 1> color_formats{{target_desc.format}};
     GraphicsPipelineState graphics_state{};
     graphics_state.vertex_bindings = vertex_bindings;
@@ -685,6 +775,8 @@ int main() {
                 .position_format = Format::kRgba32Float,
                 .uv_offset = sizeof(float) * 4u,
                 .uv_format = Format::kRg32Float,
+                .normal_offset = sizeof(float) * 6u,
+                .normal_format = Format::kRgb32Float,
             },
         };
     }
@@ -727,8 +819,9 @@ int main() {
         return {Result::success(), view};
     };
     frame_desc.render_feature_preparation = [&smoke_state, &resolver, device_ptr = device.get(), material_layout,
-                                             graphics_pipeline, target_texture, target_view, target_desc, depth_texture,
-                                             depth_view, depth_desc](const aeg::engine::EngineFramePreparationContext& context) {
+                                             lighting_layout, graphics_pipeline, target_texture, target_view,
+                                             target_desc, depth_texture, depth_view,
+                                             depth_desc](const aeg::engine::EngineFramePreparationContext& context) {
         const auto color_resource = context.render_graph.import_texture(
             target_texture, target_view, target_desc, make_undefined_state());
         if (!color_resource) {
@@ -749,9 +842,9 @@ int main() {
         const bool initialize_resources = !smoke_state.resources_ready;
         std::array<aeg::render_graph::RenderGraphTexture, kMaterialCount> texture_resources{};
         std::array<aeg::render_graph::RenderGraphBuffer, kMaterialCount> parameter_resources{};
+        aeg::resource::ResourceUploader resource_uploader(*device_ptr);
         if (initialize_resources) {
             aeg::resource::TextureUploader texture_uploader(*device_ptr);
-            aeg::resource::ResourceUploader resource_uploader(*device_ptr);
             for (uint32_t index = 0; index < kMaterialCount; ++index) {
                 TextureDesc texture_desc{};
                 texture_desc.extent = {2, 2, 1};
@@ -857,6 +950,67 @@ int main() {
                                          });
         }
 
+        const auto lighting_constants_result = make_lighting_constants(smoke_state.lighting_mode);
+        if (!lighting_constants_result) {
+            return lighting_constants_result.result;
+        }
+        const aeg::renderer::RenderLightingConstants lighting_constants = lighting_constants_result.value;
+        BufferDesc lighting_desc{};
+        lighting_desc.size = sizeof(lighting_constants);
+        lighting_desc.capabilities = BufferCapability::kTransferDestination | BufferCapability::kUniform;
+        lighting_desc.memory = MemoryClass::kDeviceLocal;
+        lighting_desc.initial_usage = ResourceUsage::kUndefined;
+        lighting_desc.initial_stages = PipelineStage::kAllCommands;
+        lighting_desc.initial_queue = QueueClass::kAuto;
+        lighting_desc.name = DebugName{"Renderer.OpaqueUvDepth.Lighting"};
+        const auto lighting_upload = resource_uploader.upload_buffer(
+            context.frame_context, context.render_graph,
+            aeg::resource::BufferUploadDesc{std::as_bytes(std::span{&lighting_constants, 1}), lighting_desc, 0, 16});
+        if (!lighting_upload) {
+            return lighting_upload.result;
+        }
+        const auto lighting_set_result = device_ptr->create_binding_set(
+            BindingSetDesc{lighting_layout, BindingSetLifetime::kPersistent,
+                           DebugName{"Renderer.OpaqueUvDepth.LightingSet"}});
+        if (!lighting_set_result) {
+            return lighting_set_result.result;
+        }
+        BindingResource lighting_resource{};
+        lighting_resource.type = BindingType::kUniformBuffer;
+        lighting_resource.buffer_range =
+            BufferRange{lighting_upload.value.destination, 0, sizeof(lighting_constants)};
+        const BindingWrite lighting_write{{2, 0}, 0, lighting_resource};
+        if (const Result result = device_ptr->update_binding_set(
+                lighting_set_result.value, std::span{&lighting_write, 1});
+            !result) {
+            (void)device_ptr->destroy_binding_set(lighting_set_result.value);
+            return result;
+        }
+        const BufferHandle previous_lighting_buffer = smoke_state.lighting_buffer;
+        const BindingSetHandle previous_lighting_set = smoke_state.lighting_binding_set;
+        smoke_state.lighting_buffer = lighting_upload.value.destination;
+        smoke_state.lighting_binding_set = lighting_set_result.value;
+        resolver.set_lighting(aeg::renderer::RenderLightingResource{
+            .binding_set = lighting_set_result.value,
+            .binding_group = 2,
+            .lighting_buffer = lighting_upload.value.destination,
+            .lighting_buffer_desc = lighting_desc,
+            .lighting_resource = to_pipeline_handle(lighting_upload.value.target),
+            .lighting_offset = 0,
+            .lighting_size = smoke_state.invalid_lighting ? sizeof(lighting_constants) + 4u
+                                                           : sizeof(lighting_constants),
+        });
+        if (previous_lighting_set.is_valid()) {
+            if (const Result result = context.frame_context.defer_destroy_binding_set(previous_lighting_set); !result) {
+                return result;
+            }
+        }
+        if (previous_lighting_buffer.is_valid()) {
+            if (const Result result = context.frame_context.defer_destroy_buffer(previous_lighting_buffer); !result) {
+                return result;
+            }
+        }
+
         const auto readback = context.frame_context.allocate_readback(kReadbackSize, 256);
         if (!readback) {
             return readback.result;
@@ -877,7 +1031,7 @@ int main() {
         return Result::success();
     };
 
-    for (uint32_t frame = 0; frame < kNormalFrameCount; ++frame) {
+    for (uint32_t frame = 0; frame < kBaseFrameCount; ++frame) {
         smoke_state.frame_index = frame;
         const Result frame_result = orchestrator.run_frame(frame_desc);
         if (!frame_result) {
@@ -892,7 +1046,7 @@ int main() {
     }
 
     std::array<std::array<std::byte, kReadbackSize>, kNormalFrameCount> pixels{};
-    for (uint32_t frame = 0; frame < kNormalFrameCount; ++frame) {
+    for (uint32_t frame = 0; frame < kBaseFrameCount; ++frame) {
         if (!require(frame_context->read_readback(smoke_state.readbacks[frame], pixels[frame]),
                      "UV/depth readback failed")) {
             return 24;
@@ -922,40 +1076,110 @@ int main() {
         return 26;
     }
 
+    smoke_state.lighting_mode = 1;
+    smoke_state.frame_index = 3;
+    if (!require(orchestrator.run_frame(frame_desc), "ambient-only lighting frame failed")) {
+        return 27;
+    }
+    smoke_state.lighting_mode = 2;
+    smoke_state.frame_index = 4;
+    if (!require(orchestrator.run_frame(frame_desc), "full directional lighting frame failed")) {
+        return 28;
+    }
+    smoke_state.lighting_mode = 3;
+    smoke_state.frame_index = 5;
+    if (!require(orchestrator.run_frame(frame_desc), "half-intensity directional lighting frame failed")) {
+        return 29;
+    }
+    smoke_state.lighting_mode = 4;
+    smoke_state.frame_index = 6;
+    if (!require(orchestrator.run_frame(frame_desc), "colored directional lighting frame failed")) {
+        return 30;
+    }
+    if (!require(device->wait_idle(), "directional lighting GPU wait failed")) {
+        return 31;
+    }
+    for (uint32_t frame = 3; frame <= 6; ++frame) {
+        if (!require(frame_context->read_readback(smoke_state.readbacks[frame], pixels[frame]),
+                     "directional lighting readback failed")) {
+            return 32;
+        }
+    }
+    const auto ambient_normal = pixel_rgb(pixels[3], 24, 48);
+    const auto ambient_reverse = pixel_rgb(pixels[3], 72, 48);
+    const auto full_normal = pixel_rgb(pixels[4], 24, 48);
+    const auto full_reverse = pixel_rgb(pixels[4], 72, 48);
+    const auto half_normal = pixel_rgb(pixels[5], 24, 48);
+    const auto red_normal = pixel_rgb(pixels[6], 24, 48);
+    if (!require(near_rgb(ambient_normal, {22, 3, 3}), "ambient-only fallback is incorrect") ||
+        !require(near_rgb(ambient_reverse, {22, 3, 3}), "ambient fallback differs by normal") ||
+        !require(near_rgb(full_normal, {242, 33, 33}), "front-facing Lambert response is incorrect") ||
+        !require(near_rgb(full_reverse, {22, 3, 3}), "back-facing Lambert response is incorrect") ||
+        !require(near_rgb(half_normal, {132, 18, 18}), "directional intensity response is incorrect") ||
+        !require(red_normal[0] > 180 && red_normal[1] < 40 && red_normal[2] < 40,
+                 "directional light color response is incorrect")) {
+        return 33;
+    }
+
     auto stale_resource = render_graph.import_texture(target_texture, target_view, target_desc, make_undefined_state());
     if (!require(stale_resource, "UV/depth stale-handle setup failed")) {
-        return 27;
+        return 34;
     }
     render_graph.reset();
     if (!require(!render_graph.contains_texture(stale_resource.value), "UV/depth stale handle was accepted")) {
-        return 28;
+        return 35;
     }
 
     smoke_state.invalid_uv = true;
-    smoke_state.frame_index = 3;
+    smoke_state.frame_index = 7;
+    smoke_state.lighting_mode = 2;
     resolver.set_invalid_uv(true);
     if (!require(!orchestrator.run_frame(frame_desc), "UV/depth missing UV layout was accepted")) {
-        return 29;
+        return 36;
     }
     smoke_state.invalid_uv = false;
     resolver.set_invalid_uv(false);
     smoke_state.missing_uv = true;
     resolver.set_missing_uv(true);
     if (!require(!orchestrator.run_frame(frame_desc), "UV/depth out-of-range UV layout was accepted")) {
-        return 30;
+        return 37;
     }
     smoke_state.missing_uv = false;
     resolver.set_missing_uv(false);
     smoke_state.invalid_parameters = true;
     resolver.set_invalid_parameters(true);
     if (!require(!orchestrator.run_frame(frame_desc), "UV/depth invalid parameter range was accepted")) {
-        return 31;
+        return 38;
     }
     smoke_state.invalid_parameters = false;
     resolver.set_invalid_parameters(false);
+    smoke_state.invalid_normal = true;
+    resolver.set_invalid_normal(true);
+    if (!require(!orchestrator.run_frame(frame_desc), "normal vertex format mismatch was accepted")) {
+        return 39;
+    }
+    smoke_state.invalid_normal = false;
+    resolver.set_invalid_normal(false);
+    smoke_state.missing_normal = true;
+    resolver.set_missing_normal(true);
+    if (!require(!orchestrator.run_frame(frame_desc), "missing normal vertex attribute was accepted")) {
+        return 40;
+    }
+    smoke_state.missing_normal = false;
+    resolver.set_missing_normal(false);
+    smoke_state.invalid_lighting = true;
+    if (!require(!orchestrator.run_frame(frame_desc), "invalid lighting parameter range was accepted")) {
+        return 41;
+    }
+    smoke_state.invalid_lighting = false;
+    smoke_state.lighting_mode = 5;
+    if (!require(!orchestrator.run_frame(frame_desc), "invalid directional light color was accepted")) {
+        return 42;
+    }
+    smoke_state.lighting_mode = 2;
     smoke_state.frame_index = 0;
     if (!require(orchestrator.run_frame(frame_desc), "UV/depth recovery frame failed")) {
-        return 32;
+        return 43;
     }
 
     if (!require(orchestrator.shutdown(), "UV/depth orchestrator shutdown failed") ||
@@ -963,13 +1187,18 @@ int main() {
         !require(orchestrator.unregister_world(world_scope.handle()), "UV/depth World unregister failed") ||
         !require(world_scope.shutdown(), "UV/depth WorldScope shutdown failed") ||
         !require(renderer.unregister_extractor(extractor.value), "UV/depth extractor unregister failed")) {
-        return 33;
+        return 44;
+    }
+    if (!require(device->wait_idle(), "UV/depth final GPU wait failed")) {
+        return 45;
     }
     frame_context.reset();
+    (void)device->destroy_binding_set(smoke_state.lighting_binding_set);
+    (void)device->destroy_buffer(smoke_state.lighting_buffer);
     for (auto& material : smoke_state.materials) {
         if (!require(aeg::resource::destroy_texture_material(*device, material.material),
                      "UV/depth material destruction failed")) {
-            return 34;
+            return 46;
         }
         if (material.texture.is_valid()) {
             (void)aeg::resource::TextureUploader(*device).destroy_texture(material.texture);
@@ -994,7 +1223,7 @@ int main() {
     (void)device->destroy_texture_view(target_view);
     (void)device->destroy_texture(target_texture);
     if (!require(shader_manager.clear_layout_cache(), "UV/depth shader layout cleanup failed")) {
-        return 35;
+        return 47;
     }
     return 0;
 }

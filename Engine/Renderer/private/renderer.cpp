@@ -27,6 +27,15 @@ using foundation::unknown_exception;
     return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
 }
 
+[[nodiscard]] bool is_finite(const math::Vec4& value) noexcept {
+    return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z) && std::isfinite(value.w);
+}
+
+[[nodiscard]] bool is_unit_range_color(const math::Vec3& value) noexcept {
+    return is_finite(value) && value.x >= 0.0f && value.x <= 1.0f && value.y >= 0.0f && value.y <= 1.0f &&
+           value.z >= 0.0f && value.z <= 1.0f;
+}
+
 [[nodiscard]] bool is_finite(const math::Mat4& value) noexcept {
     for (uint32_t column = 0; column < 4; ++column) {
         for (uint32_t row = 0; row < 4; ++row) {
@@ -84,7 +93,8 @@ void increment(uint32_t& value) noexcept {
 
 [[nodiscard]] bool is_valid_light_component(const RenderLightComponent& component) noexcept {
     return std::isfinite(component.intensity) && std::isfinite(component.range) && component.intensity >= 0.0f &&
-           component.range >= 0.0f && std::isfinite(component.inner_cone_cosine) &&
+           component.range >= 0.0f && is_unit_range_color(component.color) &&
+           std::isfinite(component.inner_cone_cosine) &&
            std::isfinite(component.outer_cone_cosine);
 }
 
@@ -200,9 +210,32 @@ bool RenderMaterialResource::is_valid() const noexcept {
     return pipeline.is_valid();
 }
 
+bool RenderLightingConstants::is_valid() const noexcept {
+    const math::Vec3 direction{directional_direction_intensity.x, directional_direction_intensity.y,
+                               directional_direction_intensity.z};
+    const math::Vec3 directional_color_value{directional_color.x, directional_color.y, directional_color.z};
+    const math::Vec3 ambient_color_value{ambient_color.x, ambient_color.y, ambient_color.z};
+    const float intensity = directional_direction_intensity.w;
+    return is_finite(directional_direction_intensity) && is_finite(directional_color) && is_finite(ambient_color) &&
+           std::isfinite(intensity) && intensity >= 0.0f && is_unit_range_color(directional_color_value) &&
+           is_unit_range_color(ambient_color_value) && directional_color.w == 1.0f && ambient_color.w == 1.0f &&
+           (intensity == 0.0f || math::length_squared(direction) > math::kEpsilon * math::kEpsilon);
+}
+
+bool RenderLightingResource::is_valid() const noexcept {
+    if (!binding_set.is_valid() || binding_group != 2 || !lighting_buffer.is_valid() ||
+        !lighting_resource.is_valid() || lighting_buffer_desc.size == 0 || lighting_size < sizeof(RenderLightingConstants) ||
+        !rhi::has_flag(lighting_buffer_desc.capabilities, rhi::BufferCapability::kUniform) ||
+        lighting_offset > lighting_buffer_desc.size ||
+        lighting_size > lighting_buffer_desc.size - lighting_offset) {
+        return false;
+    }
+    return true;
+}
+
 bool RenderObjectResource::is_valid() const noexcept {
     if (!transform_buffer.is_valid() || !binding_layout.is_valid() || !binding_set.is_valid() ||
-        transform_buffer_desc.size == 0 || transform_size == 0 ||
+        transform_buffer_desc.size == 0 || transform_size < sizeof(RenderObjectConstants) ||
         !rhi::has_flag(transform_buffer_desc.capabilities, rhi::BufferCapability::kUniform)) {
         return false;
     }
@@ -305,7 +338,8 @@ foundation::Result RenderSceneSnapshotBuilder::add_light(const RenderLight& ligh
     }
     if (!light.light.is_valid() || !std::isfinite(light.intensity) || !std::isfinite(light.range) ||
         light.intensity < 0.0f || light.range < 0.0f || !is_finite(light.position) || !is_finite(light.direction) ||
-        !is_finite(light.color) || !std::isfinite(light.inner_cone_cosine) || !std::isfinite(light.outer_cone_cosine)) {
+        !is_unit_range_color(light.color) || !std::isfinite(light.inner_cone_cosine) ||
+        !std::isfinite(light.outer_cone_cosine)) {
         return invalid_argument("render light identity or scalar values are invalid");
     }
     if (light_ids_.find(light.light) != light_ids_.end()) {
@@ -337,6 +371,48 @@ foundation::Result RenderSceneSnapshotBuilder::add_light(const RenderLight& ligh
         return out_of_memory("render light snapshot allocation failed");
     }
     return foundation::Result::success();
+}
+
+foundation::ResultValue<RenderLightingResource> RenderResourceResolver::resolve_lighting(
+    const RenderSceneSnapshot&, const RenderView&) const {
+    return {not_found("render resource resolver does not provide a frame lighting resource"), {}};
+}
+
+foundation::ResultValue<RenderLightingConstants> make_render_lighting_constants(
+    std::span<const RenderLight> lights, math::Vec3 ambient_color) {
+    if (!is_unit_range_color(ambient_color)) {
+        return {invalid_argument("render lighting ambient color must be finite and within [0, 1]"), {}};
+    }
+
+    RenderLightingConstants constants{};
+    constants.ambient_color = math::Vec4{ambient_color.x, ambient_color.y, ambient_color.z, 1.0f};
+    uint32_t directional_count = 0;
+    for (const RenderLight& light : lights) {
+        if (light.type != RenderLightType::kDirectional) {
+            continue;
+        }
+        if (++directional_count > 1) {
+            return {invalid_state("minimal opaque lighting accepts at most one Directional Light"), {}};
+        }
+        if (!std::isfinite(light.intensity) || light.intensity < 0.0f || !is_finite(light.direction) ||
+            !is_unit_range_color(light.color)) {
+            return {invalid_argument("Directional Light contains an invalid direction, color, or intensity"), {}};
+        }
+
+        math::Vec3 normalized_direction{};
+        if (light.intensity > 0.0f && !math::try_normalize(light.direction, normalized_direction)) {
+            return {invalid_argument("Directional Light direction must be non-zero"), {}};
+        }
+        if (light.intensity == 0.0f) {
+            normalized_direction = {0.0f, 0.0f, -1.0f};
+        }
+        constants.directional_direction_intensity =
+            math::Vec4{normalized_direction.x, normalized_direction.y, normalized_direction.z, light.intensity};
+        constants.directional_color = math::Vec4{light.color.x, light.color.y, light.color.z, 1.0f};
+    }
+    return {constants.is_valid() ? foundation::Result::success()
+                                 : invalid_state("render lighting constants violate the shader contract"),
+            constants};
 }
 
 foundation::ResultValue<std::shared_ptr<const RenderSceneSnapshot>> RenderSceneSnapshotBuilder::finish() {

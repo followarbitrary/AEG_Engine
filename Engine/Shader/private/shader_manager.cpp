@@ -95,6 +95,7 @@ namespace aeg::shader {
                 case Format::kR32Uint:
                 case Format::kR32Float:
                 case Format::kRg32Float:
+                case Format::kRgb32Float:
                 case Format::kD24UnormS8Uint:
                 case Format::kD32Float:
                 case Format::kD32FloatS8Uint:

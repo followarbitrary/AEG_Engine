@@ -23,6 +23,7 @@ inline constexpr uint64_t kIndexResourceNamespace = 0x7f6c2b94d8a513e9ull;
 inline constexpr uint64_t kObjectResourceNamespace = 0x1ec7d5a2b9364f0bull;
 inline constexpr uint32_t kPositionAttributeSize = sizeof(float) * 4u;
 inline constexpr uint32_t kUvAttributeSize = sizeof(float) * 2u;
+inline constexpr uint32_t kNormalAttributeSize = sizeof(float) * 3u;
 
 [[nodiscard]] pipeline::RenderResourceId make_resource_id(uint64_t resource_namespace, uint64_t identity) noexcept {
     uint64_t value = resource_namespace;
@@ -80,6 +81,11 @@ struct OpaqueDrawItem final {
 struct OpaquePassData final {
     pipeline::RenderGraphTexture color_target{};
     pipeline::RenderGraphTexture depth_target{};
+    pipeline::RenderGraphBuffer lighting_resource{};
+    rhi::BindingSetHandle lighting_binding_set{};
+    uint32_t lighting_binding_group{2};
+    uint64_t lighting_offset{0};
+    uint64_t lighting_size{0};
     bool has_depth_target{false};
     RenderExtent output_extent{};
     std::vector<OpaqueDrawItem> draws{};
@@ -94,7 +100,7 @@ public:
             .domain = pipeline::FeatureDomain::kRender,
             .domain_mask = pipeline::to_mask(pipeline::FeatureDomain::kRender),
             .supported_scopes = pipeline::to_mask(pipeline::PipelineScope::kFrame),
-            .version = {1, 1, 0},
+            .version = {1, 2, 0},
         };
         return kDescriptor;
     }
@@ -158,6 +164,11 @@ public:
                 vertex_layout.uv_offset > mesh.value.vertex_stride ||
                 kUvAttributeSize > mesh.value.vertex_stride - vertex_layout.uv_offset) {
                 return invalid_state("opaque render feature requires a float2 UV vertex attribute");
+            }
+            if (vertex_layout.normal_format != rhi::Format::kRgb32Float ||
+                vertex_layout.normal_offset > mesh.value.vertex_stride ||
+                kNormalAttributeSize > mesh.value.vertex_stride - vertex_layout.normal_offset) {
+                return invalid_state("opaque render feature requires a float3 normal vertex attribute");
             }
 
             const foundation::ResultValue<RenderMaterialResource> material =
@@ -234,6 +245,20 @@ public:
             });
         }
 
+        const foundation::ResultValue<RenderLightingResource> lighting =
+            context->resource_resolver->resolve_lighting(*context->scene_snapshot, context->scene_snapshot->view);
+        if (!lighting) {
+            return lighting.result;
+        }
+        if (!lighting.value.is_valid()) {
+            return invalid_state("opaque render feature received an invalid frame lighting resource");
+        }
+        pass_data->lighting_resource = lighting.value.lighting_resource;
+        pass_data->lighting_binding_set = lighting.value.binding_set;
+        pass_data->lighting_binding_group = lighting.value.binding_group;
+        pass_data->lighting_offset = lighting.value.lighting_offset;
+        pass_data->lighting_size = lighting.value.lighting_size;
+
         const std::shared_ptr<const OpaquePassData> captured_data = std::move(pass_data);
         const foundation::ResultValue<pipeline::RenderGraphPass> pass = builder.add_graphics_pass(
             "DrawOpaque",
@@ -275,6 +300,14 @@ public:
                         return result;
                     }
                 }
+                if (const foundation::Result result = pass_builder.read(
+                        captured_data->lighting_resource, rhi::ResourceUsage::kUniformRead,
+                        rhi::PipelineStage::kFragmentShader, rhi::ShaderStage::kFragment,
+                        pipeline::RenderGraphBufferRange{captured_data->lighting_offset,
+                                                         captured_data->lighting_size});
+                    !result) {
+                    return result;
+                }
                 if (const foundation::Result result = pass_builder.use_color_attachment(
                         captured_data->color_target, rhi::LoadOp::kClear, rhi::StoreOp::kStore,
                         rhi::ClearColorValue{0.0f, 0.0f, 0.0f, 1.0f});
@@ -314,6 +347,12 @@ public:
 
                 for (const OpaqueDrawItem& draw : captured_data->draws) {
                     if (const foundation::Result result = execution.bind_pipeline(draw.pipeline); !result) {
+                        return end_rendering_after_failure(execution, result);
+                    }
+                    if (const foundation::Result result =
+                            execution.bind_binding_set(captured_data->lighting_binding_group,
+                                                       captured_data->lighting_binding_set);
+                        !result) {
                         return end_rendering_after_failure(execution, result);
                     }
                     if (const foundation::Result result =

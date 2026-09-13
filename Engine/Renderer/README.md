@@ -88,13 +88,14 @@ GPU 资源生命周期。
 ### `RenderResourceResolver`
 
 `RenderResourceResolver` 将 `MeshAssetId`、`MaterialInstanceId` 和视图内
-`RenderInstance` 解析为后端无关的 `RenderMeshResource`、`RenderMaterialResource` 与
-`RenderObjectResource`。Mesh 资源包含 Vertex/Index Buffer 及其不可变创建描述，并通过
-`RenderMeshVertexLayout` 明确标准 Opaque 顶点的 Position/UV 格式和 interleaved byte
-offset；Material
-资源选择 Graphics Pipeline；Object 资源提供当前 View 所需的 Transform Uniform Buffer、
-Binding Layout 和 Binding Set。所有返回值均是公共 RHI Handle；实现可以由 Resource 系统、
-Asset 系统或宿主应用提供。
+`RenderInstance` 解析为后端无关的 `RenderMeshResource`、`RenderMaterialResource`、
+`RenderObjectResource` 与帧内 `RenderLightingResource`。Mesh 资源包含 Vertex/Index
+Buffer 及其不可变创建描述，并通过 `RenderMeshVertexLayout` 明确标准 Opaque 顶点的
+Position/UV/Normal 格式和 interleaved byte offset；Material 资源选择 Graphics Pipeline；
+Object 资源提供当前 View 所需的 `RenderObjectConstants` Uniform Buffer、Binding Layout
+和 Binding Set；Lighting 资源提供 group 2 的帧/View-local `RenderLightingConstants`
+BindingSet。所有返回值均是公共 RHI Handle；实现可以由 Resource 系统、Asset 系统或宿主
+应用提供。
 
 解析策略由 `RenderExtractionDesc::require_resolved_resources` 控制：
 
@@ -151,15 +152,19 @@ Texture 必须声明 `kDepthStencil` capability。
 RenderGraphFeatureRuntime。使用 `EngineFrameOrchestrator` 时，应在
 `EngineFramePreparationContext` 中导入目标并以同一稳定 `RenderResourceId` 绑定。当前
 最小 Shader Contract 位于 `shaders/core/opaque/unlit_mesh.vert.hlsl` 与
-`shaders/core/opaque/unlit_mesh.frag.hlsl`，仅覆盖 Transform Uniform 和单色不透明输出；
-材质绑定集由 Resource 层创建，Renderer 只消费 BindingSet、绑定组和对应的 RenderGraph
-纹理、材质参数 Buffer 声明；排序和光照仍由后续 RenderFeature 扩展。当前 Shader Contract
-覆盖 Transform Uniform、插值 UV 和单色不透明输出，材质参数块
-提供一个稳定的 `float4` Tint，用于验证纹理采样结果与材质参数组合。Opaque Shader 使用
-顶点插值 UV 采样纹理，Position 为 `float4`，UV 为 `float2`；缺失 UV 或布局格式/范围
-不匹配会在构图阶段失败。材质纹理必须是
-当前 RenderGraph 中声明的有效资源；缺失声明、过期 Graph Handle 或不完整参数 Buffer
-会在构图阶段失败，而不是让 Feature 继续提交不完整的 BindingSet。
+`shaders/core/opaque/unlit_mesh.frag.hlsl`，固定使用 group 0 Object、group 1 Material、
+group 2 Lighting。顶点 Position 为 `float4`、UV 为 `float2`、Normal 为 `float3`；顶点
+Shader 输出插值 UV 和 View-space Normal。材质参数块继续提供稳定的 `float4` Tint，片元
+Shader 按插值 UV 采样纹理，并计算
+`albedo * tint * (ambient + color * intensity * max(dot(normal, -direction), 0))`。
+当前实现只支持一个 Directional Light，不包含阴影、镜面反射、PBR 或多光源循环；没有
+Directional Light 时由 `make_render_lighting_constants()` 生成环境光回退。
+
+Lighting Uniform 必须作为当前帧/View 的新版本上传，并通过 `FrameContext` 的延迟销毁
+路径管理旧 Buffer 和 BindingSet；禁止在 GPU 仍可能使用时原地修改持久 Descriptor。
+Opaque Pass 会显式声明 group 2 Lighting Buffer 的 Fragment `kUniformRead`，以及材质纹理、
+Tint Buffer、Object Buffer 的对应读取。缺失声明、过期 Graph Handle、法线/UV 布局不匹配
+或 Buffer 范围不完整会在构图阶段失败，而不是让 Feature 继续提交不完整的绘制。
 
 ## 标准 RenderPipeline
 

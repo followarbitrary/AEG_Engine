@@ -39,6 +39,7 @@ using aeg::rhi::BindingSetDesc;
 using aeg::rhi::BindingSetHandle;
 using aeg::rhi::BindingSetLifetime;
 using aeg::rhi::BindingType;
+using aeg::rhi::BindingWrite;
 using aeg::rhi::BufferCapability;
 using aeg::rhi::BufferDesc;
 using aeg::rhi::BufferHandle;
@@ -87,12 +88,15 @@ struct Vertex final {
     float w{1.0f};
     float u{0.0f};
     float v{0.0f};
+    float nx{0.0f};
+    float ny{0.0f};
+    float nz{1.0f};
 };
 
 constexpr std::array<Vertex, 3> kTriangleVertices{{
-    {-0.75f, -0.75f, 0.0f, 1.0f, 0.0f, 1.0f},
-    {0.75f, -0.75f, 0.0f, 1.0f, 1.0f, 1.0f},
-    {0.0f, 0.75f, 0.0f, 1.0f, 0.5f, 0.0f},
+    {-0.75f, -0.75f, 0.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f},
+    {0.75f, -0.75f, 0.0f, 1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 1.0f},
+    {0.0f, 0.75f, 0.0f, 1.0f, 0.5f, 0.0f, 0.0f, 0.0f, 1.0f},
 }};
 constexpr std::array<uint16_t, 3> kTriangleIndices{{0, 1, 2}};
 
@@ -131,6 +135,8 @@ struct SmokeState final {
     uint32_t current_readback{0};
     uint32_t readback_build_count{0};
     bool missing_texture{false};
+    BufferHandle lighting_buffer{};
+    BindingSetHandle lighting_binding_set{};
 };
 
 template <typename Value>
@@ -258,6 +264,7 @@ public:
     }
 
     void set_missing_texture(bool missing) noexcept { missing_texture_ = missing; }
+    void set_lighting(aeg::renderer::RenderLightingResource resource) const noexcept { lighting_ = resource; }
 
     [[nodiscard]] aeg::foundation::ResultValue<aeg::renderer::RenderMeshResource> resolve_mesh(
         aeg::renderer::MeshAssetId mesh) const override {
@@ -293,11 +300,12 @@ public:
             if (instance.object != object_ids_[index]) {
                 continue;
             }
-            const aeg::math::Mat4 mvp = view.camera.view_projection() * instance.world_transform;
+            const aeg::renderer::RenderObjectConstants constants{
+                view.camera.view_projection() * instance.world_transform, aeg::math::identity()};
             const auto& object = objects_[index];
             const Result write_result = device_->write_buffer(
                 object.transform_buffer, object.transform_offset,
-                std::as_bytes(std::span<const aeg::math::Mat4>{&mvp, 1}));
+                std::as_bytes(std::span{&constants, 1}));
             if (!write_result) {
                 return {write_result, {}};
             }
@@ -305,6 +313,11 @@ public:
             return {Result::success(), object};
         }
         return {aeg::foundation::not_found("multi-material object id is unknown"), {}};
+    }
+
+    [[nodiscard]] aeg::foundation::ResultValue<aeg::renderer::RenderLightingResource> resolve_lighting(
+        const aeg::renderer::RenderSceneSnapshot&, const aeg::renderer::RenderView&) const override {
+        return {Result::success(), lighting_};
     }
 
     mutable uint32_t mesh_resolve_count{0};
@@ -319,6 +332,7 @@ private:
     aeg::renderer::RenderMeshResource mesh_{};
     std::array<aeg::renderer::RenderMaterialResource, kMaterialCount> materials_{};
     std::array<aeg::renderer::RenderObjectResource, kObjectCount> objects_{};
+    mutable aeg::renderer::RenderLightingResource lighting_{};
     bool missing_texture_{false};
 };
 
@@ -459,12 +473,15 @@ int main() {
     aeg::shader::ShaderPipelineLayout shader_layout = std::move(shader_layout_result.value);
     const auto object_layout_result = shader_manager.binding_layout(shader_layout, 0);
     const auto material_layout_result = shader_manager.binding_layout(shader_layout, 1);
+    const auto lighting_layout_result = shader_manager.binding_layout(shader_layout, 2);
     if (!require(object_layout_result, "object layout lookup failed") ||
-        !require(material_layout_result, "material layout lookup failed")) {
+        !require(material_layout_result, "material layout lookup failed") ||
+        !require(lighting_layout_result, "lighting layout lookup failed")) {
         return 11;
     }
     const BindingLayoutHandle object_layout = object_layout_result.value;
     const BindingLayoutHandle material_layout = material_layout_result.value;
+    const BindingLayoutHandle lighting_layout = lighting_layout_result.value;
 
     TextureDesc target_desc{};
     target_desc.extent = {kWidth, kHeight, 1};
@@ -531,7 +548,7 @@ int main() {
     std::array<aeg::renderer::RenderObjectResource, kObjectCount> object_resources{};
     for (uint32_t index = 0; index < kObjectCount; ++index) {
         BufferDesc transform_desc{};
-        transform_desc.size = sizeof(aeg::math::Mat4);
+        transform_desc.size = sizeof(aeg::renderer::RenderObjectConstants);
         transform_desc.capabilities = BufferCapability::kUniform;
         transform_desc.memory = MemoryClass::kUpload;
         transform_desc.initial_usage = ResourceUsage::kUniformRead;
@@ -553,20 +570,22 @@ int main() {
         write.location = {0, 0};
         write.resource = BindingResource{};
         write.resource.type = BindingType::kUniformBuffer;
-        write.resource.buffer_range = BufferRange{transform_buffers[index], 0, sizeof(aeg::math::Mat4)};
+        write.resource.buffer_range =
+            BufferRange{transform_buffers[index], 0, sizeof(aeg::renderer::RenderObjectConstants)};
         if (!require(device->update_binding_set(object_set, std::span{&write, 1}),
                      "object binding set update failed")) {
             return 18;
         }
-        object_resources[index] = {
-            transform_buffers[index], transform_desc, object_layout, object_set, 0, 0, sizeof(aeg::math::Mat4)};
+        object_resources[index] = {transform_buffers[index], transform_desc, object_layout, object_set, 0, 0,
+                                   sizeof(aeg::renderer::RenderObjectConstants)};
     }
 
     const std::array<VertexBindingDesc, 1> vertex_bindings{
         VertexBindingDesc{0, sizeof(Vertex), VertexInputRate::kVertex}};
-    const std::array<VertexAttributeDesc, 2> vertex_attributes{
+    const std::array<VertexAttributeDesc, 3> vertex_attributes{
         VertexAttributeDesc{0, 0, Format::kRgba32Float, 0},
-        VertexAttributeDesc{1, 0, Format::kRg32Float, sizeof(float) * 4u}};
+        VertexAttributeDesc{1, 0, Format::kRg32Float, sizeof(float) * 4u},
+        VertexAttributeDesc{2, 0, Format::kRgb32Float, sizeof(float) * 6u}};
     const std::array<Format, 1> color_formats{{target_desc.format}};
     GraphicsPipelineState graphics_state{};
     graphics_state.vertex_bindings = vertex_bindings;
@@ -590,7 +609,9 @@ int main() {
         {.position_offset = 0,
          .position_format = Format::kRgba32Float,
          .uv_offset = sizeof(float) * 4u,
-         .uv_format = Format::kRg32Float}};
+         .uv_format = Format::kRg32Float,
+         .normal_offset = sizeof(float) * 6u,
+         .normal_format = Format::kRgb32Float}};
     MultiMaterialResolver resolver(*device, mesh_id, material_ids, object_ids, mesh_resource, object_resources);
     resolver.set_pipeline(graphics_pipeline);
 
@@ -626,6 +647,7 @@ int main() {
         return {Result::success(), view};
     };
     frame_desc.render_feature_preparation = [&smoke_state, &resolver, device_ptr = device.get(), material_layout,
+                                             lighting_layout,
                                              graphics_pipeline, target_texture, target_view, target_desc](
                                                 const aeg::engine::EngineFramePreparationContext& context) {
         const auto target_resource = context.render_graph.import_texture(
@@ -745,6 +767,66 @@ int main() {
                                                        state.parameter_resource,
                                                        0,
                                                        sizeof(input.parameters)});
+        }
+
+        const aeg::renderer::RenderLightingConstants lighting_constants{
+            .directional_direction_intensity = {0.0f, 0.0f, -1.0f, 0.0f},
+            .directional_color = {0.0f, 0.0f, 0.0f, 1.0f},
+            .ambient_color = {1.0f, 1.0f, 1.0f, 1.0f},
+        };
+        BufferDesc lighting_desc{};
+        lighting_desc.size = sizeof(lighting_constants);
+        lighting_desc.capabilities = BufferCapability::kTransferDestination | BufferCapability::kUniform;
+        lighting_desc.memory = MemoryClass::kDeviceLocal;
+        lighting_desc.initial_usage = ResourceUsage::kUndefined;
+        lighting_desc.initial_stages = PipelineStage::kAllCommands;
+        lighting_desc.initial_queue = QueueClass::kAuto;
+        lighting_desc.name = DebugName{"Renderer.OpaqueMultiFrame.Lighting"};
+        const auto lighting_upload = resource_uploader.upload_buffer(
+            context.frame_context, context.render_graph,
+            aeg::resource::BufferUploadDesc{std::as_bytes(std::span{&lighting_constants, 1}), lighting_desc, 0, 16});
+        if (!lighting_upload) {
+            return lighting_upload.result;
+        }
+        const auto lighting_set_result = device_ptr->create_binding_set(
+            BindingSetDesc{lighting_layout, BindingSetLifetime::kPersistent,
+                           DebugName{"Renderer.OpaqueMultiFrame.LightingSet"}});
+        if (!lighting_set_result) {
+            return lighting_set_result.result;
+        }
+        BindingResource lighting_resource{};
+        lighting_resource.type = BindingType::kUniformBuffer;
+        lighting_resource.buffer_range =
+            BufferRange{lighting_upload.value.destination, 0, sizeof(lighting_constants)};
+        const BindingWrite lighting_write{{2, 0}, 0, lighting_resource};
+        if (const Result result = device_ptr->update_binding_set(
+                lighting_set_result.value, std::span{&lighting_write, 1});
+            !result) {
+            (void)device_ptr->destroy_binding_set(lighting_set_result.value);
+            return result;
+        }
+        const BufferHandle previous_lighting_buffer = smoke_state.lighting_buffer;
+        const BindingSetHandle previous_lighting_set = smoke_state.lighting_binding_set;
+        smoke_state.lighting_buffer = lighting_upload.value.destination;
+        smoke_state.lighting_binding_set = lighting_set_result.value;
+        resolver.set_lighting(aeg::renderer::RenderLightingResource{
+            .binding_set = lighting_set_result.value,
+            .binding_group = 2,
+            .lighting_buffer = lighting_upload.value.destination,
+            .lighting_buffer_desc = lighting_desc,
+            .lighting_resource = to_pipeline_handle(lighting_upload.value.target),
+            .lighting_offset = 0,
+            .lighting_size = sizeof(lighting_constants),
+        });
+        if (previous_lighting_set.is_valid()) {
+            if (const Result result = context.frame_context.defer_destroy_binding_set(previous_lighting_set); !result) {
+                return result;
+            }
+        }
+        if (previous_lighting_buffer.is_valid()) {
+            if (const Result result = context.frame_context.defer_destroy_buffer(previous_lighting_buffer); !result) {
+                return result;
+            }
         }
 
         const auto readback = context.frame_context.allocate_readback(kReadbackSize, 256);
@@ -915,6 +997,8 @@ int main() {
         (void)device->destroy_binding_set(object_resources[index].binding_set);
         (void)device->destroy_buffer(transform_buffers[index]);
     }
+    (void)device->destroy_binding_set(smoke_state.lighting_binding_set);
+    (void)device->destroy_buffer(smoke_state.lighting_buffer);
     (void)device->destroy_pipeline(graphics_pipeline);
     (void)device->destroy_buffer(index_buffer);
     (void)device->destroy_buffer(vertex_buffer);

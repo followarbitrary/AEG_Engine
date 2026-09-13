@@ -180,6 +180,7 @@ namespace aeg::rhi {
         kR32Uint,
         kR32Float,
         kRg32Float,
+        kRgb32Float,
         kD24UnormS8Uint,
         kD32Float,
         kD32FloatS8Uint,

@@ -41,7 +41,7 @@ public:
                                                         .vertex_buffer = aeg::rhi::BufferHandle{1},
                                                         .vertex_buffer_desc =
                                                             {
-                                                                .size = 64,
+                                                                .size = 144,
                                                                 .capabilities = aeg::rhi::BufferCapability::kVertex,
                                                             },
                                                         .index_buffer = aeg::rhi::BufferHandle{2},
@@ -50,10 +50,18 @@ public:
                                                                 .size = 12,
                                                                 .capabilities = aeg::rhi::BufferCapability::kIndex,
                                                             },
-                                                        .vertex_stride = 16,
+                                                        .vertex_stride = 36,
                                                         .vertex_count = 4,
                                                         .index_count = 6,
                                                         .index_format = aeg::rhi::IndexFormat::kUint16,
+                                                        .vertex_layout = {
+                                                            .position_offset = 0,
+                                                            .position_format = aeg::rhi::Format::kRgba32Float,
+                                                            .uv_offset = sizeof(float) * 4u,
+                                                            .uv_format = aeg::rhi::Format::kRg32Float,
+                                                            .normal_offset = sizeof(float) * 6u,
+                                                            .normal_format = aeg::rhi::Format::kRgb32Float,
+                                                        },
                                                     }};
     }
 
@@ -74,14 +82,14 @@ public:
                                                         .transform_buffer = aeg::rhi::BufferHandle{4},
                                                         .transform_buffer_desc =
                                                             {
-                                                                .size = sizeof(aeg::math::Mat4),
+                                                                .size = sizeof(aeg::renderer::RenderObjectConstants),
                                                                 .capabilities = aeg::rhi::BufferCapability::kUniform,
                                                             },
                                                         .binding_layout = aeg::rhi::BindingLayoutHandle{5},
                                                         .binding_set = aeg::rhi::BindingSetHandle{6},
                                                         .binding_group = 0,
                                                         .transform_offset = 0,
-                                                        .transform_size = sizeof(aeg::math::Mat4),
+                                                        .transform_size = sizeof(aeg::renderer::RenderObjectConstants),
                                                     }};
     }
 

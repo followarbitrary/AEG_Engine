@@ -9,6 +9,7 @@
 #include <functional>
 #include <memory>
 #include <shared_mutex>
+#include <span>
 #include <unordered_set>
 #include <vector>
 
@@ -28,6 +29,7 @@ struct RenderLightIdTag;
 struct RenderExtractorIdTag;
 struct MeshAssetIdTag;
 struct MaterialInstanceIdTag;
+struct RenderSceneSnapshot;
 
 using RenderViewId = pipeline::StableId<RenderViewIdTag>;
 using RenderObjectId = pipeline::StableId<RenderObjectIdTag>;
@@ -187,6 +189,10 @@ struct RenderMeshVertexLayout final {
     uint32_t uv_offset{sizeof(float) * 4u};
     /** @brief Shader-facing format of the UV attribute. */
     rhi::Format uv_format{rhi::Format::kRg32Float};
+    /** @brief Byte offset of the float3 normal within one interleaved vertex. */
+    uint32_t normal_offset{sizeof(float) * 6u};
+    /** @brief Shader-facing format of the normal attribute. */
+    rhi::Format normal_format{rhi::Format::kRgb32Float};
 };
 
 /** @brief GPU resources resolved for one mesh asset without exposing backend types. */
@@ -239,6 +245,48 @@ struct RenderMaterialResource final {
     [[nodiscard]] bool is_valid() const noexcept;
 };
 
+/** @brief Object constants shared by the standard opaque vertex shader contract. */
+struct RenderObjectConstants final {
+    /** @brief Matrix that transforms local positions into clip space. */
+    math::Mat4 model_view_projection{math::identity()};
+    /** @brief Inverse-transpose matrix that transforms local normals into view space. */
+    math::Mat4 normal_matrix{math::identity()};
+};
+
+static_assert(sizeof(RenderObjectConstants) == sizeof(math::Mat4) * 2u);
+
+/** @brief Frame/view-local constants consumed by the minimal Lambert shader contract. */
+struct RenderLightingConstants final {
+    /** @brief View-space light direction and directional intensity in w. */
+    math::Vec4 directional_direction_intensity{0.0f, 0.0f, -1.0f, 0.0f};
+    /** @brief Linear directional light color; alpha is reserved and must remain one. */
+    math::Vec4 directional_color{0.0f, 0.0f, 0.0f, 1.0f};
+    /** @brief Linear environment contribution; alpha is reserved and must remain one. */
+    math::Vec4 ambient_color{0.05f, 0.05f, 0.05f, 1.0f};
+
+    [[nodiscard]] bool is_valid() const noexcept;
+};
+
+/** @brief GPU resources resolved for one frame/view-local lighting binding. */
+struct RenderLightingResource final {
+    /** @brief Descriptor set exposing RenderLightingConstants. */
+    rhi::BindingSetHandle binding_set{};
+    /** @brief Pipeline layout group used when binding binding_set. */
+    uint32_t binding_group{2};
+    /** @brief Uniform buffer containing the frame/view-local lighting constants. */
+    rhi::BufferHandle lighting_buffer{};
+    /** @brief Immutable creation contract for lighting_buffer. */
+    rhi::BufferDesc lighting_buffer_desc{};
+    /** @brief Graph buffer used to declare the fragment uniform read. */
+    pipeline::RenderGraphBuffer lighting_resource{};
+    /** @brief Byte offset of the lighting constant range. */
+    uint64_t lighting_offset{0};
+    /** @brief Byte size of the lighting constant range. */
+    uint64_t lighting_size{sizeof(RenderLightingConstants)};
+
+    [[nodiscard]] bool is_valid() const noexcept;
+};
+
 /** @brief View-local object bindings consumed by the standard opaque shader contract. */
 struct RenderObjectResource final {
     /** @brief Uniform buffer containing the object's transform constants. */
@@ -271,6 +319,9 @@ public:
     /** @brief Resolves the view-local transform binding required for one opaque render object. */
     [[nodiscard]] virtual foundation::ResultValue<RenderObjectResource> resolve_object(
         const RenderInstance& instance, const RenderView& view) const = 0;
+    /** @brief Resolves the frame/view-local lighting binding required by Opaque. */
+    [[nodiscard]] virtual foundation::ResultValue<RenderLightingResource> resolve_lighting(
+        const RenderSceneSnapshot& snapshot, const RenderView& view) const;
 };
 
 /** @brief Immutable frame-local rendering input produced by RenderExtract. */
@@ -287,6 +338,10 @@ struct RenderSceneSnapshot final {
         return world_revision != 0 && world.is_valid() && view.is_valid() && view.world == world;
     }
 };
+
+/** @brief Selects the first supported Directional Light and builds ambient-only fallback data when absent. */
+[[nodiscard]] foundation::ResultValue<RenderLightingConstants> make_render_lighting_constants(
+    std::span<const RenderLight> lights, math::Vec3 ambient_color = math::Vec3{0.05f, 0.05f, 0.05f});
 
 class RenderSceneSnapshotBuilder;
 

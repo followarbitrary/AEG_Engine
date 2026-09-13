@@ -589,6 +589,8 @@ namespace aeg::rhi {
                     return VK_FORMAT_R32_SFLOAT;
                 case Format::kRg32Float:
                     return VK_FORMAT_R32G32_SFLOAT;
+                case Format::kRgb32Float:
+                    return VK_FORMAT_R32G32B32_SFLOAT;
                 case Format::kD24UnormS8Uint:
                     return VK_FORMAT_D24_UNORM_S8_UINT;
                 case Format::kD32Float:
@@ -631,6 +633,8 @@ namespace aeg::rhi {
                     return Format::kR32Float;
                 case VK_FORMAT_R32G32_SFLOAT:
                     return Format::kRg32Float;
+                case VK_FORMAT_R32G32B32_SFLOAT:
+                    return Format::kRgb32Float;
                 case VK_FORMAT_D24_UNORM_S8_UINT:
                     return Format::kD24UnormS8Uint;
                 case VK_FORMAT_D32_SFLOAT:
@@ -1549,6 +1553,8 @@ namespace aeg::rhi {
                     case Format::kRgba16Float:
                     case Format::kRg32Float:
                         return CopyFormatInfo{8, 1, 1, 1, false};
+                    case Format::kRgb32Float:
+                        return CopyFormatInfo{12, 1, 1, 1, false};
                     case Format::kRgba32Float:
                         return CopyFormatInfo{16, 1, 1, 1, false};
                     case Format::kBc1RgbaUnorm:
@@ -1580,6 +1586,7 @@ namespace aeg::rhi {
                     case Format::kR32Uint:
                     case Format::kR32Float:
                     case Format::kRg32Float:
+                    case Format::kRgb32Float:
                     case Format::kBc1RgbaUnorm:
                     case Format::kBc3RgbaUnorm:
                     case Format::kBc5Unorm:
@@ -1603,6 +1610,7 @@ namespace aeg::rhi {
                     case Format::kR32Uint:
                     case Format::kR32Float:
                     case Format::kRg32Float:
+                    case Format::kRgb32Float:
                     case Format::kD32Float:
                     case Format::kBc1RgbaUnorm:
                     case Format::kBc3RgbaUnorm:
