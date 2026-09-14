@@ -81,6 +81,7 @@ struct OpaqueDrawItem final {
 struct OpaquePassData final {
     pipeline::RenderGraphTexture color_target{};
     pipeline::RenderGraphTexture depth_target{};
+    rhi::ResourceUsage color_target_final_usage{rhi::ResourceUsage::kColorAttachmentWrite};
     pipeline::RenderGraphBuffer lighting_resource{};
     rhi::BindingSetHandle lighting_binding_set{};
     uint32_t lighting_binding_group{2};
@@ -141,6 +142,7 @@ public:
         auto pass_data = std::make_shared<OpaquePassData>();
         pass_data->color_target = color_target.value;
         pass_data->depth_target = depth_target;
+        pass_data->color_target_final_usage = context->scene_snapshot->view.color_target_final_usage;
         pass_data->has_depth_target = depth_target.is_valid();
         pass_data->output_extent = context->scene_snapshot->view.output_extent;
         pass_data->draws.reserve(context->scene_snapshot->instances.size());
@@ -207,14 +209,20 @@ public:
             }
 
             const foundation::ResultValue<pipeline::RenderGraphBuffer> vertex_buffer =
-                find_or_import_buffer(builder, make_resource_id(kVertexResourceNamespace, instance.mesh.value()),
-                                      mesh.value.vertex_buffer, mesh.value.vertex_buffer_desc);
+                mesh.value.vertex_resource.is_valid()
+                    ? foundation::ResultValue<pipeline::RenderGraphBuffer>{foundation::Result::success(),
+                                                                           mesh.value.vertex_resource}
+                    : find_or_import_buffer(builder, make_resource_id(kVertexResourceNamespace, instance.mesh.value()),
+                                            mesh.value.vertex_buffer, mesh.value.vertex_buffer_desc);
             if (!vertex_buffer) {
                 return vertex_buffer.result;
             }
             const foundation::ResultValue<pipeline::RenderGraphBuffer> index_buffer =
-                find_or_import_buffer(builder, make_resource_id(kIndexResourceNamespace, instance.mesh.value()),
-                                      mesh.value.index_buffer, mesh.value.index_buffer_desc);
+                mesh.value.index_resource.is_valid()
+                    ? foundation::ResultValue<pipeline::RenderGraphBuffer>{foundation::Result::success(),
+                                                                           mesh.value.index_resource}
+                    : find_or_import_buffer(builder, make_resource_id(kIndexResourceNamespace, instance.mesh.value()),
+                                            mesh.value.index_buffer, mesh.value.index_buffer_desc);
             if (!index_buffer) {
                 return index_buffer.result;
             }
@@ -303,14 +311,13 @@ public:
                 if (const foundation::Result result = pass_builder.read(
                         captured_data->lighting_resource, rhi::ResourceUsage::kUniformRead,
                         rhi::PipelineStage::kFragmentShader, rhi::ShaderStage::kFragment,
-                        pipeline::RenderGraphBufferRange{captured_data->lighting_offset,
-                                                         captured_data->lighting_size});
+                        pipeline::RenderGraphBufferRange{captured_data->lighting_offset, captured_data->lighting_size});
                     !result) {
                     return result;
                 }
                 if (const foundation::Result result = pass_builder.use_color_attachment(
                         captured_data->color_target, rhi::LoadOp::kClear, rhi::StoreOp::kStore,
-                        rhi::ClearColorValue{0.0f, 0.0f, 0.0f, 1.0f});
+                        rhi::ClearColorValue{0.0f, 0.0f, 0.0f, 1.0f}, captured_data->color_target_final_usage);
                     !result) {
                     return result;
                 }
@@ -349,9 +356,8 @@ public:
                     if (const foundation::Result result = execution.bind_pipeline(draw.pipeline); !result) {
                         return end_rendering_after_failure(execution, result);
                     }
-                    if (const foundation::Result result =
-                            execution.bind_binding_set(captured_data->lighting_binding_group,
-                                                       captured_data->lighting_binding_set);
+                    if (const foundation::Result result = execution.bind_binding_set(
+                            captured_data->lighting_binding_group, captured_data->lighting_binding_set);
                         !result) {
                         return end_rendering_after_failure(execution, result);
                     }

@@ -5,9 +5,11 @@
 #include "../public/scene_asset.hpp"
 
 #include <algorithm>
+#include <functional>
 #include <limits>
 #include <new>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -135,6 +137,78 @@ struct SceneComponentKeyHash final {
     return {foundation::Result::success(), std::move(index)};
 }
 
+struct HierarchyLists final {
+    SceneEntityIndex index{};
+    std::vector<std::vector<SceneEntityId>> children{};
+    std::vector<SceneEntityId> roots{};
+};
+
+[[nodiscard]] foundation::ResultValue<HierarchyLists> build_hierarchy_lists(
+    std::span<const SceneEntityRecord> records) {
+    HierarchyLists result;
+    try {
+        result.index.reserve(records.size());
+        result.children.resize(records.size());
+        for (std::size_t index = 0; index < records.size(); ++index) {
+            if (!result.index.emplace(records[index].id, index).second) {
+                return {invalid_state("Scene entity identity is duplicated"), {}};
+            }
+        }
+        result.roots.reserve(records.size());
+        for (const SceneEntityRecord& entity : records) {
+            if (!entity.parent.is_valid()) {
+                result.roots.push_back(entity.id);
+                continue;
+            }
+            const auto parent = result.index.find(entity.parent);
+            if (parent == result.index.end()) {
+                return {not_found("Scene entity parent is not present in the asset"), {}};
+            }
+            result.children[parent->second].push_back(entity.id);
+        }
+    } catch (const std::bad_alloc&) {
+        return {out_of_memory("Scene hierarchy index allocation failed"), {}};
+    }
+    return {foundation::Result::success(), std::move(result)};
+}
+
+[[nodiscard]] foundation::ResultValue<std::vector<SceneEntityRecord>> flatten_hierarchy(
+    std::span<const SceneEntityRecord> records, const HierarchyLists& lists) {
+    std::vector<SceneEntityRecord> result;
+    try {
+        result.reserve(records.size());
+        std::vector<uint8_t> visited(records.size(), 0);
+        std::function<foundation::Result(SceneEntityId)> append = [&](SceneEntityId entity) {
+            const auto iterator = lists.index.find(entity);
+            if (iterator == lists.index.end()) {
+                return not_found("Scene hierarchy references an unknown entity");
+            }
+            if (visited[iterator->second] != 0) {
+                return invalid_state("Scene entity hierarchy contains a cycle");
+            }
+            visited[iterator->second] = 1;
+            result.push_back(records[iterator->second]);
+            for (const SceneEntityId child : lists.children[iterator->second]) {
+                if (const foundation::Result child_result = append(child); !child_result) {
+                    return child_result;
+                }
+            }
+            return foundation::Result::success();
+        };
+        for (const SceneEntityId root : lists.roots) {
+            if (const foundation::Result root_result = append(root); !root_result) {
+                return {root_result, {}};
+            }
+        }
+        if (result.size() != records.size()) {
+            return {invalid_state("Scene entity hierarchy contains an unreachable entity"), {}};
+        }
+    } catch (const std::bad_alloc&) {
+        return {out_of_memory("Scene hierarchy ordering allocation failed"), {}};
+    }
+    return {foundation::Result::success(), std::move(result)};
+}
+
 [[nodiscard]] foundation::Result write_entity(serialization::BinaryWriter& writer, const SceneEntityRecord& entity,
                                               const SceneSerializationOptions& options) {
     if (const foundation::Result result = write_guid(writer, entity.id); !result) {
@@ -146,7 +220,10 @@ struct SceneComponentKeyHash final {
     if (const foundation::Result result = writer.write_u32(static_cast<uint32_t>(entity.flags)); !result) {
         return result;
     }
-    return write_string(writer, entity.name, options);
+    if (const foundation::Result result = write_string(writer, entity.name, options); !result) {
+        return result;
+    }
+    return write_string(writer, entity.tag, options);
 }
 
 [[nodiscard]] foundation::Result write_component(serialization::BinaryWriter& writer,
@@ -275,6 +352,239 @@ foundation::Result SceneAsset::add_entity(SceneEntityRecord entity) {
     return foundation::Result::success();
 }
 
+foundation::Result SceneAsset::set_entity_name(SceneEntityId entity, std::string name) {
+    const auto found =
+        std::find_if(entities_.begin(), entities_.end(), [entity](const auto& value) { return value.id == entity; });
+    if (found == entities_.end()) {
+        return not_found("Scene entity name target is not present in the asset");
+    }
+    if (name.empty()) {
+        return invalid_argument("Scene entity name cannot be empty");
+    }
+    try {
+        found->name = std::move(name);
+    } catch (const std::bad_alloc&) {
+        return out_of_memory("Scene entity name allocation failed");
+    }
+    return foundation::Result::success();
+}
+
+foundation::Result SceneAsset::set_entity_tag(SceneEntityId entity, std::string tag) {
+    const auto found =
+        std::find_if(entities_.begin(), entities_.end(), [entity](const auto& value) { return value.id == entity; });
+    if (found == entities_.end()) {
+        return not_found("Scene entity tag target is not present in the asset");
+    }
+    try {
+        found->tag = std::move(tag);
+    } catch (const std::bad_alloc&) {
+        return out_of_memory("Scene entity tag allocation failed");
+    }
+    return foundation::Result::success();
+}
+
+foundation::ResultValue<std::vector<SceneEntityId>> SceneAsset::children(SceneEntityId parent) const {
+    if (parent.is_valid()) {
+        const auto parent_exists = std::find_if(entities_.begin(), entities_.end(),
+                                                [parent](const auto& entity) { return entity.id == parent; });
+        if (parent_exists == entities_.end()) {
+            return {not_found("Scene hierarchy parent is not present in the asset"), {}};
+        }
+    }
+    try {
+        std::vector<SceneEntityId> result;
+        for (const SceneEntityRecord& entity : entities_) {
+            if (entity.parent == parent) {
+                result.push_back(entity.id);
+            }
+        }
+        return {foundation::Result::success(), std::move(result)};
+    } catch (const std::bad_alloc&) {
+        return {out_of_memory("Scene child list allocation failed"), {}};
+    }
+}
+
+foundation::Result SceneAsset::reparent_entities(std::span<const SceneEntityId> entities, SceneEntityId parent,
+                                                 std::size_t sibling_index) {
+    if (entities.empty()) {
+        return invalid_argument("Scene reparent operation has no entities");
+    }
+    if (parent.is_valid() && std::find_if(entities_.begin(), entities_.end(), [parent](const auto& entity) {
+                                 return entity.id == parent;
+                             }) == entities_.end()) {
+        return not_found("Scene reparent target parent is not present in the asset");
+    }
+    const auto lists_result = build_hierarchy_lists(entities_);
+    if (!lists_result) {
+        return lists_result.result;
+    }
+    try {
+        std::vector<SceneEntityId> sources;
+        sources.reserve(entities.size());
+        std::unordered_set<SceneEntityId, Guid128Hash<SceneEntityIdTag>> source_set;
+        source_set.reserve(entities.size());
+        for (const SceneEntityId entity : entities) {
+            if (!entity.is_valid() || lists_result.value.index.find(entity) == lists_result.value.index.end()) {
+                return not_found("Scene reparent source is not present in the asset");
+            }
+            if (!source_set.emplace(entity).second) {
+                return invalid_argument("Scene reparent sources contain a duplicate entity");
+            }
+            sources.push_back(entity);
+        }
+        for (const SceneEntityId source : sources) {
+            if (source == parent) {
+                return invalid_state("Scene entity cannot be its own parent");
+            }
+            SceneEntityId current = parent;
+            while (current.is_valid()) {
+                if (current == source) {
+                    return invalid_state("Scene entity cannot be parented below its descendant");
+                }
+                const auto current_index = lists_result.value.index.find(current);
+                if (current_index == lists_result.value.index.end()) {
+                    return not_found("Scene hierarchy references an unknown parent");
+                }
+                current = entities_[current_index->second].parent;
+            }
+        }
+        for (const SceneEntityId source : sources) {
+            SceneEntityId current = source;
+            while (current.is_valid()) {
+                const auto current_index = lists_result.value.index.find(current);
+                if (current_index == lists_result.value.index.end()) {
+                    break;
+                }
+                current = entities_[current_index->second].parent;
+                if (source_set.contains(current)) {
+                    return invalid_argument("Scene reparent sources cannot contain nested entities");
+                }
+            }
+        }
+
+        HierarchyLists lists = lists_result.value;
+        std::vector<SceneEntityRecord> records(entities_.begin(), entities_.end());
+        for (const SceneEntityId source : sources) {
+            const auto source_index = lists.index.find(source);
+            records[source_index->second].parent = parent;
+        }
+        for (std::vector<SceneEntityId>& siblings : lists.children) {
+            siblings.erase(std::remove_if(siblings.begin(), siblings.end(),
+                                          [&source_set](SceneEntityId value) { return source_set.contains(value); }),
+                           siblings.end());
+        }
+        lists.roots.erase(std::remove_if(lists.roots.begin(), lists.roots.end(),
+                                         [&source_set](SceneEntityId value) { return source_set.contains(value); }),
+                          lists.roots.end());
+        auto& destination = parent.is_valid() ? lists.children[lists.index.find(parent)->second] : lists.roots;
+        const std::size_t insertion = sibling_index == static_cast<std::size_t>(-1)
+                                          ? destination.size()
+                                          : std::min(sibling_index, destination.size());
+        destination.insert(destination.begin() + static_cast<std::ptrdiff_t>(insertion), sources.begin(),
+                           sources.end());
+        const auto flattened = flatten_hierarchy(records, lists);
+        if (!flattened) {
+            return flattened.result;
+        }
+        entities_ = flattened.value;
+    } catch (const std::bad_alloc&) {
+        return out_of_memory("Scene reparent operation allocation failed");
+    }
+    return foundation::Result::success();
+}
+
+foundation::Result SceneAsset::remove_entities(std::span<const SceneEntityId> entities,
+                                               SceneEntityRemovalPolicy policy) {
+    if (entities.empty()) {
+        return invalid_argument("Scene remove operation has no entities");
+    }
+    if (policy != SceneEntityRemovalPolicy::kCascade && policy != SceneEntityRemovalPolicy::kPromoteChildren) {
+        return invalid_argument("Scene remove operation has an unknown removal policy");
+    }
+    const auto lists_result = build_hierarchy_lists(entities_);
+    if (!lists_result) {
+        return lists_result.result;
+    }
+    try {
+        std::unordered_set<SceneEntityId, Guid128Hash<SceneEntityIdTag>> sources;
+        sources.reserve(entities.size());
+        for (const SceneEntityId entity : entities) {
+            if (!entity.is_valid() || lists_result.value.index.find(entity) == lists_result.value.index.end()) {
+                return not_found("Scene remove source is not present in the asset");
+            }
+            if (!sources.emplace(entity).second) {
+                return invalid_argument("Scene remove sources contain a duplicate entity");
+            }
+        }
+        for (const SceneEntityId source : sources) {
+            SceneEntityId current = entities_[lists_result.value.index.find(source)->second].parent;
+            while (current.is_valid()) {
+                if (sources.contains(current)) {
+                    return invalid_argument("Scene remove sources cannot contain nested entities");
+                }
+                current = entities_[lists_result.value.index.find(current)->second].parent;
+            }
+        }
+        std::unordered_set<SceneEntityId, Guid128Hash<SceneEntityIdTag>> removed = sources;
+        if (policy == SceneEntityRemovalPolicy::kCascade) {
+            std::function<void(SceneEntityId)> mark_descendants = [&](SceneEntityId entity) {
+                const auto index = lists_result.value.index.find(entity);
+                if (index == lists_result.value.index.end()) {
+                    return;
+                }
+                for (const SceneEntityId child : lists_result.value.children[index->second]) {
+                    if (removed.emplace(child).second) {
+                        mark_descendants(child);
+                    }
+                }
+            };
+            for (const SceneEntityId source : sources) {
+                mark_descendants(source);
+            }
+        }
+        std::vector<SceneEntityRecord> remaining;
+        remaining.reserve(entities_.size() - removed.size());
+        for (const SceneEntityRecord& entity : entities_) {
+            if (!removed.contains(entity.id)) {
+                remaining.push_back(entity);
+            }
+        }
+        if (policy == SceneEntityRemovalPolicy::kPromoteChildren) {
+            for (SceneEntityRecord& entity : remaining) {
+                const auto removed_parent = sources.find(entity.parent);
+                if (removed_parent == sources.end()) {
+                    continue;
+                }
+                const auto parent_index = lists_result.value.index.find(*removed_parent);
+                if (parent_index == lists_result.value.index.end()) {
+                    return invalid_state("Scene removal hierarchy index is incomplete");
+                }
+                entity.parent = entities_[parent_index->second].parent;
+            }
+        }
+        std::vector<SceneComponentRecord> remaining_components;
+        remaining_components.reserve(components_.size());
+        for (const SceneComponentRecord& component : components_) {
+            if (!removed.contains(component.entity)) {
+                remaining_components.push_back(component);
+            }
+        }
+        const auto remaining_lists = build_hierarchy_lists(remaining);
+        if (!remaining_lists) {
+            return remaining_lists.result;
+        }
+        const auto flattened = flatten_hierarchy(remaining, remaining_lists.value);
+        if (!flattened) {
+            return flattened.result;
+        }
+        entities_ = flattened.value;
+        components_ = std::move(remaining_components);
+    } catch (const std::bad_alloc&) {
+        return out_of_memory("Scene remove operation allocation failed");
+    }
+    return foundation::Result::success();
+}
+
 foundation::Result SceneAsset::add_component(SceneComponentRecord component) {
     if (!component.entity.is_valid() || !component.component_type.is_valid() || !component.schema_type.is_valid() ||
         component.schema_version == 0) {
@@ -319,6 +629,21 @@ foundation::Result SceneAsset::add_reflected_component(SceneEntityId entity, ecs
     } catch (const std::bad_alloc&) {
         return out_of_memory("Scene reflected component payload allocation failed");
     }
+}
+
+foundation::Result SceneAsset::remove_component(SceneEntityId entity, ecs::ComponentTypeId component_type) {
+    if (!entity.is_valid() || !component_type.is_valid()) {
+        return invalid_argument("Scene component removal input is invalid");
+    }
+    const auto found =
+        std::find_if(components_.begin(), components_.end(), [entity, component_type](const auto& value) {
+            return value.entity == entity && value.component_type == component_type;
+        });
+    if (found == components_.end()) {
+        return not_found("Scene component is not present on the entity");
+    }
+    components_.erase(found);
+    return foundation::Result::success();
 }
 
 void SceneAsset::clear() noexcept {
@@ -499,18 +824,19 @@ foundation::Result SceneSerializer::serialize(const SceneAsset& asset, serializa
             return result;
         }
 
-        std::vector<const SceneEntityRecord*> entities;
         std::vector<const SceneComponentRecord*> components;
-        entities.reserve(asset.entities().size());
         components.reserve(asset.components().size());
-        for (const SceneEntityRecord& entity : asset.entities()) {
-            entities.push_back(&entity);
-        }
         for (const SceneComponentRecord& component : asset.components()) {
             components.push_back(&component);
         }
-        std::sort(entities.begin(), entities.end(),
-                  [](const SceneEntityRecord* left, const SceneEntityRecord* right) { return left->id < right->id; });
+        const auto hierarchy = build_hierarchy_lists(asset.entities());
+        if (!hierarchy) {
+            return hierarchy.result;
+        }
+        const auto entities = flatten_hierarchy(asset.entities(), hierarchy.value);
+        if (!entities) {
+            return entities.result;
+        }
         std::sort(components.begin(), components.end(),
                   [](const SceneComponentRecord* left, const SceneComponentRecord* right) {
                       if (left->entity != right->entity) {
@@ -518,8 +844,8 @@ foundation::Result SceneSerializer::serialize(const SceneAsset& asset, serializa
                       }
                       return left->component_type < right->component_type;
                   });
-        for (const SceneEntityRecord* entity : entities) {
-            if (const foundation::Result result = write_entity(encoded, *entity, options); !result) {
+        for (const SceneEntityRecord& entity : entities.value) {
+            if (const foundation::Result result = write_entity(encoded, entity, options); !result) {
                 return result;
             }
         }
@@ -546,7 +872,8 @@ foundation::ResultValue<SceneAsset> SceneSerializer::deserialize(serialization::
         if (!magic || !format_version || !reserved) {
             return {invalid_argument("Scene archive header is truncated"), {}};
         }
-        if (magic.value != kMagic || format_version.value != kFormatVersion || reserved.value != 0) {
+        if (magic.value != kMagic || (format_version.value != 1u && format_version.value != kFormatVersion) ||
+            reserved.value != 0) {
             return {unsupported("Scene archive format is not supported"), {}};
         }
         const auto asset_id = read_asset_guid(reader);
@@ -582,9 +909,17 @@ foundation::ResultValue<SceneAsset> SceneSerializer::deserialize(serialization::
             if (!entity_name) {
                 return {entity_name.result, {}};
             }
-            if (const foundation::Result result =
-                    asset.add_entity(SceneEntityRecord{entity_id.value, parent.value, std::move(entity_name.value),
-                                                       static_cast<SceneEntityFlags>(flags.value)});
+            std::string entity_tag;
+            if (format_version.value >= 2u) {
+                const auto tag = read_string(reader, options);
+                if (!tag) {
+                    return {tag.result, {}};
+                }
+                entity_tag = std::move(tag.value);
+            }
+            if (const foundation::Result result = asset.add_entity(
+                    SceneEntityRecord{entity_id.value, parent.value, std::move(entity_name.value),
+                                      static_cast<SceneEntityFlags>(flags.value), std::move(entity_tag)});
                 !result) {
                 return {result, {}};
             }

@@ -38,6 +38,7 @@ public:
     [[nodiscard]] foundation::Result set_maximized(bool maximized) noexcept override;
     [[nodiscard]] foundation::Result set_input_enabled(bool enabled) noexcept override;
     [[nodiscard]] foundation::Result request_close() noexcept override;
+    [[nodiscard]] foundation::Result clear_close_request() noexcept override;
 
     void attach(HWND handle) noexcept { hwnd_ = handle; }
     void detach_owner() noexcept { owner_ = nullptr; }

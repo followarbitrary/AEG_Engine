@@ -2,6 +2,7 @@
  * @file runtime_components.cpp
  * @brief Implements Runtime component registration, reflection, and render extraction.
  */
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
@@ -16,6 +17,8 @@ namespace aeg::engine::components {
 const std::string_view kTransformName{"Game.Transform"};
 const std::string_view kCameraName{"Game.Camera"};
 const std::string_view kMeshRendererName{"Game.MeshRenderer"};
+const std::string_view kTextRendererName{"Game.TextRenderer"};
+const std::string_view kDirectionalLightName{"Game.DirectionalLight"};
 const std::string_view kVec3TypeName{"Math.Vec3"};
 const std::string_view kQuatTypeName{"Math.Quat"};
 const uint32_t kRenderComponentSchemaVersion = 1;
@@ -236,6 +239,16 @@ foundation::ResultValue<reflection::TypeDescriptor> mesh_renderer_reflection_des
         !result) {
         return {result, {}};
     }
+    if (const foundation::Result result =
+            builder.add_field("tint", reflection::TypeId(kVec3TypeName), make_vec3_accessor(&MeshRenderer::tint));
+        !result) {
+        return {result, {}};
+    }
+    if (const foundation::Result result = builder.add_field(
+            "tint_alpha", reflection::type_id<float>(), reflection::make_member_accessor(&MeshRenderer::tint_alpha));
+        !result) {
+        return {result, {}};
+    }
     if (const foundation::Result result = builder.add_field("bounds_center", reflection::TypeId(kVec3TypeName),
                                                             make_vec3_accessor(&MeshRenderer::bounds_center));
         !result) {
@@ -261,6 +274,77 @@ foundation::ResultValue<reflection::TypeDescriptor> mesh_renderer_reflection_des
     return std::move(builder).finish();
 }
 
+foundation::ResultValue<reflection::TypeDescriptor> text_renderer_reflection_descriptor() {
+    reflection::TypeBuilder builder(reflection::TypeDescriptor{
+        reflection::TypeId(kTextRendererName), std::string(kTextRendererName), kRenderComponentSchemaVersion,
+        reflection::TypeKind::kComponent, sizeof(TextRenderer), alignof(TextRenderer)});
+    if (const foundation::Result result =
+            builder.add_field("font_asset_id", reflection::type_id<uint64_t>(),
+                              reflection::make_member_accessor(&TextRenderer::font_asset_id));
+        !result) {
+        return {result, {}};
+    }
+    if (const foundation::Result result = builder.add_field("text", reflection::type_id<std::string>(),
+                                                            reflection::make_member_accessor(&TextRenderer::text));
+        !result) {
+        return {result, {}};
+    }
+    if (const foundation::Result result = builder.add_field(
+            "world_size", reflection::type_id<float>(), reflection::make_member_accessor(&TextRenderer::world_size));
+        !result) {
+        return {result, {}};
+    }
+    if (const foundation::Result result =
+            builder.add_field("color", reflection::TypeId(kVec3TypeName), make_vec3_accessor(&TextRenderer::color));
+        !result) {
+        return {result, {}};
+    }
+    if (const foundation::Result result = builder.add_field(
+            "color_alpha", reflection::type_id<float>(), reflection::make_member_accessor(&TextRenderer::color_alpha));
+        !result) {
+        return {result, {}};
+    }
+    if (const foundation::Result result =
+            builder.add_field("visibility_mask", reflection::type_id<uint32_t>(),
+                              reflection::make_member_accessor(&TextRenderer::visibility_mask));
+        !result) {
+        return {result, {}};
+    }
+    if (const foundation::Result result = builder.add_field("visible", reflection::type_id<bool>(),
+                                                            reflection::make_member_accessor(&TextRenderer::visible));
+        !result) {
+        return {result, {}};
+    }
+    return std::move(builder).finish();
+}
+
+foundation::ResultValue<reflection::TypeDescriptor> directional_light_reflection_descriptor() {
+    reflection::TypeBuilder builder(reflection::TypeDescriptor{
+        reflection::TypeId(kDirectionalLightName), std::string(kDirectionalLightName), kRenderComponentSchemaVersion,
+        reflection::TypeKind::kComponent, sizeof(DirectionalLight), alignof(DirectionalLight)});
+    if (const foundation::Result result = builder.add_field("direction", reflection::TypeId(kVec3TypeName),
+                                                            make_vec3_accessor(&DirectionalLight::direction));
+        !result) {
+        return {result, {}};
+    }
+    if (const foundation::Result result =
+            builder.add_field("color", reflection::TypeId(kVec3TypeName), make_vec3_accessor(&DirectionalLight::color));
+        !result) {
+        return {result, {}};
+    }
+    if (const foundation::Result result = builder.add_field(
+            "intensity", reflection::type_id<float>(), reflection::make_member_accessor(&DirectionalLight::intensity));
+        !result) {
+        return {result, {}};
+    }
+    if (const foundation::Result result = builder.add_field(
+            "enabled", reflection::type_id<bool>(), reflection::make_member_accessor(&DirectionalLight::enabled));
+        !result) {
+        return {result, {}};
+    }
+    return std::move(builder).finish();
+}
+
 foundation::Result register_render_component_reflection(reflection::TypeRegistry& registry) {
     auto transform = transform_reflection_descriptor();
     if (!transform) {
@@ -274,11 +358,19 @@ foundation::Result register_render_component_reflection(reflection::TypeRegistry
     if (!mesh_renderer) {
         return mesh_renderer.result;
     }
+    auto text_renderer = text_renderer_reflection_descriptor();
+    if (!text_renderer) {
+        return text_renderer.result;
+    }
+    auto directional_light = directional_light_reflection_descriptor();
+    if (!directional_light) {
+        return directional_light.result;
+    }
 
-    const std::array<reflection::TypeDescriptor, 3> descriptors{
-        std::move(transform.value),
-        std::move(camera.value),
-        std::move(mesh_renderer.value),
+    const std::array<reflection::TypeDescriptor, 5> descriptors{
+        std::move(transform.value),         std::move(camera.value),
+        std::move(mesh_renderer.value),     std::move(text_renderer.value),
+        std::move(directional_light.value),
     };
     std::array<reflection::TypeId, descriptors.size()> inserted{};
     std::size_t inserted_count = 0;
@@ -309,7 +401,18 @@ foundation::Result register_render_components(ecs::World& world) {
         !result) {
         return result;
     }
-    return ensure_raw_component_storage<MeshRenderer>(world, component_type_id(kMeshRendererName), kMeshRendererName);
+    if (const foundation::Result result =
+            ensure_raw_component_storage<MeshRenderer>(world, component_type_id(kMeshRendererName), kMeshRendererName);
+        !result) {
+        return result;
+    }
+    if (const foundation::Result result =
+            ensure_raw_component_storage<TextRenderer>(world, component_type_id(kTextRendererName), kTextRendererName);
+        !result) {
+        return result;
+    }
+    return ensure_raw_component_storage<DirectionalLight>(world, component_type_id(kDirectionalLightName),
+                                                          kDirectionalLightName);
 }
 
 foundation::Result register_reflected_render_components(ecs::World& world, const reflection::TypeRegistry& registry) {
@@ -323,8 +426,21 @@ foundation::Result register_reflected_render_components(ecs::World& world, const
         !result) {
         return result;
     }
-    return register_component_from_schema<MeshRenderer>(world, registry, mesh_renderer_reflection_descriptor(),
-                                                        component_type_id(kMeshRendererName), kMeshRendererName);
+    if (const foundation::Result result =
+            register_component_from_schema<MeshRenderer>(world, registry, mesh_renderer_reflection_descriptor(),
+                                                         component_type_id(kMeshRendererName), kMeshRendererName);
+        !result) {
+        return result;
+    }
+    if (const foundation::Result result =
+            register_component_from_schema<TextRenderer>(world, registry, text_renderer_reflection_descriptor(),
+                                                         component_type_id(kTextRendererName), kTextRendererName);
+        !result) {
+        return result;
+    }
+    return register_component_from_schema<DirectionalLight>(world, registry, directional_light_reflection_descriptor(),
+                                                            component_type_id(kDirectionalLightName),
+                                                            kDirectionalLightName);
 }
 
 foundation::Result register_render_component_bundle(ecs::World& world, reflection::TypeRegistry& registry) {
@@ -428,5 +544,85 @@ foundation::Result extract_mesh_renderers(const renderer::RenderExtractContext& 
 
 foundation::ResultValue<renderer::RenderExtractorId> register_mesh_renderer_extractor(renderer::Renderer& renderer) {
     return renderer.register_extractor(&extract_mesh_renderers);
+}
+
+foundation::Result extract_text_renderers(const renderer::RenderExtractContext& context) {
+    foundation::Result result = foundation::Result::success();
+    context.world_snapshot.for_each<TextRenderer>([&context, &result](ecs::EntityId entity, const TextRenderer& text) {
+        if (!result || !text.visible || text.text.empty() || !std::isfinite(text.world_size) ||
+            text.world_size <= 0.0f || !std::isfinite(text.color.x) || !std::isfinite(text.color.y) ||
+            !std::isfinite(text.color.z) || text.color.x < 0.0f || text.color.x > 1.0f || text.color.y < 0.0f ||
+            text.color.y > 1.0f || text.color.z < 0.0f || text.color.z > 1.0f || !std::isfinite(text.color_alpha) ||
+            text.color_alpha < 0.0f || text.color_alpha > 1.0f) {
+            if (!text.visible || text.text.empty()) {
+                return;
+            }
+            result = foundation::invalid_argument("TextRenderer contains invalid text, size, or color values");
+            return;
+        }
+        const Transform* transform = context.world_snapshot.get<Transform>(entity);
+        if (transform == nullptr) {
+            return;
+        }
+        const uint64_t text_hash = text_asset_hash(text.font_asset_id, text.text, text.world_size);
+        const renderer::MeshAssetId mesh(text_mesh_asset_id(text.font_asset_id, text.text, text.world_size));
+        const renderer::MaterialInstanceId material(
+            text_material_asset_id(text.font_asset_id, text.text, text.world_size));
+        const renderer::RenderObjectId object(renderer::make_render_object_id(entity).value() ^ text_hash);
+        const math::Mat4 world_transform = transform->to_matrix();
+        result = context.builder.add_instance({object,
+                                               mesh,
+                                               material,
+                                               world_transform,
+                                               world_transform,
+                                               {},
+                                               std::max(0.01f, text.world_size * static_cast<float>(text.text.size())),
+                                               text.visibility_mask});
+    });
+    return result;
+}
+
+foundation::ResultValue<renderer::RenderExtractorId> register_text_renderer_extractor(renderer::Renderer& renderer) {
+    return renderer.register_extractor(&extract_text_renderers);
+}
+
+foundation::Result extract_directional_lights(const renderer::RenderExtractContext& context) {
+    foundation::Result result = foundation::Result::success();
+    context.world_snapshot.for_each<DirectionalLight>(
+        [&context, &result](ecs::EntityId entity, const DirectionalLight& light) {
+            if (!result || !light.enabled) {
+                return;
+            }
+            if (!std::isfinite(light.intensity) || light.intensity < 0.0f || !std::isfinite(light.direction.x) ||
+                !std::isfinite(light.direction.y) || !std::isfinite(light.direction.z) ||
+                !std::isfinite(light.color.x) || !std::isfinite(light.color.y) || !std::isfinite(light.color.z) ||
+                light.color.x < 0.0f || light.color.x > 1.0f || light.color.y < 0.0f || light.color.y > 1.0f ||
+                light.color.z < 0.0f || light.color.z > 1.0f) {
+                result = foundation::invalid_argument("Directional Light contains invalid editor values");
+                return;
+            }
+            math::Vec3 direction{};
+            if (light.intensity > 0.0f && !math::try_normalize(light.direction, direction)) {
+                result = foundation::invalid_argument("Directional Light direction must be non-zero");
+                return;
+            }
+            result = context.builder.add_light({renderer::make_render_light_id(entity),
+                                                renderer::RenderLightType::kDirectional,
+                                                {},
+                                                direction,
+                                                light.color,
+                                                light.intensity,
+                                                0.0f,
+                                                1.0f,
+                                                0.0f,
+                                                0xffffffffu,
+                                                false});
+        });
+    return result;
+}
+
+foundation::ResultValue<renderer::RenderExtractorId> register_directional_light_extractor(
+    renderer::Renderer& renderer) {
+    return renderer.register_extractor(&extract_directional_lights);
 }
 }  // namespace aeg::engine::components

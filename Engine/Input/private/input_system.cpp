@@ -30,6 +30,13 @@ void InputSystem::end_frame() noexcept {
     frame_events_.clear();
 }
 
+void InputSystem::reset() noexcept {
+    std::scoped_lock lock(mutex_);
+    pending_events_.clear();
+    frame_events_.clear();
+    snapshot_ = {};
+}
+
 void InputSystem::apply_event(const platform::WindowEvent& event) noexcept {
     switch (event.type) {
         case platform::WindowEventType::kWindowResized:

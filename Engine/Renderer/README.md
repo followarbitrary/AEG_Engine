@@ -166,6 +166,18 @@ Opaque Pass 会显式声明 group 2 Lighting Buffer 的 Fragment `kUniformRead`�
 Tint Buffer、Object Buffer 的对应读取。缺失声明、过期 Graph Handle、法线/UV 布局不匹配
 或 Buffer 范围不完整会在构图阶段失败，而不是让 Feature 继续提交不完整的绘制。
 
+### 编辑器 Scene Viewport
+
+编辑器的 `Scene Viewport` 使用独立的离屏 Color/Depth Texture，并在每个
+`EngineFramePreparationContext` 中以稳定的逻辑资源身份导入 RenderGraph。Viewport 尺寸
+变化只在帧边界重建 Texture、View 和相关图资源；正常的材质、对象和光照更新则使用
+`FrameContext` 的帧槽资源，不通过每帧 `wait_idle()` 规避生命周期问题。
+
+Opaque 写入完成后，颜色目标必须显式转换为 Fragment `kSampledRead`，ImGui 只能借用该采样
+View 绘制预览。颜色目标、深度目标、材质纹理、Tint Uniform 和 Lighting Uniform 都必须在
+当前帧重新取得有效 Graph Handle；编辑器不得保存跨帧 Handle，也不得把 ImGui 纹理注册表当作
+GPU 资源所有者。
+
 ## 标准 RenderPipeline
 
 `register_render_pipeline()` 注册标准 Frame 级 `RenderPipeline`。该管线只定义

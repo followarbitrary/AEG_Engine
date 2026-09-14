@@ -16,6 +16,12 @@ namespace aeg::engine::components {
 /** @brief Returns the stable reflection descriptor for the MeshRenderer component. */
 [[nodiscard]] foundation::ResultValue<reflection::TypeDescriptor> mesh_renderer_reflection_descriptor();
 
+/** @brief Returns the stable reflection descriptor for the TextRenderer component. */
+[[nodiscard]] foundation::ResultValue<reflection::TypeDescriptor> text_renderer_reflection_descriptor();
+
+/** @brief Returns the stable reflection descriptor for the Directional Light component. */
+[[nodiscard]] foundation::ResultValue<reflection::TypeDescriptor> directional_light_reflection_descriptor();
+
 /** @brief Registers compatible Runtime component schemas in the supplied registry. */
 [[nodiscard]] foundation::Result register_render_component_reflection(reflection::TypeRegistry& registry);
 }  // namespace aeg::engine::components

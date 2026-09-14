@@ -11,8 +11,10 @@
 - `public/scene_asset.hpp`：`SceneAsset`、`SceneEntityId`、`SceneAssetId`、组件记录、
   `SceneInstance` 和 `SceneSerializer`。
 - `SceneAsset::add_entity()`：加入一个稳定场景实体及其父子关系。
+- `SceneAsset::set_entity_name()` / `set_entity_tag()`：更新编辑器可见的实体元数据。
 - `SceneAsset::add_reflected_component()`：通过 Reflection Registry 将组件对象编码为
   场景组件载荷。
+- `SceneAsset::remove_component()`：删除一个实体上的反射组件载荷。
 - `SceneAsset::validate()`：检查身份唯一性、父节点存在性、层级环、组件归属和组件键重复。
 - `SceneAsset::instantiate()`：创建运行时实体、恢复反射组件，并返回稳定身份到运行时
   `EntityId` 的映射。
@@ -28,6 +30,9 @@ World 实例内由索引和 generation 构成的运行时身份。两者不得�
 场景资产本身不拥有 World，不保存 RHI 资源对象，也不管理编辑器选择状态。组件数据以
 Reflection TypeId、Schema Version 和序列化载荷保存；资源引用应由反射字段中的稳定资产
 身份表达，而不是写入后端句柄或内存地址。
+
+实体记录同时保存稳定的 Name 和可选 Tag。当前 Scene archive writer 使用格式版本 2，
+reader 兼容版本 1 并将旧记录的 Tag 置空。
 
 ## 层级与组件约束
 

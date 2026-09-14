@@ -272,6 +272,14 @@ foundation::Result Win32Window::request_close() noexcept {
     return foundation::Result::success();
 }
 
+foundation::Result Win32Window::clear_close_request() noexcept {
+    if (hwnd_ == nullptr) {
+        return foundation::Result::failure(foundation::ResultCode::kInvalidState);
+    }
+    state_.close_requested = false;
+    return foundation::Result::success();
+}
+
 void Win32Window::destroy_native() noexcept {
     if (hwnd_ != nullptr) {
         DestroyWindow(hwnd_);
@@ -375,7 +383,6 @@ LRESULT Win32Window::handle_message(UINT message, WPARAM w_param, LPARAM l_param
         case WM_CLOSE:
             state_.close_requested = true;
             emit_event(WindowEvent{WindowEventType::kWindowCloseRequested});
-            DestroyWindow(hwnd_);
             return 0;
         case WM_DESTROY:
             state_.close_requested = true;

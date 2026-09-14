@@ -43,4 +43,18 @@ struct RuntimeRenderViewDesc final {
 /** @brief Registers the Runtime mesh extraction callback and returns its removable identity. */
 [[nodiscard]] foundation::ResultValue<renderer::RenderExtractorId> register_mesh_renderer_extractor(
     renderer::Renderer& renderer);
+
+/** @brief Extracts visible world-space TextRenderer components as indexed quads. */
+[[nodiscard]] foundation::Result extract_text_renderers(const renderer::RenderExtractContext& context);
+
+/** @brief Registers the Runtime world-space text extraction callback. */
+[[nodiscard]] foundation::ResultValue<renderer::RenderExtractorId> register_text_renderer_extractor(
+    renderer::Renderer& renderer);
+
+/** @brief Extracts one minimal Directional Light component into the renderer snapshot. */
+[[nodiscard]] foundation::Result extract_directional_lights(const renderer::RenderExtractContext& context);
+
+/** @brief Registers the Runtime Directional Light extraction callback. */
+[[nodiscard]] foundation::ResultValue<renderer::RenderExtractorId> register_directional_light_extractor(
+    renderer::Renderer& renderer);
 }  // namespace aeg::engine::components

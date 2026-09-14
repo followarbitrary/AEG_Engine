@@ -8,6 +8,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <span>
 
 #include "engine_frame_orchestrator.hpp"
@@ -127,20 +128,17 @@ struct MaterialDefinition final {
 };
 
 constexpr MaterialDefinition kMaterialDefinitions[kMaterialCount]{
-    {{{std::byte{220}, std::byte{30}, std::byte{30}, std::byte{255},
-       std::byte{220}, std::byte{30}, std::byte{30}, std::byte{255},
-       std::byte{220}, std::byte{30}, std::byte{30}, std::byte{255},
-       std::byte{220}, std::byte{30}, std::byte{30}, std::byte{255}}},
+    {{{std::byte{220}, std::byte{30}, std::byte{30}, std::byte{255}, std::byte{220}, std::byte{30}, std::byte{30},
+       std::byte{255}, std::byte{220}, std::byte{30}, std::byte{30}, std::byte{255}, std::byte{220}, std::byte{30},
+       std::byte{30}, std::byte{255}}},
      {{1.0f, 1.0f, 1.0f, 1.0f}}},
-    {{{std::byte{30}, std::byte{220}, std::byte{30}, std::byte{255},
-       std::byte{30}, std::byte{220}, std::byte{30}, std::byte{255},
-       std::byte{30}, std::byte{220}, std::byte{30}, std::byte{255},
-       std::byte{30}, std::byte{220}, std::byte{30}, std::byte{255}}},
+    {{{std::byte{30}, std::byte{220}, std::byte{30}, std::byte{255}, std::byte{30}, std::byte{220}, std::byte{30},
+       std::byte{255}, std::byte{30}, std::byte{220}, std::byte{30}, std::byte{255}, std::byte{30}, std::byte{220},
+       std::byte{30}, std::byte{255}}},
      {{1.0f, 1.0f, 1.0f, 1.0f}}},
-    {{{std::byte{20}, std::byte{40}, std::byte{220}, std::byte{255},
-       std::byte{220}, std::byte{40}, std::byte{20}, std::byte{255},
-       std::byte{20}, std::byte{220}, std::byte{40}, std::byte{255},
-       std::byte{220}, std::byte{220}, std::byte{20}, std::byte{255}}},
+    {{{std::byte{20}, std::byte{40}, std::byte{220}, std::byte{255}, std::byte{220}, std::byte{40}, std::byte{20},
+       std::byte{255}, std::byte{20}, std::byte{220}, std::byte{40}, std::byte{255}, std::byte{220}, std::byte{220},
+       std::byte{20}, std::byte{255}}},
      {{1.0f, 0.8f, 1.0f, 1.0f}}},
 };
 
@@ -150,9 +148,9 @@ using ObjectId = aeg::renderer::RenderObjectId;
 
 constexpr MeshId kMeshIds[kMeshCount]{MeshId{"OpaqueUvDepth.MeshA"}, MeshId{"OpaqueUvDepth.MeshB"},
                                       MeshId{"OpaqueUvDepth.MeshReverseNormal"}};
-constexpr MaterialId kMaterialIds[kMaterialCount]{
-    MaterialId{"OpaqueUvDepth.MaterialRed"}, MaterialId{"OpaqueUvDepth.MaterialGreen"},
-    MaterialId{"OpaqueUvDepth.MaterialUv"}};
+constexpr MaterialId kMaterialIds[kMaterialCount]{MaterialId{"OpaqueUvDepth.MaterialRed"},
+                                                  MaterialId{"OpaqueUvDepth.MaterialGreen"},
+                                                  MaterialId{"OpaqueUvDepth.MaterialUv"}};
 constexpr ObjectId kObjectIds[kObjectCount]{ObjectId{1}, ObjectId{2}, ObjectId{3}, ObjectId{4}};
 
 struct MaterialState final {
@@ -190,8 +188,7 @@ bool require(const Value& condition, const char* message) {
 }
 
 [[nodiscard]] ResourceState make_undefined_state() {
-    return {ResourceUsage::kUndefined, ShaderStage::kAll, QueueClass::kAuto, false,
-            PipelineStage::kAllCommands};
+    return {ResourceUsage::kUndefined, ShaderStage::kAll, QueueClass::kAuto, false, PipelineStage::kAllCommands};
 }
 
 [[nodiscard]] ResourceState make_sampled_state() {
@@ -257,8 +254,8 @@ struct ReadbackFeature final : public aeg::pipeline::RenderFeature {
         const auto pass = builder.add_graphics_pass(
             "ReadbackOpaqueUvDepth",
             [target = target.value, destination, allocation](aeg::pipeline::RenderPassBuilder& pass_builder) {
-                if (const Result result = pass_builder.read(target, ResourceUsage::kCopySource, PipelineStage::kCopy,
-                                                            ShaderStage::kAll);
+                if (const Result result =
+                        pass_builder.read(target, ResourceUsage::kCopySource, PipelineStage::kCopy, ShaderStage::kAll);
                     !result) {
                     return result;
                 }
@@ -361,9 +358,8 @@ public:
                 view.camera.view_projection() * instance.world_transform, aeg::math::identity()};
             const uint32_t frame = frame_index_ != nullptr ? *frame_index_ % kNormalFrameCount : 0;
             const auto& object = objects_[frame][index];
-            if (const Result result = device_->write_buffer(
-                    object.transform_buffer, object.transform_offset,
-                    std::as_bytes(std::span{&constants, 1}));
+            if (const Result result = device_->write_buffer(object.transform_buffer, object.transform_offset,
+                                                            std::as_bytes(std::span{&constants, 1}));
                 !result) {
                 return {result, {}};
             }
@@ -400,29 +396,26 @@ private:
                                    uint32_t lighting_mode) {
     const auto add = [&context](ObjectId object, MeshId mesh, MaterialId material, aeg::math::Vec3 position,
                                 float depth, float scale) {
-        const aeg::math::Mat4 transform = aeg::math::trs(
-            aeg::math::Vec3{position.x, position.y, depth}, aeg::math::Quat{},
-            aeg::math::Vec3{scale, scale, 1.0f});
+        const aeg::math::Mat4 transform = aeg::math::trs(aeg::math::Vec3{position.x, position.y, depth},
+                                                         aeg::math::Quat{}, aeg::math::Vec3{scale, scale, 1.0f});
         return context.builder.add_instance({object, mesh, material, transform, transform, {}, 1.0f, 0xffffffffu});
     };
 
     if (lighting_mode != 0) {
-        if (const Result result = add(kObjectIds[0], kMeshIds[0], kMaterialIds[0], {-0.5f, 0.0f, 0.0f}, 0.5f,
-                                      0.35f);
+        if (const Result result = add(kObjectIds[0], kMeshIds[0], kMaterialIds[0], {-0.5f, 0.0f, 0.0f}, 0.5f, 0.35f);
             !result) {
             return result;
         }
-        if (const Result result = add(kObjectIds[1], kMeshIds[2], kMaterialIds[0], {0.5f, 0.0f, 0.0f}, 0.5f,
-                                      0.35f);
+        if (const Result result = add(kObjectIds[1], kMeshIds[2], kMaterialIds[0], {0.5f, 0.0f, 0.0f}, 0.5f, 0.35f);
             !result) {
             return result;
         }
         if (lighting_mode == 1) {
             return Result::success();
         }
-        const aeg::math::Vec3 light_color = lighting_mode == 4 ? aeg::math::Vec3{1.0f, 0.0f, 0.0f}
-                                        : lighting_mode == 5 ? aeg::math::Vec3{1.5f, 1.0f, 1.0f}
-                                                             : aeg::math::Vec3{1.0f, 1.0f, 1.0f};
+        const aeg::math::Vec3 light_color = lighting_mode == 4   ? aeg::math::Vec3{1.0f, 0.0f, 0.0f}
+                                            : lighting_mode == 5 ? aeg::math::Vec3{1.5f, 1.0f, 1.0f}
+                                                                 : aeg::math::Vec3{1.0f, 1.0f, 1.0f};
         return context.builder.add_light({
             .light = aeg::renderer::RenderLightId{"OpaqueUvDepth.Directional"},
             .type = aeg::renderer::RenderLightType::kDirectional,
@@ -433,18 +426,15 @@ private:
     }
 
     if (frame_index == 0) {
-        if (const Result result = add(kObjectIds[0], kMeshIds[0], kMaterialIds[0], {-0.5f, 0.45f, 0.0f}, 0.5f,
-                                      0.35f);
+        if (const Result result = add(kObjectIds[0], kMeshIds[0], kMaterialIds[0], {-0.5f, 0.45f, 0.0f}, 0.5f, 0.35f);
             !result) {
             return result;
         }
-        if (const Result result = add(kObjectIds[1], kMeshIds[0], kMaterialIds[1], {0.5f, 0.45f, 0.0f}, 0.5f,
-                                      0.35f);
+        if (const Result result = add(kObjectIds[1], kMeshIds[0], kMaterialIds[1], {0.5f, 0.45f, 0.0f}, 0.5f, 0.35f);
             !result) {
             return result;
         }
-        if (const Result result = add(kObjectIds[2], kMeshIds[0], kMaterialIds[2], {-0.5f, -0.45f, 0.0f}, 0.5f,
-                                      0.35f);
+        if (const Result result = add(kObjectIds[2], kMeshIds[0], kMaterialIds[2], {-0.5f, -0.45f, 0.0f}, 0.5f, 0.35f);
             !result) {
             return result;
         }
@@ -453,24 +443,23 @@ private:
 
     const float first_depth = frame_index == 1 ? 0.75f : 0.25f;
     const float second_depth = frame_index == 1 ? 0.25f : 0.75f;
-    if (const Result result = add(kObjectIds[0], kMeshIds[0], kMaterialIds[0], {0.0f, 0.0f, 0.0f}, first_depth,
-                                  0.7f);
+    if (const Result result = add(kObjectIds[0], kMeshIds[0], kMaterialIds[0], {0.0f, 0.0f, 0.0f}, first_depth, 0.7f);
         !result) {
         return result;
     }
     return add(kObjectIds[1], kMeshIds[1], kMaterialIds[1], {0.0f, 0.0f, 0.0f}, second_depth, 0.7f);
 }
 
-[[nodiscard]] aeg::foundation::ResultValue<aeg::renderer::RenderLightingConstants>
-make_lighting_constants(uint32_t lighting_mode) {
-    const aeg::math::Vec3 ambient = lighting_mode == 0 ? aeg::math::Vec3{1.0f, 1.0f, 1.0f}
-                                                        : aeg::math::Vec3{0.1f, 0.1f, 0.1f};
+[[nodiscard]] aeg::foundation::ResultValue<aeg::renderer::RenderLightingConstants> make_lighting_constants(
+    uint32_t lighting_mode) {
+    const aeg::math::Vec3 ambient =
+        lighting_mode == 0 ? aeg::math::Vec3{1.0f, 1.0f, 1.0f} : aeg::math::Vec3{0.1f, 0.1f, 0.1f};
     if (lighting_mode == 0 || lighting_mode == 1) {
         return aeg::renderer::make_render_lighting_constants({}, ambient);
     }
-    const aeg::math::Vec3 color = lighting_mode == 4 ? aeg::math::Vec3{1.0f, 0.0f, 0.0f}
-                                                     : lighting_mode == 5 ? aeg::math::Vec3{1.5f, 1.0f, 1.0f}
-                                                                          : aeg::math::Vec3{1.0f, 1.0f, 1.0f};
+    const aeg::math::Vec3 color = lighting_mode == 4   ? aeg::math::Vec3{1.0f, 0.0f, 0.0f}
+                                  : lighting_mode == 5 ? aeg::math::Vec3{1.5f, 1.0f, 1.0f}
+                                                       : aeg::math::Vec3{1.0f, 1.0f, 1.0f};
     const aeg::renderer::RenderLight light{
         .light = aeg::renderer::RenderLightId{"OpaqueUvDepth.Directional"},
         .type = aeg::renderer::RenderLightType::kDirectional,
@@ -482,7 +471,7 @@ make_lighting_constants(uint32_t lighting_mode) {
 }
 
 [[nodiscard]] std::array<unsigned, 3> pixel_rgb(const std::array<std::byte, kReadbackSize>& pixels, uint32_t x,
-                                                 uint32_t y) {
+                                                uint32_t y) {
     const std::size_t offset = (static_cast<std::size_t>(y) * kWidth + x) * 4u;
     return {std::to_integer<unsigned char>(pixels[offset]), std::to_integer<unsigned char>(pixels[offset + 1]),
             std::to_integer<unsigned char>(pixels[offset + 2])};
@@ -508,9 +497,8 @@ make_lighting_constants(uint32_t lighting_mode) {
     };
 }
 
-[[nodiscard]] uint32_t count_rgb(const std::array<std::byte, kReadbackSize>& pixels, uint32_t x_begin,
-                                 uint32_t x_end, uint32_t y_begin, uint32_t y_end,
-                                 std::array<unsigned, 3> expected) {
+[[nodiscard]] uint32_t count_rgb(const std::array<std::byte, kReadbackSize>& pixels, uint32_t x_begin, uint32_t x_end,
+                                 uint32_t y_begin, uint32_t y_end, std::array<unsigned, 3> expected) {
     uint32_t count = 0;
     for (uint32_t y = y_begin; y < y_end; ++y) {
         for (uint32_t x = x_begin; x < x_end; ++x) {
@@ -566,9 +554,10 @@ int main() {
 
     SmokeState smoke_state{};
     aeg::renderer::Renderer renderer;
-    const auto extractor = renderer.register_extractor([&smoke_state](const aeg::renderer::RenderExtractContext& context) {
-        return add_instances(context, smoke_state.frame_index, smoke_state.lighting_mode);
-    });
+    const auto extractor =
+        renderer.register_extractor([&smoke_state](const aeg::renderer::RenderExtractContext& context) {
+            return add_instances(context, smoke_state.frame_index, smoke_state.lighting_mode);
+        });
     if (!require(extractor, "UV/depth extractor registration failed")) {
         return 6;
     }
@@ -588,8 +577,8 @@ int main() {
         return 8;
     }
     aeg::shader::ShaderManager shader_manager(*device);
-    auto shader_layout_result = shader_manager.build_pipeline_layout(
-        shader_program_result.value, DebugName{"Renderer.OpaqueUvDepth.Layout"});
+    auto shader_layout_result =
+        shader_manager.build_pipeline_layout(shader_program_result.value, DebugName{"Renderer.OpaqueUvDepth.Layout"});
     if (!require(shader_layout_result, "UV/depth shader layout creation failed")) {
         return 9;
     }
@@ -714,9 +703,8 @@ int main() {
                 return 17;
             }
             transform_buffers[frame][index] = buffer_result.value;
-            const auto set_result = device->create_binding_set(
-                BindingSetDesc{object_layout, BindingSetLifetime::kPersistent,
-                               DebugName{"Renderer.OpaqueUvDepth.ObjectSet"}});
+            const auto set_result = device->create_binding_set(BindingSetDesc{
+                object_layout, BindingSetLifetime::kPersistent, DebugName{"Renderer.OpaqueUvDepth.ObjectSet"}});
             if (!require(set_result, "UV/depth object binding set creation failed")) {
                 return 18;
             }
@@ -729,8 +717,13 @@ int main() {
                          "UV/depth object binding set update failed")) {
                 return 19;
             }
-            object_resources[frame][index] = {transform_buffers[frame][index], desc, object_layout, set_result.value,
-                                              0, 0, sizeof(aeg::renderer::RenderObjectConstants)};
+            object_resources[frame][index] = {transform_buffers[frame][index],
+                                              desc,
+                                              object_layout,
+                                              set_result.value,
+                                              0,
+                                              0,
+                                              sizeof(aeg::renderer::RenderObjectConstants)};
         }
     }
 
@@ -750,10 +743,10 @@ int main() {
     graphics_state.depth_write_enable = true;
     graphics_state.color_formats = color_formats;
     graphics_state.depth_stencil_format = depth_desc.format;
-    const auto pipeline_result = shader_manager.create_pipeline(
-        shader_program_result.value, shader_layout,
-        aeg::shader::ShaderPipelineDesc{PipelineType::kGraphics, graphics_state,
-                                        DebugName{"Renderer.OpaqueUvDepth.Pipeline"}});
+    const auto pipeline_result =
+        shader_manager.create_pipeline(shader_program_result.value, shader_layout,
+                                       aeg::shader::ShaderPipelineDesc{PipelineType::kGraphics, graphics_state,
+                                                                       DebugName{"Renderer.OpaqueUvDepth.Pipeline"}});
     if (!require(pipeline_result, "UV/depth graphics pipeline creation failed")) {
         return 20;
     }
@@ -770,14 +763,15 @@ int main() {
             .vertex_count = 4,
             .index_count = 6,
             .index_format = aeg::rhi::IndexFormat::kUint16,
-            .vertex_layout = {
-                .position_offset = 0,
-                .position_format = Format::kRgba32Float,
-                .uv_offset = sizeof(float) * 4u,
-                .uv_format = Format::kRg32Float,
-                .normal_offset = sizeof(float) * 6u,
-                .normal_format = Format::kRgb32Float,
-            },
+            .vertex_layout =
+                {
+                    .position_offset = 0,
+                    .position_format = Format::kRgba32Float,
+                    .uv_offset = sizeof(float) * 4u,
+                    .uv_format = Format::kRg32Float,
+                    .normal_offset = sizeof(float) * 6u,
+                    .normal_format = Format::kRgb32Float,
+                },
         };
     }
     std::array<aeg::renderer::RenderMaterialResource, kMaterialCount> material_resources{};
@@ -789,12 +783,13 @@ int main() {
     aeg::pipeline::PipelineScheduler scheduler({1, 1, 1, 1});
     auto frame_context = std::make_unique<aeg::render_graph::FrameContext>(
         *device, aeg::render_graph::FrameContextDesc{8, 4u * 1024u * 1024u, 4u * 1024u * 1024u, 256,
-                                                       std::numeric_limits<uint64_t>::max()});
+                                                     std::numeric_limits<uint64_t>::max()});
     aeg::render_graph::RenderGraph render_graph(*device);
-    aeg::engine::EngineFrameOrchestrator orchestrator(registry, scheduler, *frame_context, render_graph);
-    if (!require(orchestrator.register_world_frame(world_scope, frame_host, 1),
+    std::optional<aeg::engine::EngineFrameOrchestrator> orchestrator;
+    orchestrator.emplace(registry, scheduler, *frame_context, render_graph);
+    if (!require(orchestrator->register_world_frame(world_scope, frame_host, 1),
                  "UV/depth World frame registration failed") ||
-        !require(orchestrator.initialize(), "UV/depth orchestrator initialization failed")) {
+        !require(orchestrator->initialize(), "UV/depth orchestrator initialization failed")) {
         return 21;
     }
 
@@ -822,16 +817,16 @@ int main() {
                                              lighting_layout, graphics_pipeline, target_texture, target_view,
                                              target_desc, depth_texture, depth_view,
                                              depth_desc](const aeg::engine::EngineFramePreparationContext& context) {
-        const auto color_resource = context.render_graph.import_texture(
-            target_texture, target_view, target_desc, make_undefined_state());
+        const auto color_resource =
+            context.render_graph.import_texture(target_texture, target_view, target_desc, make_undefined_state());
         if (!color_resource) {
             return color_resource.result;
         }
         if (const Result result = context.bind_feature_texture(kSceneColor, color_resource.value); !result) {
             return result;
         }
-        const auto depth_resource = context.render_graph.import_texture(
-            depth_texture, depth_view, depth_desc, make_undefined_state());
+        const auto depth_resource =
+            context.render_graph.import_texture(depth_texture, depth_view, depth_desc, make_undefined_state());
         if (!depth_resource) {
             return depth_resource.result;
         }
@@ -861,8 +856,8 @@ int main() {
                     std::span<const std::byte>{kMaterialDefinitions[index].pixels}, 0, 0};
                 const aeg::resource::TextureData texture_data{
                     texture_desc, std::span<const aeg::resource::TextureSubresourceData>{&subresource, 1}};
-                const auto upload = texture_uploader.upload_texture(
-                    context.frame_context, context.render_graph, texture_data, "Renderer.OpaqueUvDepth.Texture");
+                const auto upload = texture_uploader.upload_texture(context.frame_context, context.render_graph,
+                                                                    texture_data, "Renderer.OpaqueUvDepth.Texture");
                 if (!upload) {
                     return upload.result;
                 }
@@ -880,8 +875,8 @@ int main() {
                 parameter_desc.name = DebugName{"Renderer.OpaqueUvDepth.Parameters"};
                 const auto parameter_upload = resource_uploader.upload_buffer(
                     context.frame_context, context.render_graph,
-                    aeg::resource::BufferUploadDesc{
-                        std::as_bytes(std::span{&kMaterialDefinitions[index].tint, 1}), parameter_desc, 0, 16});
+                    aeg::resource::BufferUploadDesc{std::as_bytes(std::span{&kMaterialDefinitions[index].tint, 1}),
+                                                    parameter_desc, 0, 16});
                 if (!parameter_upload) {
                     return parameter_upload.result;
                 }
@@ -892,16 +887,17 @@ int main() {
                 const auto material_result = aeg::resource::create_texture_material(
                     *device_ptr, aeg::resource::TextureMaterialDesc{
                                      .texture_view = upload.value.texture.sampled_view,
-                                     .sampler = {
-                                         .min_filter = aeg::rhi::Filter::kNearest,
-                                         .mag_filter = aeg::rhi::Filter::kNearest,
-                                         .mip_filter = aeg::rhi::Filter::kNearest,
-                                         .address_u = aeg::rhi::AddressMode::kClampToEdge,
-                                         .address_v = aeg::rhi::AddressMode::kClampToEdge,
-                                         .address_w = aeg::rhi::AddressMode::kClampToEdge,
-                                         .max_lod = 0.0f,
-                                         .name = DebugName{"Renderer.OpaqueUvDepth.Sampler"},
-                                     },
+                                     .sampler =
+                                         {
+                                             .min_filter = aeg::rhi::Filter::kNearest,
+                                             .mag_filter = aeg::rhi::Filter::kNearest,
+                                             .mip_filter = aeg::rhi::Filter::kNearest,
+                                             .address_u = aeg::rhi::AddressMode::kClampToEdge,
+                                             .address_v = aeg::rhi::AddressMode::kClampToEdge,
+                                             .address_w = aeg::rhi::AddressMode::kClampToEdge,
+                                             .max_lod = 0.0f,
+                                             .name = DebugName{"Renderer.OpaqueUvDepth.Sampler"},
+                                         },
                                      .binding_layout = material_layout,
                                      .binding_group = 1,
                                      .name = DebugName{"Renderer.OpaqueUvDepth.Material"},
@@ -937,17 +933,18 @@ int main() {
                 }
                 parameter_resources[index] = parameter_resource.value;
             }
-            resolver.set_material(index, aeg::renderer::RenderMaterialResource{
-                                             .pipeline = graphics_pipeline,
-                                             .binding_set = smoke_state.materials[index].material.binding_set,
-                                             .binding_group = 1,
-                                             .material_texture = to_pipeline_handle(texture_resources[index]),
-                                             .material_parameter_buffer = smoke_state.materials[index].parameter_buffer,
-                                             .material_parameter_buffer_desc = smoke_state.materials[index].parameter_desc,
-                                             .material_parameter_resource = to_pipeline_handle(parameter_resources[index]),
-                                             .material_parameter_offset = 0,
-                                             .material_parameter_size = sizeof(aeg::resource::TextureMaterialParameters),
-                                         });
+            resolver.set_material(index,
+                                  aeg::renderer::RenderMaterialResource{
+                                      .pipeline = graphics_pipeline,
+                                      .binding_set = smoke_state.materials[index].material.binding_set,
+                                      .binding_group = 1,
+                                      .material_texture = to_pipeline_handle(texture_resources[index]),
+                                      .material_parameter_buffer = smoke_state.materials[index].parameter_buffer,
+                                      .material_parameter_buffer_desc = smoke_state.materials[index].parameter_desc,
+                                      .material_parameter_resource = to_pipeline_handle(parameter_resources[index]),
+                                      .material_parameter_offset = 0,
+                                      .material_parameter_size = sizeof(aeg::resource::TextureMaterialParameters),
+                                  });
         }
 
         const auto lighting_constants_result = make_lighting_constants(smoke_state.lighting_mode);
@@ -969,19 +966,17 @@ int main() {
         if (!lighting_upload) {
             return lighting_upload.result;
         }
-        const auto lighting_set_result = device_ptr->create_binding_set(
-            BindingSetDesc{lighting_layout, BindingSetLifetime::kPersistent,
-                           DebugName{"Renderer.OpaqueUvDepth.LightingSet"}});
+        const auto lighting_set_result = device_ptr->create_binding_set(BindingSetDesc{
+            lighting_layout, BindingSetLifetime::kPersistent, DebugName{"Renderer.OpaqueUvDepth.LightingSet"}});
         if (!lighting_set_result) {
             return lighting_set_result.result;
         }
         BindingResource lighting_resource{};
         lighting_resource.type = BindingType::kUniformBuffer;
-        lighting_resource.buffer_range =
-            BufferRange{lighting_upload.value.destination, 0, sizeof(lighting_constants)};
+        lighting_resource.buffer_range = BufferRange{lighting_upload.value.destination, 0, sizeof(lighting_constants)};
         const BindingWrite lighting_write{{2, 0}, 0, lighting_resource};
-        if (const Result result = device_ptr->update_binding_set(
-                lighting_set_result.value, std::span{&lighting_write, 1});
+        if (const Result result =
+                device_ptr->update_binding_set(lighting_set_result.value, std::span{&lighting_write, 1});
             !result) {
             (void)device_ptr->destroy_binding_set(lighting_set_result.value);
             return result;
@@ -997,8 +992,8 @@ int main() {
             .lighting_buffer_desc = lighting_desc,
             .lighting_resource = to_pipeline_handle(lighting_upload.value.target),
             .lighting_offset = 0,
-            .lighting_size = smoke_state.invalid_lighting ? sizeof(lighting_constants) + 4u
-                                                           : sizeof(lighting_constants),
+            .lighting_size =
+                smoke_state.invalid_lighting ? sizeof(lighting_constants) + 4u : sizeof(lighting_constants),
         });
         if (previous_lighting_set.is_valid()) {
             if (const Result result = context.frame_context.defer_destroy_binding_set(previous_lighting_set); !result) {
@@ -1033,7 +1028,7 @@ int main() {
 
     for (uint32_t frame = 0; frame < kBaseFrameCount; ++frame) {
         smoke_state.frame_index = frame;
-        const Result frame_result = orchestrator.run_frame(frame_desc);
+        const Result frame_result = orchestrator->run_frame(frame_desc);
         if (!frame_result) {
             std::cerr << "UV/depth normal frame " << frame << " failed: " << frame_result.message << '\n';
         }
@@ -1052,8 +1047,7 @@ int main() {
             return 24;
         }
     }
-    const std::array<std::pair<uint32_t, uint32_t>, 4> quad_probe_positions{{
-        {14, 16}, {34, 16}, {14, 36}, {34, 36}}};
+    const std::array<std::pair<uint32_t, uint32_t>, 4> quad_probe_positions{{{14, 16}, {34, 16}, {14, 36}, {34, 36}}};
     for (uint32_t probe = 0; probe < quad_probe_positions.size(); ++probe) {
         const auto [x, y] = quad_probe_positions[probe];
         const std::array<uint32_t, 4> normal_texels{2, 3, 0, 1};
@@ -1078,22 +1072,22 @@ int main() {
 
     smoke_state.lighting_mode = 1;
     smoke_state.frame_index = 3;
-    if (!require(orchestrator.run_frame(frame_desc), "ambient-only lighting frame failed")) {
+    if (!require(orchestrator->run_frame(frame_desc), "ambient-only lighting frame failed")) {
         return 27;
     }
     smoke_state.lighting_mode = 2;
     smoke_state.frame_index = 4;
-    if (!require(orchestrator.run_frame(frame_desc), "full directional lighting frame failed")) {
+    if (!require(orchestrator->run_frame(frame_desc), "full directional lighting frame failed")) {
         return 28;
     }
     smoke_state.lighting_mode = 3;
     smoke_state.frame_index = 5;
-    if (!require(orchestrator.run_frame(frame_desc), "half-intensity directional lighting frame failed")) {
+    if (!require(orchestrator->run_frame(frame_desc), "half-intensity directional lighting frame failed")) {
         return 29;
     }
     smoke_state.lighting_mode = 4;
     smoke_state.frame_index = 6;
-    if (!require(orchestrator.run_frame(frame_desc), "colored directional lighting frame failed")) {
+    if (!require(orchestrator->run_frame(frame_desc), "colored directional lighting frame failed")) {
         return 30;
     }
     if (!require(device->wait_idle(), "directional lighting GPU wait failed")) {
@@ -1134,65 +1128,67 @@ int main() {
     smoke_state.frame_index = 7;
     smoke_state.lighting_mode = 2;
     resolver.set_invalid_uv(true);
-    if (!require(!orchestrator.run_frame(frame_desc), "UV/depth missing UV layout was accepted")) {
+    if (!require(!orchestrator->run_frame(frame_desc), "UV/depth missing UV layout was accepted")) {
         return 36;
     }
     smoke_state.invalid_uv = false;
     resolver.set_invalid_uv(false);
     smoke_state.missing_uv = true;
     resolver.set_missing_uv(true);
-    if (!require(!orchestrator.run_frame(frame_desc), "UV/depth out-of-range UV layout was accepted")) {
+    if (!require(!orchestrator->run_frame(frame_desc), "UV/depth out-of-range UV layout was accepted")) {
         return 37;
     }
     smoke_state.missing_uv = false;
     resolver.set_missing_uv(false);
     smoke_state.invalid_parameters = true;
     resolver.set_invalid_parameters(true);
-    if (!require(!orchestrator.run_frame(frame_desc), "UV/depth invalid parameter range was accepted")) {
+    if (!require(!orchestrator->run_frame(frame_desc), "UV/depth invalid parameter range was accepted")) {
         return 38;
     }
     smoke_state.invalid_parameters = false;
     resolver.set_invalid_parameters(false);
     smoke_state.invalid_normal = true;
     resolver.set_invalid_normal(true);
-    if (!require(!orchestrator.run_frame(frame_desc), "normal vertex format mismatch was accepted")) {
+    if (!require(!orchestrator->run_frame(frame_desc), "normal vertex format mismatch was accepted")) {
         return 39;
     }
     smoke_state.invalid_normal = false;
     resolver.set_invalid_normal(false);
     smoke_state.missing_normal = true;
     resolver.set_missing_normal(true);
-    if (!require(!orchestrator.run_frame(frame_desc), "missing normal vertex attribute was accepted")) {
+    if (!require(!orchestrator->run_frame(frame_desc), "missing normal vertex attribute was accepted")) {
         return 40;
     }
     smoke_state.missing_normal = false;
     resolver.set_missing_normal(false);
     smoke_state.invalid_lighting = true;
-    if (!require(!orchestrator.run_frame(frame_desc), "invalid lighting parameter range was accepted")) {
+    if (!require(!orchestrator->run_frame(frame_desc), "invalid lighting parameter range was accepted")) {
         return 41;
     }
     smoke_state.invalid_lighting = false;
     smoke_state.lighting_mode = 5;
-    if (!require(!orchestrator.run_frame(frame_desc), "invalid directional light color was accepted")) {
+    if (!require(!orchestrator->run_frame(frame_desc), "invalid directional light color was accepted")) {
         return 42;
     }
     smoke_state.lighting_mode = 2;
     smoke_state.frame_index = 0;
-    if (!require(orchestrator.run_frame(frame_desc), "UV/depth recovery frame failed")) {
+    if (!require(orchestrator->run_frame(frame_desc), "UV/depth recovery frame failed")) {
         return 43;
     }
 
-    if (!require(orchestrator.shutdown(), "UV/depth orchestrator shutdown failed") ||
-        !require(orchestrator.unregister_world_frame(world_scope.handle(), 1), "UV/depth World frame unregister failed") ||
-        !require(orchestrator.unregister_world(world_scope.handle()), "UV/depth World unregister failed") ||
+    if (!require(orchestrator->shutdown(), "UV/depth orchestrator shutdown failed") ||
+        !require(orchestrator->unregister_world_frame(world_scope.handle(), 1),
+                 "UV/depth World frame unregister failed") ||
+        !require(orchestrator->unregister_world(world_scope.handle()), "UV/depth World unregister failed") ||
         !require(world_scope.shutdown(), "UV/depth WorldScope shutdown failed") ||
         !require(renderer.unregister_extractor(extractor.value), "UV/depth extractor unregister failed")) {
         return 44;
     }
+    orchestrator.reset();
+    frame_context.reset();
     if (!require(device->wait_idle(), "UV/depth final GPU wait failed")) {
         return 45;
     }
-    frame_context.reset();
     (void)device->destroy_binding_set(smoke_state.lighting_binding_set);
     (void)device->destroy_buffer(smoke_state.lighting_buffer);
     for (auto& material : smoke_state.materials) {

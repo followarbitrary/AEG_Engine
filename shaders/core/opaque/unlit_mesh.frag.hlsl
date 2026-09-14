@@ -16,10 +16,11 @@ cbuffer OpaqueLightingConstants : register(b0, space2) {
 };
 
 float4 main(float2 uv : TEXCOORD0, float3 normal : NORMAL) : SV_Target0 {
-    const float3 albedo = material_color.Sample(material_sampler, uv).rgb * material_tint.rgb;
+    const float4 sampled = material_color.Sample(material_sampler, uv);
+    const float3 albedo = sampled.rgb * material_tint.rgb;
     const float directional_factor = max(
         dot(normalize(normal), normalize(-directional_direction_intensity.xyz)), 0.0f);
     const float3 lighting = ambient_color.rgb +
                             directional_color.rgb * directional_direction_intensity.w * directional_factor;
-    return float4(albedo * lighting, material_tint.a);
+    return float4(albedo * lighting, sampled.a * material_tint.a);
 }

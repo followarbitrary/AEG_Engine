@@ -21,6 +21,8 @@ public:
     [[nodiscard]] foundation::Result submit_event(const platform::WindowEvent& event);
     [[nodiscard]] foundation::Result begin_frame();
     void end_frame() noexcept;
+    /** @brief Clears transient events and held input state at a world-mode boundary. */
+    void reset() noexcept;
 
     [[nodiscard]] const InputSnapshot& snapshot() const noexcept { return snapshot_; }
     [[nodiscard]] std::span<const platform::WindowEvent> frame_events() const noexcept { return frame_events_; }

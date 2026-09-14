@@ -42,6 +42,10 @@ public:
     }
     /** @brief Posts a semantic close request to the platform window. */
     [[nodiscard]] virtual foundation::Result request_close() noexcept = 0;
+    /** @brief Clears a close request that an Application-owned confirmation dialog rejected. */
+    [[nodiscard]] virtual foundation::Result clear_close_request() noexcept {
+        return foundation::unsupported("Window close request reset is not supported by this platform adapter");
+    }
 };
 
 /** @brief Callback invoked for each semantic platform event during event polling. */

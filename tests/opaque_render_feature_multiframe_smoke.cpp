@@ -8,6 +8,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <span>
 
 #include "engine_frame_orchestrator.hpp"
@@ -203,8 +204,8 @@ struct OpaqueReadbackFeature final : public aeg::pipeline::RenderFeature {
         const auto pass = builder.add_graphics_pass(
             "ReadbackOpaqueMultiFrame",
             [target = target.value, readback_resource, readback](aeg::pipeline::RenderPassBuilder& pass_builder) {
-                if (const Result result = pass_builder.read(target, ResourceUsage::kCopySource, PipelineStage::kCopy,
-                                                            ShaderStage::kAll);
+                if (const Result result =
+                        pass_builder.read(target, ResourceUsage::kCopySource, PipelineStage::kCopy, ShaderStage::kAll);
                     !result) {
                     return result;
                 }
@@ -217,8 +218,7 @@ struct OpaqueReadbackFeature final : public aeg::pipeline::RenderFeature {
                 pass_builder.set_side_effects();
                 return Result::success();
             },
-            [target = target.value, readback_resource, readback](
-                aeg::pipeline::RenderPassExecutionContext& execution) {
+            [target = target.value, readback_resource, readback](aeg::pipeline::RenderPassExecutionContext& execution) {
                 return execution.copy_texture_to_buffer(
                     target, TextureSubresourceLayers{aeg::rhi::Aspect::kColor, 0, 0, 1}, Offset3D{0, 0, 0},
                     Extent3D{kWidth, kHeight, 1}, readback_resource, readback.offset, 0, 0);
@@ -250,7 +250,11 @@ public:
                           std::array<aeg::renderer::RenderObjectId, kObjectCount> object_ids,
                           aeg::renderer::RenderMeshResource mesh,
                           std::array<aeg::renderer::RenderObjectResource, kObjectCount> objects)
-        : device_(&device), mesh_id_(mesh_id), material_ids_(material_ids), object_ids_(object_ids), mesh_(mesh),
+        : device_(&device),
+          mesh_id_(mesh_id),
+          material_ids_(material_ids),
+          object_ids_(object_ids),
+          mesh_(mesh),
           objects_(objects) {}
 
     void set_material(uint32_t index, aeg::renderer::RenderMaterialResource resource) noexcept {
@@ -303,9 +307,8 @@ public:
             const aeg::renderer::RenderObjectConstants constants{
                 view.camera.view_projection() * instance.world_transform, aeg::math::identity()};
             const auto& object = objects_[index];
-            const Result write_result = device_->write_buffer(
-                object.transform_buffer, object.transform_offset,
-                std::as_bytes(std::span{&constants, 1}));
+            const Result write_result = device_->write_buffer(object.transform_buffer, object.transform_offset,
+                                                              std::as_bytes(std::span{&constants, 1}));
             if (!write_result) {
                 return {write_result, {}};
             }
@@ -341,15 +344,22 @@ private:
                                          const std::array<aeg::renderer::MaterialInstanceId, kMaterialCount>& materials,
                                          const std::array<aeg::renderer::RenderObjectId, kObjectCount>& objects) {
     constexpr std::array<aeg::math::Vec3, kObjectCount> positions{
-        aeg::math::Vec3{-0.55f, 0.45f, 0.0f}, aeg::math::Vec3{-0.55f, -0.45f, 0.0f},
-        aeg::math::Vec3{0.0f, 0.0f, 0.0f}, aeg::math::Vec3{0.55f, 0.0f, 0.0f},
+        aeg::math::Vec3{-0.55f, 0.45f, 0.0f},
+        aeg::math::Vec3{-0.55f, -0.45f, 0.0f},
+        aeg::math::Vec3{0.0f, 0.0f, 0.0f},
+        aeg::math::Vec3{0.55f, 0.0f, 0.0f},
     };
     constexpr std::array<uint32_t, kObjectCount> material_indices{0, 0, 1, 2};
     for (uint32_t index = 0; index < kObjectCount; ++index) {
         const aeg::math::Mat4 transform = aeg::math::trs(positions[index], aeg::math::Quat{}, {0.28f, 0.28f, 1.0f});
-        if (const Result result = context.builder.add_instance({
-                objects[index], mesh_id, materials[material_indices[index]], transform, transform, {}, 1.0f,
-                0xffffffffu});
+        if (const Result result = context.builder.add_instance({objects[index],
+                                                                mesh_id,
+                                                                materials[material_indices[index]],
+                                                                transform,
+                                                                transform,
+                                                                {},
+                                                                1.0f,
+                                                                0xffffffffu});
             !result) {
             return result;
         }
@@ -368,13 +378,14 @@ private:
     return std::to_integer<unsigned char>(pixel[3]) >= 240u;
 }
 
-[[nodiscard]] uint32_t count_color(const std::array<std::byte, kReadbackSize>& pixels, uint32_t x_begin,
-                                   uint32_t x_end, std::array<unsigned, 3> expected) {
+[[nodiscard]] uint32_t count_color(const std::array<std::byte, kReadbackSize>& pixels, uint32_t x_begin, uint32_t x_end,
+                                   std::array<unsigned, 3> expected) {
     uint32_t count = 0;
     for (uint32_t y = 0; y < kHeight; ++y) {
         for (uint32_t x = x_begin; x < x_end; ++x) {
             const std::size_t offset = (static_cast<std::size_t>(y) * kWidth + x) * 4u;
-            const std::array<std::byte, 4> pixel{pixels[offset], pixels[offset + 1], pixels[offset + 2], pixels[offset + 3]};
+            const std::array<std::byte, 4> pixel{pixels[offset], pixels[offset + 1], pixels[offset + 2],
+                                                 pixels[offset + 3]};
             count += near_color(pixel, expected) ? 1u : 0u;
         }
     }
@@ -442,10 +453,10 @@ int main() {
     }
 
     aeg::renderer::Renderer renderer;
-    const auto extractor = renderer.register_extractor([mesh_id, material_ids, object_ids](
-                                                            const aeg::renderer::RenderExtractContext& context) {
-        return add_scene_instances(context, mesh_id, material_ids, object_ids);
-    });
+    const auto extractor = renderer.register_extractor(
+        [mesh_id, material_ids, object_ids](const aeg::renderer::RenderExtractContext& context) {
+            return add_scene_instances(context, mesh_id, material_ids, object_ids);
+        });
     if (!require(extractor, "scene extractor registration failed")) {
         return 7;
     }
@@ -465,8 +476,8 @@ int main() {
         return 9;
     }
     aeg::shader::ShaderManager shader_manager(*device);
-    auto shader_layout_result = shader_manager.build_pipeline_layout(
-        shader_program_result.value, DebugName{"Renderer.OpaqueMultiFrame.Layout"});
+    auto shader_layout_result = shader_manager.build_pipeline_layout(shader_program_result.value,
+                                                                     DebugName{"Renderer.OpaqueMultiFrame.Layout"});
     if (!require(shader_layout_result, "shader layout creation failed")) {
         return 10;
     }
@@ -560,8 +571,8 @@ int main() {
             return 16;
         }
         transform_buffers[index] = transform_result.value;
-        const auto binding_result = device->create_binding_set(
-            BindingSetDesc{object_layout, BindingSetLifetime::kPersistent, DebugName{"Renderer.OpaqueMultiFrame.Object"}});
+        const auto binding_result = device->create_binding_set(BindingSetDesc{
+            object_layout, BindingSetLifetime::kPersistent, DebugName{"Renderer.OpaqueMultiFrame.Object"}});
         if (!require(binding_result, "object binding set creation failed")) {
             return 17;
         }
@@ -576,7 +587,12 @@ int main() {
                      "object binding set update failed")) {
             return 18;
         }
-        object_resources[index] = {transform_buffers[index], transform_desc, object_layout, object_set, 0, 0,
+        object_resources[index] = {transform_buffers[index],
+                                   transform_desc,
+                                   object_layout,
+                                   object_set,
+                                   0,
+                                   0,
                                    sizeof(aeg::renderer::RenderObjectConstants)};
     }
 
@@ -602,27 +618,32 @@ int main() {
     }
     PipelineHandle graphics_pipeline = pipeline_result.value;
 
-    aeg::renderer::RenderMeshResource mesh_resource{
-        vertex_buffer, vertex_desc, index_buffer, index_desc, sizeof(Vertex),
-        static_cast<uint32_t>(kTriangleVertices.size()), static_cast<uint32_t>(kTriangleIndices.size()),
-        aeg::rhi::IndexFormat::kUint16,
-        {.position_offset = 0,
-         .position_format = Format::kRgba32Float,
-         .uv_offset = sizeof(float) * 4u,
-         .uv_format = Format::kRg32Float,
-         .normal_offset = sizeof(float) * 6u,
-         .normal_format = Format::kRgb32Float}};
+    aeg::renderer::RenderMeshResource mesh_resource{vertex_buffer,
+                                                    vertex_desc,
+                                                    index_buffer,
+                                                    index_desc,
+                                                    sizeof(Vertex),
+                                                    static_cast<uint32_t>(kTriangleVertices.size()),
+                                                    static_cast<uint32_t>(kTriangleIndices.size()),
+                                                    aeg::rhi::IndexFormat::kUint16,
+                                                    {.position_offset = 0,
+                                                     .position_format = Format::kRgba32Float,
+                                                     .uv_offset = sizeof(float) * 4u,
+                                                     .uv_format = Format::kRg32Float,
+                                                     .normal_offset = sizeof(float) * 6u,
+                                                     .normal_format = Format::kRgb32Float}};
     MultiMaterialResolver resolver(*device, mesh_id, material_ids, object_ids, mesh_resource, object_resources);
     resolver.set_pipeline(graphics_pipeline);
 
     aeg::pipeline::PipelineScheduler scheduler({1, 1, 1, 1});
     auto frame_context = std::make_unique<aeg::render_graph::FrameContext>(
         *device, aeg::render_graph::FrameContextDesc{4, 4u * 1024u * 1024u, 4u * 1024u * 1024u, 256,
-                                                       std::numeric_limits<uint64_t>::max()});
+                                                     std::numeric_limits<uint64_t>::max()});
     aeg::render_graph::RenderGraph render_graph(*device);
-    aeg::engine::EngineFrameOrchestrator orchestrator(registry, scheduler, *frame_context, render_graph);
-    if (!require(orchestrator.register_world_frame(world_scope, frame_host, 1), "world frame registration failed") ||
-        !require(orchestrator.initialize(), "orchestrator initialization failed")) {
+    std::optional<aeg::engine::EngineFrameOrchestrator> orchestrator;
+    orchestrator.emplace(registry, scheduler, *frame_context, render_graph);
+    if (!require(orchestrator->register_world_frame(world_scope, frame_host, 1), "world frame registration failed") ||
+        !require(orchestrator->initialize(), "orchestrator initialization failed")) {
         return 20;
     }
 
@@ -647,13 +668,12 @@ int main() {
         return {Result::success(), view};
     };
     frame_desc.render_feature_preparation = [&smoke_state, &resolver, device_ptr = device.get(), material_layout,
-                                             lighting_layout,
-                                             graphics_pipeline, target_texture, target_view, target_desc](
-                                                const aeg::engine::EngineFramePreparationContext& context) {
-        const auto target_resource = context.render_graph.import_texture(
-            target_texture, target_view, target_desc,
-            ResourceState{ResourceUsage::kUndefined, ShaderStage::kAll, QueueClass::kAuto, false,
-                          PipelineStage::kAllCommands});
+                                             lighting_layout, graphics_pipeline, target_texture, target_view,
+                                             target_desc](const aeg::engine::EngineFramePreparationContext& context) {
+        const auto target_resource =
+            context.render_graph.import_texture(target_texture, target_view, target_desc,
+                                                ResourceState{ResourceUsage::kUndefined, ShaderStage::kAll,
+                                                              QueueClass::kAuto, false, PipelineStage::kAllCommands});
         if (!target_resource) {
             return target_resource.result;
         }
@@ -714,10 +734,9 @@ int main() {
                 sampler_desc.max_lod = 0.0f;
                 sampler_desc.name = DebugName{"Renderer.OpaqueMultiFrame.Sampler"};
                 const auto material_result = aeg::resource::create_texture_material(
-                    *device_ptr,
-                    aeg::resource::TextureMaterialDesc{texture_upload.value.texture.sampled_view, sampler_desc,
-                                                       material_layout, 1,
-                                                       DebugName{"Renderer.OpaqueMultiFrame.Material"}});
+                    *device_ptr, aeg::resource::TextureMaterialDesc{texture_upload.value.texture.sampled_view,
+                                                                    sampler_desc, material_layout, 1,
+                                                                    DebugName{"Renderer.OpaqueMultiFrame.Material"}});
                 if (!material_result) {
                     return material_result.result;
                 }
@@ -743,7 +762,8 @@ int main() {
                     return result;
                 }
                 aeg::resource::GpuTexture retired_texture = old_texture;
-                if (const Result result = texture_uploader.defer_destroy_texture(context.frame_context, retired_texture);
+                if (const Result result =
+                        texture_uploader.defer_destroy_texture(context.frame_context, retired_texture);
                     !result) {
                     return result;
                 }
@@ -757,16 +777,12 @@ int main() {
             state.parameter_buffer_desc = parameter_desc;
             state.parameter_resource = to_pipeline_handle(parameter_upload.value.target);
 
-            resolver.set_material(material_index, aeg::renderer::RenderMaterialResource{
-                                                       graphics_pipeline,
-                                                       state.material.binding_set,
-                                                       state.material.binding_group,
-                                                       to_pipeline_handle(texture_upload.value.target),
-                                                       state.parameter_buffer,
-                                                       state.parameter_buffer_desc,
-                                                       state.parameter_resource,
-                                                       0,
-                                                       sizeof(input.parameters)});
+            resolver.set_material(
+                material_index,
+                aeg::renderer::RenderMaterialResource{
+                    graphics_pipeline, state.material.binding_set, state.material.binding_group,
+                    to_pipeline_handle(texture_upload.value.target), state.parameter_buffer,
+                    state.parameter_buffer_desc, state.parameter_resource, 0, sizeof(input.parameters)});
         }
 
         const aeg::renderer::RenderLightingConstants lighting_constants{
@@ -788,19 +804,17 @@ int main() {
         if (!lighting_upload) {
             return lighting_upload.result;
         }
-        const auto lighting_set_result = device_ptr->create_binding_set(
-            BindingSetDesc{lighting_layout, BindingSetLifetime::kPersistent,
-                           DebugName{"Renderer.OpaqueMultiFrame.LightingSet"}});
+        const auto lighting_set_result = device_ptr->create_binding_set(BindingSetDesc{
+            lighting_layout, BindingSetLifetime::kPersistent, DebugName{"Renderer.OpaqueMultiFrame.LightingSet"}});
         if (!lighting_set_result) {
             return lighting_set_result.result;
         }
         BindingResource lighting_resource{};
         lighting_resource.type = BindingType::kUniformBuffer;
-        lighting_resource.buffer_range =
-            BufferRange{lighting_upload.value.destination, 0, sizeof(lighting_constants)};
+        lighting_resource.buffer_range = BufferRange{lighting_upload.value.destination, 0, sizeof(lighting_constants)};
         const BindingWrite lighting_write{{2, 0}, 0, lighting_resource};
-        if (const Result result = device_ptr->update_binding_set(
-                lighting_set_result.value, std::span{&lighting_write, 1});
+        if (const Result result =
+                device_ptr->update_binding_set(lighting_set_result.value, std::span{&lighting_write, 1});
             !result) {
             (void)device_ptr->destroy_binding_set(lighting_set_result.value);
             return result;
@@ -846,7 +860,7 @@ int main() {
 
     for (uint32_t frame = 0; frame < kFrameCount; ++frame) {
         smoke_state.frame_index = frame;
-        const Result frame_result = orchestrator.run_frame(frame_desc);
+        const Result frame_result = orchestrator->run_frame(frame_desc);
         if (!frame_result) {
             std::cerr << "multi-material frame execution failed: " << frame_result.message << '\n';
         }
@@ -890,13 +904,13 @@ int main() {
         return 26;
     }
     if (!require(frame_context->begin_frame(), "failure-path frame begin failed") ||
-        !require(!aeg::resource::update_texture_material_for_frame(
-                     *device, *frame_context, smoke_state.materials[0].material, {}),
+        !require(!aeg::resource::update_texture_material_for_frame(*device, *frame_context,
+                                                                   smoke_state.materials[0].material, {}),
                  "missing texture update was accepted") ||
         !require(!aeg::resource::update_texture_material_parameters_for_frame(
                      *device, *frame_context, smoke_state.materials[0].material,
-                     BufferRange{smoke_state.materials[0].parameter_buffer,
-                                 std::numeric_limits<uint64_t>::max() - 8u, sizeof(aeg::resource::TextureMaterialParameters)}),
+                     BufferRange{smoke_state.materials[0].parameter_buffer, std::numeric_limits<uint64_t>::max() - 8u,
+                                 sizeof(aeg::resource::TextureMaterialParameters)}),
                  "out-of-range parameter buffer was accepted") ||
         !require(smoke_state.materials[0].material.binding_set == material_set_before_failure &&
                      smoke_state.materials[0].material.texture_view == texture_before_failure &&
@@ -911,21 +925,22 @@ int main() {
         return 28;
     }
 
-    const auto stale_texture_resource = render_graph.import_texture(
-        target_texture, target_view, target_desc,
-        ResourceState{ResourceUsage::kUndefined, ShaderStage::kAll, QueueClass::kAuto, false,
-                      PipelineStage::kAllCommands});
+    const auto stale_texture_resource =
+        render_graph.import_texture(target_texture, target_view, target_desc,
+                                    ResourceState{ResourceUsage::kUndefined, ShaderStage::kAll, QueueClass::kAuto,
+                                                  false, PipelineStage::kAllCommands});
     if (!require(stale_texture_resource, "stale-handle setup import failed")) {
         return 29;
     }
     render_graph.reset();
-    if (!require(!render_graph.contains_texture(stale_texture_resource.value), "stale RenderGraph handle was accepted")) {
+    if (!require(!render_graph.contains_texture(stale_texture_resource.value),
+                 "stale RenderGraph handle was accepted")) {
         return 30;
     }
 
     smoke_state.missing_texture = true;
     resolver.set_missing_texture(true);
-    const Result missing_texture_result = orchestrator.run_frame(frame_desc);
+    const Result missing_texture_result = orchestrator->run_frame(frame_desc);
     if (!missing_texture_result) {
         std::cerr << "expected missing texture failure: " << missing_texture_result.message << '\n';
     }
@@ -934,7 +949,7 @@ int main() {
     }
     resolver.set_missing_texture(false);
     smoke_state.missing_texture = false;
-    const Result recovery_result = orchestrator.run_frame(frame_desc);
+    const Result recovery_result = orchestrator->run_frame(frame_desc);
     if (!recovery_result) {
         std::cerr << "material recovery failed: " << recovery_result.message << '\n';
     }
@@ -942,27 +957,35 @@ int main() {
         return 32;
     }
 
-    const auto incompatible_layout_result = device->create_binding_layout({
-        std::array<aeg::rhi::BindingLayoutEntry, 2>{
-            aeg::rhi::BindingLayoutEntry{{1, 0}, BindingType::kSampledTexture,
-                                         aeg::rhi::BindingArrayMode::kSingle, 1, ShaderStage::kFragment,
-                                         aeg::rhi::BindingFlags::kNone},
-            aeg::rhi::BindingLayoutEntry{{1, 1}, BindingType::kSampler,
-                                         aeg::rhi::BindingArrayMode::kSingle, 1, ShaderStage::kFragment,
-                                         aeg::rhi::BindingFlags::kNone}},
-        DebugName{"Renderer.OpaqueMultiFrame.IncompatibleLayout"}});
+    const auto incompatible_layout_result = device->create_binding_layout(
+        {std::array<aeg::rhi::BindingLayoutEntry, 2>{aeg::rhi::BindingLayoutEntry{{1, 0},
+                                                                                  BindingType::kSampledTexture,
+                                                                                  aeg::rhi::BindingArrayMode::kSingle,
+                                                                                  1,
+                                                                                  ShaderStage::kFragment,
+                                                                                  aeg::rhi::BindingFlags::kNone},
+                                                     aeg::rhi::BindingLayoutEntry{{1, 1},
+                                                                                  BindingType::kSampler,
+                                                                                  aeg::rhi::BindingArrayMode::kSingle,
+                                                                                  1,
+                                                                                  ShaderStage::kFragment,
+                                                                                  aeg::rhi::BindingFlags::kNone}},
+         DebugName{"Renderer.OpaqueMultiFrame.IncompatibleLayout"}});
     if (!require(incompatible_layout_result, "incompatible layout creation failed")) {
         return 33;
     }
     const auto incompatible_material = aeg::resource::create_texture_material(
-        *device, aeg::resource::TextureMaterialDesc{smoke_state.materials[0].texture.sampled_view, {},
-                                                    incompatible_layout_result.value, 1,
+        *device, aeg::resource::TextureMaterialDesc{smoke_state.materials[0].texture.sampled_view,
+                                                    {},
+                                                    incompatible_layout_result.value,
+                                                    1,
                                                     DebugName{"Renderer.OpaqueMultiFrame.IncompatibleMaterial"}});
     auto incompatible_material_value = incompatible_material.value;
     if (!require(incompatible_material, "incompatible material creation failed") ||
         !require(!aeg::resource::update_texture_material_parameters(
                      *device, incompatible_material_value,
-                     BufferRange{smoke_state.materials[0].parameter_buffer, 0, sizeof(aeg::resource::TextureMaterialParameters)}),
+                     BufferRange{smoke_state.materials[0].parameter_buffer, 0,
+                                 sizeof(aeg::resource::TextureMaterialParameters)}),
                  "incompatible material layout accepted parameter binding")) {
         return 34;
     }
@@ -973,13 +996,14 @@ int main() {
         return 35;
     }
 
-    if (!require(orchestrator.shutdown(), "orchestrator shutdown failed") ||
-        !require(orchestrator.unregister_world_frame(world_scope.handle(), 1), "world frame unregister failed") ||
-        !require(orchestrator.unregister_world(world_scope.handle()), "world unregister failed") ||
+    if (!require(orchestrator->shutdown(), "orchestrator shutdown failed") ||
+        !require(orchestrator->unregister_world_frame(world_scope.handle(), 1), "world frame unregister failed") ||
+        !require(orchestrator->unregister_world(world_scope.handle()), "world unregister failed") ||
         !require(world_scope.shutdown(), "WorldScope shutdown failed") ||
         !require(renderer.unregister_extractor(extractor.value), "extractor unregister failed")) {
         return 36;
     }
+    orchestrator.reset();
     frame_context.reset();
     for (auto& material : smoke_state.materials) {
         if (!require(aeg::resource::destroy_texture_material(*device, material.material),

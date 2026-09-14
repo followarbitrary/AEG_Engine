@@ -216,6 +216,14 @@ else()
     target_compile_options(aeg_input PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
+add_executable(aeg_input_smoke
+    tests/input_system_smoke.cpp
+)
+target_link_libraries(aeg_input_smoke PRIVATE aeg_input)
+if (WIN32)
+    target_compile_definitions(aeg_input_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
 if (WIN32)
     add_library(aeg_application_platform_win32 STATIC
         Application/Platform/private/win32/win32_system_fonts.cpp
@@ -881,6 +889,32 @@ else()
     target_compile_options(aeg_resource PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
+# The editor import pipeline is intentionally self-contained: image and TOML
+# decoding use vendored sources under ThirdParty and never use system codecs.
+add_library(aeg_editor_assets STATIC
+    Application/Editor/private/editor_asset_pipeline.cpp
+    Application/Editor/private/editor_font_pipeline.cpp
+)
+target_compile_features(aeg_editor_assets PUBLIC cxx_std_20)
+target_include_directories(aeg_editor_assets
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private
+    SYSTEM PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/ImGui
+    SYSTEM PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/stb
+        ${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/toml11/include
+)
+target_compile_definitions(aeg_editor_assets PUBLIC
+    AEG_ENGINE_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
+)
+target_link_libraries(aeg_editor_assets PUBLIC aeg_foundation)
+if (MSVC)
+    target_compile_options(aeg_editor_assets PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(aeg_editor_assets PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
 target_sources(aeg_editor_framework PRIVATE
     Application/EditorFramework/private/imgui/imgui_renderer.cpp
 )
@@ -1007,6 +1041,7 @@ if (WIN32)
         aeg_engine
         aeg_renderer
         aeg_resource
+        aeg_editor_assets
         aeg_rhi
         aeg_shader
         aeg_core_shaders
@@ -1024,6 +1059,7 @@ if (WIN32)
         aeg_engine
         aeg_renderer
         aeg_resource
+        aeg_editor_assets
         aeg_rhi
         aeg_shader
         aeg_core_shaders
@@ -1041,6 +1077,7 @@ if (WIN32)
         aeg_engine
         aeg_renderer
         aeg_resource
+        aeg_editor_assets
         aeg_rhi
         aeg_shader
         aeg_core_shaders
@@ -1051,24 +1088,227 @@ if (WIN32)
     )
     add_dependencies(aeg_opaque_render_feature_uv_depth_smoke aeg_core_shaders)
 
+    add_executable(aeg_editor_asset_database_smoke
+        tests/editor_asset_database_smoke.cpp
+        Application/Editor/private/editor_asset_database.cpp
+    )
+    target_include_directories(aeg_editor_asset_database_smoke PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private
+    )
+    target_link_libraries(aeg_editor_asset_database_smoke PRIVATE aeg_foundation)
+    if (WIN32)
+        target_compile_definitions(aeg_editor_asset_database_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+    endif()
+
+    add_executable(aeg_editor_project_smoke
+        tests/editor_project_smoke.cpp
+        Application/Editor/private/editor_project.cpp
+    )
+    target_include_directories(aeg_editor_project_smoke PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private
+    )
+    target_link_libraries(aeg_editor_project_smoke PRIVATE aeg_foundation)
+    if (WIN32)
+        target_compile_definitions(aeg_editor_project_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+    endif()
+
     add_executable(aeg_editor_application
         Application/Editor/private/editor_application.cpp
+        Application/Editor/private/editor_asset_database.cpp
+        Application/Editor/private/editor_project.cpp
+        Application/Editor/private/editor_scene_runtime.cpp
         Application/Editor/private/font/editor_system_font_catalog.cpp
     )
     target_link_libraries(aeg_editor_application PRIVATE
         aeg_application_platform_win32
         aeg_engine
+        aeg_scene
         aeg_editor_framework
         aeg_renderer
         aeg_resource
+        aeg_editor_assets
         aeg_rhi
         aeg_core_shaders
     )
     target_compile_definitions(aeg_editor_application PRIVATE
         _CRT_SECURE_NO_WARNINGS
         AEG_EDITOR_IMGUI_SHADER_PACKAGE_PATH="${AEG_EDITOR_IMGUI_SHADER_PACKAGE}"
+        AEG_OPAQUE_UNLIT_SHADER_PACKAGE_PATH="${AEG_OPAQUE_UNLIT_SHADER_PACKAGE}"
     )
     add_dependencies(aeg_editor_application aeg_core_shaders)
+
+    include(GNUInstallDirs)
+    install(TARGETS aeg_editor_application
+        RUNTIME DESTINATION .
+    )
+    install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/Fonts"
+        DESTINATION .
+    )
+    install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/DemoProject"
+        DESTINATION .
+    )
+    install(FILES "${AEG_OPAQUE_UNLIT_SHADER_PACKAGE}"
+        DESTINATION shaders/core
+        RENAME opaque_unlit_mesh.aegshader
+    )
+    install(FILES "${AEG_EDITOR_IMGUI_SHADER_PACKAGE}"
+        DESTINATION shaders/editor
+        RENAME editor_imgui_draw_mesh.aegshader
+    )
+    set(CPACK_GENERATOR "ZIP")
+    set(CPACK_PACKAGE_NAME "AEG-Engine-Editor")
+    set(CPACK_PACKAGE_VERSION "0.1.0")
+    include(CPack)
+
+    add_executable(aeg_editor_scene_runtime_smoke
+        tests/editor_scene_runtime_smoke.cpp
+        Application/Editor/private/editor_asset_database.cpp
+        Application/Editor/private/editor_project.cpp
+        Application/Editor/private/editor_scene_runtime.cpp
+    )
+    target_include_directories(aeg_editor_scene_runtime_smoke PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private
+    )
+    target_link_libraries(aeg_editor_scene_runtime_smoke PRIVATE
+        aeg_engine
+        aeg_scene
+        aeg_editor_framework
+        aeg_renderer
+        aeg_resource
+        aeg_editor_assets
+        aeg_rhi
+        aeg_core_shaders
+    )
+    target_compile_definitions(aeg_editor_scene_runtime_smoke PRIVATE
+        _CRT_SECURE_NO_WARNINGS
+        AEG_OPAQUE_UNLIT_SHADER_PACKAGE_PATH="${AEG_OPAQUE_UNLIT_SHADER_PACKAGE}"
+    )
+    add_dependencies(aeg_editor_scene_runtime_smoke aeg_core_shaders)
+
+    add_executable(aeg_editor_external_assets_smoke
+        tests/editor_external_assets_smoke.cpp
+        Application/Editor/private/editor_asset_database.cpp
+        Application/Editor/private/editor_project.cpp
+        Application/Editor/private/editor_scene_runtime.cpp
+    )
+    target_include_directories(aeg_editor_external_assets_smoke PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private
+    )
+    target_link_libraries(aeg_editor_external_assets_smoke PRIVATE
+        aeg_engine
+        aeg_scene
+        aeg_editor_framework
+        aeg_renderer
+        aeg_resource
+        aeg_editor_assets
+        aeg_rhi
+        aeg_core_shaders
+    )
+    target_compile_definitions(aeg_editor_external_assets_smoke PRIVATE
+        _CRT_SECURE_NO_WARNINGS
+        AEG_OPAQUE_UNLIT_SHADER_PACKAGE_PATH="${AEG_OPAQUE_UNLIT_SHADER_PACKAGE}"
+    )
+    add_dependencies(aeg_editor_external_assets_smoke aeg_core_shaders)
+
+    add_executable(aeg_editor_viewport_interaction_smoke
+        tests/editor_viewport_interaction_smoke.cpp
+        Application/Editor/private/editor_asset_database.cpp
+        Application/Editor/private/editor_project.cpp
+        Application/Editor/private/editor_scene_runtime.cpp
+    )
+    target_include_directories(aeg_editor_viewport_interaction_smoke PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private
+    )
+    target_link_libraries(aeg_editor_viewport_interaction_smoke PRIVATE
+        aeg_engine
+        aeg_scene
+        aeg_editor_framework
+        aeg_renderer
+        aeg_resource
+        aeg_editor_assets
+        aeg_rhi
+        aeg_core_shaders
+    )
+    target_compile_definitions(aeg_editor_viewport_interaction_smoke PRIVATE
+        _CRT_SECURE_NO_WARNINGS
+        AEG_OPAQUE_UNLIT_SHADER_PACKAGE_PATH="${AEG_OPAQUE_UNLIT_SHADER_PACKAGE}"
+    )
+    add_dependencies(aeg_editor_viewport_interaction_smoke aeg_core_shaders)
+
+    add_executable(aeg_editor_history_smoke
+        tests/editor_history_smoke.cpp
+        Application/Editor/private/editor_asset_database.cpp
+        Application/Editor/private/editor_project.cpp
+        Application/Editor/private/editor_scene_runtime.cpp
+    )
+    target_include_directories(aeg_editor_history_smoke PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private
+    )
+    target_link_libraries(aeg_editor_history_smoke PRIVATE
+        aeg_engine
+        aeg_scene
+        aeg_editor_framework
+        aeg_renderer
+        aeg_resource
+        aeg_editor_assets
+        aeg_rhi
+        aeg_core_shaders
+    )
+    target_compile_definitions(aeg_editor_history_smoke PRIVATE
+        _CRT_SECURE_NO_WARNINGS
+        AEG_OPAQUE_UNLIT_SHADER_PACKAGE_PATH="${AEG_OPAQUE_UNLIT_SHADER_PACKAGE}"
+    )
+    add_dependencies(aeg_editor_history_smoke aeg_core_shaders)
+
+    add_executable(aeg_editor_hierarchy_smoke
+        tests/editor_hierarchy_smoke.cpp
+        Application/Editor/private/editor_asset_database.cpp
+        Application/Editor/private/editor_project.cpp
+        Application/Editor/private/editor_scene_runtime.cpp
+    )
+    target_include_directories(aeg_editor_hierarchy_smoke PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private
+    )
+    target_link_libraries(aeg_editor_hierarchy_smoke PRIVATE
+        aeg_engine
+        aeg_scene
+        aeg_editor_framework
+        aeg_renderer
+        aeg_resource
+        aeg_editor_assets
+        aeg_rhi
+        aeg_core_shaders
+    )
+    target_compile_definitions(aeg_editor_hierarchy_smoke PRIVATE
+        _CRT_SECURE_NO_WARNINGS
+        AEG_OPAQUE_UNLIT_SHADER_PACKAGE_PATH="${AEG_OPAQUE_UNLIT_SHADER_PACKAGE}"
+    )
+    add_dependencies(aeg_editor_hierarchy_smoke aeg_core_shaders)
+
+    add_executable(aeg_editor_inspector_smoke
+        tests/editor_inspector_smoke.cpp
+        Application/Editor/private/editor_asset_database.cpp
+        Application/Editor/private/editor_project.cpp
+        Application/Editor/private/editor_scene_runtime.cpp
+    )
+    target_include_directories(aeg_editor_inspector_smoke PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private
+    )
+    target_link_libraries(aeg_editor_inspector_smoke PRIVATE
+        aeg_engine
+        aeg_scene
+        aeg_editor_framework
+        aeg_renderer
+        aeg_resource
+        aeg_editor_assets
+        aeg_rhi
+        aeg_core_shaders
+    )
+    target_compile_definitions(aeg_editor_inspector_smoke PRIVATE
+        _CRT_SECURE_NO_WARNINGS
+        AEG_OPAQUE_UNLIT_SHADER_PACKAGE_PATH="${AEG_OPAQUE_UNLIT_SHADER_PACKAGE}"
+    )
+    add_dependencies(aeg_editor_inspector_smoke aeg_core_shaders)
 
     add_executable(aeg_triangle
         tests/triangle.cpp
@@ -1103,6 +1343,7 @@ endif()
 if (BUILD_TESTING)
     add_test(NAME aeg_math_smoke COMMAND aeg_math_smoke)
     add_test(NAME aeg_result_smoke COMMAND aeg_result_smoke)
+    add_test(NAME aeg_input_smoke COMMAND aeg_input_smoke)
     add_test(NAME aeg_editor_imgui_smoke COMMAND aeg_editor_imgui_smoke)
     add_test(NAME aeg_editor_imgui_docking_smoke COMMAND aeg_editor_imgui_docking_smoke)
     add_test(NAME aeg_editor_imgui_viewport_smoke COMMAND aeg_editor_imgui_viewport_smoke)
@@ -1146,10 +1387,18 @@ if (BUILD_TESTING)
         add_test(NAME aeg_opaque_render_feature_smoke COMMAND aeg_opaque_render_feature_smoke)
         add_test(NAME aeg_opaque_render_feature_multiframe_smoke COMMAND aeg_opaque_render_feature_multiframe_smoke)
         add_test(NAME aeg_opaque_render_feature_uv_depth_smoke COMMAND aeg_opaque_render_feature_uv_depth_smoke)
+        add_test(NAME aeg_editor_scene_runtime_smoke COMMAND aeg_editor_scene_runtime_smoke)
+        add_test(NAME aeg_editor_external_assets_smoke COMMAND aeg_editor_external_assets_smoke)
+        add_test(NAME aeg_editor_viewport_interaction_smoke COMMAND aeg_editor_viewport_interaction_smoke)
+        add_test(NAME aeg_editor_history_smoke COMMAND aeg_editor_history_smoke)
+        add_test(NAME aeg_editor_hierarchy_smoke COMMAND aeg_editor_hierarchy_smoke)
+        add_test(NAME aeg_editor_inspector_smoke COMMAND aeg_editor_inspector_smoke)
+        add_test(NAME aeg_editor_asset_database_smoke COMMAND aeg_editor_asset_database_smoke)
+        add_test(NAME aeg_editor_project_smoke COMMAND aeg_editor_project_smoke)
         add_test(NAME aeg_editor_application COMMAND aeg_editor_application --frames 60 --stress-resize)
         add_test(NAME aeg_editor_application_preferences
                  COMMAND aeg_editor_application --frames 60 --stress-resize --open-preferences)
-        set_tests_properties(aeg_editor_imgui_renderer_smoke aeg_opaque_render_feature_smoke aeg_opaque_render_feature_multiframe_smoke aeg_opaque_render_feature_uv_depth_smoke aeg_editor_application aeg_editor_application_preferences
+        set_tests_properties(aeg_editor_imgui_renderer_smoke aeg_opaque_render_feature_smoke aeg_opaque_render_feature_multiframe_smoke aeg_opaque_render_feature_uv_depth_smoke aeg_editor_scene_runtime_smoke aeg_editor_external_assets_smoke aeg_editor_viewport_interaction_smoke aeg_editor_history_smoke aeg_editor_hierarchy_smoke aeg_editor_inspector_smoke aeg_editor_asset_database_smoke aeg_editor_project_smoke aeg_editor_application aeg_editor_application_preferences
             PROPERTIES
             FAIL_REGULAR_EXPRESSION "Vulkan validation \\[ERROR\\]"
         )
@@ -1161,7 +1410,7 @@ if (BUILD_TESTING)
                 aeg_pipeline_conformance_smoke aeg_pipeline_runtime_smoke aeg_pipeline_hot_swap_smoke
                 aeg_pipeline_phase_scheduler_smoke aeg_module_smoke aeg_world_scope_smoke aeg_world_serialization_smoke
                 aeg_scene_asset_smoke aeg_world_frame_orchestrator_smoke aeg_world_multi_view_smoke
-                aeg_engine_frame_orchestrator_smoke aeg_runtime_components_scene_smoke aeg_runtime_component_orchestrator_smoke aeg_renderer_smoke aeg_opaque_render_feature_smoke aeg_opaque_render_feature_multiframe_smoke aeg_opaque_render_feature_uv_depth_smoke aeg_render_feature_runtime_smoke
+                aeg_engine_frame_orchestrator_smoke aeg_runtime_components_scene_smoke aeg_runtime_component_orchestrator_smoke aeg_renderer_smoke aeg_opaque_render_feature_smoke aeg_opaque_render_feature_multiframe_smoke aeg_opaque_render_feature_uv_depth_smoke aeg_editor_scene_runtime_smoke aeg_editor_external_assets_smoke aeg_editor_viewport_interaction_smoke aeg_editor_history_smoke aeg_editor_hierarchy_smoke aeg_editor_inspector_smoke aeg_editor_asset_database_smoke aeg_editor_project_smoke aeg_render_feature_runtime_smoke
                 aeg_frame_retention_smoke aeg_rhi_smoke aeg_logging_smoke aeg_triangle aeg_editor_application
                 aeg_editor_application_preferences aeg_editor_error_smoke aeg_render_graph_imported_texture_state_smoke PROPERTIES
             ENVIRONMENT "PATH=${AEG_MINGW_RUNTIME_DIR};$ENV{PATH}"

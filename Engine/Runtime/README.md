@@ -32,16 +32,22 @@ Orchestrator；调用方必须保证传入对象的生命周期覆盖 Session，
 - `Camera` 保存透视投影参数，稳定身份为 `Game.Camera`。
 - `MeshRenderer` 保存网格、材质、局部包围球和可见性数据，稳定身份为
   `Game.MeshRenderer`。
+- `TextRenderer` 保存世界空间文字和 Font Asset ID，稳定身份为 `Game.TextRenderer`。
+- `DirectionalLight` 保存方向、颜色和强度，稳定身份为 `Game.DirectionalLight`。
 
-`register_render_component_reflection()` 显式向调用方提供的 `TypeRegistry` 注册三种
-schema；`register_reflected_render_components()` 为一个 `World` 注册对应的持久化 ECS
-storage；`register_render_component_bundle()` 顺序执行两者。注册操作会验证已有身份的
+`register_render_component_reflection()` 显式向调用方提供的 `TypeRegistry` 注册五种
+schema（包括 `TextRenderer` 和 `DirectionalLight`）；`register_reflected_render_components()`
+为一个 `World` 注册对应的持久化 ECS storage；`register_render_component_bundle()` 顺序执行两者。注册操作会验证已有身份的
 元数据，兼容的重复注册保持幂等，不兼容的注册返回失败。仅需要临时、不参与 Scene
 持久化的 World 可以使用 `register_render_components()` 注册非反射 storage。
 
 `Transform` 的 `Vec3` 字段使用 `Math.Vec3` 的固定 16 字节四浮点 wire layout：前三个
 浮点为 XYZ 语义，第四个槽位在写入和读取后规范化为零，绝不按紧凑三个浮点编码。`Quat`
 使用 `Math.Quat` 的四个 XYZW 浮点编码。
+
+`TextRenderer` 保存稳定 Font Asset ID、UTF-8 文本、世界空间字号和 RGBA 颜色；Runtime
+提取器将其转换为世界空间 RenderInstance。编辑器为其构建 vendored 字体图集并通过标准
+ResourceUploader 上传，非 ASCII 字符在当前 ASCII 图集 fast-path 中替换为 `?`。
 
 ## Scene 与 Renderer 适配
 
@@ -88,6 +94,23 @@ Directional Light 的方向、颜色、强度和环境光，使用 Lambert 项
 光照常量和 BindingSet 按帧生成。更新材质或光照时，调用方应通过 `FrameContext` 的上传
 与延迟销毁接口保留旧资源直到提交完成，不得依赖每帧 `wait_idle()`，也不得修改 GPU 仍
 在使用的持久 Descriptor。RenderFeature 只借用当前帧资源，不取得其所有权。
+
+## 最小编辑器闭环
+
+Editor 以 `SceneAsset` 作为稳定文档身份，以 `SceneInstance` 维护场景实体到 ECS
+`EntityId` 的映射。Hierarchy 选择属于 Editor-owned 状态，不写入 Runtime 组件；Inspector
+编辑通过 `WorldCommandBuffer` 排队，并在下一次 `WorldCommit` 后从新 Snapshot 读取，因此
+不会直接修改已发布的 Snapshot。
+
+`Edit` 模式绑定编辑 World。进入 `Play` 前先提交编辑命令，再从当前 Scene Asset 创建独立的
+运行 World；`Pause` 只冻结编辑器状态机，`Stop` 丢弃运行 World 并重新绑定编辑 World。运行
+期间的实体或组件修改不得回写编辑文档。保存和重新打开只序列化稳定的 Scene Entity、层级和
+反射组件 payload；缺失 Mesh/Material Asset ID 由 Renderer Resolver 返回可诊断的 fallback，
+不能使编辑器进程崩溃。
+
+Scene Viewport 是离屏 RenderGraph 输出的借用者。编辑器每帧应先导入当前尺寸的 Color/Depth
+目标，再运行 Runtime View 提取和 Opaque Feature，最后将颜色目标转换到采样态供 ImGui 使用。
+任何 RenderGraph Handle、FrameContext 分配或持久 BindingSet 都不得跨越其声明的生命周期。
 
 ## 依赖边界
 

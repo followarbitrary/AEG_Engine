@@ -104,6 +104,8 @@ struct RenderView final {
     pipeline::RenderResourceId color_target{};
     pipeline::RenderResourceId depth_target{};
     bool frustum_culling{false};
+    /** @brief Resource usage required after the opaque color pass completes. */
+    rhi::ResourceUsage color_target_final_usage{rhi::ResourceUsage::kColorAttachmentWrite};
 
     [[nodiscard]] bool is_valid() const noexcept;
 };
@@ -215,6 +217,9 @@ struct RenderMeshResource final {
     rhi::IndexFormat index_format{rhi::IndexFormat::kUint16};
     /** @brief Interleaved vertex attribute offsets and formats consumed by Opaque. */
     RenderMeshVertexLayout vertex_layout{};
+    /** @brief Optional graph-local handles supplied by a frame preparation upload. */
+    pipeline::RenderGraphBuffer vertex_resource{};
+    pipeline::RenderGraphBuffer index_resource{};
 
     /** @brief Reports whether this resource can be consumed by an indexed graphics draw. */
     [[nodiscard]] bool is_valid() const noexcept;

@@ -61,6 +61,12 @@ enum class SceneEntityFlags : uint32_t {
     kLocked = 1u << 1,
 };
 
+/** @brief Defines how descendants are handled when a Scene entity is removed. */
+enum class SceneEntityRemovalPolicy : uint8_t {
+    kCascade,
+    kPromoteChildren,
+};
+
 constexpr SceneEntityFlags operator|(SceneEntityFlags left, SceneEntityFlags right) noexcept {
     return static_cast<SceneEntityFlags>(static_cast<uint32_t>(left) | static_cast<uint32_t>(right));
 }
@@ -79,6 +85,7 @@ struct SceneEntityRecord final {
     SceneEntityId parent{};
     std::string name{};
     SceneEntityFlags flags{SceneEntityFlags::kNone};
+    std::string tag{};
 };
 
 /** @brief Serialized component payload attached to one stable scene entity. */
@@ -151,12 +158,26 @@ public:
     [[nodiscard]] foundation::Result set_identity(SceneAssetId id, std::string name, uint32_t version = 1);
     /** @brief Adds one stable entity record to the scene document. */
     [[nodiscard]] foundation::Result add_entity(SceneEntityRecord entity);
+    /** @brief Updates the user-visible name of one stable scene entity. */
+    [[nodiscard]] foundation::Result set_entity_name(SceneEntityId entity, std::string name);
+    /** @brief Updates the editor tag stored on one stable scene entity. */
+    [[nodiscard]] foundation::Result set_entity_tag(SceneEntityId entity, std::string tag);
+    /** @brief Returns the direct children in their persisted sibling order. */
+    [[nodiscard]] foundation::ResultValue<std::vector<SceneEntityId>> children(SceneEntityId parent) const;
+    /** @brief Reparents entities and optionally inserts them at a sibling index. */
+    [[nodiscard]] foundation::Result reparent_entities(std::span<const SceneEntityId> entities, SceneEntityId parent,
+                                                       std::size_t sibling_index = static_cast<std::size_t>(-1));
+    /** @brief Removes entities using either cascade or child-promotion semantics. */
+    [[nodiscard]] foundation::Result remove_entities(std::span<const SceneEntityId> entities,
+                                                     SceneEntityRemovalPolicy policy);
     /** @brief Adds one reflected component payload to the scene document. */
     [[nodiscard]] foundation::Result add_component(SceneComponentRecord component);
     /** @brief Encodes one reflected component value and adds it to the scene document. */
     [[nodiscard]] foundation::Result add_reflected_component(SceneEntityId entity, ecs::ComponentTypeId component_type,
                                                              const reflection::TypeRegistry& registry,
                                                              reflection::TypeId schema_type, const void* value);
+    /** @brief Removes one reflected component payload from a stable scene entity. */
+    [[nodiscard]] foundation::Result remove_component(SceneEntityId entity, ecs::ComponentTypeId component_type);
     /** @brief Removes all entities and component records while retaining asset metadata. */
     void clear() noexcept;
     /** @brief Validates identities, hierarchy, component references, and duplicate records. */
@@ -178,7 +199,7 @@ private:
 class SceneSerializer final {
 public:
     inline static constexpr uint64_t kMagic = 0x3154534547414541ull;
-    inline static constexpr uint32_t kFormatVersion = 1;
+    inline static constexpr uint32_t kFormatVersion = 2;
 
     SceneSerializer() = delete;
 

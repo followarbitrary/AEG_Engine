@@ -4,7 +4,10 @@
  */
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+#include <string>
+#include <string_view>
 
 #include "math.hpp"
 
@@ -28,6 +31,10 @@ struct MeshRenderer final {
     uint64_t mesh_asset_id{0};
     /** @brief Stable renderer material identity; zero leaves the renderer unassigned. */
     uint64_t material_asset_id{0};
+    /** @brief Linear RGB material tint applied by the standard opaque shader. */
+    math::Vec3 tint{1.0f, 1.0f, 1.0f};
+    /** @brief Alpha multiplier retained by the material contract. */
+    float tint_alpha{1.0f};
     /** @brief Local-space center of the conservative mesh bounds. */
     math::Vec3 bounds_center{};
     /** @brief Non-negative local-space radius of the conservative mesh bounds. */
@@ -36,5 +43,61 @@ struct MeshRenderer final {
     uint32_t visibility_mask{0xffffffffu};
     /** @brief Controls whether a fully assigned renderer contributes an instance. */
     bool visible{true};
+};
+
+/** @brief Runtime world-space text rendered through the same frame resource path as meshes. */
+struct TextRenderer final {
+    /** @brief Stable imported font Asset ID; zero selects the bundled fallback font. */
+    uint64_t font_asset_id{0};
+    /** @brief UTF-8 text; the runtime atlas currently guarantees ASCII and substitutes '?' for other codepoints. */
+    std::string text{"AEG"};
+    /** @brief World-space pixel height of the glyphs. */
+    float world_size{0.5f};
+    /** @brief Linear RGBA text color. */
+    math::Vec3 color{1.0f, 1.0f, 1.0f};
+    float color_alpha{1.0f};
+    /** @brief Per-view visibility mask. */
+    uint32_t visibility_mask{0xffffffffu};
+    /** @brief Controls whether the text contributes an instance. */
+    bool visible{true};
+};
+
+[[nodiscard]] inline uint64_t text_asset_hash(uint64_t font_asset_id, std::string_view text,
+                                              float world_size) noexcept {
+    uint64_t hash = 14695981039346656037ull ^ font_asset_id;
+    const auto mix = [&hash](uint8_t value) {
+        hash ^= value;
+        hash *= 1099511628211ull;
+    };
+    for (const unsigned char value : text) {
+        mix(value);
+    }
+    const auto* size_bytes = reinterpret_cast<const uint8_t*>(&world_size);
+    for (std::size_t index = 0; index < sizeof(world_size); ++index) {
+        mix(size_bytes[index]);
+    }
+    return hash == 0 ? 1 : hash;
+}
+
+[[nodiscard]] inline uint64_t text_mesh_asset_id(uint64_t font_asset_id, std::string_view text,
+                                                 float world_size) noexcept {
+    return 0x4000000000000000ull | (text_asset_hash(font_asset_id, text, world_size) & 0x3fffffffffffffffull);
+}
+
+[[nodiscard]] inline uint64_t text_material_asset_id(uint64_t font_asset_id, std::string_view text,
+                                                     float world_size) noexcept {
+    return 0x6000000000000000ull | (text_asset_hash(font_asset_id, text, world_size) & 0x1fffffffffffffffull);
+}
+
+/** @brief Minimal directional light parameters consumed by the opaque Lambert pass. */
+struct DirectionalLight final {
+    /** @brief World-space direction from the light toward the scene. */
+    math::Vec3 direction{0.0f, 0.0f, -1.0f};
+    /** @brief Linear RGB light color in the normalized range. */
+    math::Vec3 color{1.0f, 1.0f, 1.0f};
+    /** @brief Non-negative directional intensity. */
+    float intensity{1.0f};
+    /** @brief Controls whether this light contributes during extraction. */
+    bool enabled{true};
 };
 }  // namespace aeg::engine::components

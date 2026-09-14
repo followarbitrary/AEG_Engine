@@ -1,0 +1,5 @@
+AEG_PROJECT	2
+AEG Demonstration Project
+assets=Assets
+scenes=Scenes
+default_scene=Scenes/Main.aegscene
