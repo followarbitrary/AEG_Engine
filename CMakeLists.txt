@@ -232,8 +232,11 @@ if (WIN32)
 endif()
 
 if (WIN32)
+    enable_language(RC)
+
     add_library(aeg_application_platform_win32 STATIC
         Application/Platform/private/win32/win32_system_fonts.cpp
+        Application/Platform/private/win32/win32_startup_splash.cpp
         Application/Platform/private/win32/win32_window.cpp
         Application/Platform/private/win32/win32_window_system.cpp
     )
@@ -252,7 +255,7 @@ if (WIN32)
             _UNICODE
             WIN32_LEAN_AND_MEAN
     )
-    target_link_libraries(aeg_application_platform_win32 PUBLIC aeg_platform aeg_input user32 imm32 dwrite ole32 shell32 uuid)
+    target_link_libraries(aeg_application_platform_win32 PUBLIC aeg_platform aeg_input user32 gdi32 gdiplus imm32 dwrite ole32 shell32 uuid)
 
     if (MSVC)
         target_compile_options(aeg_application_platform_win32 PRIVATE /W4 /permissive-)
@@ -262,6 +265,7 @@ if (WIN32)
 
     add_executable(aeg_application_platform_win32_smoke
         tests/application_platform_win32_smoke.cpp
+        Application/Editor/private/editor_resources.rc
     )
     target_link_libraries(aeg_application_platform_win32_smoke PRIVATE aeg_application_platform_win32)
     target_compile_definitions(aeg_application_platform_win32_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
@@ -1139,6 +1143,7 @@ if (WIN32)
         Application/Editor/private/editor_application.cpp
         Application/Editor/private/editor_asset_database.cpp
         Application/Editor/private/editor_project.cpp
+        Application/Editor/private/editor_resources.rc
         Application/Editor/private/editor_scene_runtime.cpp
         Application/Editor/private/font/editor_system_font_catalog.cpp
     )
@@ -1153,6 +1158,7 @@ if (WIN32)
         aeg_rhi
         aeg_core_shaders
     )
+    set_target_properties(aeg_editor_application PROPERTIES OUTPUT_NAME "AetherEngine")
 target_compile_definitions(aeg_editor_application PRIVATE
         _CRT_SECURE_NO_WARNINGS
         AEG_EDITOR_ENABLE_BUILTIN_PIPELINE_DEBUG=${AEG_EDITOR_ENABLE_BUILTIN_PIPELINE_DEBUG_VALUE}
@@ -1161,6 +1167,22 @@ target_compile_definitions(aeg_editor_application PRIVATE
         AEG_STATE_COMPOSITE_SHADER_PACKAGE_PATH="${AEG_STATE_COMPOSITE_SHADER_PACKAGE}"
     )
     add_dependencies(aeg_editor_application aeg_core_shaders)
+    add_executable(aeg_editor_application_identity_smoke
+        tests/editor_application_identity_smoke.cpp
+    )
+    target_compile_definitions(aeg_editor_application_identity_smoke PRIVATE
+        AEG_EDITOR_APPLICATION_PATH="$<TARGET_FILE:aeg_editor_application>"
+    )
+    target_link_libraries(aeg_editor_application_identity_smoke PRIVATE user32)
+    add_dependencies(aeg_editor_application_identity_smoke aeg_editor_application)
+    add_custom_command(TARGET aeg_editor_application POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+            "$<TARGET_FILE_DIR:aeg_editor_application>/branding"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/Assets/Branding/aether-engine-graph-mark.png"
+            "$<TARGET_FILE_DIR:aeg_editor_application>/branding/aether-engine-graph-mark.png"
+        VERBATIM
+    )
 
     include(GNUInstallDirs)
     install(TARGETS aeg_editor_application
@@ -1171,6 +1193,9 @@ target_compile_definitions(aeg_editor_application PRIVATE
     )
     install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/DemoProject"
         DESTINATION .
+    )
+    install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/Assets/Branding/aether-engine-graph-mark.png"
+        DESTINATION branding
     )
     install(FILES "${AEG_OPAQUE_UNLIT_SHADER_PACKAGE}"
         DESTINATION shaders/core
@@ -1430,6 +1455,7 @@ if (BUILD_TESTING)
         add_test(NAME aeg_editor_inspector_smoke COMMAND aeg_editor_inspector_smoke)
         add_test(NAME aeg_editor_asset_database_smoke COMMAND aeg_editor_asset_database_smoke)
         add_test(NAME aeg_editor_project_smoke COMMAND aeg_editor_project_smoke)
+        add_test(NAME aeg_editor_application_identity_smoke COMMAND aeg_editor_application_identity_smoke)
         add_test(NAME aeg_editor_application COMMAND aeg_editor_application --frames 60 --stress-resize)
         add_test(NAME aeg_editor_application_preferences
                  COMMAND aeg_editor_application --frames 60 --stress-resize --open-preferences)
@@ -1446,7 +1472,7 @@ if (BUILD_TESTING)
                 aeg_pipeline_phase_scheduler_smoke aeg_module_smoke aeg_world_scope_smoke aeg_world_serialization_smoke
                 aeg_scene_asset_smoke aeg_world_frame_orchestrator_smoke aeg_world_multi_view_smoke
                 aeg_engine_frame_orchestrator_smoke aeg_runtime_components_scene_smoke aeg_runtime_component_orchestrator_smoke aeg_renderer_smoke aeg_opaque_render_feature_smoke aeg_opaque_render_feature_multiframe_smoke aeg_opaque_render_feature_uv_depth_smoke aeg_editor_scene_runtime_smoke aeg_editor_external_assets_smoke aeg_editor_viewport_interaction_smoke aeg_editor_history_smoke aeg_editor_hierarchy_smoke aeg_editor_inspector_smoke aeg_editor_asset_database_smoke aeg_editor_project_smoke aeg_render_feature_runtime_smoke
-                aeg_frame_retention_smoke aeg_rhi_smoke aeg_logging_smoke aeg_triangle aeg_editor_application
+                aeg_frame_retention_smoke aeg_rhi_smoke aeg_logging_smoke aeg_triangle aeg_editor_application_identity_smoke aeg_editor_application
                 aeg_editor_application_preferences aeg_editor_error_smoke aeg_render_graph_imported_texture_state_smoke PROPERTIES
             ENVIRONMENT "PATH=${AEG_MINGW_RUNTIME_DIR};$ENV{PATH}"
         )

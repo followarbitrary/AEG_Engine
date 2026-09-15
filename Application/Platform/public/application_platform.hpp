@@ -5,17 +5,41 @@
 #pragma once
 
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
 
-#include "window.hpp"
 #include "result.hpp"
+#include "window.hpp"
 
 namespace aeg::application {
+/** @brief Parameters for an Application-owned native startup splash. */
+struct StartupSplashDesc final {
+    /** @brief Image displayed inside the splash window. */
+    std::filesystem::path image_path{};
+    /** @brief Splash client-area extent in physical pixels. */
+    platform::WindowExtent extent{560, 560};
+    /** @brief Native accessibility and diagnostics name for the splash window. */
+    std::string accessible_name{"Aether Engine"};
+};
+
+/** @brief Owns one native startup splash without exposing platform handles. */
+class IStartupSplash {
+public:
+    virtual ~IStartupSplash() = default;
+
+    /** @brief Closes the splash immediately; repeated calls are harmless. */
+    virtual void close() noexcept = 0;
+};
+
 /** @brief Creates the Win32 window system without exposing Win32 types. */
 [[nodiscard]] foundation::ResultValue<std::unique_ptr<platform::IWindowSystem>> create_win32_window_system();
+
+/** @brief Shows a centered transparent Win32 startup splash loaded from an image file. */
+[[nodiscard]] foundation::ResultValue<std::unique_ptr<IStartupSplash>> show_startup_splash(
+    const StartupSplashDesc& desc);
 
 /** @brief Shows an Application-owned native error dialog without exposing Win32 types. */
 [[nodiscard]] foundation::Result show_error_dialog(std::string_view title, std::string_view message);
@@ -27,8 +51,9 @@ namespace aeg::application {
  * initial directory may name a not-yet-created project; its nearest existing
  * parent is used as the picker's starting location.
  */
-[[nodiscard]] foundation::ResultValue<std::string> select_directory(
-    platform::WindowSurfaceBinding owner, std::string_view title, std::string_view initial_directory = {});
+[[nodiscard]] foundation::ResultValue<std::string> select_directory(platform::WindowSurfaceBinding owner,
+                                                                    std::string_view title,
+                                                                    std::string_view initial_directory = {});
 
 /** @brief Describes one installed system font face without exposing platform API types. */
 struct SystemFontRecord final {

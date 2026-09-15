@@ -1,0 +1,3 @@
+#include "editor_resources.h"
+
+AEG_EDITOR_ICON_RESOURCE_ID ICON "../../../Assets/Branding/aether-engine-graph.ico"

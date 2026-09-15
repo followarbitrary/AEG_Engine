@@ -4,8 +4,8 @@
  */
 #include "win32_window_system.hpp"
 
-#include <windows.h>
 #include <shobjidl.h>
+#include <windows.h>
 
 #include <algorithm>
 #include <bit>
@@ -25,6 +25,12 @@
 namespace aeg::application::win32 {
 namespace {
 constexpr wchar_t kWindowClassName[] = L"AEG.Engine.Application.Win32Window";
+constexpr WORD kApplicationIconResourceId = 101;
+
+HICON load_application_icon(HINSTANCE instance, int width, int height) noexcept {
+    return static_cast<HICON>(
+        LoadImageW(instance, MAKEINTRESOURCEW(kApplicationIconResourceId), IMAGE_ICON, width, height, LR_SHARED));
+}
 
 foundation::Result backend_error(const char* message) {
     return foundation::Result::failure(foundation::ResultCode::kBackendError, message);
@@ -151,8 +157,8 @@ foundation::ResultValue<std::shared_ptr<platform::IWindow>> Win32WindowSystem::c
         const int x = desc.position_specified ? desc.position.x : CW_USEDEFAULT;
         const int y = desc.position_specified ? desc.position.y : CW_USEDEFAULT;
         HWND handle = CreateWindowExW(0, kWindowClassName, title_result.value.c_str(), window_style(desc), x, y,
-                                      client_rect.right - client_rect.left,
-                                      client_rect.bottom - client_rect.top, nullptr, nullptr, instance_, window.get());
+                                      client_rect.right - client_rect.left, client_rect.bottom - client_rect.top,
+                                      nullptr, nullptr, instance_, window.get());
         if (handle == nullptr) {
             return {backend_error("CreateWindowExW failed"), {}};
         }
@@ -372,10 +378,10 @@ foundation::ResultValue<platform::DisplayWorkArea> Win32WindowSystem::query_disp
     const RECT& work = monitor_info.rcWork;
     const LONG width = std::max<LONG>(work.right - work.left, 1);
     const LONG height = std::max<LONG>(work.bottom - work.top, 1);
-    return {foundation::Result::success(),
-            platform::DisplayWorkArea{platform::WindowPosition{work.left, work.top},
-                                      platform::WindowExtent{static_cast<uint32_t>(width),
-                                                             static_cast<uint32_t>(height)}}};
+    return {
+        foundation::Result::success(),
+        platform::DisplayWorkArea{platform::WindowPosition{work.left, work.top},
+                                  platform::WindowExtent{static_cast<uint32_t>(width), static_cast<uint32_t>(height)}}};
 }
 
 foundation::Result Win32WindowSystem::register_window_class() {
@@ -390,6 +396,15 @@ foundation::Result Win32WindowSystem::register_window_class() {
     window_class.style = CS_HREDRAW | CS_VREDRAW;
     window_class.lpfnWndProc = &Win32Window::window_proc;
     window_class.hInstance = instance_;
+    window_class.hIcon = load_application_icon(instance_, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON));
+    if (window_class.hIcon == nullptr) {
+        window_class.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    }
+    window_class.hIconSm =
+        load_application_icon(instance_, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON));
+    if (window_class.hIconSm == nullptr) {
+        window_class.hIconSm = window_class.hIcon;
+    }
     window_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     window_class.lpszClassName = kWindowClassName;
     if (RegisterClassExW(&window_class) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
@@ -497,8 +512,7 @@ foundation::Result show_error_dialog(std::string_view title, std::string_view me
     }
 }
 
-foundation::ResultValue<std::string> select_directory(platform::WindowSurfaceBinding owner,
-                                                      std::string_view title,
+foundation::ResultValue<std::string> select_directory(platform::WindowSurfaceBinding owner, std::string_view title,
                                                       std::string_view initial_directory) {
     if (title.empty() || title.find('\0') != std::string_view::npos ||
         initial_directory.find('\0') != std::string_view::npos ||
@@ -512,47 +526,55 @@ foundation::ResultValue<std::string> select_directory(platform::WindowSurfaceBin
             foundation::Result::failure(foundation::ResultCode::kBackendError, message), {}};
     };
     const auto to_wide = [](std::string_view value) -> foundation::ResultValue<std::wstring> {
-        if (value.empty()) return {foundation::Result::success(), {}};
+        if (value.empty())
+            return {foundation::Result::success(), {}};
         const int source_length = static_cast<int>(value.size());
         const int required =
             MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(), source_length, nullptr, 0);
         if (required <= 0) {
             return {foundation::Result::failure(foundation::ResultCode::kBackendError,
-                                                "Directory picker UTF-8 conversion failed"), {}};
+                                                "Directory picker UTF-8 conversion failed"),
+                    {}};
         }
         std::wstring converted(static_cast<std::size_t>(required), L'\0');
-        if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(), source_length,
-                                converted.data(), required) != required) {
+        if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(), source_length, converted.data(),
+                                required) != required) {
             return {foundation::Result::failure(foundation::ResultCode::kBackendError,
-                                                "Directory picker UTF-8 conversion failed"), {}};
+                                                "Directory picker UTF-8 conversion failed"),
+                    {}};
         }
         return {foundation::Result::success(), std::move(converted)};
     };
     const auto to_utf8 = [](std::wstring_view value) -> foundation::ResultValue<std::string> {
-        if (value.empty()) return {foundation::Result::success(), {}};
+        if (value.empty())
+            return {foundation::Result::success(), {}};
         if (value.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
             return {foundation::invalid_argument("Selected directory is too long"), {}};
         }
         const int source_length = static_cast<int>(value.size());
-        const int required = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value.data(), source_length,
-                                                 nullptr, 0, nullptr, nullptr);
+        const int required = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value.data(), source_length, nullptr, 0,
+                                                 nullptr, nullptr);
         if (required <= 0) {
             return {foundation::Result::failure(foundation::ResultCode::kBackendError,
-                                                "Directory picker UTF-16 conversion failed"), {}};
+                                                "Directory picker UTF-16 conversion failed"),
+                    {}};
         }
         std::string converted(static_cast<std::size_t>(required), '\0');
-        if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value.data(), source_length,
-                                converted.data(), required, nullptr, nullptr) != required) {
+        if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value.data(), source_length, converted.data(), required,
+                                nullptr, nullptr) != required) {
             return {foundation::Result::failure(foundation::ResultCode::kBackendError,
-                                                "Directory picker UTF-16 conversion failed"), {}};
+                                                "Directory picker UTF-16 conversion failed"),
+                    {}};
         }
         return {foundation::Result::success(), std::move(converted)};
     };
 
     const auto title_result = to_wide(title);
-    if (!title_result) return {title_result.result, {}};
+    if (!title_result)
+        return {title_result.result, {}};
     const auto initial_result = to_wide(initial_directory);
-    if (!initial_result) return {initial_result.result, {}};
+    if (!initial_result)
+        return {initial_result.result, {}};
 
     const HRESULT initialize_result = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     if (FAILED(initialize_result)) {
@@ -560,8 +582,8 @@ foundation::ResultValue<std::string> select_directory(platform::WindowSurfaceBin
     }
 
     IFileOpenDialog* dialog = nullptr;
-    HRESULT result = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
-                                      IID_IFileOpenDialog, reinterpret_cast<void**>(&dialog));
+    HRESULT result = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_IFileOpenDialog,
+                                      reinterpret_cast<void**>(&dialog));
     if (FAILED(result) || dialog == nullptr) {
         CoUninitialize();
         return backend_failure("Directory picker creation failed");
@@ -572,17 +594,18 @@ foundation::ResultValue<std::string> select_directory(platform::WindowSurfaceBin
     if (SUCCEEDED(result)) {
         result = dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
     }
-    if (SUCCEEDED(result)) result = dialog->SetTitle(title_result.value.c_str());
+    if (SUCCEEDED(result))
+        result = dialog->SetTitle(title_result.value.c_str());
 
     if (SUCCEEDED(result) && !initial_result.value.empty()) {
         std::filesystem::path initial_path(initial_result.value);
         std::error_code error;
-        while (!initial_path.empty() &&
-               (!std::filesystem::exists(initial_path, error) || error ||
-                !std::filesystem::is_directory(initial_path, error) || error)) {
+        while (!initial_path.empty() && (!std::filesystem::exists(initial_path, error) || error ||
+                                         !std::filesystem::is_directory(initial_path, error) || error)) {
             error.clear();
             const std::filesystem::path parent = initial_path.parent_path();
-            if (parent == initial_path) break;
+            if (parent == initial_path)
+                break;
             initial_path = parent;
         }
         if (!initial_path.empty()) {
@@ -602,8 +625,8 @@ foundation::ResultValue<std::string> select_directory(platform::WindowSurfaceBin
     if (result == HRESULT_FROM_WIN32(ERROR_CANCELLED)) {
         dialog->Release();
         CoUninitialize();
-        return {foundation::Result::failure(foundation::ResultCode::kCancelled,
-                                            "Directory selection was cancelled"), {}};
+        return {foundation::Result::failure(foundation::ResultCode::kCancelled, "Directory selection was cancelled"),
+                {}};
     }
     if (FAILED(result)) {
         dialog->Release();
@@ -622,8 +645,10 @@ foundation::ResultValue<std::string> select_directory(platform::WindowSurfaceBin
         FAILED(result) || selected_path == nullptr
             ? backend_failure("Directory picker did not return a filesystem path")
             : to_utf8(selected_path);
-    if (selected_path != nullptr) CoTaskMemFree(selected_path);
-    if (selected_item != nullptr) selected_item->Release();
+    if (selected_path != nullptr)
+        CoTaskMemFree(selected_path);
+    if (selected_item != nullptr)
+        selected_item->Release();
     dialog->Release();
     CoUninitialize();
     return selected_result;

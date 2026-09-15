@@ -1,5 +1,11 @@
 # Application Platform
 
+`aeg_application_platform_win32` owns native Win32 integration without exposing Win32 types to Engine or
+Application callers. Alongside window creation, clipboard, cursor, IME, system-font discovery, and native dialogs,
+it provides an RAII startup splash loaded from a caller-supplied image path. Splash creation validates the image and
+window extent, displays a centered borderless per-pixel transparent window, and remains non-owning with respect to the editor lifecycle;
+closing or destroying the returned `IStartupSplash` releases all native resources.
+
 该目录承载 Application 所拥有的具体平台实现。`Engine/Platform` 只定义窗口、Surface
 绑定和事件语义；Win32 的 `HWND`、窗口类、消息循环和 `WndProc` 只能出现在本目录的
 private 实现中。

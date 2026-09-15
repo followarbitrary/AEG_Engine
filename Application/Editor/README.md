@@ -64,12 +64,12 @@ Runtime `TextRenderer` 在 Scene Viewport 以世界空间绘制 ASCII 字形；�
 
 ## 启动与演示
 
-可运行交付包中的 `aeg_editor_application.exe` 会从自身所在目录解析着色器、字体和
+可运行交付包中的 `AetherEngine.exe` 会从自身所在目录解析着色器、字体和
 `DemoProject`，因此启动目录可以是任意目录。默认启动会打开内置演示项目；也可以显式指定
 项目：
 
 ```text
-aeg_editor_application.exe --project E:\Projects\MyGame\project.aegproject
+AetherEngine.exe --project E:\Projects\MyGame\project.aegproject
 ```
 
 启动失败会显示可恢复错误，并将详细日志写入系统临时目录

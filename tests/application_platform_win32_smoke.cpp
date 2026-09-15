@@ -2,12 +2,28 @@
  * @file application_platform_win32_smoke.cpp
  * @brief Verifies the Application-owned Win32 window adapter.
  */
+#include <filesystem>
 #include <memory>
+
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 
 #include "application_platform.hpp"
 #include "window_event.hpp"
 
 int main() {
+    constexpr WORD kEditorIconResourceId = 101;
+    constexpr WORD kGroupIconResourceType = 14;
+    if (FindResourceW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(kEditorIconResourceId),
+                      MAKEINTRESOURCEW(kGroupIconResourceType)) == nullptr) {
+        return 27;
+    }
+
     auto system_result = aeg::application::create_win32_window_system();
     if (!system_result) {
         return 1;
@@ -19,8 +35,33 @@ int main() {
         return 20;
     }
 
-    const auto invalid_directory_dialog =
-        aeg::application::select_directory({}, "", "C:\\");
+    const auto invalid_splash = aeg::application::show_startup_splash({});
+    if (invalid_splash || invalid_splash.result.code != aeg::foundation::ResultCode::kInvalidArgument) {
+        return 29;
+    }
+    aeg::application::StartupSplashDesc missing_splash_desc{};
+    missing_splash_desc.image_path = std::filesystem::path{__FILE__}.parent_path() / "missing-startup-logo.png";
+    const auto missing_splash = aeg::application::show_startup_splash(missing_splash_desc);
+    if (missing_splash || missing_splash.result.code != aeg::foundation::ResultCode::kNotFound) {
+        return 30;
+    }
+    aeg::application::StartupSplashDesc splash_desc{};
+    splash_desc.image_path = std::filesystem::path{__FILE__}.parent_path().parent_path() / "Assets" / "Branding" /
+                             "aether-engine-graph-mark.png";
+    splash_desc.extent = {320, 320};
+    splash_desc.accessible_name = "AEG transparent startup splash smoke";
+    auto splash_result = aeg::application::show_startup_splash(splash_desc);
+    if (!splash_result || splash_result.value == nullptr) {
+        return 31;
+    }
+    const HWND splash_window = FindWindowW(nullptr, L"AEG transparent startup splash smoke");
+    if (splash_window == nullptr ||
+        (static_cast<DWORD>(GetWindowLongPtrW(splash_window, GWL_EXSTYLE)) & WS_EX_LAYERED) == 0) {
+        return 32;
+    }
+    splash_result.value->close();
+
+    const auto invalid_directory_dialog = aeg::application::select_directory({}, "", "C:\\");
     if (invalid_directory_dialog ||
         invalid_directory_dialog.result.code != aeg::foundation::ResultCode::kInvalidArgument) {
         return 26;
@@ -47,6 +88,14 @@ int main() {
     const std::shared_ptr<aeg::platform::IWindow> window = window_result.value;
     if (!window->id().is_valid() || !window->surface_binding().is_valid() || window->state().extent != desc.extent) {
         return 3;
+    }
+    const HICON expected_small_icon =
+        static_cast<HICON>(LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(kEditorIconResourceId), IMAGE_ICON,
+                                      GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_SHARED));
+    const auto native_window = static_cast<HWND>(window->surface_binding().window_handle);
+    const HICON actual_small_icon = reinterpret_cast<HICON>(GetClassLongPtrW(native_window, GCLP_HICONSM));
+    if (expected_small_icon == nullptr || actual_small_icon != expected_small_icon) {
+        return 28;
     }
     const aeg::platform::WindowPosition position{96, 144};
     if (!window->set_position(position) || window->state().position != position) {

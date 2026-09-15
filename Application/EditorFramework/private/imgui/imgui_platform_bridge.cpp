@@ -205,8 +205,8 @@ void update_monitors(ImGuiPlatformBridgeContext& context) noexcept {
         const platform::WindowMetrics& metrics = metrics_result.value;
         ImGuiPlatformMonitor monitor{};
         monitor.MainPos = ImVec2(static_cast<float>(position.x), static_cast<float>(position.y));
-        monitor.MainSize = ImVec2(static_cast<float>(metrics.display_extent.width),
-                                  static_cast<float>(metrics.display_extent.height));
+        monitor.MainSize =
+            ImVec2(static_cast<float>(metrics.display_extent.width), static_cast<float>(metrics.display_extent.height));
         monitor.WorkPos = monitor.MainPos;
         monitor.WorkSize = monitor.MainSize;
         monitor.DpiScale = metrics.framebuffer_scale_x;
@@ -243,7 +243,7 @@ void create_platform_window(ImGuiViewport* viewport) noexcept {
     data->window_system = context->window_system;
 
     platform::WindowDesc desc{};
-    desc.title = "AEG Editor Viewport";
+    desc.title = "Aether Engine Viewport";
     desc.extent = extent;
     desc.position = to_window_position(viewport->Pos);
     desc.position_specified = true;
@@ -520,8 +520,7 @@ void ImGuiPlatformBridge::install(ImGuiIO& io, ImGuiPlatformBridgeContext& conte
 
 void ImGuiPlatformBridge::shutdown(ImGuiIO& io, ImGuiPlatformBridgeContext& context) noexcept {
     ImGuiPlatformIO& platform_io = ImGui::GetPlatformIO();
-    if (ImGui::GetMainViewport() != nullptr &&
-        ImGui::GetMainViewport()->PlatformUserData == &context.main_viewport) {
+    if (ImGui::GetMainViewport() != nullptr && ImGui::GetMainViewport()->PlatformUserData == &context.main_viewport) {
         ImGui::GetMainViewport()->PlatformUserData = nullptr;
         ImGui::GetMainViewport()->PlatformHandle = nullptr;
     }
