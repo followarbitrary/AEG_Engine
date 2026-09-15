@@ -208,6 +208,16 @@ int main() {
         return packet.window == floating_window;
     }));
 
+    // An interrupted viewport frame still finishes platform bookkeeping, so
+    // the next NewFrame does not assert that UpdatePlatformWindows was skipped.
+    assert(host.begin_frame(frame_desc));
+    ImGui::Begin("Interrupted viewport frame");
+    ImGui::BeginChild("Interrupted viewport child");
+    assert(host.abort_frame());
+    assert(host.draw_data() == nullptr);
+    assert(host.begin_frame(frame_desc));
+    assert(host.build_panels());
+    assert(host.end_frame());
     assert(host.shutdown());
     assert(window_system.destroy_count != 0);
 

@@ -8,6 +8,7 @@
 #include <cassert>
 #include <cstring>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -28,6 +29,7 @@ public:
 
     aeg::foundation::Result apply(const aeg::editor::EditorPreferenceState& state) override {
         ++apply_count;
+        if (throw_apply) throw std::runtime_error("recoverable preferences action failure");
         applied_key = state.active_font_key;
         applied_size = state.font_size_pixels;
         return fail_apply ? aeg::foundation::invalid_state("test apply failure") : aeg::foundation::Result::success();
@@ -53,6 +55,7 @@ public:
     uint32_t cancel_count{0};
     bool fail_preview{false};
     bool fail_apply{false};
+    bool throw_apply{false};
     bool fail_save{false};
     std::string previewed_key{};
     float previewed_size{0.0f};
@@ -196,6 +199,21 @@ int main() {
     assert(ImGui::GetCurrentContext()->StyleVarStack.Size == 0);
     assert(host.end_frame());
     assert(host.draw_data() != nullptr);
+    assert(panel_model.select_font("inter"));
+    panel_actions.throw_apply = true;
+    ImGui::ActivateItemByID(find_window("PreferenceActionBar")->GetID("Apply"));
+    const auto apply_count_before_failure = panel_actions.apply_count;
+    for (int frame = 0; frame < 3; ++frame) {
+        assert(host.begin_frame(frame_desc));
+        assert(host.build_panels());
+        assert(ImGui::GetCurrentContext()->ColorStack.Size == 0);
+        assert(ImGui::GetCurrentContext()->StyleVarStack.Size == 0);
+        assert(host.end_frame());
+    }
+    assert(panel_actions.apply_count == apply_count_before_failure + 1);
+    assert(!panel_model.state().error_message.empty());
+    assert(panel_model.state().dirty);
+    panel_actions.throw_apply = false;
     // An applied accessibility-sized font may enlarge text, but must not let
     // navigation consume the workspace or move Preview below the form.
     assert(host.set_font("", 40));

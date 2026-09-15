@@ -3,7 +3,9 @@
  * @brief Verifies the Application-owned Win32 window adapter.
  */
 #include <filesystem>
+#include <limits>
 #include <memory>
+#include <stdexcept>
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -13,10 +15,27 @@
 #endif
 #include <windows.h>
 
+#include "../Application/Platform/private/win32/win32_clipboard_text.hpp"
 #include "application_platform.hpp"
 #include "window_event.hpp"
 
 int main() {
+    // Validate clipboard storage using owned buffers; the desktop clipboard is never changed.
+    const wchar_t terminated_text[]{L'o', L'k', L'\0', L'x'};
+    const auto text_view = aeg::application::win32::clipboard_text_view(terminated_text);
+    if (!text_view || text_view.value != L"ok") {
+        return 42;
+    }
+    const auto unterminated_text =
+        aeg::application::win32::clipboard_text_view(std::span<const wchar_t>{terminated_text, 2});
+    const auto missing_text = aeg::application::win32::clipboard_text_view({});
+    const wchar_t empty_text[]{L'\0'};
+    const auto empty_view = aeg::application::win32::clipboard_text_view(empty_text);
+    if (unterminated_text || unterminated_text.result.code != aeg::foundation::ResultCode::kInvalidArgument ||
+        missing_text || !empty_view || !empty_view.value.empty()) {
+        return 43;
+    }
+
     constexpr WORD kEditorIconResourceId = 101;
     constexpr WORD kGroupIconResourceType = 14;
     if (FindResourceW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(kEditorIconResourceId),
@@ -150,6 +169,54 @@ int main() {
         return 4;
     }
 
+    // A failing event consumer must leave the message pump available for later input.
+    for (const bool standard_exception : {true, false}) {
+        if (!window->request_close()) {
+            return 34;
+        }
+        aeg::foundation::Result callback_result{};
+        try {
+            callback_result = system->poll_events([standard_exception](const aeg::platform::WindowEvent& event) {
+                if (event.type != aeg::platform::WindowEventType::kWindowCloseRequested) {
+                    return;
+                }
+                if (standard_exception) {
+                    throw std::runtime_error("Recoverable window event consumer failure");
+                }
+                throw 7;
+            });
+        } catch (...) {
+            return 35;
+        }
+        if (callback_result || callback_result.code != aeg::foundation::ResultCode::kUnknown ||
+            !window->clear_close_request()) {
+            return 36;
+        }
+        if (PostMessageW(native_window, WM_CHAR, L'R', 0) == FALSE) {
+            return 37;
+        }
+        bool recovery_input_seen = false;
+        if (!system->poll_events([&recovery_input_seen](const aeg::platform::WindowEvent& event) {
+                recovery_input_seen |=
+                    event.type == aeg::platform::WindowEventType::kTextInput && event.codepoint == U'R';
+            }) || !recovery_input_seen) {
+            return 38;
+        }
+    }
+
+    const auto oversized_extent = window->set_extent({std::numeric_limits<uint32_t>::max(), 240});
+    if (oversized_extent || oversized_extent.code != aeg::foundation::ResultCode::kInvalidArgument) {
+        return 39;
+    }
+    const auto oversized_frame = window->set_extent({static_cast<uint32_t>(std::numeric_limits<int32_t>::max()), 240});
+    auto oversized_desc = desc;
+    oversized_desc.extent.width = static_cast<uint32_t>(std::numeric_limits<int32_t>::max());
+    const auto oversized_window = system->create_window(oversized_desc);
+    if (oversized_frame || oversized_frame.code != aeg::foundation::ResultCode::kInvalidArgument || oversized_window ||
+        oversized_window.result.code != aeg::foundation::ResultCode::kInvalidArgument) {
+        return 44;
+    }
+
     bool close_event_seen = false;
     if (!window->request_close()) {
         return 5;
@@ -174,6 +241,13 @@ int main() {
     const auto stale_metrics = platform_services.query_window_metrics(window->id());
     if (stale_metrics || stale_metrics.result.code != aeg::foundation::ResultCode::kNotFound) {
         return 12;
+    }
+    if (window->surface_binding().display_handle != nullptr || window->surface_binding().window_handle != nullptr) {
+        return 40;
+    }
+    system.reset();
+    if (window->surface_binding().display_handle != nullptr || window->surface_binding().window_handle != nullptr) {
+        return 41;
     }
     return 0;
 }

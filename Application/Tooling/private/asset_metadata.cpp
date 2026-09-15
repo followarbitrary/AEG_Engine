@@ -137,19 +137,14 @@ foundation::ResultValue<Uuid> Uuid::parse(std::string_view text) {
     }
 
     Uuid uuid{};
-    std::size_t output = 0;
-    for (std::size_t index = 0; index < text.size();) {
-        if (text[index] == '-') {
-            ++index;
-            continue;
-        }
+    for (std::size_t output = 0; output < uuid.bytes.size(); ++output) {
+        const std::size_t index = output * 2 + (output >= 4) + (output >= 6) + (output >= 8) + (output >= 10);
         const int high = decode_hex_digit(text[index]);
         const int low = decode_hex_digit(text[index + 1]);
         if (high < 0 || low < 0) {
             return {foundation::invalid_argument("UUID contains a non-hexadecimal digit"), {}};
         }
-        uuid.bytes[output++] = static_cast<uint8_t>((high << 4) | low);
-        index += 2;
+        uuid.bytes[output] = static_cast<uint8_t>((high << 4) | low);
     }
     return {foundation::Result::success(), uuid};
 }

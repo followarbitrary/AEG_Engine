@@ -491,6 +491,15 @@ int main() {
     if (!check(frame_context.end_frame(), "end_imgui_frame")) {
         return 27;
     }
+    // A failed next preparation must not expose the previous frame's packet
+    // to render-graph construction when the application discards this frame.
+    if (!check(frame_context.begin_frame(), "begin_rejected_imgui_frame")) return 31;
+    const auto rejected_next_frame = imgui_renderer.prepare_frame(frame_context, graph, invalid_packet, imgui_target);
+    if (rejected_next_frame || imgui_renderer.has_prepared_frame()) {
+        (void)frame_context.abort_frame();
+        return 32;
+    }
+    if (!check(frame_context.abort_frame(), "abort_rejected_imgui_frame")) return 33;
     if (!check(imgui_renderer.release_prepared_frame(), "release_prepared_imgui_frame") ||
         !check(device->wait_idle(), "wait_before_imgui_resource_replacement") ||
         !check(texture_uploader.destroy_texture(ui_texture), "destroy_ui_texture_before_renderer_shutdown")) {

@@ -5082,6 +5082,9 @@ foundation::Result EditorSceneRuntime::save_scene() {
 }
 
 foundation::Result EditorSceneRuntime::save_scene_as(const std::filesystem::path& path) {
+    if (impl_ == nullptr || !impl_->initialized_) {
+        return aeg::foundation::invalid_state("Editor scene runtime is not initialized");
+    }
     if (path.empty()) {
         return foundation::invalid_argument("Scene Save As path is empty");
     }

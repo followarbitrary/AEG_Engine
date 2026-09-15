@@ -7,14 +7,35 @@
 #include <filesystem>
 #include <fstream>
 #include <imgui.h>
+#include <limits>
 #include <string>
 #include <vector>
 
 #include "application_platform.hpp"
 #include "editor_font.hpp"
 #include "editor_imgui.hpp"
+#include "font/editor_system_font_catalog.hpp"
 
 namespace {
+struct AtlasAllocationWatch {
+    ImGuiMemAllocFunc allocate{};
+    ImGuiMemFreeFunc release{};
+    void* user_data{};
+    void* texture_data{};
+    bool texture_released{false};
+
+    static void* alloc(std::size_t size, void* context) {
+        auto& watch = *static_cast<AtlasAllocationWatch*>(context);
+        return watch.allocate(size, watch.user_data);
+    }
+
+    static void free(void* allocation, void* context) {
+        auto& watch = *static_cast<AtlasAllocationWatch*>(context);
+        if (allocation == watch.texture_data) watch.texture_released = true;
+        watch.release(allocation, watch.user_data);
+    }
+};
+
 [[nodiscard]] std::vector<std::byte> read_font_file(const aeg::application::SystemFontRecord& record) {
     const std::filesystem::path path = std::filesystem::u8path(record.file_path);
     std::ifstream stream(path, std::ios::binary);
@@ -162,6 +183,16 @@ int main() {
         }
     }
     assert(catalog.register_font(invalid_descriptor, invalid_font_data));
+    auto short_descriptor = invalid_descriptor;
+    short_descriptor.key = "short_font_data";
+    assert(catalog.register_font(short_descriptor, std::vector<std::byte>(16)));
+    auto invalid_face_descriptor = invalid_descriptor;
+    invalid_face_descriptor.key = "invalid_face_index";
+    const auto* valid_asset = catalog.find(first_key);
+    assert(valid_asset != nullptr);
+    const auto valid_font_data = valid_asset->font_data;
+    const auto valid_face_index = valid_asset->face_index;
+    assert(catalog.register_font(invalid_face_descriptor, valid_font_data, std::numeric_limits<uint32_t>::max()));
 
     EditorImGuiHost host;
     EditorImGuiDesc imgui_desc{};
@@ -169,6 +200,8 @@ int main() {
     imgui_desc.default_font_key = first_key;
     imgui_desc.font_size_pixels = 18.0f;
     assert(host.initialize(imgui_desc));
+    // Rejected external bytes must return Results before reaching ImGui's asserts.
+    ImGui::GetIO().ConfigErrorRecoveryEnableAssert = true;
     assert(host.active_font_key() == first_key);
     assert(host.active_font_size_pixels() == 18.0f);
 
@@ -184,12 +217,64 @@ int main() {
     assert(ImGui::GetIO().FontDefault != nullptr);
     assert(ImGui::GetIO().FontDefault->LegacySize == 18.0f);
     assert(preview_font->LegacySize == 20.0f);
+
+    // A rejected preview must leave the current atlas usable on the very next
+    // frame, without reloading a good font to repair the failed operation.
+    const aeg::editor::ImGuiTextureHandle texture{1, 1};
+    assert(host.set_font_texture(texture));
+    ImFontAtlas* previous_atlas = ImGui::GetIO().Fonts;
+    ImFont* previous_default = ImGui::GetIO().FontDefault;
+    const void* previous_display = host.display_font();
+    const ImTextureID previous_texture = previous_atlas->TexRef.GetTexID();
+    ImGuiFontAtlasData previous_pixels;
+    assert(host.capture_font_atlas(previous_pixels));
+    assert(!host.set_preview_font("invalid_font_data", 24.0f));
+    assert(ImGui::GetIO().Fonts == previous_atlas);
+    assert(ImGui::GetIO().Fonts->IsBuilt());
+    assert(ImGui::GetIO().FontDefault == previous_default);
+    assert(host.preview_font() == preview_font);
+    assert(host.display_font() == previous_display);
+    assert(host.preview_font_key() == second_key);
+    assert(host.preview_font_size_pixels() == 20.0f);
+    assert(ImGui::GetIO().Fonts->TexRef.GetTexID() == previous_texture);
+    ImGuiFontAtlasData retained_pixels;
+    assert(host.capture_font_atlas(retained_pixels));
+    assert(retained_pixels.rgba8_pixels == previous_pixels.rgba8_pixels);
+
+    EditorImGuiFrameDesc recovery_frame{};
+    recovery_frame.window = WindowId{0, 1};
+    recovery_frame.display_extent = WindowExtent{1280, 720};
+    assert(host.begin_frame(recovery_frame));
+    ImGui::Begin("Failed preview recovery");
+    ImGui::TextUnformatted("The existing editor font is still usable.");
+    ImGui::PushFont(const_cast<ImFont*>(preview_font));
+    ImGui::TextUnformatted("The previous preview is still usable.");
+    ImGui::PopFont();
+    ImGui::End();
+    assert(host.end_frame());
+    aeg::editor::ImGuiDrawPacket recovery_packet;
+    assert(host.capture_draw_packet(recovery_packet));
+
+    // Finalized draw packets remain valid until the next begin_frame, even
+    // when a successful font change replaces their atlas in between.
+    AtlasAllocationWatch allocation_watch;
+    ImGui::GetAllocatorFunctions(&allocation_watch.allocate, &allocation_watch.release, &allocation_watch.user_data);
+    allocation_watch.texture_data = ImGui::GetIO().Fonts->TexData;
+    ImGui::SetAllocatorFunctions(AtlasAllocationWatch::alloc, AtlasAllocationWatch::free, &allocation_watch);
     assert(host.set_font(second_key, 20.0f));
+    assert(!allocation_watch.texture_released);
+    aeg::editor::ImGuiDrawPacket previous_frame_packet;
+    assert(host.capture_draw_packet(previous_frame_packet));
+    assert(previous_frame_packet.commands.size() == recovery_packet.commands.size());
     assert(host.active_font_key() == second_key);
     assert(host.preview_font_key().empty());
     assert(!host.set_font("invalid_font_data", 20.0f));
     assert(host.active_font_key() == second_key);
-    assert(host.set_font(second_key, 20.0f));
+    assert(ImGui::GetIO().Fonts->IsBuilt());
+    assert(host.begin_frame(recovery_frame));
+    assert(allocation_watch.texture_released);
+    ImGui::SetAllocatorFunctions(allocation_watch.allocate, allocation_watch.release, allocation_watch.user_data);
+    assert(host.end_frame());
     ImGuiFontAtlasData atlas;
     assert(host.capture_font_atlas(atlas));
     assert(atlas.is_valid());
@@ -209,5 +294,89 @@ int main() {
     ImGui::End();
     assert(host.end_frame());
     assert(host.shutdown());
+
+    // Preferences keeps additional heading/icon/preview font pointers. Repeated
+    // failures must preserve those as well, including after a rendered frame.
+    imgui_desc.enable_preference_fonts = true;
+    assert(host.initialize(imgui_desc));
+    ImGui::GetIO().ConfigErrorRecoveryEnableAssert = true;
+    assert(host.set_preview_font(second_key, 20.0f));
+    assert(host.set_font_texture(texture));
+    const void* preference_heading = host.preference_font(24);
+    const void* preference_preview = host.preview_font();
+    EditorImGuiHost other_host;
+    assert(other_host.initialize());
+    assert(other_host.set_font_texture(texture));
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        for (const char* key : {"invalid_font_data", "short_font_data", "invalid_face_index"}) {
+            assert(!host.set_preview_font(key, 22.0f));
+            assert(!host.set_font(key, 22.0f));
+        }
+        assert(host.preference_font(24) == preference_heading);
+        assert(host.preview_font() == preference_preview);
+        assert(host.active_font_key() == first_key);
+        assert(host.preview_font_key() == second_key);
+        assert(host.begin_frame(recovery_frame));
+        ImGui::Begin("Preferences failure recovery");
+        ImGui::PushFont(static_cast<ImFont*>(const_cast<void*>(preference_heading)));
+        ImGui::TextUnformatted("Settings heading");
+        ImGui::PopFont();
+        ImGui::PushFont(static_cast<ImFont*>(const_cast<void*>(preference_preview)));
+        ImGui::TextUnformatted("Preview remains available");
+        ImGui::PopFont();
+        ImGui::End();
+        assert(host.end_frame());
+        assert(host.capture_draw_packet(recovery_packet));
+    }
+    assert(host.set_preview_font(first_key, 24.0f));
+    assert(host.set_font(second_key, 24.0f));
+    assert(host.begin_frame(recovery_frame));
+    assert(host.end_frame());
+    ImGui::GetIO().Fonts->Clear();
+    assert(!host.begin_frame(recovery_frame));
+    assert(host.shutdown());
+    assert(other_host.begin_frame(recovery_frame));
+    ImGui::Begin("Other host survives preferences rebuild and shutdown");
+    ImGui::TextUnformatted("Independent context is still usable");
+    ImGui::End();
+    assert(other_host.end_frame());
+    assert(other_host.capture_draw_packet(recovery_packet));
+    assert(other_host.shutdown());
+
+    // A malformed merged fallback is rejected after a valid primary was added
+    // to the candidate atlas. The built-in active font remains renderable.
+    EditorFontCatalog fallback_catalog;
+    EditorFontDescriptor primary_descriptor{"primary", "Primary", EditorFontKind::kInterface};
+    auto fallback_descriptor = invalid_descriptor;
+    fallback_descriptor.key = "invalid_chinese_fallback";
+    fallback_descriptor.supports_chinese = true;
+    assert(fallback_catalog.register_font(primary_descriptor, valid_font_data, valid_face_index));
+    assert(fallback_catalog.register_font(fallback_descriptor, invalid_font_data));
+    EditorImGuiDesc fallback_desc{};
+    fallback_desc.font_catalog = &fallback_catalog;
+    assert(host.initialize(fallback_desc));
+    ImGui::GetIO().ConfigErrorRecoveryEnableAssert = true;
+    assert(host.set_font_texture(texture));
+    assert(!host.set_font("primary", 18.0f));
+    assert(host.active_font_key().empty());
+    assert(host.begin_frame(recovery_frame));
+    ImGui::Begin("Rejected fallback recovery");
+    ImGui::TextUnformatted("Built-in font is preserved");
+    ImGui::End();
+    assert(host.end_frame());
+    assert(host.capture_draw_packet(recovery_packet));
+    assert(host.shutdown());
+
+    // Exercise the actual catalog consumed by Settings, including all installed
+    // collection faces; incompatible faces must never enter the selectable list.
+    const auto system_catalog = aeg::application::EditorSystemFontCatalog{}.load();
+    assert(system_catalog);
+    assert(system_catalog.value.catalog.font_count() >= 2);
+    for (const auto& asset : system_catalog.value.catalog.assets()) {
+        assert(aeg::editor::validate_editor_font_data(asset.font_data, asset.face_index));
+        assert(asset.descriptor.display_name != "Symbol");
+        assert(asset.descriptor.display_name != "Wingdings");
+        assert(asset.descriptor.display_name != "Webdings");
+    }
     return 0;
 }

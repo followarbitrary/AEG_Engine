@@ -5,17 +5,44 @@
 #pragma once
 
 #include <cstdint>
+#include <exception>
+#include <new>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #include "result.hpp"
 
 namespace aeg::editor {
+/** @brief Converts exceptions at an editor operation boundary into ordinary failures. */
+template <typename Operation>
+[[nodiscard]] foundation::Result guard_editor_operation(Operation&& operation) noexcept {
+    try {
+        return std::forward<Operation>(operation)();
+    } catch (const std::bad_alloc&) {
+        return foundation::Result::failure(foundation::ResultCode::kOutOfMemory);
+    } catch (const std::exception& exception) {
+        try {
+            return foundation::unknown_exception(exception);
+        } catch (...) {
+            return foundation::Result::failure(foundation::ResultCode::kUnknown);
+        }
+    } catch (...) {
+        return foundation::Result::failure(foundation::ResultCode::kUnknown);
+    }
+}
+
 /** @brief Controls whether an editor error is non-blocking or requires termination. */
 enum class EditorErrorSeverity : uint8_t {
     kRecoverable,
     kFatal,
 };
+
+/** @brief Runtime failures requiring a controlled shutdown rather than another operation. */
+[[nodiscard]] constexpr EditorErrorSeverity editor_error_severity(foundation::ResultCode code) noexcept {
+    return code == foundation::ResultCode::kDeviceLost || code == foundation::ResultCode::kOutOfMemory
+               ? EditorErrorSeverity::kFatal : EditorErrorSeverity::kRecoverable;
+}
 
 /** @brief One user-visible error captured by the editor application. */
 struct EditorErrorNotice final {

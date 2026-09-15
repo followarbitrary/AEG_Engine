@@ -3,6 +3,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <string>
 #include <string_view>
 
@@ -37,6 +38,26 @@ int main() {
     assert(cooked);
     assert(cooked.value.size() == 1U);
     assert(cooked.value[0].payload.size() == 16U + 3U * 32U + 3U * 4U);
+
+    // The backing allocation is large enough to make the old unchecked read deterministic,
+    // but the accessor extends beyond its declared buffer view.
+    {
+        const std::array<float, 12> vertices{};
+        std::ofstream bytes(root / "triangle.bin", std::ios::binary | std::ios::trunc);
+        bytes.write(reinterpret_cast<const char*>(vertices.data()), static_cast<std::streamsize>(sizeof(vertices)));
+    }
+    std::ofstream(root / "bad-view.gltf")
+        << R"({"asset":{"version":"2.0"},"buffers":[{"uri":"triangle.bin","byteLength":48}],"bufferViews":[{"buffer":0,"byteOffset":0,"byteLength":36}],"accessors":[{"bufferView":0,"componentType":5126,"count":4,"type":"VEC3"}],"meshes":[{"primitives":[{"attributes":{"POSITION":0}}]}]})";
+    if (aeg::tooling::CgltfMeshImporter{}.cook(root / "bad-view.gltf", meta)) {
+        std::cerr << "glTF accessor outside its declared view must be rejected\n";
+        return 1;
+    }
+    std::ofstream(root / "bad-normal.gltf")
+        << R"({"asset":{"version":"2.0"},"buffers":[{"uri":"triangle.bin","byteLength":48}],"bufferViews":[{"buffer":0,"byteOffset":0,"byteLength":36}],"accessors":[{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3"},{"bufferView":0,"componentType":5126,"count":1,"type":"VEC3"}],"meshes":[{"primitives":[{"attributes":{"POSITION":0,"NORMAL":1}}]}]})";
+    if (aeg::tooling::CgltfMeshImporter{}.cook(root / "bad-normal.gltf", meta)) {
+        std::cerr << "glTF attributes with mismatched counts must be rejected\n";
+        return 2;
+    }
     std::filesystem::remove_all(root);
     return 0;
 }

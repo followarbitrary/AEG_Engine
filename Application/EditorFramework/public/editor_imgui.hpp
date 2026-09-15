@@ -38,9 +38,9 @@ public:
     [[nodiscard]] foundation::Result set_font_texture(ImGuiTextureHandle texture);
     /** @brief Copies the engine-owned RGBA8 font atlas for upload through Resource/RHI APIs. */
     [[nodiscard]] foundation::Result capture_font_atlas(ImGuiFontAtlasData& atlas) const;
-    /** @brief Rebuilds the CPU font atlas for a registered font before the next frame. */
+    /** @brief Rebuilds the CPU font atlas before the next frame; failures retain the current fonts and texture. */
     [[nodiscard]] foundation::Result set_font(std::string_view font_key, float size_pixels);
-    /** @brief Rebuilds the atlas while keeping the active UI font and changing only the preview font. */
+    /** @brief Changes only the preview font; failures retain the current atlas, preview and texture. */
     [[nodiscard]] foundation::Result set_preview_font(std::string_view font_key, float size_pixels);
     /** @brief Returns the stable key of the currently selected font. */
     [[nodiscard]] std::string_view active_font_key() const noexcept;
@@ -68,6 +68,8 @@ public:
     [[nodiscard]] foundation::Result build_panels();
     /** @brief Finalizes the current frame and makes its draw data available internally. */
     [[nodiscard]] foundation::Result end_frame();
+    /** @brief Unwinds an interrupted frame without rendering and invalidates its draw data. */
+    [[nodiscard]] foundation::Result abort_frame() noexcept;
     /** @brief Copies the finalized ImGui draw lists into engine-owned storage. */
     [[nodiscard]] foundation::Result capture_draw_packet(ImGuiDrawPacket& packet) const;
     /** @brief Copies every active ImGui viewport into engine-owned draw packets. */

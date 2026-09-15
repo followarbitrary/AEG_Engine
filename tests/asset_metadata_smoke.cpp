@@ -25,6 +25,11 @@ int main() {
     using aeg::tooling::CookedProduct;
     using aeg::tooling::SourceId;
 
+    if (!require(!SourceId::parse("169c2f30-3a65-4f6a-8fb8---62346cca57"),
+                 "asset metadata accepted extra UUID separators")) {
+        return 8;
+    }
+
     const auto source_id = SourceId::parse("169c2f30-3a65-4f6a-8fb8-f062346cca57");
     const auto mesh_id = AssetId::parse("72a9df5e-4ef1-4fc2-a197-0325620b1be5");
     const auto material_id = AssetId::parse("8a103433-4b67-4f4e-9ab8-b8976556ac58");

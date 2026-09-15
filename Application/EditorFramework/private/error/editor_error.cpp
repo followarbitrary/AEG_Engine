@@ -37,8 +37,17 @@ foundation::Result EditorErrorState::report(std::string_view operation, const fo
         has_notice_ = true;
         notification_requested_ = true;
         return foundation::Result::success();
-    } catch (const std::bad_alloc&) {
-        return foundation::Result::failure(foundation::ResultCode::kOutOfMemory);
+    } catch (...) {
+        // Reporting a recoverable failure must not itself become a fatal one.
+        // Preserve classification without allocating when diagnostic text fails.
+        notice_.operation.clear();
+        notice_.message.clear();
+        notice_.code = result.code;
+        notice_.severity = severity;
+        notice_.occurrence_count = 1;
+        has_notice_ = true;
+        notification_requested_ = true;
+        return foundation::Result::success();
     }
 }
 

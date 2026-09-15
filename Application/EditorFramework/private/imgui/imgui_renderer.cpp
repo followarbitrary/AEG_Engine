@@ -296,12 +296,17 @@ ImGuiRenderer::ImGuiRenderer(rhi::Device& device, ImGuiTextureRegistry& texture_
     : impl_(std::make_unique<Impl>(device, texture_registry)) {}
 
 ImGuiRenderer::~ImGuiRenderer() {
-    if (impl_ == nullptr) {
-        return;
-    }
-    static_cast<void>(release_prepared_frame());
-    if (impl_->initialized) {
-        static_cast<void>(shutdown());
+    try {
+        if (impl_ == nullptr) {
+            return;
+        }
+        static_cast<void>(release_prepared_frame());
+        if (impl_->initialized) {
+            static_cast<void>(shutdown());
+        }
+    } catch (...) {
+        // Destructors are a final process boundary. Resource cleanup must not
+        // turn a recoverable backend failure into std::terminate.
     }
 }
 
@@ -413,6 +418,11 @@ foundation::Result ImGuiRenderer::prepare_frame(render_graph::FrameContext& fram
     if (impl_ == nullptr || !impl_->initialized) {
         return foundation::invalid_state("ImGui renderer is not initialized");
     }
+    // A caller begins preparing a replacement frame only after discarding the
+    // previous packet. Never leave that stale packet visible if validation of
+    // the new packet fails.
+    impl_->prepared_frame.reset();
+    impl_->imported_textures.clear();
     if (&frame_context.device() != &impl_->device || &graph.device() != &impl_->device) {
         return foundation::invalid_argument("ImGui renderer objects must use the same RHI device");
     }
@@ -902,22 +912,23 @@ foundation::Result ImGuiRenderer::shutdown() {
 }
 
 foundation::Result ImGuiRenderer::release_prepared_frame() {
-    if (impl_ == nullptr || !impl_->initialized) {
-        return foundation::Result::success();
-    }
-    if (const foundation::Result result = impl_->device.wait_idle(); !result) {
-        return result;
-    }
-    if (impl_->prepared_frame == nullptr && impl_->prepared_frame_history.empty()) {
+    try {
+      if (impl_ == nullptr || !impl_->initialized) {
+          return foundation::Result::success();
+      }
+      if (const foundation::Result result = impl_->device.wait_idle(); !result) {
+          return result;
+      }
+      if (impl_->prepared_frame == nullptr && impl_->prepared_frame_history.empty()) {
         // The caller may be replacing an externally-owned texture even when
         // this renderer has no current draw packet. Do not retain its logical
         // RenderGraph resource: the RHI handle may have been recycled with a
         // different state on the next frame.
-        impl_->imported_textures.clear();
-        return foundation::Result::success();
-    }
-    foundation::Result first_result = foundation::Result::success();
-    for (const std::weak_ptr<Impl::PreparedFrame>& frame_weak : impl_->prepared_frame_history) {
+          impl_->imported_textures.clear();
+          return foundation::Result::success();
+      }
+      foundation::Result first_result = foundation::Result::success();
+      for (const std::weak_ptr<Impl::PreparedFrame>& frame_weak : impl_->prepared_frame_history) {
         const std::shared_ptr<Impl::PreparedFrame> frame = frame_weak.lock();
         if (frame == nullptr) {
             continue;
@@ -926,18 +937,25 @@ foundation::Result ImGuiRenderer::release_prepared_frame() {
         if (!result && first_result) {
             first_result = result;
         }
-    }
-    if (!first_result) {
-        return first_result;
-    }
-    impl_->prepared_frame.reset();
-    impl_->prepared_frame_history.clear();
+      }
+      if (!first_result) {
+          return first_result;
+      }
+      impl_->prepared_frame.reset();
+      impl_->prepared_frame_history.clear();
     // A caller releases the prepared frame before replacing an externally
     // owned texture (for example the editor viewport after a resize). The
     // next graph must import that replacement instead of reusing a logical
     // resource that still describes the retired image.
-    impl_->imported_textures.clear();
-    return foundation::Result::success();
+      impl_->imported_textures.clear();
+      return foundation::Result::success();
+    } catch (const std::bad_alloc&) {
+        return foundation::out_of_memory("ImGui prepared-frame cleanup allocation failed");
+    } catch (const std::exception& exception) {
+        return foundation::unknown_exception(exception);
+    } catch (...) {
+        return foundation::Result::failure(foundation::ResultCode::kUnknown);
+    }
 }
 
 bool ImGuiRenderer::is_initialized() const noexcept {

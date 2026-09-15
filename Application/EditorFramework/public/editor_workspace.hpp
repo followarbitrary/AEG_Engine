@@ -98,6 +98,7 @@ private:
     std::vector<EditorWorkspaceActionDescriptor> view_actions_{};
     /** @brief True after the current layout has been applied to the ImGui dockspace. */
     bool dockspace_initialized_{false};
+    bool building_ui_{false};
     bool preferences_open_{false};
     bool playing_{false};
     std::string active_rail_{"Scene"};

@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <utility>
 
 #include "win32_window_system.hpp"
@@ -174,8 +175,9 @@ foundation::Result Win32Window::set_extent(platform::WindowExtent extent) noexce
     if (hwnd_ == nullptr) {
         return foundation::Result::failure(foundation::ResultCode::kInvalidState);
     }
-    if (!extent.is_valid()) {
-        return foundation::invalid_argument("Win32 window extent must be non-zero");
+    if (!extent.is_valid() || extent.width > static_cast<uint32_t>(std::numeric_limits<int32_t>::max()) ||
+        extent.height > static_cast<uint32_t>(std::numeric_limits<int32_t>::max())) {
+        return foundation::invalid_argument("Win32 window extent is outside native limits");
     }
 
     RECT window_rect{};
@@ -183,12 +185,18 @@ foundation::Result Win32Window::set_extent(platform::WindowExtent extent) noexce
     if (GetWindowRect(hwnd_, &window_rect) == FALSE || GetClientRect(hwnd_, &client_rect) == FALSE) {
         return foundation::Result::failure(foundation::ResultCode::kBackendError, "Win32 window extent query failed");
     }
-    const int32_t frame_width = (window_rect.right - window_rect.left) - (client_rect.right - client_rect.left);
-    const int32_t frame_height = (window_rect.bottom - window_rect.top) - (client_rect.bottom - client_rect.top);
-    const int32_t width = static_cast<int32_t>(extent.width) + frame_width;
-    const int32_t height = static_cast<int32_t>(extent.height) + frame_height;
-    if (width <= 0 || height <= 0 ||
-        SetWindowPos(hwnd_, nullptr, 0, 0, width, height, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE) == FALSE) {
+    const int64_t frame_width = (static_cast<int64_t>(window_rect.right) - window_rect.left) -
+                               (static_cast<int64_t>(client_rect.right) - client_rect.left);
+    const int64_t frame_height = (static_cast<int64_t>(window_rect.bottom) - window_rect.top) -
+                                (static_cast<int64_t>(client_rect.bottom) - client_rect.top);
+    const int64_t width = static_cast<int64_t>(extent.width) + frame_width;
+    const int64_t height = static_cast<int64_t>(extent.height) + frame_height;
+    if (width <= 0 || height <= 0 || width > std::numeric_limits<int32_t>::max() ||
+        height > std::numeric_limits<int32_t>::max()) {
+        return foundation::invalid_argument("Win32 window extent exceeds native limits");
+    }
+    if (SetWindowPos(hwnd_, nullptr, 0, 0, static_cast<int32_t>(width), static_cast<int32_t>(height),
+                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE) == FALSE) {
         return foundation::Result::failure(foundation::ResultCode::kBackendError, "Win32 window extent update failed");
     }
     sync_state_from_native();

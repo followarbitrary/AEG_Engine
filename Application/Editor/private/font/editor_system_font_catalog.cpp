@@ -116,7 +116,7 @@ foundation::ResultValue<EditorSystemFontCatalogData> EditorSystemFontCatalog::lo
             descriptor.is_protected = true;
 
             const foundation::ResultValue<std::vector<std::byte>> data_result = read_font_file(record.file_path);
-            if (!data_result) {
+            if (!data_result || !editor::validate_editor_font_data(data_result.value, record.face_index)) {
                 continue;
             }
             if (const foundation::Result register_result =

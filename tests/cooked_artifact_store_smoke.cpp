@@ -3,6 +3,8 @@
 #include <chrono>
 #include <cstddef>
 #include <filesystem>
+#include <fstream>
+#include <iostream>
 #include <string>
 #include <vector>
 
@@ -72,6 +74,24 @@ int main() {
     assert(indexed);
     assert(indexed.value == replacement[0].bytes);
     assert(!index.read(material));
+
+    // A truncated metadata field must become a failed Result, without throwing.
+    const auto manifest = republished.value.manifest;
+    for (const std::string& bad_field : {std::string{}, std::string{"id = \"\""}}) {
+        std::ofstream(manifest, std::ios::binary | std::ios::trunc)
+            << "version = 1\nsource_uuid = \"" << source.to_string()
+            << "\"\n[[artifacts]]\n" << bad_field
+            << "\n\nschema_version = 4\nfile = \"missing.aegmesh\"\n";
+        try {
+            if (store.load_current(source) || index.refresh() || !index.read(mesh)) {
+                std::cerr << "Malformed cooked metadata must fail and preserve the previous index\n";
+                return 1;
+            }
+        } catch (const std::exception& exception) {
+            std::cerr << "Malformed cooked metadata threw: " << exception.what() << '\n';
+            return 2;
+        }
+    }
 
     std::filesystem::remove_all(root);
     return 0;

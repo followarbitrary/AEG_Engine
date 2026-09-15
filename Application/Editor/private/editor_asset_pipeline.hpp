@@ -91,6 +91,9 @@ private:
     std::vector<EditorAssetRecord> records_{};
     std::vector<WorkItem> work_{};
     std::vector<CpuAsset> completed_{};
+    // Worker and watcher exceptions must be surfaced to the editor thread;
+    // letting one escape a std::thread entry point terminates the process.
+    std::atomic<bool> background_failure_{false};
     std::atomic<bool> stopping_{false};
     std::thread worker_{};
     std::thread watcher_{};

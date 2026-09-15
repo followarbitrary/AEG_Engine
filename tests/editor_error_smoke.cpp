@@ -1,6 +1,22 @@
 #include <cassert>
+#include <cstdlib>
+#include <new>
+#include <stdexcept>
 
 #include "editor_error.hpp"
+
+namespace {
+bool reject_allocations = false;
+}
+
+void* operator new(std::size_t size) {
+    if (!reject_allocations) {
+        if (void* allocation = std::malloc(size == 0 ? 1 : size)) return allocation;
+    }
+    throw std::bad_alloc{};
+}
+void operator delete(void* allocation) noexcept { std::free(allocation); }
+void operator delete(void* allocation, std::size_t) noexcept { std::free(allocation); }
 
 int main() {
     using aeg::editor::EditorErrorSeverity;
@@ -40,5 +56,38 @@ int main() {
 
     assert(state.report("ignored_success", Result::success(), EditorErrorSeverity::kRecoverable));
     assert(!state.has_pending());
+
+    // A failed notification allocation must not upgrade a recoverable operation
+    // into a fatal error; retain a code-only notice that the UI can still show.
+    reject_allocations = true;
+    const Result notification_result = state.report("recoverable_operation_with_long_name", failure,
+                                                     EditorErrorSeverity::kRecoverable);
+    reject_allocations = false;
+    assert(notification_result);
+    assert(state.has_pending());
+    assert(state.pending()->code == ResultCode::kBackendError);
+    assert(state.pending()->severity == EditorErrorSeverity::kRecoverable);
+    assert(state.consume_notification_request());
+    state.dismiss();
+
+    const auto thrown = aeg::editor::guard_editor_operation([]() -> Result {
+        throw std::runtime_error("recoverable action failure");
+    });
+    assert(!thrown && thrown.code == ResultCode::kUnknown);
+    assert(thrown.message == "recoverable action failure");
+    assert(aeg::editor::editor_error_severity(thrown.code) == EditorErrorSeverity::kRecoverable);
+    const auto nonstandard = aeg::editor::guard_editor_operation([]() -> Result { throw 42; });
+    assert(!nonstandard && nonstandard.code == ResultCode::kUnknown);
+    const auto allocation = aeg::editor::guard_editor_operation([]() -> Result { throw std::bad_alloc{}; });
+    assert(!allocation && allocation.code == ResultCode::kOutOfMemory);
+    assert(aeg::editor::editor_error_severity(allocation.code) == EditorErrorSeverity::kFatal);
+    assert(aeg::editor::editor_error_severity(ResultCode::kDeviceLost) == EditorErrorSeverity::kFatal);
+    assert(aeg::editor::guard_editor_operation([] { return Result::success(); }));
+    const std::runtime_error conversion_failure("diagnostic allocation failed");
+    reject_allocations = true;
+    const auto code_only = aeg::editor::guard_editor_operation([&]() -> Result { throw conversion_failure; });
+    reject_allocations = false;
+    assert(!code_only && code_only.code == ResultCode::kUnknown);
+    assert(code_only.message.empty());
     return 0;
 }

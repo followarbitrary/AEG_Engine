@@ -14,6 +14,10 @@
 #include "result.hpp"
 
 namespace aeg::editor {
+/** @brief Checks the bounded TrueType/collection subset supported by the editor rasterizer. */
+[[nodiscard]] foundation::Result validate_editor_font_data(std::span<const std::byte> font_data,
+                                                           uint32_t face_index = 0);
+
 /** @brief Usage category exposed by the editor font preference model. */
 enum class EditorFontKind : uint8_t {
     kInterface,

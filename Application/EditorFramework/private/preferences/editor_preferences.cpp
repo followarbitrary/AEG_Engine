@@ -3,6 +3,7 @@
  * @brief Implements the editor Preferences draft model and panel.
  */
 #include "editor_preferences.hpp"
+#include "editor_error.hpp"
 
 #include <imgui.h>
 
@@ -188,7 +189,7 @@ void EditorPreferencePanel::build_ui() {
         ImGui::SetCursorPosY(ImGui::GetCursorPosY() + pixels);
     };
     const auto preview_draft = [this]() {
-        if (!actions_->preview(model_->state()))
+        if (!guard_editor_operation([&] { return actions_->preview(model_->state()); }))
             static_cast<void>(model_->set_error("The font preview could not be updated. Please try again."));
     };
     const auto update_font_size = [this, &preview_draft](float size) {
@@ -465,7 +466,7 @@ void EditorPreferencePanel::build_ui() {
             if (compact_footer) ImGui::SetCursorPos(ImVec2(actions_x, control_height + 24));
             else ImGui::SameLine(actions_x);
             if (ImGui::Button("Cancel", ImVec2(button_width, control_height))) {
-                if (!actions_->cancel(model_->applied_state()))
+                if (!guard_editor_operation([&] { return actions_->cancel(model_->applied_state()); }))
                     static_cast<void>(model_->set_error("The preferences could not be cancelled. Please try again."));
             }
             ImGui::SameLine();
@@ -473,7 +474,7 @@ void EditorPreferencePanel::build_ui() {
             ImGui::BeginDisabled(disabled);
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.075f, 0.21f, 0.32f, 1));
             if (ImGui::Button("Apply", ImVec2(button_width, control_height))) {
-                if (!actions_->apply(state))
+                if (!guard_editor_operation([&] { return actions_->apply(state); }))
                     static_cast<void>(model_->set_error("The preferences could not be applied. Please try again."));
             }
             ImGui::PopStyleColor();
@@ -483,7 +484,7 @@ void EditorPreferencePanel::build_ui() {
             ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.03f, 0.62f, 0.72f, 1));
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.01f, 0.08f, 0.11f, 1));
             if (ImGui::Button("Save", ImVec2(button_width, control_height))) {
-                if (!actions_->save(state))
+                if (!guard_editor_operation([&] { return actions_->save(state); }))
                     static_cast<void>(model_->set_error("The preferences could not be saved. Please try again."));
             }
             ImGui::PopStyleColor(4);

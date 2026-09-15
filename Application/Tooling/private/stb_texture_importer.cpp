@@ -44,12 +44,14 @@ void write_u32(std::vector<std::byte>& bytes, size_t offset, uint32_t value) {
 }
 }  // namespace
 
-bool StbTextureImporter::supports(const std::filesystem::path& source) const noexcept {
+bool StbTextureImporter::supports(const std::filesystem::path& source) const noexcept try {
     const std::string extension = lowercase_extension(source);
     constexpr std::array<std::string_view, 7> kExtensions{
         ".png", ".jpg", ".jpeg", ".tga", ".bmp", ".psd", ".hdr",
     };
     return std::find(kExtensions.begin(), kExtensions.end(), extension) != kExtensions.end();
+} catch (...) {
+    return false;
 }
 
 foundation::ResultValue<std::vector<CookedAsset>> StbTextureImporter::cook(const std::filesystem::path& source,

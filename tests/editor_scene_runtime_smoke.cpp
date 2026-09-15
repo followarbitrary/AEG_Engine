@@ -47,6 +47,10 @@ int main() {
     std::unique_ptr<aeg::rhi::Device> device = std::move(device_result.value);
 
     aeg::application::EditorSceneRuntime runtime;
+    if (!require(!runtime.save_scene_as("uninitialized.aegscene"),
+                 "Save As on an uninitialized runtime must return a failure")) {
+        return 13;
+    }
     if (!require(runtime.initialize(*device), "editor scene smoke runtime initialization failed") ||
         !require(runtime.request_viewport_extent(96, 64), "editor scene smoke viewport request failed") ||
         !require(runtime.entities().size() == 4, "editor scene smoke default scene entity count is invalid")) {

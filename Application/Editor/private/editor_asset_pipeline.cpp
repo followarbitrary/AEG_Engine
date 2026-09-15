@@ -198,7 +198,6 @@ template <typename T>
     output.asset_id = record.id;
     output.source_hash = record.content_hash;
     output.kind = record.kind;
-    output.success = true;
     output.from_baked_format = true;
     std::size_t offset = sizeof(BakedHeader);
     const std::span<const std::byte> payload = std::span<const std::byte>(bytes).subspan(offset);
@@ -209,8 +208,11 @@ template <typename T>
         }
         uint64_t vertex_bytes = 0;
         uint64_t index_bytes = 0;
-        if (!checked_size(mesh.vertex_stride, mesh.vertex_count, vertex_bytes) ||
+        if ((mesh.index_width != sizeof(uint16_t) && mesh.index_width != sizeof(uint32_t)) ||
+            !checked_size(mesh.vertex_stride, mesh.vertex_count, vertex_bytes) ||
             !checked_size(mesh.index_width, mesh.index_count, index_bytes) ||
+            vertex_bytes > std::numeric_limits<uint64_t>::max() - index_bytes ||
+            sizeof(MeshHeader) > std::numeric_limits<uint64_t>::max() - vertex_bytes - index_bytes ||
             sizeof(MeshHeader) + vertex_bytes + index_bytes != payload.size()) {
             return foundation::invalid_argument("AEG mesh payload sizes are invalid");
         }
@@ -248,6 +250,7 @@ template <typename T>
     } else if (record.kind == EditorAssetKind::kFont) {
         output.font_data.assign(payload.begin(), payload.end());
     }
+    output.success = true;
     return Result::success();
 }
 
@@ -651,25 +654,47 @@ foundation::Result EditorAssetPipeline::request_reimport(uint64_t asset_id) {
 }
 
 foundation::Result EditorAssetPipeline::load_fast_path(uint64_t asset_id, CpuAsset& output) const {
-    EditorAssetRecord record{};
-    {
-        std::scoped_lock lock(mutex_);
-        const auto found = std::find_if(records_.begin(), records_.end(),
-                                        [asset_id](const EditorAssetRecord& value) { return value.id == asset_id; });
-        if (found == records_.end()) {
-            return foundation::not_found("Asset ID is not present in the import pipeline");
+    try {
+        EditorAssetRecord record{};
+        {
+            std::scoped_lock lock(mutex_);
+            const auto found = std::find_if(records_.begin(), records_.end(),
+                                            [asset_id](const EditorAssetRecord& value) { return value.id == asset_id; });
+            if (found == records_.end()) {
+                return foundation::not_found("Asset ID is not present in the import pipeline");
+            }
+            record = *found;
         }
-        record = *found;
+        return decode_record(project_root_, derived_root_, record, output, true);
+    } catch (const std::bad_alloc&) {
+        output = {};
+        return foundation::out_of_memory("Asset fast-path loading allocation failed");
+    } catch (const std::exception& exception) {
+        output = {};
+        return foundation::unknown_exception(exception);
+    } catch (...) {
+        output = {};
+        return foundation::Result::failure(ResultCode::kUnknown);
     }
-    return decode_record(project_root_, derived_root_, record, output, true);
 }
 
 foundation::Result EditorAssetPipeline::poll(std::vector<CpuAsset>& completed) {
-    std::scoped_lock lock(mutex_);
-    completed.insert(completed.end(), std::make_move_iterator(completed_.begin()),
-                     std::make_move_iterator(completed_.end()));
-    completed_.clear();
-    return Result::success();
+    if (background_failure_.exchange(false)) {
+        return Result::failure(ResultCode::kUnknown, "Editor asset background task failed");
+    }
+    try {
+        std::scoped_lock lock(mutex_);
+        completed.insert(completed.end(), std::make_move_iterator(completed_.begin()),
+                         std::make_move_iterator(completed_.end()));
+        completed_.clear();
+        return Result::success();
+    } catch (const std::bad_alloc&) {
+        return foundation::out_of_memory("Asset completion queue allocation failed");
+    } catch (const std::exception& exception) {
+        return foundation::unknown_exception(exception);
+    } catch (...) {
+        return Result::failure(ResultCode::kUnknown);
+    }
 }
 
 void EditorAssetPipeline::shutdown() noexcept {
@@ -689,6 +714,7 @@ void EditorAssetPipeline::shutdown() noexcept {
 
 void EditorAssetPipeline::worker_loop() {
     while (!stopping_) {
+      try {
         WorkItem item{};
         {
             std::unique_lock lock(mutex_);
@@ -745,11 +771,15 @@ void EditorAssetPipeline::worker_loop() {
             std::scoped_lock lock(mutex_);
             completed_.push_back(std::move(asset));
         }
+      } catch (...) {
+        background_failure_.store(true);
+      }
     }
 }
 
 void EditorAssetPipeline::watcher_loop() {
     while (!stopping_) {
+      try {
         std::this_thread::sleep_for(std::chrono::milliseconds(120));
         if (stopping_) {
             return;
@@ -786,6 +816,9 @@ void EditorAssetPipeline::watcher_loop() {
         for (const EditorAssetRecord& record : changed) {
             static_cast<void>(queue_record(record, true));
         }
+      } catch (...) {
+        background_failure_.store(true);
+      }
     }
 }
 

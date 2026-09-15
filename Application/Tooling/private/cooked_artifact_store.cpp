@@ -229,6 +229,10 @@ foundation::ResultValue<CookedArtifactBundle> CookedArtifactStore::load_current(
             !std::getline(stream, file_line)) {
             return {foundation::invalid_argument("cooked bundle manifest is truncated"), {}};
         }
+        if (!id_line.starts_with("id = \"") || !id_line.ends_with("\"") ||
+            !kind_line.starts_with("kind = \"") || !kind_line.ends_with("\"")) {
+            return {foundation::invalid_argument("cooked bundle manifest contains invalid artifact metadata"), {}};
+        }
         const auto id_text = id_line.substr(6, id_line.size() - 7);
         const auto kind_text = kind_line.substr(8, kind_line.size() - 9);
         const auto parsed_id = AssetId::parse(id_text);

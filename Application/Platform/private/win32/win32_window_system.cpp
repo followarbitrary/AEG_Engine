@@ -6,6 +6,7 @@
 
 #include <shobjidl.h>
 #include <windows.h>
+#include <wrl/client.h>
 
 #include <algorithm>
 #include <bit>
@@ -20,7 +21,39 @@
 #include <utility>
 
 #include "application_platform.hpp"
+#include "win32_clipboard_text.hpp"
 #include "win32_window.hpp"
+
+namespace {
+[[nodiscard]] aeg::foundation::Result exception_result(const std::exception& exception) noexcept {
+    try {
+        return aeg::foundation::unknown_exception(exception);
+    } catch (...) {
+        return aeg::foundation::Result::failure(aeg::foundation::ResultCode::kUnknown);
+    }
+}
+
+struct ClipboardCloser final {
+    ~ClipboardCloser() { CloseClipboard(); }
+};
+
+struct ClipboardUnlocker final {
+    HGLOBAL handle{};
+    ~ClipboardUnlocker() { GlobalUnlock(handle); }
+};
+
+struct GlobalMemoryDeleter final {
+    void operator()(void* memory) const noexcept { GlobalFree(memory); }
+};
+
+struct ComApartmentCloser final {
+    ~ComApartmentCloser() { CoUninitialize(); }
+};
+
+struct ComMemoryDeleter final {
+    void operator()(wchar_t* memory) const noexcept { CoTaskMemFree(memory); }
+};
+}  // namespace
 
 namespace aeg::application::win32 {
 namespace {
@@ -154,10 +187,16 @@ foundation::ResultValue<std::shared_ptr<platform::IWindow>> Win32WindowSystem::c
         if (AdjustWindowRectEx(&client_rect, window_style(desc), FALSE, 0) == FALSE) {
             return {backend_error("AdjustWindowRectEx failed"), {}};
         }
+        const int64_t native_width = static_cast<int64_t>(client_rect.right) - client_rect.left;
+        const int64_t native_height = static_cast<int64_t>(client_rect.bottom) - client_rect.top;
+        if (native_width <= 0 || native_height <= 0 || native_width > std::numeric_limits<int>::max() ||
+            native_height > std::numeric_limits<int>::max()) {
+            return {foundation::invalid_argument("Window extent including its frame exceeds Win32 limits"), {}};
+        }
         const int x = desc.position_specified ? desc.position.x : CW_USEDEFAULT;
         const int y = desc.position_specified ? desc.position.y : CW_USEDEFAULT;
         HWND handle = CreateWindowExW(0, kWindowClassName, title_result.value.c_str(), window_style(desc), x, y,
-                                      client_rect.right - client_rect.left, client_rect.bottom - client_rect.top,
+                                      static_cast<int>(native_width), static_cast<int>(native_height),
                                       nullptr, nullptr, instance_, window.get());
         if (handle == nullptr) {
             return {backend_error("CreateWindowExW failed"), {}};
@@ -186,6 +225,7 @@ foundation::Result Win32WindowSystem::destroy_window(platform::WindowId window) 
     if (slot.window == nullptr || slot.generation != window.generation) {
         return foundation::not_found("Win32 window identity is stale");
     }
+    slot.window->detach_owner();
     slot.window->destroy_native();
     slot.window.reset();
     ++slot.generation;
@@ -196,10 +236,10 @@ foundation::Result Win32WindowSystem::destroy_window(platform::WindowId window) 
 }
 
 foundation::Result Win32WindowSystem::poll_events(const platform::WindowEventSink& sink) {
-    if (!sink) {
-        return foundation::invalid_argument("Window event sink must not be empty");
-    }
     try {
+        if (!sink) {
+            return foundation::invalid_argument("Window event sink must not be empty");
+        }
         MSG message{};
         while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE) != FALSE) {
             if (message.message == WM_QUIT) {
@@ -220,9 +260,11 @@ foundation::Result Win32WindowSystem::poll_events(const platform::WindowEventSin
         }
         return foundation::Result::success();
     } catch (const std::bad_alloc&) {
-        return foundation::out_of_memory("Win32 window event polling allocation failed");
+        return foundation::Result::failure(foundation::ResultCode::kOutOfMemory);
     } catch (const std::exception& exception) {
-        return foundation::unknown_exception(exception);
+        return exception_result(exception);
+    } catch (...) {
+        return foundation::Result::failure(foundation::ResultCode::kUnknown);
     }
 }
 
@@ -243,29 +285,39 @@ foundation::ResultValue<std::shared_ptr<platform::IWindow>> Win32WindowSystem::f
 }
 
 foundation::ResultValue<std::string> Win32WindowSystem::get_clipboard_text() const {
-    if (OpenClipboard(nullptr) == FALSE) {
-        return {backend_error("OpenClipboard failed"), {}};
+    try {
+        if (OpenClipboard(nullptr) == FALSE) {
+            return {backend_error("OpenClipboard failed"), {}};
+        }
+        const ClipboardCloser clipboard_closer{};
+        const HANDLE data = GetClipboardData(CF_UNICODETEXT);
+        if (data == nullptr) {
+            return {foundation::Result::success(), {}};
+        }
+        const SIZE_T allocation_size = GlobalSize(data);
+        if (allocation_size < sizeof(wchar_t) || allocation_size % sizeof(wchar_t) != 0) {
+            return {foundation::invalid_argument("Clipboard text storage is invalid"), {}};
+        }
+        const auto* text = static_cast<const wchar_t*>(GlobalLock(data));
+        if (text == nullptr) {
+            return {backend_error("GlobalLock for clipboard text failed"), {}};
+        }
+        const ClipboardUnlocker clipboard_unlocker{data};
+        const auto value = clipboard_text_view({text, allocation_size / sizeof(wchar_t)});
+        if (!value) {
+            return {value.result, {}};
+        }
+        return convert_wide_to_utf8(value.value);
+    } catch (const std::bad_alloc&) {
+        return {foundation::Result::failure(foundation::ResultCode::kOutOfMemory), {}};
+    } catch (const std::exception& exception) {
+        return {exception_result(exception), {}};
+    } catch (...) {
+        return {foundation::Result::failure(foundation::ResultCode::kUnknown), {}};
     }
-
-    const HANDLE data = GetClipboardData(CF_UNICODETEXT);
-    if (data == nullptr) {
-        CloseClipboard();
-        return {foundation::Result::success(), {}};
-    }
-
-    const auto* text = static_cast<const wchar_t*>(GlobalLock(data));
-    if (text == nullptr) {
-        CloseClipboard();
-        return {backend_error("GlobalLock for clipboard text failed"), {}};
-    }
-    const std::wstring_view value{text, static_cast<std::size_t>(lstrlenW(text))};
-    const foundation::ResultValue<std::string> result = convert_wide_to_utf8(value);
-    GlobalUnlock(data);
-    CloseClipboard();
-    return result;
 }
 
-foundation::Result Win32WindowSystem::set_clipboard_text(std::string_view text) {
+foundation::Result Win32WindowSystem::set_clipboard_text(std::string_view text) try {
     if (text.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
         return foundation::invalid_argument("Clipboard text is too large");
     }
@@ -281,33 +333,36 @@ foundation::Result Win32WindowSystem::set_clipboard_text(std::string_view text) 
     if (OpenClipboard(nullptr) == FALSE) {
         return backend_error("OpenClipboard failed");
     }
+    const ClipboardCloser clipboard_closer{};
     if (EmptyClipboard() == FALSE) {
-        CloseClipboard();
         return backend_error("EmptyClipboard failed");
     }
 
     const SIZE_T allocation_size = (wide_text.size() + 1u) * sizeof(wchar_t);
-    HGLOBAL allocation = GlobalAlloc(GMEM_MOVEABLE, allocation_size);
+    std::unique_ptr<void, GlobalMemoryDeleter> allocation{GlobalAlloc(GMEM_MOVEABLE, allocation_size)};
     if (allocation == nullptr) {
-        CloseClipboard();
         return foundation::out_of_memory("Clipboard text allocation failed");
     }
-    void* destination = GlobalLock(allocation);
-    if (destination == nullptr) {
-        GlobalFree(allocation);
-        CloseClipboard();
-        return backend_error("GlobalLock for clipboard text failed");
+    {
+        void* destination = GlobalLock(allocation.get());
+        if (destination == nullptr) {
+            return backend_error("GlobalLock for clipboard text failed");
+        }
+        const ClipboardUnlocker clipboard_unlocker{allocation.get()};
+        std::memcpy(destination, wide_text.c_str(), allocation_size);
     }
-    std::memcpy(destination, wide_text.c_str(), allocation_size);
-    GlobalUnlock(allocation);
 
-    if (SetClipboardData(CF_UNICODETEXT, allocation) == nullptr) {
-        GlobalFree(allocation);
-        CloseClipboard();
+    if (SetClipboardData(CF_UNICODETEXT, allocation.get()) == nullptr) {
         return backend_error("SetClipboardData failed");
     }
-    CloseClipboard();
+    static_cast<void>(allocation.release());
     return foundation::Result::success();
+} catch (const std::bad_alloc&) {
+    return foundation::Result::failure(foundation::ResultCode::kOutOfMemory);
+} catch (const std::exception& exception) {
+    return exception_result(exception);
+} catch (...) {
+    return foundation::Result::failure(foundation::ResultCode::kUnknown);
 }
 
 foundation::Result Win32WindowSystem::set_cursor(platform::WindowId window, platform::CursorShape shape) noexcept {
@@ -513,7 +568,7 @@ foundation::Result show_error_dialog(std::string_view title, std::string_view me
 }
 
 foundation::ResultValue<std::string> select_directory(platform::WindowSurfaceBinding owner, std::string_view title,
-                                                      std::string_view initial_directory) {
+                                                      std::string_view initial_directory) try {
     if (title.empty() || title.find('\0') != std::string_view::npos ||
         initial_directory.find('\0') != std::string_view::npos ||
         title.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
@@ -580,12 +635,12 @@ foundation::ResultValue<std::string> select_directory(platform::WindowSurfaceBin
     if (FAILED(initialize_result)) {
         return backend_failure("Directory picker COM initialization failed");
     }
+    const ComApartmentCloser apartment_closer{};
 
-    IFileOpenDialog* dialog = nullptr;
+    Microsoft::WRL::ComPtr<IFileOpenDialog> dialog;
     HRESULT result = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_IFileOpenDialog,
-                                      reinterpret_cast<void**>(&dialog));
+                                      reinterpret_cast<void**>(dialog.GetAddressOf()));
     if (FAILED(result) || dialog == nullptr) {
-        CoUninitialize();
         return backend_failure("Directory picker creation failed");
     }
 
@@ -609,12 +664,11 @@ foundation::ResultValue<std::string> select_directory(platform::WindowSurfaceBin
             initial_path = parent;
         }
         if (!initial_path.empty()) {
-            IShellItem* initial_item = nullptr;
+            Microsoft::WRL::ComPtr<IShellItem> initial_item;
             if (SUCCEEDED(SHCreateItemFromParsingName(initial_path.c_str(), nullptr, IID_IShellItem,
-                                                      reinterpret_cast<void**>(&initial_item))) &&
+                                                      reinterpret_cast<void**>(initial_item.GetAddressOf()))) &&
                 initial_item != nullptr) {
-                static_cast<void>(dialog->SetFolder(initial_item));
-                initial_item->Release();
+                static_cast<void>(dialog->SetFolder(initial_item.Get()));
             }
         }
     }
@@ -623,34 +677,29 @@ foundation::ResultValue<std::string> select_directory(platform::WindowSurfaceBin
         result = dialog->Show(static_cast<HWND>(owner.window_handle));
     }
     if (result == HRESULT_FROM_WIN32(ERROR_CANCELLED)) {
-        dialog->Release();
-        CoUninitialize();
         return {foundation::Result::failure(foundation::ResultCode::kCancelled, "Directory selection was cancelled"),
                 {}};
     }
     if (FAILED(result)) {
-        dialog->Release();
-        CoUninitialize();
         return backend_failure("Directory picker could not be shown");
     }
 
-    IShellItem* selected_item = nullptr;
-    result = dialog->GetResult(&selected_item);
+    Microsoft::WRL::ComPtr<IShellItem> selected_item;
+    result = dialog->GetResult(selected_item.GetAddressOf());
     PWSTR selected_path = nullptr;
     if (SUCCEEDED(result) && selected_item != nullptr) {
         result = selected_item->GetDisplayName(SIGDN_FILESYSPATH, &selected_path);
     }
+    const std::unique_ptr<wchar_t, ComMemoryDeleter> selected_path_owner{selected_path};
 
-    foundation::ResultValue<std::string> selected_result =
-        FAILED(result) || selected_path == nullptr
-            ? backend_failure("Directory picker did not return a filesystem path")
-            : to_utf8(selected_path);
-    if (selected_path != nullptr)
-        CoTaskMemFree(selected_path);
-    if (selected_item != nullptr)
-        selected_item->Release();
-    dialog->Release();
-    CoUninitialize();
-    return selected_result;
+    return FAILED(result) || selected_path == nullptr
+               ? backend_failure("Directory picker did not return a filesystem path")
+               : to_utf8(selected_path);
+} catch (const std::bad_alloc&) {
+    return {foundation::Result::failure(foundation::ResultCode::kOutOfMemory), {}};
+} catch (const std::exception& exception) {
+    return {exception_result(exception), {}};
+} catch (...) {
+    return {foundation::Result::failure(foundation::ResultCode::kUnknown), {}};
 }
 }  // namespace aeg::application

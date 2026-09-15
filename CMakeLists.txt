@@ -547,10 +547,17 @@ if (WIN32)
     target_compile_definitions(aeg_editor_workspace_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
+add_executable(aeg_editor_font_validation_smoke
+    tests/editor_font_validation_smoke.cpp
+)
+target_link_libraries(aeg_editor_font_validation_smoke PRIVATE aeg_editor_framework)
+
 if (WIN32)
     add_executable(aeg_editor_font_smoke
         tests/editor_font_smoke.cpp
+        Application/Editor/private/font/editor_system_font_catalog.cpp
     )
+    target_include_directories(aeg_editor_font_smoke PRIVATE Application/Editor/private)
     target_link_libraries(aeg_editor_font_smoke PRIVATE aeg_editor_framework aeg_application_platform)
     target_compile_definitions(aeg_editor_font_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
@@ -1100,6 +1107,8 @@ target_compile_definitions(aeg_editor_assets PUBLIC
     AEG_ENGINE_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
 )
 target_link_libraries(aeg_editor_assets PUBLIC aeg_foundation aeg_application_project)
+add_executable(aeg_editor_asset_pipeline_recovery_smoke tests/editor_asset_pipeline_recovery_smoke.cpp)
+target_link_libraries(aeg_editor_asset_pipeline_recovery_smoke PRIVATE aeg_editor_assets)
 if (MSVC)
     target_compile_options(aeg_editor_assets PRIVATE /W4 /permissive-)
 else()
@@ -1596,6 +1605,8 @@ if (BUILD_TESTING)
     add_test(NAME aeg_editor_workspace_smoke COMMAND aeg_editor_workspace_smoke)
     add_test(NAME aeg_editor_preferences_smoke COMMAND aeg_editor_preferences_smoke)
     add_test(NAME aeg_editor_error_smoke COMMAND aeg_editor_error_smoke)
+    add_test(NAME aeg_editor_asset_pipeline_recovery_smoke COMMAND aeg_editor_asset_pipeline_recovery_smoke)
+    add_test(NAME aeg_editor_font_validation_smoke COMMAND aeg_editor_font_validation_smoke)
     if (WIN32)
         add_test(NAME aeg_editor_font_smoke COMMAND aeg_editor_font_smoke)
         add_test(NAME aeg_application_platform_win32_smoke COMMAND aeg_application_platform_win32_smoke)
@@ -1644,6 +1655,8 @@ if (BUILD_TESTING)
         add_test(NAME aeg_editor_application COMMAND aeg_editor_application --frames 60 --stress-resize)
         add_test(NAME aeg_editor_application_preferences
                  COMMAND aeg_editor_application --frames 60 --stress-resize --open-preferences)
+        add_test(NAME aeg_editor_application_missing_project
+                 COMMAND aeg_editor_application --frames 2 --project "${CMAKE_CURRENT_BINARY_DIR}/missing-recovery-project/project.aegproject")
         set_tests_properties(aeg_editor_imgui_renderer_smoke aeg_opaque_render_feature_smoke aeg_opaque_render_feature_multiframe_smoke aeg_opaque_render_feature_uv_depth_smoke aeg_editor_scene_runtime_smoke aeg_editor_external_assets_smoke aeg_editor_viewport_interaction_smoke aeg_editor_history_smoke aeg_editor_hierarchy_smoke aeg_editor_inspector_smoke aeg_editor_asset_database_smoke aeg_editor_project_smoke aeg_editor_application aeg_editor_application_preferences
             PROPERTIES
             FAIL_REGULAR_EXPRESSION "Vulkan validation \\[ERROR\\]"
@@ -1651,14 +1664,14 @@ if (BUILD_TESTING)
     endif()
     if (MINGW)
         get_filename_component(AEG_MINGW_RUNTIME_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
-        set_tests_properties(aeg_application_platform_win32_smoke aeg_editor_imgui_smoke aeg_editor_imgui_docking_smoke aeg_editor_imgui_viewport_smoke aeg_editor_layout_smoke aeg_editor_workspace_smoke aeg_editor_font_smoke aeg_editor_preferences_smoke aeg_editor_imgui_renderer_smoke aeg_math_smoke aeg_result_smoke aeg_reflection_smoke aeg_serialization_smoke
+        set_tests_properties(aeg_application_platform_win32_smoke aeg_editor_imgui_smoke aeg_editor_imgui_docking_smoke aeg_editor_imgui_viewport_smoke aeg_editor_layout_smoke aeg_editor_workspace_smoke aeg_editor_font_smoke aeg_editor_font_validation_smoke aeg_editor_preferences_smoke aeg_editor_imgui_renderer_smoke aeg_math_smoke aeg_result_smoke aeg_reflection_smoke aeg_serialization_smoke
                 aeg_concurrency_smoke aeg_ecs_smoke aeg_pipeline_smoke aeg_pipeline_extension_smoke
                 aeg_pipeline_conformance_smoke aeg_pipeline_runtime_smoke aeg_pipeline_hot_swap_smoke
                 aeg_pipeline_phase_scheduler_smoke aeg_module_smoke aeg_world_scope_smoke aeg_world_serialization_smoke
                 aeg_scene_asset_smoke aeg_world_frame_orchestrator_smoke aeg_world_multi_view_smoke
                 aeg_engine_frame_orchestrator_smoke aeg_runtime_components_scene_smoke aeg_runtime_component_orchestrator_smoke aeg_renderer_smoke aeg_opaque_render_feature_smoke aeg_opaque_render_feature_multiframe_smoke aeg_opaque_render_feature_uv_depth_smoke aeg_editor_scene_runtime_smoke aeg_editor_external_assets_smoke aeg_editor_viewport_interaction_smoke aeg_editor_history_smoke aeg_editor_hierarchy_smoke aeg_editor_inspector_smoke aeg_editor_asset_database_smoke aeg_editor_project_smoke aeg_render_feature_runtime_smoke
                 aeg_frame_retention_smoke aeg_rhi_smoke aeg_logging_smoke aeg_triangle aeg_editor_application_identity_smoke aeg_editor_application
-                aeg_editor_application_preferences aeg_editor_error_smoke aeg_render_graph_imported_texture_state_smoke PROPERTIES
+                aeg_editor_application_preferences aeg_editor_application_missing_project aeg_editor_error_smoke aeg_editor_asset_pipeline_recovery_smoke aeg_render_graph_imported_texture_state_smoke PROPERTIES
             ENVIRONMENT "PATH=${AEG_MINGW_RUNTIME_DIR};$ENV{PATH}"
         )
     endif()

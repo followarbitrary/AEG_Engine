@@ -3,6 +3,7 @@
  * @brief Implements the application-owned editor workspace orchestration.
  */
 #include "editor_workspace.hpp"
+#include "editor_error.hpp"
 #include "editor_toolbar.hpp"
 
 #include <imgui.h>
@@ -71,6 +72,7 @@ EditorWorkspace::EditorWorkspace(EditorImGuiHost& imgui_host) noexcept : imgui_h
 
 foundation::Result EditorWorkspace::register_panel(EditorPanelDescriptor descriptor,
                                                    std::unique_ptr<EditorPanel> panel) {
+    if (building_ui_) return foundation::invalid_state("Cannot register workspace panels during UI traversal");
     if (imgui_host_ == nullptr || !imgui_host_->is_initialized()) {
         return foundation::invalid_state("Editor workspace requires an initialized ImGui host");
     }
@@ -149,6 +151,7 @@ foundation::Result EditorWorkspace::register_panel(EditorPanelDescriptor descrip
 }
 
 foundation::Result EditorWorkspace::unregister_panel(std::string_view panel_key) {
+    if (building_ui_) return foundation::invalid_state("Cannot unregister workspace panels during UI traversal");
     PanelEntry* entry = find_panel(panel_key);
     if (entry == nullptr || layout_ == nullptr) {
         return foundation::not_found("Editor workspace panel key is not registered");
@@ -183,6 +186,7 @@ foundation::Result EditorWorkspace::set_panel_visible(std::string_view panel_key
 }
 
 foundation::Result EditorWorkspace::register_view_action(EditorWorkspaceActionDescriptor descriptor) {
+    if (building_ui_) return foundation::invalid_state("Cannot register workspace actions during UI traversal");
     if (!descriptor.is_valid()) {
         return foundation::invalid_argument("Editor workspace action descriptor is incomplete");
     }
@@ -202,16 +206,33 @@ foundation::Result EditorWorkspace::invoke_view_action(std::string_view action_k
     if (action == nullptr) {
         return foundation::not_found("Editor workspace View action key is not registered");
     }
-    try {
-        return action->callback();
-    } catch (const std::bad_alloc&) {
-        return foundation::out_of_memory("Editor workspace action callback allocation failed");
-    } catch (const std::exception& exception) {
-        return foundation::unknown_exception(exception);
-    } catch (...) {
-        return foundation::Result::failure(foundation::ResultCode::kUnknown,
-                                            "Editor workspace action callback threw an unknown exception");
-    }
+    ImGuiContext* context = ImGui::GetCurrentContext();
+    const bool has_frame = context != nullptr && context->WithinFrameScope;
+    ImGuiWindow* owner_window = has_frame ? context->CurrentWindow : nullptr;
+    const bool owner_menu_bar = owner_window != nullptr && owner_window->DC.MenuBarAppending;
+    ImGuiErrorRecoveryState checkpoint{};
+    if (has_frame) ImGui::ErrorRecoveryStoreState(&checkpoint);
+    const auto result = guard_editor_operation([&] {
+        // A callback may register another action outside UI traversal.
+        const auto callback = action->callback;
+        return callback();
+    });
+    const auto recovery = guard_editor_operation([&] {
+        ImGui::SetCurrentContext(context);
+        if (has_frame) {
+            // ImGui's recovery also closes menu bars belonging to the current
+            // window. This bar belongs to the workspace, not the action.
+            struct MenuBarScope {
+                ImGuiWindow* window;
+                bool appending;
+                ~MenuBarScope() { window->DC.MenuBarAppending = appending; }
+            } menu_bar{owner_window, owner_menu_bar};
+            owner_window->DC.MenuBarAppending = false;
+            ImGui::ErrorRecoveryTryToRecoverState(&checkpoint);
+        }
+        return foundation::Result::success();
+    });
+    return result ? recovery : result;
 }
 
 foundation::Result EditorWorkspace::build_ui() {
@@ -221,6 +242,18 @@ foundation::Result EditorWorkspace::build_ui() {
     if (layout_ == nullptr) {
         return foundation::invalid_state("Editor workspace has no registered panels");
     }
+    if (building_ui_) return foundation::invalid_state("Cannot recursively build the editor workspace");
+    struct UiTraversalScope {
+        bool& active;
+        explicit UiTraversalScope(bool& value) : active(value) { active = true; }
+        ~UiTraversalScope() { active = false; }
+    } traversal(building_ui_);
+    return guard_editor_operation([&]() -> foundation::Result {
+    foundation::Result action_result;
+    const auto invoke_action = [&](std::string_view key) {
+        const auto result = invoke_view_action(key);
+        if (!result && action_result) action_result = result;
+    };
     if (ImGui::BeginMainMenuBar()) {
         const float controls_width = ImGui::CalcTextSize("PlayPauseStopBuildView").x + 230.0f;
         const float search_width = std::clamp(ImGui::GetWindowWidth() - ImGui::GetCursorPosX() - controls_width, 0.0f, 300.0f);
@@ -234,16 +267,16 @@ foundation::Result EditorWorkspace::build_ui() {
         ImGui::SameLine();
         }
         if (toolbar_button("Play", "Start or resume the game preview.", ToolbarIcon::Play, true)) {
-            if (find_view_action("play")) static_cast<void>(invoke_view_action("play"));
+            if (find_view_action("play")) invoke_action("play");
         }
         ImGui::SameLine();
         ImGui::BeginDisabled(!playing_);
         if (toolbar_button("Pause", "Pause the running game preview.", ToolbarIcon::Pause)) {
-            if (find_view_action("pause")) static_cast<void>(invoke_view_action("pause"));
+            if (find_view_action("pause")) invoke_action("pause");
         }
         ImGui::SameLine();
         if (toolbar_button("Stop", "Stop preview and return to the editable scene.", ToolbarIcon::Stop)) {
-            if (find_view_action("stop")) static_cast<void>(invoke_view_action("stop"));
+            if (find_view_action("stop")) invoke_action("stop");
         }
         ImGui::EndDisabled();
         ImGui::SameLine();
@@ -251,7 +284,7 @@ foundation::Result EditorWorkspace::build_ui() {
         if(ImGui::BeginPopup("BuildActions")) {
             for (const char* key : {"refresh_assets","rebuild_pipeline"}) {
                 const auto* action=find_view_action(key);
-                if(action && ImGui::MenuItem(action->title.c_str())) static_cast<void>(invoke_view_action(key));
+                if(action && ImGui::MenuItem(action->title.c_str())) invoke_action(key);
             }
             ImGui::EndPopup();
         }
@@ -271,7 +304,6 @@ foundation::Result EditorWorkspace::build_ui() {
                 }
                 if (ImGui::MenuItem(entry.descriptor.title.c_str(), nullptr, &visible) && entry.descriptor.closable) {
                     if (const foundation::Result result = set_panel_visible(entry.descriptor.key, visible); !result) {
-                        ImGui::EndDisabled();
                         ImGui::EndMenu();
                         ImGui::EndMainMenuBar();
                         return result;
@@ -325,7 +357,7 @@ foundation::Result EditorWorkspace::build_ui() {
             if (settings_active) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4{0.07f, 0.25f, 0.22f, 1.0f});
             if (editor_rail_button("Settings", settings_active)) {
                 const auto action = find_view_action("preferences");
-                if (action != nullptr) static_cast<void>(invoke_view_action(action->key));
+                if (action != nullptr) invoke_action(action->key);
             }
             if (settings_active) ImGui::PopStyleColor();
             ImGui::PopStyleVar();
@@ -363,7 +395,8 @@ foundation::Result EditorWorkspace::build_ui() {
         }
         ImGui::End();
     }
-    return foundation::Result::success();
+    return action_result;
+    });
 }
 
 foundation::Result EditorWorkspace::serialize_layout(std::string& serialized) const {

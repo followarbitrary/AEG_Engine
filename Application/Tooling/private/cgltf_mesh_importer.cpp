@@ -8,6 +8,7 @@
 #include <array>
 #include <cctype>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -54,15 +55,42 @@ void write_float(std::vector<std::byte>& bytes, size_t offset, float value) {
     }
     return nullptr;
 }
+
+[[nodiscard]] bool buffers_are_bounded(const cgltf_data& data) noexcept {
+    for (cgltf_size index = 0; index < data.buffer_views_count; ++index) {
+        const auto& view = data.buffer_views[index];
+        if (view.buffer == nullptr || view.offset > view.buffer->size || view.size > view.buffer->size - view.offset ||
+            view.has_meshopt_compression) {
+            return false;
+        }
+    }
+    for (cgltf_size index = 0; index < data.accessors_count; ++index) {
+        const auto& accessor = data.accessors[index];
+        const cgltf_size element = cgltf_calc_size(accessor.type, accessor.component_type);
+        // Sparse data is not supported by the accessor readers used below.
+        if (accessor.is_sparse || accessor.count == 0 || element == 0 || accessor.stride < element) {
+            return false;
+        }
+        if (const auto* view = accessor.buffer_view; view != nullptr) {
+            if (accessor.offset > view->size || element > view->size - accessor.offset ||
+                accessor.count - 1 > (view->size - accessor.offset - element) / accessor.stride) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
 }  // namespace
 
-bool CgltfMeshImporter::supports(const std::filesystem::path& source) const noexcept {
+bool CgltfMeshImporter::supports(const std::filesystem::path& source) const noexcept try {
     const std::string extension = lowercase_extension(source);
     return extension == ".gltf" || extension == ".glb";
+} catch (...) {
+    return false;
 }
 
 foundation::ResultValue<std::vector<CookedAsset>> CgltfMeshImporter::cook(const std::filesystem::path& source,
-                                                                          const AssetMeta& meta) const {
+                                                                          const AssetMeta& meta) const try {
     cgltf_options options{};
     cgltf_data* raw_data = nullptr;
     if (cgltf_parse_file(&options, source.string().c_str(), &raw_data) != cgltf_result_success || raw_data == nullptr) {
@@ -71,6 +99,9 @@ foundation::ResultValue<std::vector<CookedAsset>> CgltfMeshImporter::cook(const 
     const std::unique_ptr<cgltf_data, decltype(&cgltf_free)> data(raw_data, cgltf_free);
     if (cgltf_load_buffers(&options, raw_data, source.string().c_str()) != cgltf_result_success) {
         return {foundation::invalid_argument("cgltf could not load mesh buffers"), {}};
+    }
+    if (!buffers_are_bounded(*raw_data) || cgltf_validate(raw_data) != cgltf_result_success) {
+        return {foundation::invalid_argument("glTF buffer ranges or primitive attributes are invalid or unsupported"), {}};
     }
 
     std::vector<const cgltf_primitive*> primitives;
@@ -101,7 +132,10 @@ foundation::ResultValue<std::vector<CookedAsset>> CgltfMeshImporter::cook(const 
         const cgltf_accessor* positions = find_accessor(primitive, cgltf_attribute_type_position);
         const cgltf_accessor* normals = find_accessor(primitive, cgltf_attribute_type_normal);
         const cgltf_accessor* texcoords = find_accessor(primitive, cgltf_attribute_type_texcoord);
-        if (positions == nullptr || positions->count == 0 || positions->count > UINT32_MAX) {
+        if (positions == nullptr || positions->buffer_view == nullptr || positions->type != cgltf_type_vec3 ||
+            positions->count == 0 || positions->count > UINT32_MAX ||
+            (normals != nullptr && (normals->type != cgltf_type_vec3 || normals->count != positions->count)) ||
+            (texcoords != nullptr && (texcoords->type != cgltf_type_vec2 || texcoords->count != positions->count))) {
             return {foundation::invalid_argument("glTF triangle primitive has invalid POSITION data"), {}};
         }
         const uint32_t vertex_count = static_cast<uint32_t>(positions->count);
@@ -110,8 +144,12 @@ foundation::ResultValue<std::vector<CookedAsset>> CgltfMeshImporter::cook(const 
         if (primitive.indices != nullptr && primitive.indices->count > UINT32_MAX) {
             return {foundation::invalid_argument("glTF triangle primitive has too many indices"), {}};
         }
-        std::vector<std::byte> payload(16U + static_cast<size_t>(vertex_count) * kMeshVertexStride +
-                                       static_cast<size_t>(index_count) * sizeof(uint32_t));
+        const uint64_t payload_size = 16ull + static_cast<uint64_t>(vertex_count) * kMeshVertexStride +
+                                     static_cast<uint64_t>(index_count) * sizeof(uint32_t);
+        if (index_count == 0 || index_count % 3 != 0 || payload_size > std::numeric_limits<std::size_t>::max()) {
+            return {foundation::invalid_argument("glTF triangle count or decoded mesh size is invalid"), {}};
+        }
+        std::vector<std::byte> payload(static_cast<std::size_t>(payload_size));
         write_u32(payload, 0, vertex_count);
         write_u32(payload, 4, index_count);
         write_u32(payload, 8, kMeshVertexStride);
@@ -123,11 +161,11 @@ foundation::ResultValue<std::vector<CookedAsset>> CgltfMeshImporter::cook(const 
             if (cgltf_accessor_read_float(positions, vertex, position.data(), position.size()) == 0) {
                 return {foundation::invalid_argument("cgltf could not read mesh position"), {}};
             }
-            if (normals != nullptr) {
-                static_cast<void>(cgltf_accessor_read_float(normals, vertex, normal.data(), normal.size()));
+            if (normals != nullptr && !cgltf_accessor_read_float(normals, vertex, normal.data(), normal.size())) {
+                return {foundation::invalid_argument("cgltf could not read mesh normal"), {}};
             }
-            if (texcoords != nullptr) {
-                static_cast<void>(cgltf_accessor_read_float(texcoords, vertex, texcoord.data(), texcoord.size()));
+            if (texcoords != nullptr && !cgltf_accessor_read_float(texcoords, vertex, texcoord.data(), texcoord.size())) {
+                return {foundation::invalid_argument("cgltf could not read mesh texcoord"), {}};
             }
             const size_t offset = 16U + static_cast<size_t>(vertex) * kMeshVertexStride;
             for (size_t component = 0; component < position.size(); ++component) {
@@ -154,5 +192,9 @@ foundation::ResultValue<std::vector<CookedAsset>> CgltfMeshImporter::cook(const 
             {products[primitive_index]->id, AssetKind::kMesh, kMeshPayloadSchemaVersion, {}, std::move(payload)});
     }
     return {{}, std::move(result)};
+} catch (const std::bad_alloc&) {
+    return {foundation::out_of_memory("Mesh import allocation failed"), {}};
+} catch (const std::exception& exception) {
+    return {foundation::unknown_exception(exception), {}};
 }
 }  // namespace aeg::tooling

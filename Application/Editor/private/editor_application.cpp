@@ -129,18 +129,23 @@ using aeg::rhi::SwapchainInfo;
 using aeg::rhi::TextureCapability;
 using aeg::rhi::TextureDesc;
 
-bool report_result(const Result& result, std::string_view operation) {
+// Bounded CLI runs must never wait behind a native error dialog.
+bool error_dialogs_enabled = true;
+
+bool report_result(const Result& result, std::string_view operation) noexcept {
     if (result) {
         return true;
     }
-    AEG_LOG_ERROR(aeg::logging::Category::kApplication, "Editor operation {} failed [{}]: {}", operation,
-                  aeg::foundation::result_code_name(result.code), result.message);
-    try {
-        static_cast<void>(aeg::application::show_error_dialog("Aether Engine Error",
-                                                              "The editor could not complete an initialization step."));
-    } catch (...) {
-        static_cast<void>(aeg::application::show_error_dialog("Aether Engine Error",
-                                                              "The editor could not complete an initialization step."));
+    static_cast<void>(aeg::editor::guard_editor_operation([&] {
+        AEG_LOG_ERROR(aeg::logging::Category::kApplication, "Editor operation {} failed [{}]: {}", operation,
+                      aeg::foundation::result_code_name(result.code), result.message);
+        return Result::success();
+    }));
+    if (error_dialogs_enabled) {
+        static_cast<void>(aeg::editor::guard_editor_operation([] {
+            return aeg::application::show_error_dialog("Aether Engine Error",
+                "The editor could not complete the requested operation. Details are available in the log.");
+        }));
     }
     return false;
 }
@@ -201,7 +206,9 @@ bool report_result(const aeg::foundation::ResultValue<T>& result, std::string_vi
 }
 
 std::filesystem::path editor_log_path() {
-    return std::filesystem::temp_directory_path() / "AEG-Engine" / "Editor" / "logs" / "aeg-editor.log";
+    std::error_code error;
+    const auto temporary = std::filesystem::temp_directory_path(error);
+    return error ? std::filesystem::path{} : temporary / "AEG-Engine" / "Editor" / "logs" / "aeg-editor.log";
 }
 
 struct ResourceDragPayload final {
@@ -2252,22 +2259,18 @@ public:
         startup_project_ = startup_project;
         const std::filesystem::path log_path = editor_log_path();
         std::error_code log_directory_error;
-        std::filesystem::create_directories(log_path.parent_path(), log_directory_error);
-        if (log_directory_error) {
-            static_cast<void>(aeg::application::show_error_dialog(
-                "Aether Engine Startup Failure",
-                "The editor could not create its log directory. Check the user data directory."));
-            return false;
-        }
+        if (!log_path.empty()) std::filesystem::create_directories(log_path.parent_path(), log_directory_error);
         aeg::logging::Config logging_config{};
-        logging_config.file_enabled = true;
+        logging_config.file_enabled = !log_path.empty() && !log_directory_error;
         logging_config.file_path = log_path;
-        const aeg::logging::Status logging_status = aeg::logging::initialize(logging_config);
+        aeg::logging::Status logging_status = aeg::logging::initialize(logging_config);
         if (!logging_status) {
-            static_cast<void>(aeg::application::show_error_dialog(
-                "Aether Engine Startup Failure",
-                "The editor could not initialize its log file. Check the user data directory."));
-            return false;
+            // An unavailable log file must not prevent the editor from opening.
+            logging_config.file_enabled = false;
+            logging_status = aeg::logging::initialize(logging_config);
+            if (!logging_status) {
+                return false;
+            }
         }
         aeg::application::StartupSplashDesc splash_desc{};
         splash_desc.image_path = resource_root_ / "branding" / "aether-engine-graph-mark.png";
@@ -2319,13 +2322,20 @@ public:
                 startup_project_ = bundled_demo;
             }
         }
-        if (!startup_project_.empty() &&
-            !report_result(scene_runtime_->import_project(startup_project_), "open_startup_project")) {
-            return false;
-        }
-        if (!startup_project_.empty() &&
-            !report_result(restore_pipeline_document(), "restore_startup_pipeline_document")) {
-            return false;
+        if (!startup_project_.empty()) {
+            const auto project_result = aeg::editor::guard_editor_operation([&] {
+                return scene_runtime_->import_project(startup_project_);
+            });
+            if (!project_result) {
+                notify_runtime_result(project_result, "open_startup_project");
+                if (fatal_runtime_error_) return false;
+            } else {
+                const auto pipeline_result = aeg::editor::guard_editor_operation([&] { return restore_pipeline_document(); });
+                if (!pipeline_result) {
+                    notify_runtime_result(pipeline_result, "restore_startup_pipeline_document");
+                    if (fatal_runtime_error_) return false;
+                }
+            }
         }
 
         const aeg::platform::WindowSurfaceBinding surface_binding = window_->surface_binding();
@@ -2351,12 +2361,15 @@ public:
         frame_context_ = std::make_unique<FrameContext>(*device_);
         render_graph_ = std::make_unique<RenderGraph>(*device_);
         texture_uploader_ = std::make_unique<TextureUploader>(*device_);
-        const auto system_font_result = EditorSystemFontCatalog{}.load();
-        if (!report_result(system_font_result, "load_system_fonts")) {
-            return false;
+        auto system_font_result = EditorSystemFontCatalog{}.load();
+        if (!system_font_result) {
+            notify_runtime_result(system_font_result.result, "load_system_fonts");
+            if (fatal_runtime_error_) return false;
+            // An empty catalog selects ImGui's embedded default font.
+        } else {
+            font_catalog_ = std::move(system_font_result.value.catalog);
+            default_font_key_ = std::move(system_font_result.value.default_font_key);
         }
-        font_catalog_ = std::move(system_font_result.value.catalog);
-        default_font_key_ = std::move(system_font_result.value.default_font_key);
 
         aeg::editor::EditorImGuiDesc imgui_desc{};
         imgui_desc.platform_services = &window_system_->platform_services();
@@ -2487,10 +2500,15 @@ public:
         preferences_regression_preview_requested_ = false;
         preferences_regression_preview_completed_ = false;
         preferences_open_requested_ = open_preferences_regression;
+        uint32_t attempted_frames = 0;
         while (!close_requested() && !console_interrupt.interrupted()) {
-            if (frame_limit != 0 && frame_count_ >= frame_limit) {
+          try {
+            // A bounded automated run must finish even when every attempted
+            // frame reports a recoverable error before it can be presented.
+            if (frame_limit != 0 && attempted_frames >= frame_limit) {
                 break;
             }
+            ++attempted_frames;
 
             Result event_result = Result::success();
             const Result poll_result = window_system_->poll_events([this, &event_result](const WindowEvent& event) {
@@ -2719,7 +2737,7 @@ public:
             const Result build_workspace_result = workspace_.build_ui();
             if (!build_workspace_result) {
                 notify_runtime_result(build_workspace_result, "build_editor_workspace");
-                static_cast<void>(imgui_host_.end_frame());
+                static_cast<void>(imgui_host_.abort_frame());
                 finish_input_frame();
                 if (fatal_runtime_error_) {
                     return 1;
@@ -2820,6 +2838,23 @@ public:
             if (!process_pending_preference()) {
                 return 1;
             }
+          } catch (...) {
+            // A user action or platform callback may throw after opening UI
+            // scopes. Discard that frame before the next iteration can render.
+            const Result failure = aeg::editor::guard_editor_operation([]() -> Result { throw; });
+            static_cast<void>(imgui_host_.abort_frame());
+            static_cast<void>(preferences_imgui_host_.abort_frame());
+            input_system_.end_frame();
+            for (FrameContext* frame : {frame_context_.get(), preferences_frame_context_.get()}) {
+                if (frame != nullptr && frame->is_frame_active()) {
+                    const auto abort_result = aeg::editor::guard_editor_operation([&] { return frame->abort_frame(); });
+                    if (!abort_result) notify_runtime_result(abort_result, "abort_interrupted_frame");
+                }
+            }
+            notify_runtime_result(failure, "editor_operation_exception");
+            if (fatal_runtime_error_ || regression_mode_) return 1;
+            std::this_thread::sleep_for(std::chrono::milliseconds(16));
+          }
         }
         if (preferences_regression_mode_ &&
             (!preferences_regression_opened_ || !preferences_regression_closed_ || !preferences_regression_reopened_ ||
@@ -3409,19 +3444,22 @@ private:
 
     /** @brief Routes one runtime failure to the editor notification or fatal fallback. */
     void notify_runtime_result(const Result& result, std::string_view operation) noexcept {
-        if (result) {
+        if (result || result.code == ResultCode::kCancelled) {
             return;
         }
-        AEG_LOG_ERROR(aeg::logging::Category::kApplication, "Editor operation {} failed [{}]: {}", operation,
-                      aeg::foundation::result_code_name(result.code), result.message);
+        const EditorErrorSeverity severity = aeg::editor::editor_error_severity(result.code);
+        fatal_runtime_error_ = fatal_runtime_error_ || severity == EditorErrorSeverity::kFatal;
+        static_cast<void>(aeg::editor::guard_editor_operation([&] {
+            AEG_LOG_ERROR(aeg::logging::Category::kApplication, "Editor operation {} failed [{}]: {}", operation,
+                          aeg::foundation::result_code_name(result.code), result.message);
+            return Result::success();
+        }));
         // Automated editor runs must fail deterministically instead of waiting
         // behind a native modal error dialog.
         if (regression_mode_) {
             fatal_runtime_error_ = true;
             return;
         }
-        const EditorErrorSeverity severity =
-            is_fatal_runtime_error(result.code) ? EditorErrorSeverity::kFatal : EditorErrorSeverity::kRecoverable;
         if (severity == EditorErrorSeverity::kFatal) {
             static_cast<void>(report_result(result, operation));
             fatal_runtime_error_ = true;
@@ -3430,34 +3468,18 @@ private:
         const Result notification_result = error_state_.report(operation, result, severity);
         if (!notification_result) {
             static_cast<void>(report_result(notification_result, "report_editor_error"));
-            fatal_runtime_error_ = true;
             return;
         }
         if (!error_state_.consume_notification_request()) {
             return;
         }
-        const EditorErrorNotice* notice = error_state_.pending();
-        if (notice == nullptr) {
+        if (!error_dialogs_enabled || error_state_.pending() == nullptr) {
             return;
         }
-        try {
-            std::string message;
-            message.reserve(notice->operation.size() + notice->message.size() + 96u);
-            message.append("The editor could not complete the requested operation.");
-            if (notice->occurrence_count > 1) {
-                message.append("\nOccurrences: ");
-                message.append(std::to_string(notice->occurrence_count));
-            }
-            static_cast<void>(aeg::application::show_error_dialog("Aether Engine Error", message));
-        } catch (...) {
-            static_cast<void>(aeg::application::show_error_dialog(
-                "Aether Engine Error", "The editor could not display a runtime error notification."));
-        }
-    }
-
-    /** @brief Identifies runtime failures that cannot be recovered by another frame. */
-    [[nodiscard]] static bool is_fatal_runtime_error(ResultCode code) noexcept {
-        return code == ResultCode::kDeviceLost || code == ResultCode::kOutOfMemory;
+        static_cast<void>(aeg::editor::guard_editor_operation([] {
+            return aeg::application::show_error_dialog("Aether Engine Error",
+                "The editor could not complete the requested operation. Details are available in the log.");
+        }));
     }
 
     /** @brief Sizes and places one hidden window relative to its nearest display work area. */
@@ -3789,7 +3811,7 @@ private:
         }
         imgui_frame_active = true;
         if (const Result result = preferences_imgui_host_.build_panels(); !result) {
-            static_cast<void>(preferences_imgui_host_.end_frame());
+            static_cast<void>(preferences_imgui_host_.abort_frame());
             return result;
         }
         if (const Result result = preferences_imgui_host_.end_frame(); !result) {
@@ -3988,7 +4010,7 @@ private:
                 notify_runtime_result(preview_result, "preview_editor_font");
                 if (preference_model_ != nullptr) {
                     static_cast<void>(
-                        preference_model_->set_error("The font preview could not be updated. Please try again."));
+                        preference_model_->set_error("This font could not be previewed. The previous font has been kept."));
                 }
                 return !fatal_runtime_error_;
             }
@@ -4011,16 +4033,13 @@ private:
         Result set_font_result = imgui_host_.set_font(request.font_key, request.font_size_pixels);
         if (!set_font_result) {
             notify_runtime_result(set_font_result, "set_editor_font");
-            const Result restore_result = restore_editor_font(previous_font_key, previous_font_size);
-            if (!restore_result) {
-                static_cast<void>(report_result(restore_result, "restore_editor_font"));
-                fatal_runtime_error_ = true;
-                return false;
-            }
+            // The host commits only complete atlases; a rejected font leaves the
+            // active font and GPU texture intact, so no recovery rebuild is needed.
             if (preference_model_ != nullptr) {
-                static_cast<void>(preference_model_->set_error("The selected editor font could not be loaded."));
+                static_cast<void>(preference_model_->set_error(
+                    "The selected font could not be loaded. The current font has been kept."));
             }
-            return true;
+            return !fatal_runtime_error_;
         }
 
         const Result refresh_result = refresh_font_texture();
@@ -4828,17 +4847,23 @@ bool has_argument(int argc, char** argv, std::string_view argument) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    const auto console_interrupt_result = aeg::application::install_console_interrupt_controller();
-    if (!console_interrupt_result || console_interrupt_result.value == nullptr) {
+    try {
+        error_dialogs_enabled = parse_frame_limit(argc, argv) == 0;
+        const auto console_interrupt_result = aeg::application::install_console_interrupt_controller();
+        if (!console_interrupt_result || console_interrupt_result.value == nullptr) {
+            return 1;
+        }
+        EditorApplication application;
+        const std::filesystem::path resource_root =
+            std::filesystem::absolute(std::filesystem::path{argv[0]}).parent_path();
+        if (!application.initialize(resource_root, parse_path_argument(argc, argv, "--project"))) {
+            return 1;
+        }
+        return application.run(parse_frame_limit(argc, argv), has_argument(argc, argv, "--stress-resize"),
+                               has_argument(argc, argv, "--open-preferences"), *console_interrupt_result.value);
+    } catch (...) {
+        // Startup is also an application boundary: a malformed argument,
+        // filesystem failure, or backend exception must have a controlled exit.
         return 1;
     }
-    EditorApplication application;
-    const std::filesystem::path resource_root = std::filesystem::absolute(std::filesystem::path{argv[0]}).parent_path();
-    if (!application.initialize(resource_root, parse_path_argument(argc, argv, "--project"))) {
-        return 1;
-    }
-    const int result = application.run(parse_frame_limit(argc, argv), has_argument(argc, argv, "--stress-resize"),
-                                       has_argument(argc, argv, "--open-preferences"),
-                                       *console_interrupt_result.value);
-    return result;
 }

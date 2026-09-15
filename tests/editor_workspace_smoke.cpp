@@ -7,6 +7,7 @@
 
 #include <cassert>
 #include <memory>
+#include <stdexcept>
 #include <string>
 
 #include "editor_imgui.hpp"
@@ -62,6 +63,7 @@ int main() {
         std::make_unique<TestPanel>(hierarchy_build_count, "Hierarchy")));
 
     uint32_t preferences_action_count = 0;
+    bool fail_preferences_action = false;
     // Preferences is launched from the Settings rail; it must not duplicate
     // that entry in the workspace View menu.
     assert(!aeg::application::preferences_action_shows_in_view_menu());
@@ -72,8 +74,9 @@ int main() {
         aeg::editor::EditorWorkspaceActionDescriptor{
             "preferences",
             "Preferences",
-            [&preferences_action_count]() {
+            [&preferences_action_count, &fail_preferences_action]() {
                 ++preferences_action_count;
+                if (fail_preferences_action) throw std::runtime_error("recoverable Settings action failure");
                 return aeg::foundation::Result::success();
             },
             aeg::application::preferences_action_shows_in_view_menu()}));
@@ -133,6 +136,22 @@ int main() {
         assert(host.end_frame());
     }
     assert(preferences_action_count == 2);
+    fail_preferences_action = true;
+    ImGui::ActivateItemByID(ImGui::FindWindowByName("##EditorRail")->GetID("Settings"));
+    bool action_failure_reported = false;
+    for (int frame = 0; frame < 3; ++frame) {
+        assert(host.begin_frame(frame_desc));
+        const auto result = workspace.build_ui();
+        if (!result) {
+            action_failure_reported = true;
+            assert(result.message.find("Settings action failure") != std::string::npos);
+        }
+        assert(ImGui::GetCurrentContext()->ColorStack.Size == 0);
+        assert(ImGui::GetCurrentContext()->StyleVarStack.Size == 0);
+        assert(host.end_frame());
+    }
+    assert(action_failure_reported);
+    fail_preferences_action = false;
     uint32_t bottom_build_count = 0;
     for (const auto* title : {"Pipeline", "Assets"}) {
         assert(workspace.register_panel(
