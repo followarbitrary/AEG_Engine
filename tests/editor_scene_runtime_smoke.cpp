@@ -272,9 +272,23 @@ int main() {
         !require(runtime.project_root() == std::filesystem::weakly_canonical(project_root),
                  "editor scene smoke active project root is incorrect") ||
         !require(runtime.entities().empty(), "editor scene smoke new project inherited editor sample entities") ||
+        !require(runtime.pipeline_snapshots().empty(),
+                 "editor scene smoke new project exposed the internal renderer pipeline") ||
         !require(std::ranges::none_of(runtime.resource_descriptors(),
                                      [](const auto& resource) { return resource.path.empty(); }),
                  "editor scene smoke new project exposed editor sample resources") ||
+        !require(runtime.create_project_renderer_pipeline(),
+                 "editor scene smoke could not create the project renderer pipeline") ||
+        !require(std::ranges::any_of(runtime.pipeline_snapshots(),
+                                    [](const auto& snapshot) { return snapshot.first == "Game / Renderer"; }),
+                 "editor scene smoke created project renderer pipeline is missing") ||
+        !require(runtime.pipeline_snapshots().front().second->nodes.size() == 1 &&
+                     runtime.pipeline_snapshots().front().second->nodes.front().phase ==
+                         aeg::pipeline::EnginePhase::kPresent &&
+                     runtime.pipeline_snapshots().front().second->feature_implementations.empty(),
+                 "editor scene smoke new project renderer pipeline is not a Present-only output bus") ||
+        !require(!runtime.viewport_present_connected(),
+                 "editor scene smoke project renderer pipeline did not replace the live Engine state flow") ||
         !require(runtime.render_frame(100), "editor scene smoke empty project viewport frame failed") ||
         !require(runtime.play(), "editor scene smoke empty project Play failed") ||
         !require(runtime.render_frame(101), "editor scene smoke empty project Play frame failed") ||
@@ -325,10 +339,20 @@ int main() {
         std::filesystem::remove_all(project_root, remove_error);
         return 17;
     }
-    std::filesystem::remove_all(project_root, remove_error);
     if (!require(runtime.shutdown(), "editor scene smoke shutdown failed")) {
+        std::filesystem::remove_all(project_root, remove_error);
         return 18;
     }
+    aeg::application::EditorSceneRuntime imported_runtime;
+    if (!require(imported_runtime.initialize(*device), "editor scene smoke imported runtime initialization failed") ||
+        !require(imported_runtime.import_project(project_root), "editor scene smoke fresh project import failed") ||
+        !require(imported_runtime.pipeline_snapshots().empty(),
+                 "editor scene smoke fresh import exposed an internal renderer pipeline without a document") ||
+        !require(imported_runtime.shutdown(), "editor scene smoke imported runtime shutdown failed")) {
+        std::filesystem::remove_all(project_root, remove_error);
+        return 18;
+    }
+    std::filesystem::remove_all(project_root, remove_error);
     std::cout << "Editor scene runtime smoke passed\n";
     return 0;
 }

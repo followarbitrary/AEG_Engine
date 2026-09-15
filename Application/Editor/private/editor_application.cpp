@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -28,6 +29,9 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 
 #include "Components/component_ids.hpp"
 #include "application_platform.hpp"
@@ -57,6 +61,16 @@
 #include "texture_uploader.hpp"
 
 namespace {
+std::atomic_bool g_console_interrupt_requested{false};
+
+BOOL WINAPI handle_console_control(DWORD control) noexcept {
+    if (control != CTRL_C_EVENT && control != CTRL_BREAK_EVENT) {
+        return FALSE;
+    }
+    g_console_interrupt_requested.store(true, std::memory_order_relaxed);
+    return TRUE;
+}
+
 using aeg::application::ComponentUpdateView;
 using aeg::application::EditorAssetStatus;
 using aeg::application::EditorResourceDescriptor;
@@ -756,7 +770,15 @@ public:
                 sources.emplace_back("Built-in / Editor UI", std::move(snapshot));
         }
         if (sources.empty()) {
-            ImGui::TextDisabled("No compiled pipelines");
+            ImGui::TextDisabled("This project has no Pipeline yet.");
+            if (runtime_.project_loaded() && ImGui::Button("Create Renderer Pipeline")) {
+                Result result = runtime_.create_project_renderer_pipeline();
+                if (result)
+                    result = save_changes_();
+                feedback_ = result ? "Renderer Pipeline created." : result.message;
+            }
+            if (!feedback_.empty())
+                ImGui::TextWrapped("%s", feedback_.c_str());
             ImGui::End();
             return;
         }
@@ -2478,7 +2500,7 @@ public:
         preferences_regression_preview_requested_ = false;
         preferences_regression_preview_completed_ = false;
         preferences_open_requested_ = open_preferences_regression;
-        while (!close_requested()) {
+        while (!close_requested() && !g_console_interrupt_requested.load(std::memory_order_relaxed)) {
             if (frame_limit != 0 && frame_count_ >= frame_limit) {
                 break;
             }
@@ -3004,6 +3026,10 @@ private:
         const std::filesystem::path path = pipeline_document_path();
         if (path.empty() || !std::filesystem::exists(path))
             return Result::success();
+        if (scene_runtime_ != nullptr && scene_runtime_->project_loaded()) {
+            if (const Result result = scene_runtime_->create_project_renderer_pipeline(); !result)
+                return result;
+        }
         std::ifstream stream(path, std::ios::binary);
         std::string signature;
         uint32_t version = 0;
@@ -4815,11 +4841,15 @@ bool has_argument(int argc, char** argv, std::string_view argument) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    g_console_interrupt_requested.store(false, std::memory_order_relaxed);
+    SetConsoleCtrlHandler(&handle_console_control, TRUE);
     EditorApplication application;
     const std::filesystem::path resource_root = std::filesystem::absolute(std::filesystem::path{argv[0]}).parent_path();
     if (!application.initialize(resource_root, parse_path_argument(argc, argv, "--project"))) {
         return 1;
     }
-    return application.run(parse_frame_limit(argc, argv), has_argument(argc, argv, "--stress-resize"),
-                           has_argument(argc, argv, "--open-preferences"));
+    const int result = application.run(parse_frame_limit(argc, argv), has_argument(argc, argv, "--stress-resize"),
+                                       has_argument(argc, argv, "--open-preferences"));
+    SetConsoleCtrlHandler(&handle_console_control, FALSE);
+    return result;
 }

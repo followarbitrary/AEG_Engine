@@ -952,6 +952,7 @@ struct EditorSceneRuntime::Impl final {
     uint32_t current_slot_{0};
     std::vector<render_graph::RenderStateLinkOverride> render_state_link_overrides_{};
     std::vector<render_graph::RenderStateBlendOverride> render_state_blend_overrides_{};
+    pipeline::PipelinePlanHandle project_renderer_pipeline_{};
     EditTransaction transform_edit_{};
     EditorCommand component_edit_command_{};
     bool component_edit_active_{false};
@@ -1328,9 +1329,77 @@ std::vector<std::pair<std::string, pipeline::PipelinePlanHandle>> EditorSceneRun
         auto plan = impl_->active_scope_->pipeline_host().active_plan_snapshot();
         if (plan) result.emplace_back("Game / World", std::move(plan));
     }
-    auto plan = impl_->frame_host_.active_plan_snapshot();
-    if (plan) result.emplace_back("Game / Renderer", std::move(plan));
+    if (!impl_->project_manager_.loaded()) {
+        auto plan = impl_->frame_host_.active_plan_snapshot();
+        if (plan) result.emplace_back("Game / Renderer", std::move(plan));
+    } else if (impl_->project_renderer_pipeline_) {
+        result.emplace_back("Game / Renderer", impl_->project_renderer_pipeline_);
+    }
     return result;
+}
+
+foundation::Result EditorSceneRuntime::create_project_renderer_pipeline() {
+    if (impl_ == nullptr || !impl_->initialized_) {
+        return foundation::invalid_state("Editor scene runtime is not initialized");
+    }
+    if (!impl_->project_manager_.loaded()) {
+        return foundation::invalid_state("A game project must be open before creating its Renderer Pipeline");
+    }
+    if (impl_->project_renderer_pipeline_) {
+        return Result::success();
+    }
+    const pipeline::PipelineId renderer_pipeline("RenderPipeline");
+    const pipeline::FeaturePointId opaque_point("RenderPipeline.Opaque");
+    const pipeline::FeatureInstanceId opaque_instance = pipeline::make_feature_instance_id(
+        renderer::kOpaqueRenderFeatureId, renderer_pipeline, pipeline::PipelineScope::kFrame, opaque_point);
+    const Result unbound = impl_->registry_.unbind_feature(opaque_instance);
+    const bool removed_opaque = static_cast<bool>(unbound);
+    if (!unbound && unbound.code != ResultCode::kNotFound) {
+        return unbound;
+    }
+    const auto restore_opaque = [impl = impl_.get(), removed_opaque]() {
+        if (!removed_opaque) {
+            return;
+        }
+        static_cast<void>(renderer::bind_opaque_render_feature(impl->registry_));
+        if (impl->frame_host_.rebuild(impl->registry_)) {
+            static_cast<void>(impl->frame_host_.apply_pending_plan());
+        }
+    };
+    if (const Result result = impl_->frame_host_.rebuild(impl_->registry_); !result) {
+        restore_opaque();
+        return result;
+    }
+    if (const Result result = impl_->frame_host_.apply_pending_plan(); !result) {
+        restore_opaque();
+        return result;
+    }
+    const auto runtime_plan = impl_->frame_host_.active_plan_snapshot();
+    if (!runtime_plan) {
+        restore_opaque();
+        return foundation::invalid_state("The renderer has no compiled Pipeline plan");
+    }
+    const auto present = std::find_if(runtime_plan->nodes.begin(), runtime_plan->nodes.end(), [](const auto& node) {
+        return node.phase == pipeline::EnginePhase::kPresent;
+    });
+    if (present == runtime_plan->nodes.end()) {
+        restore_opaque();
+        return foundation::invalid_state("The renderer Pipeline has no Present output stage");
+    }
+    try {
+        auto plan = std::make_shared<pipeline::PipelinePlan>();
+        plan->revision = runtime_plan->revision;
+        plan->pipeline = pipeline::PipelineId("Project.RendererPipeline");
+        plan->instance = pipeline::PipelineInstanceId("Project.RendererPipeline.Editor");
+        plan->scope = pipeline::PipelineScope::kFrame;
+        plan->nodes.push_back(*present);
+        plan->topological_order.push_back(0);
+        impl_->project_renderer_pipeline_ = std::move(plan);
+    } catch (const std::bad_alloc&) {
+        restore_opaque();
+        return foundation::out_of_memory("Project Renderer Pipeline allocation failed");
+    }
+    return Result::success();
 }
 
 foundation::Result EditorSceneRuntime::add_pipeline_runtime_ordering(PipelineTarget target, uint32_t source_node,
@@ -2014,6 +2083,7 @@ foundation::Result EditorSceneRuntime::Impl::make_default_scene() {
 foundation::Result EditorSceneRuntime::Impl::make_empty_project_scene() {
     scene_asset_ = scene::SceneAsset{};
     active_camera_scene_ = {};
+    project_renderer_pipeline_.reset();
     return scene_asset_.set_identity(scene::SceneAssetId{0xAE62026u, 2u}, "Main Scene", 1);
 }
 
@@ -4799,6 +4869,9 @@ foundation::Result EditorSceneRuntime::import_project(const std::filesystem::pat
     if (const Result result = impl_->project_manager_.import_project(root_or_project_file); !result) {
         return result;
     }
+    // A freshly imported project owns no visible Renderer Pipeline until its
+    // scene sidecar is restored by the editor application.
+    impl_->project_renderer_pipeline_.reset();
     if (const Result result = impl_->asset_database_.initialize(impl_->project_manager_.descriptor().root); !result) {
         static_cast<void>(impl_->project_manager_.close_project());
         return result;

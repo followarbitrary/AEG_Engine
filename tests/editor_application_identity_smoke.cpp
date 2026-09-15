@@ -46,7 +46,7 @@ int main() {
     STARTUPINFOW startup{};
     startup.cb = sizeof(startup);
     PROCESS_INFORMATION process{};
-    if (CreateProcessW(editor_path.c_str(), command_line.data(), nullptr, nullptr, FALSE, 0, nullptr,
+    if (CreateProcessW(editor_path.c_str(), command_line.data(), nullptr, nullptr, FALSE, CREATE_NEW_PROCESS_GROUP, nullptr,
                        editor_path.parent_path().c_str(), &startup, &process) == FALSE) {
         return 2;
     }
@@ -66,12 +66,19 @@ int main() {
     }
 
     if (search.matching_window != nullptr) {
-        PostMessageW(search.matching_window, WM_CLOSE, 0, 0);
+        if (GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, process.dwProcessId) == FALSE) {
+            TerminateProcess(process.hProcess, 4);
+        }
     }
     if (WaitForSingleObject(process.hProcess, 5000) == WAIT_TIMEOUT) {
         TerminateProcess(process.hProcess, 3);
         WaitForSingleObject(process.hProcess, 5000);
     }
+    DWORD exit_code = STILL_ACTIVE;
+    GetExitCodeProcess(process.hProcess, &exit_code);
     CloseHandle(process.hProcess);
-    return search.matching_window == nullptr ? 3 : 0;
+    if (search.matching_window == nullptr) {
+        return 3;
+    }
+    return exit_code == 0 ? 0 : 4;
 }

@@ -132,6 +132,8 @@ public:
 
     /** @brief Renders the active World into the current viewport target. */
     [[nodiscard]] foundation::Result render_frame(uint64_t frame_number);
+    /** @brief Exposes the engine renderer plan as this project's editable Renderer Pipeline. */
+    [[nodiscard]] foundation::Result create_project_renderer_pipeline();
     [[nodiscard]] std::vector<std::pair<std::string, pipeline::PipelinePlanHandle>> pipeline_snapshots() const;
     /** @brief Stages an Editor-authored ordering override for the selected live game pipeline. */
     [[nodiscard]] foundation::Result add_pipeline_runtime_ordering(PipelineTarget target, uint32_t source_node,
