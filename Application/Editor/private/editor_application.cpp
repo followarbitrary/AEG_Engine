@@ -6,7 +6,6 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -29,9 +28,6 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
-
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
 
 #include "Components/component_ids.hpp"
 #include "application_platform.hpp"
@@ -61,16 +57,6 @@
 #include "texture_uploader.hpp"
 
 namespace {
-std::atomic_bool g_console_interrupt_requested{false};
-
-BOOL WINAPI handle_console_control(DWORD control) noexcept {
-    if (control != CTRL_C_EVENT && control != CTRL_BREAK_EVENT) {
-        return FALSE;
-    }
-    g_console_interrupt_requested.store(true, std::memory_order_relaxed);
-    return TRUE;
-}
-
 using aeg::application::ComponentUpdateView;
 using aeg::application::EditorAssetStatus;
 using aeg::application::EditorResourceDescriptor;
@@ -2292,8 +2278,8 @@ public:
             AEG_LOG_WARNING(aeg::logging::Category::kApplication, "Startup splash unavailable [{}]: {}",
                             aeg::foundation::result_code_name(splash_result.result.code), splash_result.result.message);
         }
-        auto window_system_result = aeg::application::create_win32_window_system();
-        if (!report_result(window_system_result, "create_win32_window_system")) {
+        auto window_system_result = aeg::application::create_window_system();
+        if (!report_result(window_system_result, "create_window_system")) {
             return false;
         }
         window_system_ = std::move(window_system_result.value);
@@ -2490,7 +2476,8 @@ public:
         return true;
     }
 
-    [[nodiscard]] int run(uint32_t frame_limit, bool resize_regression, bool open_preferences_regression) {
+    [[nodiscard]] int run(uint32_t frame_limit, bool resize_regression, bool open_preferences_regression,
+                          const aeg::application::IConsoleInterruptController& console_interrupt) {
         regression_mode_ = resize_regression || open_preferences_regression;
         resize_regression_ = resize_regression;
         preferences_regression_mode_ = open_preferences_regression;
@@ -2500,7 +2487,7 @@ public:
         preferences_regression_preview_requested_ = false;
         preferences_regression_preview_completed_ = false;
         preferences_open_requested_ = open_preferences_regression;
-        while (!close_requested() && !g_console_interrupt_requested.load(std::memory_order_relaxed)) {
+        while (!close_requested() && !console_interrupt.interrupted()) {
             if (frame_limit != 0 && frame_count_ >= frame_limit) {
                 break;
             }
@@ -4841,15 +4828,17 @@ bool has_argument(int argc, char** argv, std::string_view argument) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    g_console_interrupt_requested.store(false, std::memory_order_relaxed);
-    SetConsoleCtrlHandler(&handle_console_control, TRUE);
+    const auto console_interrupt_result = aeg::application::install_console_interrupt_controller();
+    if (!console_interrupt_result || console_interrupt_result.value == nullptr) {
+        return 1;
+    }
     EditorApplication application;
     const std::filesystem::path resource_root = std::filesystem::absolute(std::filesystem::path{argv[0]}).parent_path();
     if (!application.initialize(resource_root, parse_path_argument(argc, argv, "--project"))) {
         return 1;
     }
     const int result = application.run(parse_frame_limit(argc, argv), has_argument(argc, argv, "--stress-resize"),
-                                       has_argument(argc, argv, "--open-preferences"));
-    SetConsoleCtrlHandler(&handle_console_control, FALSE);
+                                       has_argument(argc, argv, "--open-preferences"),
+                                       *console_interrupt_result.value);
     return result;
 }

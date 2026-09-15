@@ -234,40 +234,41 @@ endif()
 if (WIN32)
     enable_language(RC)
 
-    add_library(aeg_application_platform_win32 STATIC
+    add_library(aeg_application_platform STATIC
+        Application/Platform/private/win32/win32_console_interrupt.cpp
         Application/Platform/private/win32/win32_system_fonts.cpp
         Application/Platform/private/win32/win32_startup_splash.cpp
         Application/Platform/private/win32/win32_window.cpp
         Application/Platform/private/win32/win32_window_system.cpp
     )
-    target_compile_features(aeg_application_platform_win32 PUBLIC cxx_std_20)
-    target_include_directories(aeg_application_platform_win32
+    target_compile_features(aeg_application_platform PUBLIC cxx_std_20)
+    target_include_directories(aeg_application_platform
         PUBLIC
             ${CMAKE_CURRENT_SOURCE_DIR}/Application/Platform/public
             ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Platform/public
         PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/Application/Platform/private/win32
     )
-    target_compile_definitions(aeg_application_platform_win32
+    target_compile_definitions(aeg_application_platform
         PRIVATE
             NOMINMAX
             UNICODE
             _UNICODE
             WIN32_LEAN_AND_MEAN
     )
-    target_link_libraries(aeg_application_platform_win32 PUBLIC aeg_platform aeg_input user32 gdi32 gdiplus imm32 dwrite ole32 shell32 uuid)
+    target_link_libraries(aeg_application_platform PUBLIC aeg_platform aeg_input user32 gdi32 gdiplus imm32 dwrite ole32 shell32 uuid)
 
     if (MSVC)
-        target_compile_options(aeg_application_platform_win32 PRIVATE /W4 /permissive-)
+        target_compile_options(aeg_application_platform PRIVATE /W4 /permissive-)
     else()
-        target_compile_options(aeg_application_platform_win32 PRIVATE -Wall -Wextra -Wpedantic)
+        target_compile_options(aeg_application_platform PRIVATE -Wall -Wextra -Wpedantic)
     endif()
 
     add_executable(aeg_application_platform_win32_smoke
         tests/application_platform_win32_smoke.cpp
-        Application/Editor/private/editor_resources.rc
+        Application/Platform/private/win32/aether_editor_resources.rc
     )
-    target_link_libraries(aeg_application_platform_win32_smoke PRIVATE aeg_application_platform_win32)
+    target_link_libraries(aeg_application_platform_win32_smoke PRIVATE aeg_application_platform)
     target_compile_definitions(aeg_application_platform_win32_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
@@ -375,7 +376,7 @@ if (WIN32)
     add_executable(aeg_editor_font_smoke
         tests/editor_font_smoke.cpp
     )
-    target_link_libraries(aeg_editor_font_smoke PRIVATE aeg_editor_framework aeg_application_platform_win32)
+    target_link_libraries(aeg_editor_font_smoke PRIVATE aeg_editor_framework aeg_application_platform)
     target_compile_definitions(aeg_editor_font_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
@@ -1143,12 +1144,12 @@ if (WIN32)
         Application/Editor/private/editor_application.cpp
         Application/Editor/private/editor_asset_database.cpp
         Application/Editor/private/editor_project.cpp
-        Application/Editor/private/editor_resources.rc
+        Application/Platform/private/win32/aether_editor_resources.rc
         Application/Editor/private/editor_scene_runtime.cpp
         Application/Editor/private/font/editor_system_font_catalog.cpp
     )
     target_link_libraries(aeg_editor_application PRIVATE
-        aeg_application_platform_win32
+        aeg_application_platform
         aeg_engine
         aeg_scene
         aeg_editor_framework

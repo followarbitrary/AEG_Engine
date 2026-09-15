@@ -34,14 +34,33 @@ public:
     virtual void close() noexcept = 0;
 };
 
-/** @brief Creates the Win32 window system without exposing Win32 types. */
-[[nodiscard]] foundation::ResultValue<std::unique_ptr<platform::IWindowSystem>> create_win32_window_system();
+/** @brief Creates the active host platform window system without exposing native types. */
+[[nodiscard]] foundation::ResultValue<std::unique_ptr<platform::IWindowSystem>> create_window_system();
 
-/** @brief Shows a centered transparent Win32 startup splash loaded from an image file. */
+/** @brief Receives process-interrupt requests from the active host platform. */
+class IConsoleInterruptController {
+public:
+    virtual ~IConsoleInterruptController() = default;
+
+    /** @brief Returns true after the host has requested orderly process termination. */
+    [[nodiscard]] virtual bool interrupted() const noexcept = 0;
+};
+
+/**
+ * @brief Installs one process-wide, platform-owned interrupt controller.
+ *
+ * The controller is removed when the returned object is destroyed. A second
+ * active controller is rejected so the host owns signal registration in one
+ * place.
+ */
+[[nodiscard]] foundation::ResultValue<std::unique_ptr<IConsoleInterruptController>>
+install_console_interrupt_controller();
+
+/** @brief Shows a centered transparent native startup splash loaded from an image file. */
 [[nodiscard]] foundation::ResultValue<std::unique_ptr<IStartupSplash>> show_startup_splash(
     const StartupSplashDesc& desc);
 
-/** @brief Shows an Application-owned native error dialog without exposing Win32 types. */
+/** @brief Shows an Application-owned native error dialog without exposing native types. */
 [[nodiscard]] foundation::Result show_error_dialog(std::string_view title, std::string_view message);
 
 /**

@@ -1,11 +1,11 @@
 # Editor Application
 
 `aeg_editor_application` 是由 Application 持有的最小编辑器宿主。它通过
-`aeg_application_platform_win32` 创建 Win32 窗口，创建 RHI Surface 和 Swapchain，持有
+`aeg_application_platform` 创建宿主平台窗口，创建 RHI Surface 和 Swapchain，持有
 `FrameContext` 与 `RenderGraph`，并将编辑器 ImGui RenderFeature 注册到标准
 `RenderPipeline`。
 
-Application 不包含 Win32 头文件。窗口消息由 `Application/Platform/private/win32` 转换为
+Application 不包含具体平台头文件。窗口消息由 `Application/Platform/private/<platform>` 转换为
 `WindowEvent`，再提交给 `InputSystem` 和 `EditorImGuiHost`。ImGui 绘制数据被复制为
 `ImGuiDrawPacket`；`ImGuiRenderer::prepare_frame()` 由受控的
 `EngineFrameOrchestrator` RenderBuild Hook 在 RenderFeature 构图前调用。

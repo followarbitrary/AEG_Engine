@@ -458,7 +458,7 @@ void Win32WindowSystem::enqueue_event(platform::WindowEvent event) noexcept {
 }  // namespace aeg::application::win32
 
 namespace aeg::application {
-foundation::ResultValue<std::unique_ptr<platform::IWindowSystem>> create_win32_window_system() {
+foundation::ResultValue<std::unique_ptr<platform::IWindowSystem>> create_window_system() {
     try {
         return {foundation::Result::success(), std::make_unique<win32::Win32WindowSystem>()};
     } catch (const std::bad_alloc&) {

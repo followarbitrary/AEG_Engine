@@ -312,9 +312,6 @@ foundation::Result ImGuiRenderer::initialize() {
     if (impl_->initialized) {
         return foundation::invalid_state("ImGui renderer is already initialized");
     }
-#if !defined(_WIN32)
-    return foundation::unsupported("ImGui shader contracts are currently available only on Windows builds");
-#else
     try {
         const foundation::ResultValue<shader::ShaderProgram> program_result =
             shader::load_shader_program(std::filesystem::path{AEG_EDITOR_IMGUI_SHADER_PACKAGE_PATH});
@@ -345,7 +342,6 @@ foundation::Result ImGuiRenderer::initialize() {
     } catch (const std::exception& exception) {
         return foundation::unknown_exception(exception);
     }
-#endif
 }
 
 foundation::ResultValue<rhi::PipelineHandle> ImGuiRenderer::get_or_create_pipeline(rhi::Format format) {

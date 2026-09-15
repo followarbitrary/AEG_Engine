@@ -24,11 +24,17 @@ int main() {
         return 27;
     }
 
-    auto system_result = aeg::application::create_win32_window_system();
+    auto system_result = aeg::application::create_window_system();
     if (!system_result) {
         return 1;
     }
     std::unique_ptr<aeg::platform::IWindowSystem> system = std::move(system_result.value);
+
+    const auto console_interrupt_result = aeg::application::install_console_interrupt_controller();
+    if (!console_interrupt_result || console_interrupt_result.value == nullptr ||
+        console_interrupt_result.value->interrupted()) {
+        return 33;
+    }
 
     const aeg::foundation::Result invalid_dialog = aeg::application::show_error_dialog("", "invalid");
     if (invalid_dialog || invalid_dialog.code != aeg::foundation::ResultCode::kInvalidArgument) {
