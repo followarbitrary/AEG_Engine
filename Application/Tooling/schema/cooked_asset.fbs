@@ -1,0 +1,24 @@
+namespace aeg.tooling.fb;
+
+enum AssetKind : ubyte {
+    Mesh,
+    Texture,
+    Material,
+    Scene,
+    Font
+}
+
+table AssetReference {
+    id:[ubyte] (required);
+}
+
+table CookedAsset {
+    id:[ubyte] (required);
+    kind:AssetKind;
+    schema_version:uint;
+    runtime_dependencies:[AssetReference];
+    payload:[ubyte] (required);
+}
+
+root_type CookedAsset;
+file_identifier "AEGC";

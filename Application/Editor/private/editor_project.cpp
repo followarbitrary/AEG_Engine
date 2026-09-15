@@ -9,10 +9,17 @@
 #include <fstream>
 #include <system_error>
 
+#include "project_context.hpp"
+
 namespace aeg::application {
 namespace {
 constexpr std::string_view kProjectHeader{"AEG_PROJECT\t2"};
 constexpr std::string_view kLegacyProjectHeader{"AEG_PROJECT\t1"};
+
+[[nodiscard]] EditorProjectDescriptor make_descriptor(const std::filesystem::path& root,
+                                                      const project::ProjectConfig& config) {
+    return {root, config.name, config.paths.assets, config.startup_scene.parent_path(), config.startup_scene};
+}
 
 [[nodiscard]] std::filesystem::path canonical_or_absolute(const std::filesystem::path& path, std::error_code& error) {
     auto result = std::filesystem::weakly_canonical(path, error);
@@ -40,7 +47,7 @@ constexpr std::string_view kLegacyProjectHeader{"AEG_PROJECT\t1"};
 }
 
 [[nodiscard]] std::filesystem::path global_recent_projects_file() {
-    static const std::filesystem::path path = [] {
+    static const std::filesystem::path kPath = [] {
         const char* app_data = std::getenv("APPDATA");
         if (app_data != nullptr && *app_data != '\0') {
             return std::filesystem::path(std::string(app_data)) / "AEG" / "recent_projects.tsv";
@@ -51,7 +58,7 @@ constexpr std::string_view kLegacyProjectHeader{"AEG_PROJECT\t1"};
         }
         return std::filesystem::temp_directory_path() / "AEG" / "recent_projects.tsv";
     }();
-    return path;
+    return kPath;
 }
 }  // namespace
 
@@ -71,14 +78,19 @@ foundation::Result EditorProjectManager::new_project(const std::filesystem::path
     if (!valid_project_name(project_name)) {
         return foundation::invalid_argument("Project name is invalid");
     }
-    std::filesystem::create_directories(canonical_root / "Assets", error);
-    std::filesystem::create_directories(canonical_root / "Scenes", error);
+    const project::ProjectConfig config{
+        1, project_name, "windows-x64-vulkan", "Assets/Scenes/Main.aegscene", {"Assets", "Cache", "Saved", "Binaries"}};
+    std::filesystem::create_directories(canonical_root / config.paths.assets, error);
+    std::filesystem::create_directories(canonical_root / config.startup_scene.parent_path(), error);
+    std::filesystem::create_directories(canonical_root / config.paths.cache, error);
+    std::filesystem::create_directories(canonical_root / config.paths.saved, error);
+    std::filesystem::create_directories(canonical_root / config.paths.binaries, error);
     std::filesystem::create_directories(canonical_root / ".aeg", error);
     if (error) {
         return foundation::Result::failure(foundation::ResultCode::kUnknown,
                                            "Cannot create the game project directories");
     }
-    EditorProjectDescriptor next{canonical_root, project_name, "Assets", "Scenes", "Scenes/Main.aegscene"};
+    EditorProjectDescriptor next = make_descriptor(canonical_root, config);
     if (const foundation::Result result = write_project_file(next); !result) {
         return result;
     }
@@ -248,6 +260,19 @@ foundation::ResultValue<std::vector<EditorRecentProject>> EditorProjectManager::
 
 foundation::Result EditorProjectManager::read_project_file(const std::filesystem::path& root,
                                                            EditorProjectDescriptor& descriptor) const {
+    project::ProjectFileCodec codec;
+    const auto modern_project = codec.load(root / "project.aegproject");
+    if (modern_project) {
+        EditorProjectDescriptor parsed = make_descriptor(root, modern_project.value.config);
+        std::error_code error;
+        if (!std::filesystem::is_directory(root / parsed.assets_directory, error) || error ||
+            !std::filesystem::is_directory(root / parsed.scenes_directory, error) || error) {
+            return foundation::invalid_argument("Project does not contain configured asset and scene directories");
+        }
+        descriptor = std::move(parsed);
+        return foundation::Result::success();
+    }
+
     std::ifstream file(root / "project.aegproject");
     if (!file) {
         return foundation::not_found("Project file project.aegproject is missing");
@@ -284,22 +309,20 @@ foundation::Result EditorProjectManager::read_project_file(const std::filesystem
         !std::filesystem::is_directory(root / parsed.scenes_directory, error) || error) {
         return foundation::invalid_argument("Project does not contain an Assets directory");
     }
+    file.close();
+    if (const foundation::Result result = write_project_file(parsed); !result) {
+        return result;
+    }
     descriptor = std::move(parsed);
     return foundation::Result::success();
 }
 
 foundation::Result EditorProjectManager::write_project_file(const EditorProjectDescriptor& descriptor) const {
-    std::ofstream file(descriptor.root / "project.aegproject", std::ios::trunc);
-    if (!file) {
-        return foundation::Result::failure(foundation::ResultCode::kUnknown, "Cannot write project.aegproject");
-    }
-    file << kProjectHeader << '\n'
-         << descriptor.name << '\n'
-         << "assets=" << descriptor.assets_directory.generic_string() << '\n'
-         << "scenes=" << descriptor.scenes_directory.generic_string() << '\n'
-         << "default_scene=" << descriptor.default_scene.generic_string() << '\n';
-    return file ? foundation::Result::success()
-                : foundation::Result::failure(foundation::ResultCode::kUnknown, "Cannot write project.aegproject");
+    project::ProjectConfig config{};
+    config.name = descriptor.name;
+    config.startup_scene = descriptor.default_scene;
+    config.paths.assets = descriptor.assets_directory;
+    return project::ProjectFileCodec{}.save(descriptor.root / "project.aegproject", config);
 }
 
 }  // namespace aeg::application

@@ -223,6 +223,181 @@ else()
     target_compile_options(aeg_input PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
+set(FLATBUFFERS_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(FLATBUFFERS_INSTALL OFF CACHE BOOL "" FORCE)
+set(FLATBUFFERS_BUILD_FLATHASH OFF CACHE BOOL "" FORCE)
+set(FLATBUFFERS_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
+add_subdirectory(ThirdParty/flatbuffers EXCLUDE_FROM_ALL)
+
+set(AEG_COOKED_ASSET_SCHEMA
+    "${CMAKE_CURRENT_SOURCE_DIR}/Application/Tooling/schema/cooked_asset.fbs")
+set(AEG_COOKED_ASSET_GENERATED_DIR
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/tooling")
+set(AEG_COOKED_ASSET_GENERATED_HEADER
+    "${AEG_COOKED_ASSET_GENERATED_DIR}/cooked_asset_generated.h")
+add_custom_command(
+    OUTPUT "${AEG_COOKED_ASSET_GENERATED_HEADER}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${AEG_COOKED_ASSET_GENERATED_DIR}"
+    COMMAND $<TARGET_FILE:flatc> --cpp --scoped-enums --gen-object-api
+            -o "${AEG_COOKED_ASSET_GENERATED_DIR}" "${AEG_COOKED_ASSET_SCHEMA}"
+    DEPENDS flatc "${AEG_COOKED_ASSET_SCHEMA}"
+    VERBATIM
+)
+add_custom_target(aeg_cooked_asset_schema DEPENDS "${AEG_COOKED_ASSET_GENERATED_HEADER}")
+
+add_library(aeg_application_project STATIC
+    Application/Project/private/project_context.cpp
+)
+target_compile_features(aeg_application_project PUBLIC cxx_std_20)
+target_include_directories(aeg_application_project
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/Application/Project/public
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/toml11/include
+)
+target_link_libraries(aeg_application_project PUBLIC aeg_foundation)
+
+if (MSVC)
+    target_compile_options(aeg_application_project PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(aeg_application_project PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+add_executable(aeg_project_smoke
+    tests/project_smoke.cpp
+)
+target_link_libraries(aeg_project_smoke PRIVATE aeg_application_project)
+
+if (MSVC)
+    target_compile_options(aeg_project_smoke PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(aeg_project_smoke PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+add_library(aeg_application_tooling STATIC
+    Application/Tooling/private/asset_metadata.cpp
+    Application/Tooling/private/asset_package.cpp
+    Application/Tooling/private/asset_dependency_packer.cpp
+    Application/Tooling/private/asset_cooker.cpp
+    Application/Tooling/private/cgltf_mesh_importer.cpp
+    Application/Tooling/private/stb_texture_importer.cpp
+    Application/Tooling/private/cooked_asset.cpp
+    Application/Tooling/private/cooked_artifact_store.cpp
+    "${AEG_COOKED_ASSET_GENERATED_HEADER}"
+)
+target_compile_features(aeg_application_tooling PUBLIC cxx_std_20)
+target_include_directories(aeg_application_tooling
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/Application/Tooling/public
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/toml11/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/cgltf
+        ${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/stb
+        ${AEG_COOKED_ASSET_GENERATED_DIR}
+)
+target_link_libraries(aeg_application_tooling PUBLIC aeg_foundation flatbuffers)
+add_dependencies(aeg_application_tooling aeg_cooked_asset_schema)
+
+if (MSVC)
+    target_compile_options(aeg_application_tooling PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(aeg_application_tooling PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+add_executable(aeg_asset_metadata_smoke
+    tests/asset_metadata_smoke.cpp
+)
+target_link_libraries(aeg_asset_metadata_smoke PRIVATE aeg_application_tooling)
+
+if (MSVC)
+    target_compile_options(aeg_asset_metadata_smoke PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(aeg_asset_metadata_smoke PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+add_executable(aeg_asset_package_smoke
+    tests/asset_package_smoke.cpp
+)
+target_include_directories(aeg_asset_package_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Tooling/public
+)
+target_link_libraries(aeg_asset_package_smoke PRIVATE aeg_application_tooling)
+
+if (MSVC)
+    target_compile_options(aeg_asset_package_smoke PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(aeg_asset_package_smoke PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+add_executable(aeg_cooked_asset_smoke
+    tests/cooked_asset_smoke.cpp
+)
+target_include_directories(aeg_cooked_asset_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Tooling/public
+)
+target_link_libraries(aeg_cooked_asset_smoke PRIVATE aeg_application_tooling)
+
+if (MSVC)
+    target_compile_options(aeg_cooked_asset_smoke PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(aeg_cooked_asset_smoke PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+add_executable(aeg_cooked_artifact_store_smoke
+    tests/cooked_artifact_store_smoke.cpp
+)
+target_link_libraries(aeg_cooked_artifact_store_smoke PRIVATE aeg_application_tooling)
+
+if (MSVC)
+    target_compile_options(aeg_cooked_artifact_store_smoke PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(aeg_cooked_artifact_store_smoke PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+add_executable(aeg_asset_cooker_smoke
+    tests/asset_cooker_smoke.cpp
+)
+target_link_libraries(aeg_asset_cooker_smoke PRIVATE aeg_application_tooling)
+
+if (MSVC)
+    target_compile_options(aeg_asset_cooker_smoke PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(aeg_asset_cooker_smoke PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+add_executable(aeg_stb_texture_importer_smoke
+    tests/stb_texture_importer_smoke.cpp
+)
+target_link_libraries(aeg_stb_texture_importer_smoke PRIVATE aeg_application_tooling)
+
+if (MSVC)
+    target_compile_options(aeg_stb_texture_importer_smoke PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(aeg_stb_texture_importer_smoke PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+add_executable(aeg_asset_dependency_packer_smoke
+    tests/asset_dependency_packer_smoke.cpp
+)
+target_link_libraries(aeg_asset_dependency_packer_smoke PRIVATE aeg_application_tooling)
+
+if (MSVC)
+    target_compile_options(aeg_asset_dependency_packer_smoke PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(aeg_asset_dependency_packer_smoke PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+add_executable(aeg_cgltf_mesh_importer_smoke
+    tests/cgltf_mesh_importer_smoke.cpp
+)
+target_link_libraries(aeg_cgltf_mesh_importer_smoke PRIVATE aeg_application_tooling)
+
+if (MSVC)
+    target_compile_options(aeg_cgltf_mesh_importer_smoke PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(aeg_cgltf_mesh_importer_smoke PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
 add_executable(aeg_input_smoke
     tests/input_system_smoke.cpp
 )
@@ -924,7 +1099,7 @@ target_include_directories(aeg_editor_assets
 target_compile_definitions(aeg_editor_assets PUBLIC
     AEG_ENGINE_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
 )
-target_link_libraries(aeg_editor_assets PUBLIC aeg_foundation)
+target_link_libraries(aeg_editor_assets PUBLIC aeg_foundation aeg_application_project)
 if (MSVC)
     target_compile_options(aeg_editor_assets PRIVATE /W4 /permissive-)
 else()
@@ -1135,7 +1310,7 @@ if (WIN32)
     target_include_directories(aeg_editor_project_smoke PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private
     )
-    target_link_libraries(aeg_editor_project_smoke PRIVATE aeg_foundation)
+    target_link_libraries(aeg_editor_project_smoke PRIVATE aeg_foundation aeg_application_project)
     if (WIN32)
         target_compile_definitions(aeg_editor_project_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
     endif()
@@ -1404,6 +1579,15 @@ endif()
 if (BUILD_TESTING)
     add_test(NAME aeg_math_smoke COMMAND aeg_math_smoke)
     add_test(NAME aeg_result_smoke COMMAND aeg_result_smoke)
+    add_test(NAME aeg_project_smoke COMMAND aeg_project_smoke)
+    add_test(NAME aeg_asset_metadata_smoke COMMAND aeg_asset_metadata_smoke)
+    add_test(NAME aeg_asset_package_smoke COMMAND aeg_asset_package_smoke)
+    add_test(NAME aeg_cooked_asset_smoke COMMAND aeg_cooked_asset_smoke)
+    add_test(NAME aeg_cooked_artifact_store_smoke COMMAND aeg_cooked_artifact_store_smoke)
+    add_test(NAME aeg_asset_cooker_smoke COMMAND aeg_asset_cooker_smoke)
+    add_test(NAME aeg_stb_texture_importer_smoke COMMAND aeg_stb_texture_importer_smoke)
+    add_test(NAME aeg_asset_dependency_packer_smoke COMMAND aeg_asset_dependency_packer_smoke)
+    add_test(NAME aeg_cgltf_mesh_importer_smoke COMMAND aeg_cgltf_mesh_importer_smoke)
     add_test(NAME aeg_input_smoke COMMAND aeg_input_smoke)
     add_test(NAME aeg_editor_imgui_smoke COMMAND aeg_editor_imgui_smoke)
     add_test(NAME aeg_editor_imgui_docking_smoke COMMAND aeg_editor_imgui_docking_smoke)

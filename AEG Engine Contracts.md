@@ -42,13 +42,14 @@
 | `Runtime`       | Engine 生命周期、Scope 注册、Pipeline 执行和 RenderGraph 帧编排                 |
 | `Platform`      | 窗口、Surface、文件系统、动态库和操作系统适配；公共窗口契约为 Experimental      |
 | `Diagnostics`   | 断言、验证、性能分析、崩溃上下文和运行时诊断；当前为预留目录                    |
-| `Tooling`       | Shader、资产、代码生成和格式验证工具；当前为预留目录                            |
 
 ### 2.2 `Application` 一级目录
 
 | 目录              | 职责                                                                                                                |
 |-------------------|---------------------------------------------------------------------------------------------------------------------|
 | `Editor`          | 编辑器应用入口、主窗口和独立工具窗口、Surface/Swapchain、FrameContext、Orchestrator、错误通知和应用侧帧编排         |
+| `Project`         | `.aegproject` 配置、项目根路径映射、项目会话与应用资源生命周期协调                                                    |
+| `Tooling`         | Shader、资产、代码生成、格式验证和离线打包；资产 Meta、导入与烘焙数据契约                                            |
 | `EditorFramework` | Engine-owned ImGui Host、工具窗口、Workspace、Preferences、字体目录状态、场景预览和编辑器扩展生命周期；Experimental |
 | `Platform`        | 操作系统窗口、Surface 和平台事件的具体实现；公共语义来自 `Engine/Platform/public`                                   |
 
