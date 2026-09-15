@@ -42,6 +42,8 @@ struct EditorImGuiDesc final {
     std::string_view default_font_key{};
     /** @brief Base font size in pixels used to build the initial atlas. */
     float font_size_pixels{16.0f};
+    /** @brief Pre-rasterize the fixed Settings chrome independently of the editable preview. */
+    bool enable_preference_fonts{false};
 };
 
 /** @brief Engine-owned timing and display metrics for one ImGui frame. */

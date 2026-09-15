@@ -97,6 +97,8 @@ struct EngineFrameDesc final {
     bool present_acquired_frame{false};
     std::span<const render_graph::RenderGraphFeatureBufferBinding> render_feature_buffers{};
     std::span<const render_graph::RenderGraphFeatureTextureBinding> render_feature_textures{};
+    /** @brief Optional state texture template and Present target for RenderFeature composition. */
+    render_graph::RenderGraphFeatureStateDesc render_feature_state{};
     std::span<const render_graph::RenderGraphExecutionLease> render_graph_execution_leases{};
     renderer::Renderer* renderer{nullptr};
     std::span<const renderer::RenderView> render_views{};

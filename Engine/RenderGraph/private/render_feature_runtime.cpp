@@ -3,6 +3,7 @@
  * @brief Adapts Pipeline render features to the concrete RenderGraph API.
  */
 #include "../public/render_feature_runtime.hpp"
+#include "../public/render_state_flow.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -762,6 +763,11 @@ foundation::Result RenderPassExecutionContextBackendImpl::set_viewport(const rhi
     return context_.set_viewport(viewport);
 }
 
+[[nodiscard]] pipeline::RenderResourceId render_state_output_id(uint32_t contribution_index) noexcept {
+    constexpr uint64_t kRenderStateOutputSalt = 0x9e3779b97f4a7c15ull;
+    return pipeline::RenderResourceId(kRenderStateOutputSalt ^ (static_cast<uint64_t>(contribution_index) + 1ull));
+}
+
 foundation::Result RenderPassExecutionContextBackendImpl::set_scissor(const rhi::ScissorRect& scissor) {
     return context_.set_scissor(scissor);
 }
@@ -960,7 +966,106 @@ foundation::Result RenderGraphFeatureRuntime::build() {
         return rollback(result);
     }
 
-    for (const pipeline::PipelineFeatureContributionRecord& contribution : impl_->plan->feature_contributions) {
+    const RenderStateFlow state_flow = build_render_state_flow(*impl_->plan, impl_->desc.state.link_overrides);
+    if (state_flow.has_cycle) {
+        return rollback(invalid_argument("render-state links form a cycle"));
+    }
+    std::vector<pipeline::RenderGraphTexture> state_outputs(impl_->plan->feature_contributions.size());
+    std::vector<std::vector<pipeline::RenderGraphTexture>> state_inputs(impl_->plan->feature_contributions.size());
+    // A RenderFeature may consume state without producing a replacement state
+    // texture (for example readback, inspection, or culling).  Keep the writer
+    // identities separately so downstream writers can receive the original
+    // state through such pass-through Features.
+    std::vector<std::vector<uint32_t>> state_input_writers(impl_->plan->feature_contributions.size());
+    std::vector<uint8_t> state_writer_contributions(impl_->plan->feature_contributions.size(), 0);
+    std::vector<pipeline::RenderStateBlendMode> state_writer_blend_modes(
+        impl_->plan->feature_contributions.size(), pipeline::RenderStateBlendMode::kReplace);
+    std::vector<uint8_t> state_writer_capabilities(impl_->plan->feature_contributions.size(), 0);
+    if (impl_->desc.state.enabled) {
+        for (uint32_t contribution_index = 0; contribution_index < impl_->plan->feature_contributions.size();
+             ++contribution_index) {
+            const auto& contribution = impl_->plan->feature_contributions[contribution_index];
+            if (contribution.domain != pipeline::FeatureDomain::kRender ||
+                !state_flow.contributions[contribution_index].reaches_present) {
+                continue;
+            }
+            std::shared_ptr<const pipeline::PipelineFeature> feature_implementation =
+                find_plan_feature_implementation(*impl_->plan, contribution);
+            if (feature_implementation == nullptr) {
+                const auto feature_result = impl_->registry.find_feature(contribution.feature);
+                if (!feature_result) {
+                    return rollback(append_feature_message("render feature lookup failed", feature_result.result));
+                }
+                feature_implementation = feature_result.value;
+            }
+            state_writer_capabilities[contribution_index] = feature_implementation->uses_render_state_output() ? 1u : 0u;
+            state_writer_blend_modes[contribution_index] = feature_implementation->render_state_blend_mode();
+            for (const RenderStateBlendOverride& override : impl_->desc.state.blend_overrides) {
+                if (override.node >= impl_->plan->nodes.size()) {
+                    continue;
+                }
+                const uint64_t stage_index = impl_->plan->nodes[override.node].definition_stage_index;
+                if (stage_index >= contribution.first_stage_index &&
+                    stage_index < contribution.first_stage_index + contribution.stage_count) {
+                    state_writer_blend_modes[contribution_index] = override.blend_mode;
+                }
+            }
+        }
+    }
+    if (impl_->desc.state.enabled) {
+        const rhi::TextureDesc& state_desc = impl_->desc.state.texture_desc;
+        if (state_desc.format == rhi::Format::kUnknown || state_desc.extent.width == 0 ||
+            state_desc.extent.height == 0 || state_desc.extent.depth == 0 || state_desc.mip_levels == 0 ||
+            state_desc.array_layers == 0 || state_desc.capabilities == rhi::TextureCapability::kNone) {
+            return rollback(invalid_argument("render-state texture template is incomplete (format=" +
+                                             std::to_string(static_cast<uint32_t>(state_desc.format)) + ", extent=" +
+                                             std::to_string(state_desc.extent.width) + "x" +
+                                             std::to_string(state_desc.extent.height) + "x" +
+                                             std::to_string(state_desc.extent.depth) + ")"));
+        }
+        for (uint32_t contribution_index = 0; contribution_index < impl_->plan->feature_contributions.size();
+             ++contribution_index) {
+            const auto& contribution = impl_->plan->feature_contributions[contribution_index];
+            if (contribution.domain != pipeline::FeatureDomain::kRender ||
+                !state_flow.contributions[contribution_index].reaches_present ||
+                state_writer_capabilities[contribution_index] == 0) {
+                continue;
+            }
+            const auto texture = backend->create_texture(
+                render_state_output_id(contribution_index), impl_->desc.state.texture_desc,
+                pipeline::RenderGraphResourceLifetime::kTransient);
+            if (!texture) {
+                return rollback(append_feature_message("render state output allocation failed", texture.result));
+            }
+            state_outputs[contribution_index] = texture.value;
+        }
+        for (uint32_t contribution_index = 0; contribution_index < impl_->plan->feature_contributions.size();
+             ++contribution_index) {
+            std::vector<uint8_t> visiting(impl_->plan->feature_contributions.size(), 0);
+            const auto collect_input_writers = [&](auto&& self, uint32_t destination) -> void {
+                if (destination >= state_flow.contributions.size() || visiting[destination] != 0) return;
+                visiting[destination] = 1;
+                for (const uint32_t predecessor : state_flow.contributions[destination].input_contributions) {
+                    if (predecessor >= state_outputs.size()) continue;
+                    if (state_writer_capabilities[predecessor] != 0 && state_outputs[predecessor].is_valid()) {
+                        if (std::find(state_input_writers[contribution_index].begin(),
+                                      state_input_writers[contribution_index].end(), predecessor) ==
+                            state_input_writers[contribution_index].end()) {
+                            state_input_writers[contribution_index].push_back(predecessor);
+                            state_inputs[contribution_index].push_back(state_outputs[predecessor]);
+                        }
+                    } else {
+                        self(self, predecessor);
+                    }
+                }
+            };
+            collect_input_writers(collect_input_writers, contribution_index);
+        }
+    }
+    for (uint32_t contribution_index = 0; contribution_index < impl_->plan->feature_contributions.size();
+         ++contribution_index) {
+        const pipeline::PipelineFeatureContributionRecord& contribution =
+            impl_->plan->feature_contributions[contribution_index];
         if (contribution.domain != pipeline::FeatureDomain::kRender) {
             continue;
         }
@@ -978,12 +1083,73 @@ foundation::Result RenderGraphFeatureRuntime::build() {
             0) {
             return rollback(invalid_state("render feature contribution has no render domain implementation"));
         }
+        // A disconnected state writer must not render into the final target.
+        // Non-writer features still build: editor output/readback features use
+        // this path to clear the viewport and report a detached Present state.
+        if (!state_flow.contributions[contribution_index].reaches_present &&
+            (!impl_->desc.state.enabled || feature_implementation->uses_render_state_output())) {
+            continue;
+        }
+        const bool writes_render_state = impl_->desc.state.enabled && feature_implementation->uses_render_state_output();
+        if (writes_render_state) {
+            if (!state_outputs[contribution_index].is_valid()) {
+                return rollback(invalid_state("render-state feature has no allocated state output"));
+            }
+            if (state_inputs[contribution_index].size() > 1) {
+                if (!impl_->desc.state.compose_terminal_states) {
+                    return rollback(invalid_state(
+                        "multiple render-state inputs require a state compositor callback"));
+                }
+                std::vector<RenderStateCompositeInput> merge_inputs{};
+                merge_inputs.reserve(state_input_writers[contribution_index].size());
+                for (const uint32_t writer : state_input_writers[contribution_index]) {
+                    merge_inputs.push_back({state_outputs[writer], state_writer_blend_modes[writer]});
+                }
+                if (merge_inputs.size() > 1) {
+                    const pipeline::RenderGraphFeatureContext composite_context{
+                        .scope = impl_->plan->scope,
+                        .pipeline = impl_->plan->pipeline,
+                        .point_flags = pipeline::FeaturePointFlags::kMayCreateArtifacts |
+                                       pipeline::FeaturePointFlags::kMayCreateGraphicsPass |
+                                       pipeline::FeaturePointFlags::kMayCreateComputePass |
+                                       pipeline::FeaturePointFlags::kMayCreateCopyPass |
+                                       pipeline::FeaturePointFlags::kMayUseDedicatedQueue |
+                                       pipeline::FeaturePointFlags::kMayWriteFinalOutput,
+                        .user_data = impl_->desc.user_data,
+                        .feature_data = impl_->desc.feature_data,
+                    };
+                    backend->set_feature_point_flags(composite_context.point_flags);
+                    pipeline::RenderGraphBuilder composite_builder(*backend, composite_context);
+                    foundation::Result composite_result;
+                    try {
+                        composite_result = impl_->desc.state.compose_terminal_states(
+                            composite_builder, merge_inputs, state_outputs[contribution_index]);
+                    } catch (const std::bad_alloc&) {
+                        composite_result = foundation::Result::failure(
+                            foundation::ResultCode::kOutOfMemory, "render-state merge compositor allocation failed");
+                    } catch (const std::exception& exception) {
+                        composite_result = foundation::Result::failure(foundation::ResultCode::kUnknown, exception.what());
+                    } catch (...) {
+                        composite_result = foundation::Result::failure(
+                            foundation::ResultCode::kUnknown, "render-state merge compositor threw an unknown exception");
+                    }
+                    backend->set_feature_point_flags(pipeline::FeaturePointFlags::kNone);
+                    if (!composite_result) {
+                        return rollback(append_feature_message("render-state input composition failed", composite_result));
+                    }
+                }
+            }
+        }
 
         backend->set_feature_owner(feature_implementation);
         backend->set_feature_point_flags(contribution.point_flags);
         const pipeline::RenderGraphFeatureContext feature_context{
             impl_->plan->scope,    impl_->plan->pipeline,    contribution.feature,        contribution.feature_instance,
             contribution.part,     contribution.point,       contribution.point_position, contribution.point_flags,
+            state_outputs[contribution_index],
+            state_inputs[contribution_index].empty() ? pipeline::RenderGraphTexture{}
+                                                     : state_inputs[contribution_index].front(),
+            state_inputs[contribution_index], state_flow.contributions[contribution_index].layer_count,
             impl_->desc.user_data, impl_->desc.feature_data,
         };
         pipeline::RenderGraphBuilder builder(*backend, feature_context);
@@ -1004,6 +1170,123 @@ foundation::Result RenderGraphFeatureRuntime::build() {
         backend->set_feature_point_flags(pipeline::FeaturePointFlags::kNone);
         if (!build_result) {
             return rollback(append_feature_message("render feature graph build failed", build_result));
+        }
+        if (writes_render_state) {
+            state_writer_contributions[contribution_index] = 1;
+        }
+    }
+
+    std::vector<uint32_t> terminal_state_writers{};
+    for (uint32_t source = 0; source < state_writer_contributions.size(); ++source) {
+        if (state_writer_contributions[source] == 0) {
+            continue;
+        }
+        if (state_flow.contributions[source].connects_to_present) {
+            terminal_state_writers.push_back(source);
+            continue;
+        }
+        std::vector<uint8_t> visited(state_writer_contributions.size(), 0);
+        std::vector<uint32_t> pending = state_flow.contributions[source].output_contributions;
+        bool reaches_later_writer = false;
+        for (std::size_t cursor = 0; cursor < pending.size() && !reaches_later_writer; ++cursor) {
+            const uint32_t node = pending[cursor];
+            if (node >= state_writer_contributions.size() || visited[node] != 0) {
+                continue;
+            }
+            visited[node] = 1;
+            if (state_writer_contributions[node] != 0) {
+                reaches_later_writer = true;
+                break;
+            }
+            pending.insert(pending.end(), state_flow.contributions[node].output_contributions.begin(),
+                           state_flow.contributions[node].output_contributions.end());
+        }
+        if (!reaches_later_writer) {
+            terminal_state_writers.push_back(source);
+        }
+    }
+    if (impl_->desc.state.enabled && impl_->desc.state.present_target_id.is_valid() && !terminal_state_writers.empty()) {
+        if (impl_->desc.state.present_extent.width == 0 || impl_->desc.state.present_extent.height == 0 ||
+            impl_->desc.state.present_extent.depth == 0) {
+            return rollback(invalid_argument("render-state Present extent is invalid"));
+        }
+        const auto present_target = backend->find_texture(impl_->desc.state.present_target_id);
+        if (!present_target) {
+            return rollback(append_feature_message("render-state Present target lookup failed", present_target.result));
+        }
+        const pipeline::RenderGraphTexture destination = present_target.value;
+        std::vector<RenderStateCompositeInput> terminal_states{};
+        terminal_states.reserve(terminal_state_writers.size());
+        for (const uint32_t writer : terminal_state_writers) {
+            terminal_states.push_back({state_outputs[writer], state_writer_blend_modes[writer]});
+        }
+        if (terminal_states.size() > 1) {
+            if (!impl_->desc.state.compose_terminal_states) {
+                return rollback(invalid_state(
+                    "multiple terminal render-state outputs require a terminal compositor callback"));
+            }
+            const pipeline::RenderGraphFeatureContext composite_context{
+                .scope = impl_->plan->scope,
+                .pipeline = impl_->plan->pipeline,
+                .point_flags = pipeline::FeaturePointFlags::kMayCreateArtifacts |
+                               pipeline::FeaturePointFlags::kMayCreateGraphicsPass |
+                               pipeline::FeaturePointFlags::kMayCreateComputePass |
+                               pipeline::FeaturePointFlags::kMayCreateCopyPass |
+                               pipeline::FeaturePointFlags::kMayUseDedicatedQueue |
+                               pipeline::FeaturePointFlags::kMayWriteFinalOutput,
+                .user_data = impl_->desc.user_data,
+                .feature_data = impl_->desc.feature_data,
+            };
+            backend->set_feature_point_flags(composite_context.point_flags);
+            pipeline::RenderGraphBuilder composite_builder(*backend, composite_context);
+            foundation::Result composite_result;
+            try {
+                composite_result = impl_->desc.state.compose_terminal_states(
+                    composite_builder, terminal_states, destination);
+            } catch (const std::bad_alloc&) {
+                composite_result = foundation::Result::failure(foundation::ResultCode::kOutOfMemory,
+                                                               "render-state terminal compositor allocation failed");
+            } catch (const std::exception& exception) {
+                composite_result = foundation::Result::failure(foundation::ResultCode::kUnknown, exception.what());
+            } catch (...) {
+                composite_result = foundation::Result::failure(foundation::ResultCode::kUnknown,
+                                                               "render-state terminal compositor threw an unknown exception");
+            }
+            backend->set_feature_point_flags(pipeline::FeaturePointFlags::kNone);
+            if (!composite_result) {
+                return rollback(append_feature_message("render-state terminal composition failed", composite_result));
+            }
+        } else {
+            const pipeline::RenderGraphTexture source = terminal_states.front().texture;
+            const rhi::Extent3D extent = impl_->desc.state.present_extent;
+            const auto pass = backend->add_pass(
+                "RenderState.Present", pipeline::RenderGraphPassType::kCopy, rhi::QueueClass::kCopy,
+                [source, destination](pipeline::RenderPassBuilder& pass_builder) {
+                    if (const foundation::Result result = pass_builder.read(
+                            source, rhi::ResourceUsage::kCopySource, rhi::PipelineStage::kCopy,
+                            rhi::ShaderStage::kAll);
+                        !result) {
+                        return result;
+                    }
+                    if (const foundation::Result result = pass_builder.write(
+                            destination, rhi::ResourceUsage::kCopyDestination, rhi::PipelineStage::kCopy,
+                            rhi::ShaderStage::kAll, {}, true);
+                        !result) {
+                        return result;
+                    }
+                    pass_builder.set_side_effects();
+                    return foundation::Result::success();
+                },
+                [source, destination, extent](pipeline::RenderPassExecutionContext& execution) {
+                    return execution.copy_texture(source,
+                                                  rhi::TextureSubresourceLayers{rhi::Aspect::kColor, 0, 0, 1},
+                                                  rhi::Offset3D{0, 0, 0}, destination,
+                                                  rhi::TextureSubresourceLayers{rhi::Aspect::kColor, 0, 0, 1},
+                                                  rhi::Offset3D{0, 0, 0}, extent);
+                });
+            if (!pass) {
+                return rollback(append_feature_message("render-state Present copy creation failed", pass.result));
+            }
         }
     }
 

@@ -5,12 +5,14 @@
 #include "win32_window_system.hpp"
 
 #include <windows.h>
+#include <shobjidl.h>
 
 #include <algorithm>
 #include <bit>
 #include <cstddef>
 #include <cstring>
 #include <exception>
+#include <filesystem>
 #include <limits>
 #include <new>
 #include <string>
@@ -493,5 +495,137 @@ foundation::Result show_error_dialog(std::string_view title, std::string_view me
     } catch (...) {
         return foundation::Result::failure(foundation::ResultCode::kUnknown);
     }
+}
+
+foundation::ResultValue<std::string> select_directory(platform::WindowSurfaceBinding owner,
+                                                      std::string_view title,
+                                                      std::string_view initial_directory) {
+    if (title.empty() || title.find('\0') != std::string_view::npos ||
+        initial_directory.find('\0') != std::string_view::npos ||
+        title.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+        initial_directory.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        return {foundation::invalid_argument("Directory picker parameters are invalid"), {}};
+    }
+
+    const auto backend_failure = [](const char* message) {
+        return foundation::ResultValue<std::string>{
+            foundation::Result::failure(foundation::ResultCode::kBackendError, message), {}};
+    };
+    const auto to_wide = [](std::string_view value) -> foundation::ResultValue<std::wstring> {
+        if (value.empty()) return {foundation::Result::success(), {}};
+        const int source_length = static_cast<int>(value.size());
+        const int required =
+            MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(), source_length, nullptr, 0);
+        if (required <= 0) {
+            return {foundation::Result::failure(foundation::ResultCode::kBackendError,
+                                                "Directory picker UTF-8 conversion failed"), {}};
+        }
+        std::wstring converted(static_cast<std::size_t>(required), L'\0');
+        if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(), source_length,
+                                converted.data(), required) != required) {
+            return {foundation::Result::failure(foundation::ResultCode::kBackendError,
+                                                "Directory picker UTF-8 conversion failed"), {}};
+        }
+        return {foundation::Result::success(), std::move(converted)};
+    };
+    const auto to_utf8 = [](std::wstring_view value) -> foundation::ResultValue<std::string> {
+        if (value.empty()) return {foundation::Result::success(), {}};
+        if (value.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+            return {foundation::invalid_argument("Selected directory is too long"), {}};
+        }
+        const int source_length = static_cast<int>(value.size());
+        const int required = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value.data(), source_length,
+                                                 nullptr, 0, nullptr, nullptr);
+        if (required <= 0) {
+            return {foundation::Result::failure(foundation::ResultCode::kBackendError,
+                                                "Directory picker UTF-16 conversion failed"), {}};
+        }
+        std::string converted(static_cast<std::size_t>(required), '\0');
+        if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value.data(), source_length,
+                                converted.data(), required, nullptr, nullptr) != required) {
+            return {foundation::Result::failure(foundation::ResultCode::kBackendError,
+                                                "Directory picker UTF-16 conversion failed"), {}};
+        }
+        return {foundation::Result::success(), std::move(converted)};
+    };
+
+    const auto title_result = to_wide(title);
+    if (!title_result) return {title_result.result, {}};
+    const auto initial_result = to_wide(initial_directory);
+    if (!initial_result) return {initial_result.result, {}};
+
+    const HRESULT initialize_result = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (FAILED(initialize_result)) {
+        return backend_failure("Directory picker COM initialization failed");
+    }
+
+    IFileOpenDialog* dialog = nullptr;
+    HRESULT result = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                                      IID_IFileOpenDialog, reinterpret_cast<void**>(&dialog));
+    if (FAILED(result) || dialog == nullptr) {
+        CoUninitialize();
+        return backend_failure("Directory picker creation failed");
+    }
+
+    DWORD options = 0;
+    result = dialog->GetOptions(&options);
+    if (SUCCEEDED(result)) {
+        result = dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+    }
+    if (SUCCEEDED(result)) result = dialog->SetTitle(title_result.value.c_str());
+
+    if (SUCCEEDED(result) && !initial_result.value.empty()) {
+        std::filesystem::path initial_path(initial_result.value);
+        std::error_code error;
+        while (!initial_path.empty() &&
+               (!std::filesystem::exists(initial_path, error) || error ||
+                !std::filesystem::is_directory(initial_path, error) || error)) {
+            error.clear();
+            const std::filesystem::path parent = initial_path.parent_path();
+            if (parent == initial_path) break;
+            initial_path = parent;
+        }
+        if (!initial_path.empty()) {
+            IShellItem* initial_item = nullptr;
+            if (SUCCEEDED(SHCreateItemFromParsingName(initial_path.c_str(), nullptr, IID_IShellItem,
+                                                      reinterpret_cast<void**>(&initial_item))) &&
+                initial_item != nullptr) {
+                static_cast<void>(dialog->SetFolder(initial_item));
+                initial_item->Release();
+            }
+        }
+    }
+
+    if (SUCCEEDED(result)) {
+        result = dialog->Show(static_cast<HWND>(owner.window_handle));
+    }
+    if (result == HRESULT_FROM_WIN32(ERROR_CANCELLED)) {
+        dialog->Release();
+        CoUninitialize();
+        return {foundation::Result::failure(foundation::ResultCode::kCancelled,
+                                            "Directory selection was cancelled"), {}};
+    }
+    if (FAILED(result)) {
+        dialog->Release();
+        CoUninitialize();
+        return backend_failure("Directory picker could not be shown");
+    }
+
+    IShellItem* selected_item = nullptr;
+    result = dialog->GetResult(&selected_item);
+    PWSTR selected_path = nullptr;
+    if (SUCCEEDED(result) && selected_item != nullptr) {
+        result = selected_item->GetDisplayName(SIGDN_FILESYSPATH, &selected_path);
+    }
+
+    foundation::ResultValue<std::string> selected_result =
+        FAILED(result) || selected_path == nullptr
+            ? backend_failure("Directory picker did not return a filesystem path")
+            : to_utf8(selected_path);
+    if (selected_path != nullptr) CoTaskMemFree(selected_path);
+    if (selected_item != nullptr) selected_item->Release();
+    dialog->Release();
+    CoUninitialize();
+    return selected_result;
 }
 }  // namespace aeg::application

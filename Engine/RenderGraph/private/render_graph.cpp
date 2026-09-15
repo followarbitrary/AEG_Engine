@@ -1775,6 +1775,37 @@ namespace aeg::render_graph {
     }
 
     foundation::Result RenderGraph::Impl::compile_graph(RenderGraphCompileInfo& info) {
+        // Imported resources may be transitioned by another RenderGraph between
+        // two executions of this graph. Refresh their RHI state before deciding
+        // whether the cached barrier plan is reusable; otherwise a cached plan
+        // can omit the transition required by a newly produced external image.
+        try {
+            bool imported_state_changed = false;
+            for (TextureRecord& record : textures) {
+                if (record.lifetime != ResourceLifetime::kImported || !record.physical.handle.is_valid()) {
+                    continue;
+                }
+                const auto snapshot = device.query_texture_state(record.physical.handle);
+                if (!snapshot) {
+                    return snapshot.result;
+                }
+                if (snapshot.value.subresource_states.empty()) {
+                    return foundation::Result::failure(foundation::ResultCode::kInvalidState,
+                                                       "Imported texture state snapshot is empty");
+                }
+                if (record.physical.states != snapshot.value.subresource_states) {
+                    record.physical.states = snapshot.value.subresource_states;
+                    record.imported_state = record.physical.states.front();
+                    imported_state_changed = true;
+                }
+            }
+            if (imported_state_changed) {
+                mark_dirty();
+            }
+        } catch (const std::bad_alloc&) {
+            return foundation::Result::failure(foundation::ResultCode::kOutOfMemory,
+                                               "Imported texture state refresh allocation failed");
+        }
         if (compiled && compiled_revision == revision) {
             info.resource_count = static_cast<uint32_t>(buffers.size() + textures.size());
             info.pass_count = static_cast<uint32_t>(passes.size());
@@ -4219,11 +4250,16 @@ namespace aeg::render_graph {
                                 "Render graph pass plan does not match its batch"));
                     }
                     PassRecord& pass = impl_->passes[pass_index];
+                    const auto fail_pass = [&fail_execution, &pass](foundation::Result result)
+                            -> foundation::ResultValue<RenderGraphExecutionResult> {
+                        result.message = "Render graph pass '" + pass.name + "' failed: " + result.message;
+                        return fail_execution(std::move(result));
+                    };
                     const foundation::Result before_barrier_result = impl_->record_barrier_batch(
                             command_list, frame_slot, pass_plan, RenderGraphBarrierPhase::kBeforePass,
                             buffer_states, texture_states);
                     if (!before_barrier_result) {
-                        return fail_execution(before_barrier_result);
+                        return fail_pass(before_barrier_result);
                     }
 
                     PassExecutionContext context(
@@ -4233,7 +4269,7 @@ namespace aeg::render_graph {
                         if (pass.execute) {
                             const foundation::Result execute_result = pass.execute(context);
                             if (!execute_result) {
-                                return fail_execution(execute_result);
+                                return fail_pass(execute_result);
                             }
                         }
                     } catch (const std::bad_alloc&) {
@@ -4262,7 +4298,7 @@ namespace aeg::render_graph {
                             command_list, frame_slot, pass_plan, RenderGraphBarrierPhase::kAfterPass,
                             buffer_states, texture_states);
                     if (!after_barrier_result) {
-                        return fail_execution(after_barrier_result);
+                        return fail_pass(after_barrier_result);
                     }
                 }
 

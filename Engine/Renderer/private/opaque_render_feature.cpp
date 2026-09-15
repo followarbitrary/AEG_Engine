@@ -88,12 +88,18 @@ struct OpaquePassData final {
     uint64_t lighting_offset{0};
     uint64_t lighting_size{0};
     bool has_depth_target{false};
+    bool preserve_color{false};
     RenderExtent output_extent{};
     std::vector<OpaqueDrawItem> draws{};
 };
 
 class OpaqueRenderFeature final : public pipeline::RenderFeature {
 public:
+    [[nodiscard]] bool uses_render_state_output() const noexcept override { return true; }
+    [[nodiscard]] pipeline::RenderStateBlendMode render_state_blend_mode() const noexcept override {
+        return pipeline::RenderStateBlendMode::kOver;
+    }
+
     [[nodiscard]] const pipeline::FeatureDescriptor& descriptor() const noexcept override {
         static const pipeline::FeatureDescriptor kDescriptor{
             .id = kOpaqueRenderFeatureId,
@@ -111,20 +117,52 @@ public:
         if (context == nullptr || !context->is_valid()) {
             return invalid_state("opaque render feature requires a valid renderer context");
         }
-        if (context->scene_snapshot->instances.empty()) {
-            return foundation::Result::success();
-        }
-        if (context->resource_resolver == nullptr) {
+        if (!context->scene_snapshot->instances.empty() && context->resource_resolver == nullptr) {
             return invalid_state("opaque render feature requires a render resource resolver");
         }
         if (!context->scene_snapshot->view.color_target.is_valid()) {
             return invalid_argument("opaque render feature requires a RenderView color target");
         }
 
-        const foundation::ResultValue<pipeline::RenderGraphTexture> color_target =
-            builder.find_texture(context->scene_snapshot->view.color_target);
-        if (!color_target) {
-            return color_target.result;
+        const pipeline::RenderGraphTexture state_output = builder.state_output();
+        const pipeline::RenderGraphTexture state_input = builder.state_input();
+        const std::span<const pipeline::RenderGraphTexture> state_inputs = builder.state_inputs();
+        const bool preserve_state = state_output.is_valid() && !state_inputs.empty();
+        // RenderFeatureRuntime pre-composes multi-input state into state_output.
+        // A serial input still needs the inexpensive copy seed below.
+        const bool needs_state_seed = preserve_state && state_inputs.size() == 1 && state_input.is_valid();
+        const foundation::ResultValue<pipeline::RenderGraphTexture> color_target = state_output.is_valid()
+            ? foundation::ResultValue<pipeline::RenderGraphTexture>{foundation::Result::success(), state_output}
+            : builder.find_texture(context->scene_snapshot->view.color_target);
+        if (!color_target) return color_target.result;
+        const rhi::ResourceUsage color_final_usage = state_output.is_valid()
+            ? rhi::ResourceUsage::kCopySource
+            : context->scene_snapshot->view.color_target_final_usage;
+
+        if (needs_state_seed) {
+            const rhi::Extent3D extent{context->scene_snapshot->view.output_extent.width,
+                                       context->scene_snapshot->view.output_extent.height, 1};
+            const auto seed = builder.add_copy_pass(
+                "Opaque.StateSeed",
+                [state_input, state_output](pipeline::RenderPassBuilder& pass) {
+                    if (const foundation::Result result = pass.read(
+                            state_input, rhi::ResourceUsage::kCopySource, rhi::PipelineStage::kCopy,
+                            rhi::ShaderStage::kAll);
+                        !result) {
+                        return result;
+                    }
+                    return pass.write(state_output, rhi::ResourceUsage::kCopyDestination, rhi::PipelineStage::kCopy,
+                                      rhi::ShaderStage::kAll, {}, true);
+                },
+                [state_input, state_output, extent](pipeline::RenderPassExecutionContext& execution) {
+                    return execution.copy_texture(state_input, rhi::TextureSubresourceLayers{rhi::Aspect::kColor, 0, 0, 1},
+                                                  rhi::Offset3D{}, state_output,
+                                                  rhi::TextureSubresourceLayers{rhi::Aspect::kColor, 0, 0, 1},
+                                                  rhi::Offset3D{}, extent);
+                });
+            if (!seed) {
+                return seed.result;
+            }
         }
 
         pipeline::RenderGraphTexture depth_target{};
@@ -138,12 +176,32 @@ public:
             depth_target = depth_target_result.value;
         }
 
+        // Empty frames still own and clear their targets; otherwise imported textures retain old geometry.
+        if (context->scene_snapshot->instances.empty()) {
+            const auto final_usage = color_final_usage;
+            const auto clear = builder.add_graphics_pass("Opaque.ClearEmpty",
+                [color = color_target.value, depth_target, final_usage, preserve_state](pipeline::RenderPassBuilder& pass) {
+                    if (const auto result = pass.use_color_attachment(color,
+                            preserve_state ? rhi::LoadOp::kLoad : rhi::LoadOp::kClear,
+                            rhi::StoreOp::kStore, rhi::ClearColorValue{0, 0, 0, 1}, final_usage); !result) return result;
+                    if (depth_target.is_valid()) return pass.use_depth_stencil_attachment(
+                        depth_target, rhi::LoadOp::kClear, rhi::StoreOp::kStore, 1.0f, 0);
+                    return foundation::Result::success();
+                },
+                [](pipeline::RenderPassExecutionContext& pass) {
+                    if (const auto result = pass.begin_rendering(); !result) return result;
+                    return pass.end_rendering();
+                });
+            return clear ? foundation::Result::success() : clear.result;
+        }
+
         // The graph owns callbacks past build(), so draw declarations need shared ownership.
         auto pass_data = std::make_shared<OpaquePassData>();
         pass_data->color_target = color_target.value;
         pass_data->depth_target = depth_target;
-        pass_data->color_target_final_usage = context->scene_snapshot->view.color_target_final_usage;
+        pass_data->color_target_final_usage = color_final_usage;
         pass_data->has_depth_target = depth_target.is_valid();
+        pass_data->preserve_color = preserve_state;
         pass_data->output_extent = context->scene_snapshot->view.output_extent;
         pass_data->draws.reserve(context->scene_snapshot->instances.size());
 
@@ -316,7 +374,9 @@ public:
                     return result;
                 }
                 if (const foundation::Result result = pass_builder.use_color_attachment(
-                        captured_data->color_target, rhi::LoadOp::kClear, rhi::StoreOp::kStore,
+                        captured_data->color_target,
+                        captured_data->preserve_color ? rhi::LoadOp::kLoad : rhi::LoadOp::kClear,
+                        rhi::StoreOp::kStore,
                         rhi::ClearColorValue{0.0f, 0.0f, 0.0f, 1.0f}, captured_data->color_target_final_usage);
                     !result) {
                     return result;

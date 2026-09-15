@@ -651,6 +651,7 @@ namespace aeg::pipeline {
         bool stage_parallelizable{false};
         std::vector<ArtifactBinding> artifact_bindings{};
         PhaseId phase_id{};
+        uint32_t definition_stage_index{kInvalidPipelineHandleIndex};
     };
 
     /** @brief One directed dependency edge between compiled nodes. */
@@ -659,6 +660,8 @@ namespace aeg::pipeline {
         uint32_t destination_node{kInvalidPipelineHandleIndex};
         PipelineDependencyKind kind{PipelineDependencyKind::kArtifact};
         ArtifactId artifact{};
+        /** @brief True when the Editor added this ordering at runtime rather than from the pipeline definition. */
+        bool runtime_override{false};
     };
 
     /** @brief A set of nodes that can be scheduled after earlier batches complete. */

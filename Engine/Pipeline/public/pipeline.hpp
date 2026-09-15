@@ -50,6 +50,16 @@ using PhysicsGraphBuilder = DomainGraphBuilder<FeatureDomain::kPhysics>;
 using AudioGraphBuilder = DomainGraphBuilder<FeatureDomain::kAudio>;
 using StreamGraphBuilder = DomainGraphBuilder<FeatureDomain::kStream>;
 
+/** @brief Declares how an explicit RenderFeature compositor combines state textures. */
+enum class RenderStateBlendMode : uint8_t {
+    /** The compositor replaces the destination with the selected state. */
+    kReplace,
+    /** The compositor alpha-composites each state over the destination. */
+    kOver,
+    /** The compositor additively combines state colors. */
+    kAdd,
+};
+
 /** @brief Runtime metadata associated with one render-feature contribution. */
 struct RenderGraphFeatureContext {
     PipelineScope scope{PipelineScope::kFrame};
@@ -60,6 +70,14 @@ struct RenderGraphFeatureContext {
     FeaturePointId feature_point{};
     FeaturePointPosition point_position{FeaturePointPosition::kBefore};
     FeaturePointFlags point_flags{FeaturePointFlags::kNone};
+    /** State texture produced by this contribution when RenderGraph state composition is enabled. */
+    RenderGraphTexture state_output{};
+    /** State texture forwarded from an upstream contribution; invalid until an input link is resolved. */
+    RenderGraphTexture state_input{};
+    /** All state textures entering this contribution, in compiled Pipeline edge order. */
+    std::span<const RenderGraphTexture> state_inputs{};
+    /** Number of independent state layers represented by this contribution. */
+    uint32_t state_layer_count{0};
     void* user_data{nullptr};
     const void* feature_data{nullptr};
 
@@ -225,6 +243,10 @@ public:
     [[nodiscard]] FeaturePointFlags feature_point_flags() const noexcept;
     [[nodiscard]] void* user_data() const noexcept;
     [[nodiscard]] const void* feature_data() const noexcept;
+    [[nodiscard]] RenderGraphTexture state_input() const noexcept;
+    [[nodiscard]] std::span<const RenderGraphTexture> state_inputs() const noexcept;
+    [[nodiscard]] RenderGraphTexture state_output() const noexcept;
+    [[nodiscard]] uint32_t state_layer_count() const noexcept;
     [[nodiscard]] bool allows(FeaturePointFlags flag) const noexcept;
     [[nodiscard]] bool is_runtime() const noexcept;
 
@@ -799,6 +821,12 @@ public:
     [[nodiscard]] virtual foundation::Result build_render_graph(RenderGraphBuilder&) const {
         return foundation::Result::success();
     }
+    /** @brief True when this feature writes a composable color state output. */
+    [[nodiscard]] virtual bool uses_render_state_output() const noexcept { return false; }
+    /** @brief Declares the blending semantic used when this feature consumes state inputs. */
+    [[nodiscard]] virtual RenderStateBlendMode render_state_blend_mode() const noexcept {
+        return RenderStateBlendMode::kReplace;
+    }
 };
 
 /** @brief Construction-time context that restricts a feature to one pipeline extension point. */
@@ -1274,6 +1302,10 @@ public:
     [[nodiscard]] foundation::Result bind_pipeline(PipelineId pipeline);
     [[nodiscard]] foundation::Result rebuild(const PipelineRegistry& registry,
                                              CapabilityMask available_capabilities = 0);
+    /** @brief Stages an Editor-authored dependency override that becomes active at the next safe execution boundary. */
+    [[nodiscard]] foundation::Result add_runtime_ordering(uint32_t source_node, uint32_t destination_node);
+    /** @brief Removes one dependency override at the next safe execution boundary. */
+    [[nodiscard]] foundation::Result remove_runtime_ordering(uint32_t source_node, uint32_t destination_node);
     /** @brief Applies a plan staged by rebuild at a safe execution boundary. */
     [[nodiscard]] foundation::Result apply_pending_plan();
     /** @brief Releases retired plans that have no remaining external references. */
@@ -1451,6 +1483,22 @@ inline void* RenderGraphBuilder::user_data() const noexcept {
 
 inline const void* RenderGraphBuilder::feature_data() const noexcept {
     return declaration_context_ != nullptr ? nullptr : runtime_context_.feature_data;
+}
+
+inline RenderGraphTexture RenderGraphBuilder::state_input() const noexcept {
+    return declaration_context_ != nullptr ? RenderGraphTexture{} : runtime_context_.state_input;
+}
+
+inline std::span<const RenderGraphTexture> RenderGraphBuilder::state_inputs() const noexcept {
+    return declaration_context_ != nullptr ? std::span<const RenderGraphTexture>{} : runtime_context_.state_inputs;
+}
+
+inline RenderGraphTexture RenderGraphBuilder::state_output() const noexcept {
+    return declaration_context_ != nullptr ? RenderGraphTexture{} : runtime_context_.state_output;
+}
+
+inline uint32_t RenderGraphBuilder::state_layer_count() const noexcept {
+    return declaration_context_ != nullptr ? 0 : runtime_context_.state_layer_count;
 }
 
 inline bool RenderGraphBuilder::allows(FeaturePointFlags flag) const noexcept {

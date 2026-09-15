@@ -27,8 +27,8 @@ namespace {
 using aeg::editor::EditorFontDescriptor;
 using aeg::editor::EditorFontKind;
 
-constexpr std::array<std::string_view, 6> kPreferredFamilies{
-    "Noto Sans SC", "Inter", "IBM Plex Sans", "JetBrains Mono", "Fira Code", "Source Code Pro"};
+constexpr std::array<std::string_view, 7> kPreferredFamilies{
+    "Segoe UI", "Inter", "Noto Sans SC", "IBM Plex Sans", "JetBrains Mono", "Fira Code", "Source Code Pro"};
 
 [[nodiscard]] std::string lower_ascii(std::string_view value) {
     std::string result;
@@ -104,6 +104,7 @@ foundation::ResultValue<EditorSystemFontCatalogData> EditorSystemFontCatalog::lo
 
         EditorSystemFontCatalogData result{};
         std::string fallback_key;
+        std::size_t preferred_rank = kPreferredFamilies.size();
         for (const SystemFontRecord& record : records_result.value) {
             EditorFontDescriptor descriptor{};
             descriptor.key = make_font_key(record.family_name);
@@ -126,8 +127,11 @@ foundation::ResultValue<EditorSystemFontCatalogData> EditorSystemFontCatalog::lo
             if (fallback_key.empty()) {
                 fallback_key = descriptor.key;
             }
-            if (result.default_font_key.empty() && descriptor.is_default) {
+            const auto preferred = std::find(kPreferredFamilies.begin(), kPreferredFamilies.end(), record.family_name);
+            const auto rank = static_cast<std::size_t>(preferred - kPreferredFamilies.begin());
+            if (rank < preferred_rank) {
                 result.default_font_key = descriptor.key;
+                preferred_rank = rank;
             }
         }
         if (result.catalog.font_count() == 0) {

@@ -682,7 +682,8 @@ foundation::Result RenderPipeline::build(pipeline::PipelineBuilder& builder) con
              pipeline::FeaturePointFlags::kMayCreateComputePass},
         {pipeline::StageId("RenderPipeline.Opaque"), pipeline::FeaturePointId("RenderPipeline.Opaque"),
          "RenderPipeline.Opaque", pipeline::EnginePhase::kRenderBuild, pipeline::ExecutionDomain::kRenderThread,
-         pipeline::FeaturePointFlags::kMayCreateArtifacts | pipeline::FeaturePointFlags::kMayCreateGraphicsPass},
+         pipeline::FeaturePointFlags::kMayCreateArtifacts | pipeline::FeaturePointFlags::kMayCreateGraphicsPass |
+             pipeline::FeaturePointFlags::kMayCreateCopyPass | pipeline::FeaturePointFlags::kMayUseDedicatedQueue},
         {pipeline::StageId("RenderPipeline.Lighting"), pipeline::FeaturePointId("RenderPipeline.Lighting"),
          "RenderPipeline.Lighting", pipeline::EnginePhase::kRenderBuild, pipeline::ExecutionDomain::kRenderThread,
          pipeline::FeaturePointFlags::kMayCreateArtifacts | pipeline::FeaturePointFlags::kMayCreateComputePass |

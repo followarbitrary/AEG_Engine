@@ -4,15 +4,22 @@
  */
 #include <memory>
 #include <array>
+#include <vector>
 
 #include <pipeline.hpp>
+#include <render_feature_flow.hpp>
 #include <render_feature_runtime.hpp>
 #include <render_graph.hpp>
 #include <rhi.hpp>
 
+#include <render_state_flow.hpp>
+
 namespace {
     struct RuntimeFeatureUserData {
         bool fail_after_graph_build{false};
+        aeg::pipeline::RenderGraphTexture observed_state_output{};
+        uint32_t observed_state_layer_count{0};
+        std::vector<aeg::pipeline::RenderGraphTexture> observed_state_inputs{};
     };
 
     using aeg::foundation::Result;
@@ -30,6 +37,87 @@ namespace {
     using aeg::rhi::ShaderStage;
     using aeg::rhi::TextureCapability;
     using aeg::rhi::TextureDesc;
+
+    [[nodiscard]] bool verify_present_flow_filtering() {
+        aeg::pipeline::PipelinePlan plan{};
+        plan.nodes.resize(4);
+        plan.nodes[0].definition_stage_index = 0;
+        plan.nodes[1].definition_stage_index = 1;
+        plan.nodes[2].definition_stage_index = 2;
+        plan.nodes[3].definition_stage_index = 3;
+        plan.nodes[3].phase = aeg::pipeline::EnginePhase::kPresent;
+        plan.dependencies = {
+            {0, 1},
+            {1, 2},
+            {2, 3},
+        };
+
+        aeg::pipeline::PipelineFeatureContributionRecord connected{};
+        connected.domain = FeatureDomain::kRender;
+        connected.first_stage_index = 0;
+        connected.stage_count = 1;
+        if (!aeg::render_graph::render_feature_contribution_reaches_present(plan, connected)) {
+            return false;
+        }
+
+        plan.dependencies.pop_back();
+        if (aeg::render_graph::render_feature_contribution_reaches_present(plan, connected)) {
+            return false;
+        }
+
+        aeg::pipeline::PipelineFeatureContributionRecord unmapped{};
+        unmapped.domain = FeatureDomain::kRender;
+        unmapped.first_stage_index = 99;
+        unmapped.stage_count = 1;
+        if (aeg::render_graph::render_feature_contribution_reaches_present(plan, unmapped)) {
+            return false;
+        }
+
+        plan.nodes.pop_back();
+        if (!aeg::render_graph::render_feature_contribution_reaches_present(plan, connected)) {
+            return false;
+        }
+        return true;
+    }
+
+    [[nodiscard]] bool verify_render_state_layer_flow() {
+        aeg::pipeline::PipelinePlan plan{};
+        plan.nodes.resize(5);
+        for (uint32_t index = 0; index < plan.nodes.size(); ++index) {
+            plan.nodes[index].definition_stage_index = index;
+        }
+        plan.nodes[3].phase = aeg::pipeline::EnginePhase::kPresent;
+        plan.dependencies = {
+            {0, 2},
+            {1, 2},
+            {2, 3},
+        };
+        for (const uint32_t index : {0u, 1u, 2u, 4u}) {
+            aeg::pipeline::PipelineFeatureContributionRecord contribution{};
+            contribution.domain = aeg::pipeline::FeatureDomain::kRender;
+            contribution.first_stage_index = index;
+            contribution.stage_count = 1;
+            plan.feature_contributions.push_back(contribution);
+        }
+
+        const auto flow = aeg::render_graph::build_render_state_flow(plan);
+        const std::array<aeg::render_graph::RenderStateLinkOverride, 1> detached_present{{{2, 3, false}}};
+        const auto detached_flow = aeg::render_graph::build_render_state_flow(plan, detached_present);
+        const std::array<aeg::render_graph::RenderStateLinkOverride, 1> cyclic_link{{{2, 0, true}}};
+        const auto cyclic_flow = aeg::render_graph::build_render_state_flow(plan, cyclic_link);
+        return flow.present_node_count == 1 && !flow.has_cycle && flow.contributions.size() == 4 &&
+               flow.contributions[0].reaches_present && flow.contributions[0].input_count == 0 &&
+               flow.contributions[0].layer_count == 1 && flow.contributions[1].reaches_present &&
+               flow.contributions[1].input_count == 0 && flow.contributions[1].layer_count == 1 &&
+               flow.contributions[2].reaches_present && flow.contributions[2].input_count == 2 &&
+               flow.contributions[2].layer_count == 2 &&
+               flow.contributions[2].input_contributions == std::vector<uint32_t>{0, 1} &&
+               flow.contributions[0].output_contributions == std::vector<uint32_t>{2} &&
+               flow.contributions[1].output_contributions == std::vector<uint32_t>{2} &&
+               !flow.contributions[3].reaches_present &&
+               !detached_flow.contributions[0].reaches_present && !detached_flow.contributions[1].reaches_present &&
+               !detached_flow.contributions[2].reaches_present && cyclic_flow.has_cycle;
+    }
 
     class RuntimeRenderPipeline final : public aeg::pipeline::Pipeline {
     public:
@@ -78,6 +166,8 @@ namespace {
 
     class RuntimeRenderFeature final : public aeg::pipeline::RenderFeature {
     public:
+        [[nodiscard]] bool uses_render_state_output() const noexcept override { return true; }
+
         [[nodiscard]] const aeg::pipeline::FeatureDescriptor& descriptor() const noexcept override {
             static const aeg::pipeline::FeatureDescriptor descriptor{
                 aeg::pipeline::FeatureId("RuntimeRenderFeature"),
@@ -92,6 +182,11 @@ namespace {
         }
 
         [[nodiscard]] Result build_render_graph(aeg::pipeline::RenderGraphBuilder& builder) const override {
+            if (auto* user_data = static_cast<RuntimeFeatureUserData*>(builder.user_data()); user_data != nullptr) {
+                user_data->observed_state_output = builder.state_output();
+                user_data->observed_state_layer_count = builder.state_layer_count();
+                user_data->observed_state_inputs.assign(builder.state_inputs().begin(), builder.state_inputs().end());
+            }
             if (!builder.is_runtime() || builder.scope() != PipelineScope::kFrame) {
                 return Result::failure(ResultCode::kInvalidState,
                                        "runtime render feature received an invalid builder");
@@ -103,23 +198,28 @@ namespace {
                 return input.result;
             }
 
-            TextureDesc output_desc{};
-            output_desc.extent = {4, 4, 1};
-            output_desc.format = Format::kRgba8Unorm;
-            output_desc.capabilities = TextureCapability::kStorage;
-            output_desc.memory = MemoryClass::kDeviceLocal;
-
-            const auto output = builder.create_texture(
-                aeg::pipeline::RenderResourceId("RuntimeRenderOutput"),
-                output_desc,
-                aeg::pipeline::RenderGraphResourceLifetime::kTransient);
-            if (!output) {
-                return output.result;
+            aeg::pipeline::RenderGraphTexture output = builder.state_output();
+            if (!output.is_valid()) {
+                TextureDesc output_desc{};
+                output_desc.extent = {4, 4, 1};
+                output_desc.format = Format::kRgba8Unorm;
+                output_desc.capabilities = TextureCapability::kStorage;
+                output_desc.memory = MemoryClass::kDeviceLocal;
+                const auto created_output = builder.create_texture(
+                    aeg::pipeline::RenderResourceId("RuntimeRenderOutput"),
+                    output_desc,
+                    aeg::pipeline::RenderGraphResourceLifetime::kTransient);
+                if (!created_output) {
+                    return created_output.result;
+                }
+                output = created_output.value;
             }
 
+            const std::vector<aeg::pipeline::RenderGraphTexture> state_inputs(
+                builder.state_inputs().begin(), builder.state_inputs().end());
             const auto pass = builder.add_compute_pass(
                 "RuntimeRenderPass",
-                [input, output](aeg::pipeline::RenderPassBuilder& pass_builder) {
+                [input, state_inputs, output](aeg::pipeline::RenderPassBuilder& pass_builder) {
                     if (const Result result = pass_builder.read(
                             input.value,
                             ResourceUsage::kStorageRead,
@@ -128,8 +228,16 @@ namespace {
                         !result) {
                         return result;
                     }
+                    for (const aeg::pipeline::RenderGraphTexture state_input : state_inputs) {
+                        if (const Result result = pass_builder.read(
+                                state_input, ResourceUsage::kStorageRead, PipelineStage::kCompute,
+                                ShaderStage::kCompute);
+                            !result) {
+                            return result;
+                        }
+                    }
                     return pass_builder.write(
-                            output.value,
+                            output,
                             ResourceUsage::kStorageWrite,
                             PipelineStage::kCompute,
                             ShaderStage::kCompute);
@@ -142,9 +250,11 @@ namespace {
                 return pass.result;
             }
 
-            const Result export_result = builder.export_texture(output.value);
-            if (!export_result) {
-                return export_result;
+            if (!builder.state_output().is_valid()) {
+                const Result export_result = builder.export_texture(output);
+                if (!export_result) {
+                    return export_result;
+                }
             }
             if (const auto* user_data = static_cast<const RuntimeFeatureUserData*>(builder.user_data());
                 user_data != nullptr && user_data->fail_after_graph_build) {
@@ -168,9 +278,38 @@ namespace {
                 "runtime render feature declaration failed");
         }
     };
+
+    /** A real RenderFeature that reads state but deliberately creates no state output. */
+    class RuntimeStateConsumerFeature final : public aeg::pipeline::RenderFeature {
+    public:
+        [[nodiscard]] const aeg::pipeline::FeatureDescriptor& descriptor() const noexcept override {
+            static const aeg::pipeline::FeatureDescriptor descriptor{
+                aeg::pipeline::FeatureId("RuntimeStateConsumerFeature"), "RuntimeStateConsumerFeature",
+                FeatureDomain::kRender, aeg::pipeline::to_mask(FeatureDomain::kRender),
+                aeg::pipeline::to_mask(PipelineScope::kFrame), {1, 0, 0}, {},
+            };
+            return descriptor;
+        }
+
+    protected:
+        [[nodiscard]] Result setup(aeg::pipeline::RenderGraphBuilder& builder) const override {
+            const auto stage = builder.add_stage({
+                aeg::pipeline::StageId("RuntimeStateConsumerStage"), aeg::pipeline::EnginePhase::kRenderBuild,
+                aeg::pipeline::ExecutionDomain::kMainThread, aeg::pipeline::TimePolicy::kFrame, false,
+            });
+            return stage ? Result::success() : Result::failure(
+                ResultCode::kInvalidState, "runtime state consumer declaration failed");
+        }
+    };
 }  // namespace
 
 int main() {
+    if (!verify_present_flow_filtering()) {
+        return 1;
+    }
+    if (!verify_render_state_layer_flow()) {
+        return 2;
+    }
     DeviceCreateDesc device_desc{};
     device_desc.application_name = "AEG RenderFeature Runtime Smoke";
     auto device_result = aeg::rhi::create_device(device_desc);
@@ -231,11 +370,18 @@ int main() {
         return 7;
     }
 
+    aeg::pipeline::PipelinePlan disconnected_plan = plan;
+    aeg::pipeline::PipelineNode present_node{};
+    present_node.definition_stage_index = static_cast<uint32_t>(disconnected_plan.nodes.size());
+    present_node.phase = aeg::pipeline::EnginePhase::kPresent;
+    disconnected_plan.nodes.push_back(present_node);
+
     aeg::render_graph::RenderGraph graph(*device);
     TextureDesc input_desc{};
     input_desc.extent = {4, 4, 1};
     input_desc.format = Format::kRgba8Unorm;
-    input_desc.capabilities = TextureCapability::kStorage;
+    input_desc.capabilities = TextureCapability::kStorage | TextureCapability::kTransferSource |
+        TextureCapability::kTransferDestination;
     input_desc.memory = MemoryClass::kDeviceLocal;
     const auto input_result = graph.create_texture(
         input_desc, aeg::render_graph::ResourceLifetime::kPersistent);
@@ -243,11 +389,30 @@ int main() {
         return 8;
     }
 
+    aeg::render_graph::RenderGraph disconnected_graph(*device);
+    const auto disconnected_input_result = disconnected_graph.create_texture(
+        input_desc, aeg::render_graph::ResourceLifetime::kPersistent);
+    if (!disconnected_input_result) {
+        return 9;
+    }
+    const std::array<aeg::render_graph::RenderGraphFeatureTextureBinding, 1> disconnected_bindings{{
+        {aeg::pipeline::RenderResourceId("RuntimeHostInput"), disconnected_input_result.value},
+    }};
+    const aeg::render_graph::RenderGraphFeatureRuntimeDesc disconnected_runtime_desc{
+        {}, disconnected_bindings, nullptr,
+    };
+    aeg::render_graph::RenderGraphFeatureRuntime disconnected_runtime(
+        disconnected_graph, disconnected_plan, registry, disconnected_runtime_desc);
+    if (const Result result = disconnected_runtime.build(); !result || !disconnected_graph.compile() ||
+        disconnected_graph.compile_info().pass_count != 0 || disconnected_graph.compile_info().resource_count != 1) {
+        return 10;
+    }
+
     aeg::render_graph::RenderGraph foreign_graph(*device);
     const auto foreign_input_result = foreign_graph.create_texture(
         input_desc, aeg::render_graph::ResourceLifetime::kPersistent);
     if (!foreign_input_result) {
-        return 9;
+        return 11;
     }
     const std::array<aeg::render_graph::RenderGraphFeatureTextureBinding, 1> foreign_bindings{{
         {aeg::pipeline::RenderResourceId("RuntimeHostInput"), foreign_input_result.value},
@@ -261,12 +426,256 @@ int main() {
         graph, plan, registry, foreign_runtime_desc);
     if (const Result result = foreign_runtime.build();
         result || result.code != ResultCode::kNotFound) {
-        return 10;
+        return 12;
     }
 
     const std::array<aeg::render_graph::RenderGraphFeatureTextureBinding, 1> input_bindings{{
         {aeg::pipeline::RenderResourceId("RuntimeHostInput"), input_result.value},
     }};
+
+    aeg::render_graph::RenderGraph state_graph(*device);
+    const auto state_input_result = state_graph.create_texture(
+        input_desc, aeg::render_graph::ResourceLifetime::kPersistent);
+    if (!state_input_result) {
+        return 13;
+    }
+    const std::array<aeg::render_graph::RenderGraphFeatureTextureBinding, 1> state_bindings{{
+        {aeg::pipeline::RenderResourceId("RuntimeHostInput"), state_input_result.value},
+    }};
+    RuntimeFeatureUserData state_data{};
+    aeg::render_graph::RenderGraphFeatureRuntimeDesc state_runtime_desc{
+        {}, state_bindings, &state_data,
+        nullptr, {.enabled = true, .texture_desc = input_desc,
+                  .present_target_id = aeg::pipeline::RenderResourceId("RuntimeHostInput"),
+                  .present_extent = {4, 4, 1}},
+    };
+    aeg::render_graph::RenderGraphFeatureRuntime state_runtime(state_graph, plan, registry, state_runtime_desc);
+    const Result state_build_result = state_runtime.build();
+    const Result state_compile_result = state_build_result ? state_graph.compile() : state_build_result;
+    if (!state_build_result || !state_data.observed_state_output.is_valid() ||
+        state_data.observed_state_layer_count != 1 || !state_compile_result ||
+        state_graph.compile_info().pass_count != 2) {
+        return 14;
+    }
+
+    aeg::pipeline::PipelinePlan layered_plan = plan;
+    layered_plan.nodes.resize(3);
+    for (uint32_t index = 0; index < layered_plan.nodes.size(); ++index) {
+        layered_plan.nodes[index].definition_stage_index = index;
+        layered_plan.nodes[index].phase = index == 2 ? aeg::pipeline::EnginePhase::kPresent
+                                                     : aeg::pipeline::EnginePhase::kRenderBuild;
+    }
+    layered_plan.dependencies = {{0, 1}, {1, 2}};
+    layered_plan.feature_contributions = {plan.feature_contributions.front(), plan.feature_contributions.front()};
+    layered_plan.feature_contributions[0].first_stage_index = 0;
+    layered_plan.feature_contributions[1].first_stage_index = 1;
+    aeg::render_graph::RenderGraph layered_graph(*device);
+    const auto layered_target = layered_graph.create_texture(input_desc, aeg::render_graph::ResourceLifetime::kPersistent);
+    if (!layered_target) {
+        return 15;
+    }
+    const std::array<aeg::render_graph::RenderGraphFeatureTextureBinding, 1> layered_bindings{{
+        {aeg::pipeline::RenderResourceId("RuntimeHostInput"), layered_target.value},
+    }};
+    RuntimeFeatureUserData layered_data{};
+    const aeg::render_graph::RenderGraphFeatureRuntimeDesc layered_runtime_desc{
+        {}, layered_bindings, &layered_data,
+        nullptr, {.enabled = true, .texture_desc = input_desc,
+                  .present_target_id = aeg::pipeline::RenderResourceId("RuntimeHostInput"),
+                  .present_extent = {4, 4, 1}},
+    };
+    aeg::render_graph::RenderGraphFeatureRuntime layered_runtime(layered_graph, layered_plan, registry,
+                                                                  layered_runtime_desc);
+    const Result layered_build_result = layered_runtime.build();
+    const Result layered_compile_result = layered_build_result ? layered_graph.compile() : layered_build_result;
+    if (!layered_build_result || layered_data.observed_state_inputs.size() != 1 ||
+        !layered_data.observed_state_inputs.front().is_valid() || !layered_compile_result ||
+        layered_graph.compile_info().pass_count != 3) {
+        return 16;
+    }
+
+    // State must pass through a non-writing RenderFeature.  This models a
+    // readback/culling/effect Feature placed between two state-writing layers.
+    aeg::pipeline::PipelinePlan forwarded_plan = layered_plan;
+    forwarded_plan.nodes.resize(4);
+    for (uint32_t index = 0; index < forwarded_plan.nodes.size(); ++index) {
+        forwarded_plan.nodes[index].definition_stage_index = index;
+        forwarded_plan.nodes[index].phase = index == 3 ? aeg::pipeline::EnginePhase::kPresent
+                                                        : aeg::pipeline::EnginePhase::kRenderBuild;
+    }
+    forwarded_plan.dependencies = {{0, 1}, {1, 2}, {2, 3}};
+    aeg::pipeline::PipelineFeatureContributionRecord consumer_contribution = plan.feature_contributions.front();
+    consumer_contribution.feature_instance = aeg::pipeline::FeatureInstanceId("RuntimeStateConsumerInstance");
+    consumer_contribution.feature = aeg::pipeline::FeatureId("RuntimeStateConsumerFeature");
+    consumer_contribution.part = aeg::pipeline::FeaturePartId("RuntimeStateConsumerPart");
+    consumer_contribution.first_stage_index = 1;
+    forwarded_plan.feature_contributions = {plan.feature_contributions.front(), consumer_contribution,
+                                            plan.feature_contributions.front()};
+    forwarded_plan.feature_contributions[0].first_stage_index = 0;
+    forwarded_plan.feature_contributions[2].first_stage_index = 2;
+    forwarded_plan.feature_implementations.push_back({consumer_contribution.feature_instance, consumer_contribution.feature,
+                                                       consumer_contribution.part,
+                                                       std::make_shared<RuntimeStateConsumerFeature>()});
+    aeg::render_graph::RenderGraph forwarded_graph(*device);
+    const auto forwarded_target = forwarded_graph.create_texture(input_desc, aeg::render_graph::ResourceLifetime::kPersistent);
+    if (!forwarded_target) {
+        return 17;
+    }
+    const std::array<aeg::render_graph::RenderGraphFeatureTextureBinding, 1> forwarded_bindings{{
+        {aeg::pipeline::RenderResourceId("RuntimeHostInput"), forwarded_target.value},
+    }};
+    RuntimeFeatureUserData forwarded_data{};
+    const aeg::render_graph::RenderGraphFeatureRuntimeDesc forwarded_runtime_desc{
+        {}, forwarded_bindings, &forwarded_data,
+        nullptr, {.enabled = true, .texture_desc = input_desc,
+                  .present_target_id = aeg::pipeline::RenderResourceId("RuntimeHostInput"),
+                  .present_extent = {4, 4, 1}},
+    };
+    aeg::render_graph::RenderGraphFeatureRuntime forwarded_runtime(forwarded_graph, forwarded_plan, registry,
+                                                                    forwarded_runtime_desc);
+    const Result forwarded_build_result = forwarded_runtime.build();
+    const Result forwarded_compile_result = forwarded_build_result ? forwarded_graph.compile() : forwarded_build_result;
+    if (!forwarded_build_result || forwarded_data.observed_state_inputs.size() != 1 ||
+        !forwarded_data.observed_state_inputs.front().is_valid() || !forwarded_compile_result ||
+        forwarded_graph.compile_info().pass_count != 3) {
+        return 17;
+    }
+
+    aeg::pipeline::PipelinePlan merged_plan = plan;
+    merged_plan.nodes.resize(4);
+    for (uint32_t index = 0; index < merged_plan.nodes.size(); ++index) {
+        merged_plan.nodes[index].definition_stage_index = index;
+        merged_plan.nodes[index].phase = index == 3 ? aeg::pipeline::EnginePhase::kPresent
+                                                    : aeg::pipeline::EnginePhase::kRenderBuild;
+    }
+    merged_plan.dependencies = {{0, 2}, {1, 2}, {2, 3}};
+    merged_plan.feature_contributions = {
+        plan.feature_contributions.front(), plan.feature_contributions.front(), plan.feature_contributions.front()};
+    for (uint32_t index = 0; index < merged_plan.feature_contributions.size(); ++index) {
+        merged_plan.feature_contributions[index].first_stage_index = index;
+    }
+    aeg::render_graph::RenderGraph merged_graph(*device);
+    const auto merged_target = merged_graph.create_texture(input_desc, aeg::render_graph::ResourceLifetime::kPersistent);
+    if (!merged_target) {
+        return 17;
+    }
+    const std::array<aeg::render_graph::RenderGraphFeatureTextureBinding, 1> merged_bindings{{
+        {aeg::pipeline::RenderResourceId("RuntimeHostInput"), merged_target.value},
+    }};
+    RuntimeFeatureUserData merged_data{};
+    bool merged_compositor_called = false;
+    const std::array<aeg::render_graph::RenderStateBlendOverride, 2> merged_blend_overrides{{
+        {0, aeg::pipeline::RenderStateBlendMode::kAdd},
+        {1, aeg::pipeline::RenderStateBlendMode::kAdd},
+    }};
+    const aeg::render_graph::RenderGraphFeatureRuntimeDesc merged_runtime_desc{
+        {}, merged_bindings, &merged_data,
+        nullptr, {.enabled = true, .texture_desc = input_desc,
+                  .present_target_id = aeg::pipeline::RenderResourceId("RuntimeHostInput"),
+                  .present_extent = {4, 4, 1},
+                  .blend_overrides = merged_blend_overrides,
+                  .compose_terminal_states = [&merged_compositor_called](
+                      aeg::pipeline::RenderGraphBuilder& builder,
+                      std::span<const aeg::render_graph::RenderStateCompositeInput> inputs,
+                      aeg::pipeline::RenderGraphTexture destination) -> Result {
+                      merged_compositor_called = inputs.size() == 2 &&
+                                                inputs[0].blend_mode == aeg::pipeline::RenderStateBlendMode::kAdd &&
+                                                inputs[1].blend_mode == aeg::pipeline::RenderStateBlendMode::kAdd;
+                      if (!merged_compositor_called) {
+                          return Result::failure(ResultCode::kInvalidArgument, "state merge inputs are invalid");
+                      }
+                      const auto pass = builder.add_copy_pass(
+                          "RuntimeStateMerge",
+                          [source = inputs.front().texture, destination](aeg::pipeline::RenderPassBuilder& pass_builder) {
+                              if (const Result result = pass_builder.read(
+                                      source, ResourceUsage::kCopySource, PipelineStage::kCopy, ShaderStage::kAll);
+                                  !result) return result;
+                              return pass_builder.write(destination, ResourceUsage::kCopyDestination,
+                                                        PipelineStage::kCopy, ShaderStage::kAll, {}, true);
+                          },
+                          [source = inputs.front().texture, destination](aeg::pipeline::RenderPassExecutionContext& execution) {
+                              return execution.copy_texture(source, {aeg::rhi::Aspect::kColor, 0, 0, 1}, {}, destination,
+                                                            {aeg::rhi::Aspect::kColor, 0, 0, 1}, {}, {4, 4, 1});
+                          });
+                      return pass ? Result::success() : pass.result;
+                  }},
+    };
+    aeg::render_graph::RenderGraphFeatureRuntime merged_runtime(merged_graph, merged_plan, registry,
+                                                                 merged_runtime_desc);
+    const Result merged_build_result = merged_runtime.build();
+    const Result merged_compile_result = merged_build_result ? merged_graph.compile() : merged_build_result;
+    if (!merged_build_result || merged_data.observed_state_inputs.size() != 2 ||
+        !merged_data.observed_state_inputs[0].is_valid() || !merged_data.observed_state_inputs[1].is_valid() ||
+        !merged_compositor_called || !merged_compile_result || merged_graph.compile_info().pass_count != 5) {
+        return 18;
+    }
+
+    aeg::pipeline::PipelinePlan branching_plan = merged_plan;
+    branching_plan.feature_contributions.resize(2);
+    branching_plan.dependencies = {{0, 2}, {1, 2}, {2, 3}};
+    aeg::render_graph::RenderGraph branching_graph(*device);
+    const auto branching_target = branching_graph.create_texture(input_desc, aeg::render_graph::ResourceLifetime::kPersistent);
+    if (!branching_target) {
+        return 19;
+    }
+    const std::array<aeg::render_graph::RenderGraphFeatureTextureBinding, 1> branching_bindings{{
+        {aeg::pipeline::RenderResourceId("RuntimeHostInput"), branching_target.value},
+    }};
+    bool terminal_compositor_called = false;
+    const std::array<aeg::render_graph::RenderStateBlendOverride, 2> branching_blend_overrides{{
+        {0, aeg::pipeline::RenderStateBlendMode::kAdd},
+        {1, aeg::pipeline::RenderStateBlendMode::kAdd},
+    }};
+    const aeg::render_graph::RenderGraphFeatureRuntimeDesc branching_runtime_desc{
+        {}, branching_bindings, nullptr,
+        nullptr, {.enabled = true, .texture_desc = input_desc,
+                  .present_target_id = aeg::pipeline::RenderResourceId("RuntimeHostInput"),
+                  .present_extent = {4, 4, 1},
+                  .blend_overrides = branching_blend_overrides,
+                  .compose_terminal_states = [&terminal_compositor_called](
+                      aeg::pipeline::RenderGraphBuilder& builder,
+                      std::span<const aeg::render_graph::RenderStateCompositeInput> inputs,
+                      aeg::pipeline::RenderGraphTexture destination) -> Result {
+                      terminal_compositor_called = inputs.size() == 2 &&
+                                                   inputs[0].blend_mode == aeg::pipeline::RenderStateBlendMode::kAdd &&
+                                                   inputs[1].blend_mode == aeg::pipeline::RenderStateBlendMode::kAdd;
+                      if (!terminal_compositor_called) {
+                          return Result::failure(ResultCode::kInvalidArgument, "terminal compositor received invalid inputs");
+                      }
+                      const auto pass = builder.add_copy_pass(
+                          "RuntimeTerminalComposite",
+                          [source = inputs.front().texture, destination](aeg::pipeline::RenderPassBuilder& pass_builder) {
+                              if (const Result result = pass_builder.read(
+                                      source, ResourceUsage::kCopySource, PipelineStage::kCopy, ShaderStage::kAll);
+                                  !result) {
+                                  return result;
+                              }
+                              if (const Result result = pass_builder.write(
+                                      destination, ResourceUsage::kCopyDestination, PipelineStage::kCopy,
+                                      ShaderStage::kAll, {}, true);
+                                  !result) {
+                                  return result;
+                              }
+                              pass_builder.set_side_effects();
+                              return Result::success();
+                          },
+                          [source = inputs.front().texture, destination](aeg::pipeline::RenderPassExecutionContext& execution) {
+                              return execution.copy_texture(
+                                  source, {aeg::rhi::Aspect::kColor, 0, 0, 1}, {}, destination,
+                                  {aeg::rhi::Aspect::kColor, 0, 0, 1}, {}, {4, 4, 1});
+                          });
+                      return pass ? Result::success() : pass.result;
+                  }},
+    };
+    aeg::render_graph::RenderGraphFeatureRuntime branching_runtime(branching_graph, branching_plan, registry,
+                                                                    branching_runtime_desc);
+    const Result branching_build_result = branching_runtime.build();
+    const Result branching_compile_result = branching_build_result ? branching_graph.compile() : branching_build_result;
+    if (!branching_build_result || !terminal_compositor_called || !branching_compile_result ||
+        branching_graph.compile_info().pass_count != 3) {
+        return 20;
+    }
+
     const aeg::render_graph::RenderGraphFeatureRuntimeDesc runtime_desc{
         {},
         input_bindings,
@@ -274,22 +683,22 @@ int main() {
     };
     aeg::render_graph::RenderGraphFeatureRuntime runtime(graph, plan, registry, runtime_desc);
     if (const Result result = runtime.build(); !result) {
-        return 11;
-    }
-    if (const Result result = runtime.build(); result || result.code != ResultCode::kInvalidState) {
-        return 12;
-    }
-    if (const Result result = graph.compile(); !result) {
         return 13;
     }
-    if (graph.compile_info().pass_count != 1) {
+    if (const Result result = runtime.build(); result || result.code != ResultCode::kInvalidState) {
         return 14;
     }
-    if (graph.compile_info().culled_pass_count != 0) {
+    if (const Result result = graph.compile(); !result) {
         return 15;
     }
-    if (graph.compile_info().barrier_count == 0) {
+    if (graph.compile_info().pass_count != 1) {
         return 16;
+    }
+    if (graph.compile_info().culled_pass_count != 0) {
+        return 17;
+    }
+    if (graph.compile_info().barrier_count == 0) {
+        return 18;
     }
 
     aeg::render_graph::RenderGraph rollback_graph(*device);

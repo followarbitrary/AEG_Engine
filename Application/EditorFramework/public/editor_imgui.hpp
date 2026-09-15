@@ -52,6 +52,15 @@ public:
     [[nodiscard]] float preview_font_size_pixels() const noexcept;
     /** @brief Returns an opaque ImGui font pointer for the current preview scope. */
     [[nodiscard]] const void* preview_font() const noexcept;
+    /** @brief Returns an opaque native-size font for preference headings and display copy. */
+    [[nodiscard]] const void* display_font() const noexcept;
+    /** @brief Returns the rasterized pixel size of the display font. */
+    [[nodiscard]] float display_font_size_pixels() const noexcept;
+    /** @brief Settings type role (16 caption, 20 body, 24 subheading, 32 title).
+     * Use the returned face's raster size; null when the Settings roles are not enabled. */
+    [[nodiscard]] const void* preference_font(float size_pixels) const noexcept;
+    /** @brief System icon-library face for Settings navigation, rasterized at 24px. */
+    [[nodiscard]] const void* preference_icon_font() const noexcept;
 
     /** @brief Starts one ImGui frame using engine-owned display timing. */
     [[nodiscard]] foundation::Result begin_frame(const EditorImGuiFrameDesc& desc);

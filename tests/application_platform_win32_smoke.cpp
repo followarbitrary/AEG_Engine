@@ -19,6 +19,13 @@ int main() {
         return 20;
     }
 
+    const auto invalid_directory_dialog =
+        aeg::application::select_directory({}, "", "C:\\");
+    if (invalid_directory_dialog ||
+        invalid_directory_dialog.result.code != aeg::foundation::ResultCode::kInvalidArgument) {
+        return 26;
+    }
+
     const auto font_result = aeg::application::enumerate_system_fonts();
     if (!font_result || font_result.value.empty()) {
         return 18;

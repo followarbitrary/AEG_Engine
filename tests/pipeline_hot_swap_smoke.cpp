@@ -2,6 +2,7 @@
  * @file pipeline_hot_swap_smoke.cpp
  * @brief Exercises pipeline plan staging, safe switching, and retirement.
  */
+#include <algorithm>
 #include <memory>
 
 #include <pipeline.hpp>
@@ -61,6 +62,19 @@ namespace {
             });
             if (!anchor) {
                 return builder.status();
+            }
+            const auto independent = builder.add_stage({
+                aeg::pipeline::StageId("HotSwapIndependent"),
+                aeg::pipeline::EnginePhase::kVariableUpdate,
+                aeg::pipeline::ExecutionDomain::kMainThread,
+                aeg::pipeline::TimePolicy::kFrame,
+                false,
+            });
+            if (!independent) {
+                return builder.status();
+            }
+            if (const auto result = builder.runs_before(anchor, aeg::pipeline::StageId("HotSwapIndependent")); !result) {
+                return result;
             }
             const auto point = builder.add_feature_point({
                 aeg::pipeline::FeaturePointId("HotSwapFeaturePoint"),
@@ -136,7 +150,7 @@ int main() {
     }
 
     aeg::pipeline::PipelinePlanHandle initial_plan = host.active_plan_snapshot();
-    if (initial_plan == nullptr || initial_plan->nodes.size() != 1 || host.has_pending_plan()) {
+    if (initial_plan == nullptr || initial_plan->nodes.size() != 2 || host.has_pending_plan()) {
         return 4;
     }
     if (const auto result = host.activate({}); !result) {
@@ -165,7 +179,7 @@ int main() {
     }
     aeg::pipeline::PipelinePlanHandle active_before_apply = host.active_plan_snapshot();
     if (active_before_apply == nullptr || active_before_apply->revision != initial_plan->revision ||
-        active_before_apply->nodes.size() != 1) {
+        active_before_apply->nodes.size() != 2) {
         return 9;
     }
 
@@ -174,11 +188,56 @@ int main() {
     }
     aeg::pipeline::PipelinePlanHandle active_after_apply = host.active_plan_snapshot();
     if (active_after_apply == nullptr || active_after_apply->revision == initial_plan->revision ||
-        active_after_apply->nodes.size() != 2 || host.has_pending_plan() || host.retired_plan_count() != 1) {
+        active_after_apply->nodes.size() != 3 || host.has_pending_plan() || host.retired_plan_count() != 1) {
         return 11;
     }
+    if (active_after_apply->dependencies.empty()) {
+        return 17;
+    }
+    const auto compiled_dependency = active_after_apply->dependencies.front();
+    if (const auto result = host.remove_runtime_ordering(compiled_dependency.source_node, compiled_dependency.destination_node);
+        !result || !host.has_pending_plan()) {
+        return 17;
+    }
+    if (const auto result = host.apply_pending_plan(); !result) {
+        return 18;
+    }
+    auto without_compiled_order = host.active_plan_snapshot();
+    if (without_compiled_order == nullptr || std::any_of(without_compiled_order->dependencies.begin(),
+        without_compiled_order->dependencies.end(), [&](const auto& edge) {
+            return edge.source_node == compiled_dependency.source_node && edge.destination_node == compiled_dependency.destination_node;
+        })) {
+        return 19;
+    }
+    if (const auto result = host.add_runtime_ordering(1, 0); !result || !host.has_pending_plan()) {
+        return 20;
+    }
+    // Saving a graph draft may replay an edge already present in the pending plan.
+    // That replay must be harmless rather than aborting the rest of the save.
+    if (const auto result = host.add_runtime_ordering(1, 0); !result) {
+        return 26;
+    }
+    if (const auto result = host.apply_pending_plan(); !result) {
+        return 21;
+    }
+    auto ordered_plan = host.active_plan_snapshot();
+    if (ordered_plan == nullptr || ordered_plan->dependencies.empty() ||
+        !ordered_plan->dependencies.back().runtime_override) {
+        return 22;
+    }
+    if (const auto result = host.remove_runtime_ordering(1, 0); !result || !host.has_pending_plan()) {
+        return 23;
+    }
+    if (const auto result = host.apply_pending_plan(); !result) {
+        return 24;
+    }
+    auto restored_plan = host.active_plan_snapshot();
+    if (restored_plan == nullptr || std::any_of(restored_plan->dependencies.begin(), restored_plan->dependencies.end(),
+        [](const auto& edge) { return edge.runtime_override; })) {
+        return 25;
+    }
 
-    if (const auto result = host.collect_retired_plans(); !result || host.retired_plan_count() != 1) {
+    if (const auto result = host.collect_retired_plans(); !result || host.retired_plan_count() < 1) {
         return 12;
     }
 
@@ -206,6 +265,9 @@ int main() {
 
     initial_plan.reset();
     active_before_apply.reset();
+    active_after_apply.reset();
+    without_compiled_order.reset();
+    ordered_plan.reset();
     if (const auto result = host.collect_retired_plans(); !result || host.retired_plan_count() != 0) {
         return 16;
     }
@@ -230,6 +292,7 @@ int main() {
     }
 
     active_after_apply.reset();
+    restored_plan.reset();
     aeg::pipeline::PipelineExecutionContext hot_swap_context(
         &state,
         aeg::pipeline::PipelineScope::kEngine,

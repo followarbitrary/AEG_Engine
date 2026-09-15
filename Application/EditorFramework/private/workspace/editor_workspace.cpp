@@ -3,6 +3,7 @@
  * @brief Implements the application-owned editor workspace orchestration.
  */
 #include "editor_workspace.hpp"
+#include "editor_toolbar.hpp"
 
 #include <imgui.h>
 #include <imgui_internal.h>
@@ -16,6 +17,40 @@
 
 namespace aeg::editor {
 namespace {
+float editor_rail_width() {
+    return std::max(64.0f, ImGui::CalcTextSize("Settings").x + 16.0f);
+}
+constexpr float editor_status_height = 28.0f;
+bool editor_rail_button(const char* label, bool active) {
+    const ImVec2 pos = ImGui::GetCursorScreenPos();
+    const ImVec2 size{ImGui::GetContentRegionAvail().x, 64.0f};
+    const bool pressed = ImGui::InvisibleButton(label, size);
+    auto* draw = ImGui::GetWindowDrawList();
+    const ImU32 color = active ? IM_COL32(115,230,195,255) : IM_COL32(144,165,176,255);
+    if (active || ImGui::IsItemHovered()) draw->AddRectFilled(pos, ImVec2{pos.x + size.x, pos.y + size.y},
+        active ? IM_COL32(18,51,47,255) : IM_COL32(16,35,44,255), 4.0f);
+    if (active) draw->AddLine(pos, ImVec2{pos.x, pos.y + size.y}, color, 2.0f);
+    const ImVec2 center{pos.x + size.x * 0.5f, pos.y + 22.0f};
+    if (std::string_view(label) == "Pipeline") {
+        for (int i=0; i<3; ++i) draw->AddRect(ImVec2{center.x - 8.0f + i*6, center.y + 6.0f - (i+1)*5},
+            ImVec2{center.x - 4.0f + i*6, center.y + 7.0f}, color, 0, 0, 1.3f);
+    } else if (std::string_view(label) == "Settings") {
+        draw->AddCircle(center, 8.0f, color, 8, 1.5f);
+        draw->AddCircle(center, 3.0f, color, 12, 1.5f);
+    } else if (std::string_view(label) == "Assets") {
+        draw->AddRect(ImVec2{center.x-9,center.y-5}, ImVec2{center.x+9,center.y+7}, color, 2, 0, 1.5f);
+        draw->AddLine(ImVec2{center.x-8,center.y-8}, ImVec2{center.x-1,center.y-8}, color, 1.5f);
+    } else {
+        draw->AddQuad(ImVec2{center.x,center.y-9}, ImVec2{center.x+8,center.y-4},
+            ImVec2{center.x,center.y+1}, ImVec2{center.x-8,center.y-4}, color, 1.5f);
+        draw->AddLine(ImVec2{center.x-8,center.y-4}, ImVec2{center.x-8,center.y+5}, color,1.5f);
+        draw->AddLine(ImVec2{center.x+8,center.y-4}, ImVec2{center.x+8,center.y+5}, color,1.5f);
+        draw->AddLine(ImVec2{center.x-8,center.y+5}, ImVec2{center.x,center.y+10}, color,1.5f);
+        draw->AddLine(ImVec2{center.x+8,center.y+5}, ImVec2{center.x,center.y+10}, color,1.5f);
+    }
+    draw->AddText(ImVec2{center.x-ImGui::CalcTextSize(label).x*0.5f,pos.y+43}, color,label);
+    return pressed;
+}
 [[nodiscard]] ImGuiID dock_node_for_region(EditorDockRegion region, ImGuiID center, ImGuiID left, ImGuiID right,
                                            ImGuiID bottom) noexcept {
     switch (region) {
@@ -187,6 +222,41 @@ foundation::Result EditorWorkspace::build_ui() {
         return foundation::invalid_state("Editor workspace has no registered panels");
     }
     if (ImGui::BeginMainMenuBar()) {
+        const float controls_width = ImGui::CalcTextSize("PlayPauseStopBuildView").x + 230.0f;
+        const float search_width = std::clamp(ImGui::GetWindowWidth() - ImGui::GetCursorPosX() - controls_width, 0.0f, 300.0f);
+        ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(), ImGui::GetWindowWidth() - controls_width - search_width));
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2{10.0f,8.0f});
+        ImGui::SetNextItemWidth(std::max(80.0f, search_width));
+        static char global_search[128]{};
+        if (search_width >= 80.0f) {
+        ImGui::InputTextWithHint("##GlobalSearch", "Search assets, entities, settings...", global_search,
+                                 sizeof(global_search));
+        ImGui::SameLine();
+        }
+        if (toolbar_button("Play", "Start or resume the game preview.", ToolbarIcon::Play, true)) {
+            if (find_view_action("play")) static_cast<void>(invoke_view_action("play"));
+        }
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!playing_);
+        if (toolbar_button("Pause", "Pause the running game preview.", ToolbarIcon::Pause)) {
+            if (find_view_action("pause")) static_cast<void>(invoke_view_action("pause"));
+        }
+        ImGui::SameLine();
+        if (toolbar_button("Stop", "Stop preview and return to the editable scene.", ToolbarIcon::Stop)) {
+            if (find_view_action("stop")) static_cast<void>(invoke_view_action("stop"));
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        if(toolbar_button("Build", "Refresh project assets or rebuild the editor pipeline. Game packaging is not available yet.", ToolbarIcon::None, false, true)) ImGui::OpenPopup("BuildActions");
+        if(ImGui::BeginPopup("BuildActions")) {
+            for (const char* key : {"refresh_assets","rebuild_pipeline"}) {
+                const auto* action=find_view_action(key);
+                if(action && ImGui::MenuItem(action->title.c_str())) static_cast<void>(invoke_view_action(key));
+            }
+            ImGui::EndPopup();
+        }
+        ImGui::SameLine();
+        ImGui::PopStyleVar();
         if (ImGui::BeginMenu("View")) {
             for (const PanelEntry& entry : panels_) {
                 const EditorPanelLayoutState* state = layout_->find_panel(entry.descriptor.key);
@@ -212,6 +282,9 @@ foundation::Result EditorWorkspace::build_ui() {
                 }
             }
             for (const EditorWorkspaceActionDescriptor& action : view_actions_) {
+                if (!action.show_in_view_menu) {
+                    continue;
+                }
                 if (ImGui::MenuItem(action.title.c_str())) {
                     if (const foundation::Result result = invoke_view_action(action.key); !result) {
                         ImGui::EndMenu();
@@ -225,10 +298,72 @@ foundation::Result EditorWorkspace::build_ui() {
         ImGui::EndMainMenuBar();
     }
 
+    const ImGuiViewport* main_viewport = ImGui::GetMainViewport();
+    if (main_viewport != nullptr) {
+        ImGui::SetNextWindowPos(main_viewport->WorkPos);
+        ImGui::SetNextWindowSize(ImVec2{editor_rail_width(), std::max(0.0f, main_viewport->WorkSize.y - editor_status_height)});
+        constexpr ImGuiWindowFlags rail_flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoDocking |
+                                                 ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove |
+                                                 ImGuiWindowFlags_NoBringToFrontOnFocus;
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2{4.0f, 8.0f});
+        if (ImGui::Begin("##EditorRail", nullptr, rail_flags)) {
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2{4.0f, 8.0f});
+            const auto rail_button = [this](const char* label, const char* panel_key) {
+                const bool active = !preferences_open_ && active_rail_ == label;
+                if (active) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4{0.07f, 0.25f, 0.22f, 1.0f});
+                if (editor_rail_button(label, active)) {
+                    active_rail_ = label;
+                    static_cast<void>(set_panel_visible(panel_key, true));
+                    pending_panel_focus_ = panel_key;
+                }
+                if (active) ImGui::PopStyleColor();
+            };
+            rail_button("Scene", "scene_viewport");
+            rail_button("Pipeline", "pipeline");
+            rail_button("Assets", "assets");
+            const bool settings_active = preferences_open_;
+            if (settings_active) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4{0.07f, 0.25f, 0.22f, 1.0f});
+            if (editor_rail_button("Settings", settings_active)) {
+                const auto action = find_view_action("preferences");
+                if (action != nullptr) static_cast<void>(invoke_view_action(action->key));
+            }
+            if (settings_active) ImGui::PopStyleColor();
+            ImGui::PopStyleVar();
+        }
+        ImGui::End();
+        ImGui::PopStyleVar();
+    }
+
     if (const foundation::Result result = initialize_dockspace(); !result) {
         return result;
     }
-    return imgui_host_->build_panels();
+    const foundation::Result panel_result = imgui_host_->build_panels();
+    if (!panel_result) {
+        return panel_result;
+    }
+    if (!pending_panel_focus_.empty()) {
+        if (const auto* entry = find_panel(pending_panel_focus_)) {
+            ImGui::SetWindowFocus(entry->descriptor.title.c_str());
+        }
+        pending_panel_focus_.clear();
+    }
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    if (viewport != nullptr && viewport->WorkSize.x > 0.0f && viewport->WorkSize.y > 30.0f) {
+        ImGui::SetNextWindowPos(ImVec2{viewport->WorkPos.x, viewport->WorkPos.y + viewport->WorkSize.y - 28.0f});
+        ImGui::SetNextWindowSize(ImVec2{viewport->WorkSize.x, 28.0f});
+        constexpr ImGuiWindowFlags status_flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoDocking |
+                                                   ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
+                                                   ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoMove;
+        if (ImGui::Begin("##EditorStatusBar", nullptr, status_flags)) {
+            ImGui::TextDisabled("AEG Engine / Editor");
+            ImGui::SameLine();
+            ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(), ImGui::GetWindowWidth() - 240.0f));
+            const float fps = ImGui::GetIO().Framerate;
+            ImGui::TextDisabled("Frame %.1f ms  |  %.0f FPS", fps > 0.0f ? 1000.0f / fps : 0.0f, fps);
+        }
+        ImGui::End();
+    }
+    return foundation::Result::success();
 }
 
 foundation::Result EditorWorkspace::serialize_layout(std::string& serialized) const {
@@ -276,6 +411,13 @@ std::size_t EditorWorkspace::view_action_count() const noexcept {
     return view_actions_.size();
 }
 
+std::size_t EditorWorkspace::view_menu_action_count() const noexcept {
+    return static_cast<std::size_t>(std::count_if(view_actions_.begin(), view_actions_.end(),
+                                                   [](const EditorWorkspaceActionDescriptor& action) {
+                                                       return action.show_in_view_menu;
+                                                   }));
+}
+
 EditorWorkspace::PanelEntry* EditorWorkspace::find_panel(std::string_view panel_key) noexcept {
     const auto iterator = std::find_if(panels_.begin(), panels_.end(), [panel_key](const PanelEntry& entry) {
         return entry.descriptor.key == panel_key;
@@ -305,7 +447,29 @@ const EditorWorkspaceActionDescriptor* EditorWorkspace::find_view_action(std::st
 }
 
 foundation::Result EditorWorkspace::initialize_dockspace() {
-    const ImGuiID dockspace_id = ImGui::DockSpaceOverViewport(0, ImGui::GetMainViewport());
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    if (viewport == nullptr || viewport->WorkSize.x <= 0.0f || viewport->WorkSize.y <= 0.0f) {
+        return foundation::invalid_state("Editor workspace main viewport is invalid");
+    }
+    // The rail is outside the dock tree. Empty dock leaves are collapsed by ImGui,
+    // so reserve its space in the host rectangle instead of an empty split node.
+    const ImVec2 dock_pos{viewport->WorkPos.x + editor_rail_width(), viewport->WorkPos.y};
+    const ImVec2 dock_size{std::max(1.0f, viewport->WorkSize.x - editor_rail_width()),
+                           std::max(1.0f, viewport->WorkSize.y - editor_status_height)};
+    ImGui::SetNextWindowPos(dock_pos);
+    ImGui::SetNextWindowSize(dock_size);
+    ImGui::SetNextWindowViewport(viewport->ID);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2{0.0f, 0.0f});
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    ImGui::Begin("##EditorDockHost", nullptr,
+        ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoDocking |
+        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus |
+        ImGuiWindowFlags_NoNavFocus);
+    const ImGuiID dockspace_id = ImGui::GetID("EditorDockSpace");
+    ImGui::DockSpace(dockspace_id, dock_size);
+    ImGui::End();
+    ImGui::PopStyleVar(3);
     if (dockspace_id == 0) {
         return foundation::invalid_state("Editor workspace dockspace creation failed");
     }
@@ -313,19 +477,18 @@ foundation::Result EditorWorkspace::initialize_dockspace() {
         return foundation::Result::success();
     }
 
-    const ImGuiViewport* viewport = ImGui::GetMainViewport();
-    if (viewport == nullptr || viewport->WorkSize.x <= 0.0f || viewport->WorkSize.y <= 0.0f) {
-        return foundation::invalid_state("Editor workspace main viewport is invalid");
-    }
     ImGui::DockBuilderRemoveNode(dockspace_id);
     ImGui::DockBuilderAddNode(dockspace_id, ImGuiDockNodeFlags_DockSpace);
-    ImGui::DockBuilderSetNodeSize(dockspace_id, viewport->WorkSize);
+    ImGui::DockBuilderSetNodePos(dockspace_id, dock_pos);
+    ImGui::DockBuilderSetNodeSize(dockspace_id, dock_size);
 
     ImGuiID left_node = 0;
     ImGuiID remaining_node = 0;
-    ImGui::DockBuilderSplitNode(dockspace_id, ImGuiDir_Left, 0.22f, &left_node, &remaining_node);
+    const float hierarchy_width = std::clamp(dock_size.x * 0.095f, 180.0f, 240.0f);
+    ImGui::DockBuilderSplitNode(dockspace_id, ImGuiDir_Left, hierarchy_width / dock_size.x, &left_node, &remaining_node);
     ImGuiID right_node = 0;
-    ImGui::DockBuilderSplitNode(remaining_node, ImGuiDir_Right, 0.22f, &right_node, &remaining_node);
+    const float inspector_width = std::clamp(dock_size.x * 0.13f, 280.0f, 340.0f);
+    ImGui::DockBuilderSplitNode(remaining_node, ImGuiDir_Right, inspector_width / std::max(1.0f, dock_size.x - hierarchy_width), &right_node, &remaining_node);
     ImGuiID bottom_node = 0;
     ImGui::DockBuilderSplitNode(remaining_node, ImGuiDir_Down, 0.28f, &bottom_node, &remaining_node);
 

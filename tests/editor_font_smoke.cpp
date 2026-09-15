@@ -114,9 +114,29 @@ int main() {
         collection_desc.font_catalog = &collection_catalog;
         collection_desc.default_font_key = "collection_primary";
         collection_desc.font_size_pixels = 18.0f;
+        collection_desc.enable_preference_fonts = true;
         assert(collection_host.initialize(collection_desc));
         assert(ImGui::GetIO().Fonts->Sources.Size >= 2);
         assert(ImGui::GetIO().Fonts->Sources[1].FontNo == collection_fallback_record->face_index);
+        // The exact preview text previously showed replacement glyphs for
+        // characters outside ImGui's simplified-common subset.
+        assert(collection_host.set_preview_font("collection_primary", 16));
+        auto* sample = const_cast<ImFont*>(static_cast<const ImFont*>(collection_host.preview_font()));
+        assert(sample->LegacySize == 16.0f); // Preview is actual size, never magnified.
+        for (ImWchar codepoint : {ImWchar(0x5668), ImWchar(0x6670), ImWchar(0x8BFB)}) {
+            assert(sample->GetFontBaked(sample->LegacySize)->FindGlyphNoFallback(codepoint) != nullptr);
+        }
+        auto* chrome = static_cast<const ImFont*>(collection_host.preference_font(20));
+        const float chrome_size = chrome->LegacySize;
+        assert(collection_host.set_preview_font("collection_primary", 48));
+        assert(collection_host.active_font_size_pixels() == 18);
+        // Editing the draft changes only Preview. Settings chrome remains on
+        // the applied font until Apply/Save updates the active host font.
+        assert(static_cast<const ImFont*>(collection_host.preference_font(20))->LegacySize == chrome_size);
+        assert(static_cast<const ImFont*>(collection_host.preview_font())->LegacySize == 48);
+        assert(collection_host.set_font("collection_primary", 24));
+        assert(static_cast<const ImFont*>(collection_host.preference_font(20))->LegacySize == 24);
+        assert(static_cast<const ImFont*>(collection_host.preview_font())->LegacySize == 48);
         assert(collection_host.shutdown());
     }
 
@@ -179,6 +199,14 @@ int main() {
     frame_desc.display_extent = WindowExtent{1280, 720};
     assert(host.begin_frame(frame_desc));
     assert(!host.set_font(first_key, 16.0f));
+    assert(host.end_frame());
+    assert(host.set_font(second_key, 28.0f));
+    assert(host.begin_frame(frame_desc));
+    ImGui::Begin("Font size regression");
+    assert(ImGui::GetFontSize() == 28.0f);
+    ImGui::Selectable("Selected asset", true);
+    assert(ImGui::GetItemRectSize().y >= ImGui::CalcTextSize("Selected asset").y);
+    ImGui::End();
     assert(host.end_frame());
     assert(host.shutdown());
     return 0;

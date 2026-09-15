@@ -5370,9 +5370,13 @@ Result VulkanDevice::transition_texture(CommandListResource& command, TextureHan
             for (uint32_t mip = subresources.base_mip; mip < subresources.base_mip + mip_count; ++mip) {
                 for (uint32_t layer = subresources.base_layer; layer < subresources.base_layer + layer_count; ++layer) {
                     const uint32_t index = texture_subresource_index(*resource, aspect, mip, layer);
-                    if (!resource_usage_matches(current_texture_state(command, texture, index), normalized_after)) {
-                        return Result::failure(ResultCode::kInvalidState,
-                                               "Explicit command list texture state does not match the declared usage");
+                    const ResourceState current = current_texture_state(command, texture, index);
+                    if (!resource_usage_matches(current, normalized_after)) {
+                        return Result::failure(
+                            ResultCode::kInvalidState,
+                            "Explicit command list texture state does not match the declared usage (current=" +
+                                std::to_string(static_cast<uint32_t>(current.usage)) + ", requested=" +
+                                std::to_string(static_cast<uint32_t>(normalized_after.usage)) + ")");
                     }
                 }
             }
@@ -7831,7 +7835,11 @@ Result VulkanDevice::bind_binding_set(CommandListHandle command_list, uint32_t g
                 const Result transition_result =
                     transition_texture(*command, view->desc.texture, view->desc.subresources, state);
                 if (!transition_result) {
-                    return transition_result;
+                    const TextureResource* texture = textures_.get(view->desc.texture);
+                    const std::string_view debug_name = texture == nullptr ? std::string_view{} : texture->desc.name.value;
+                    return Result::failure(transition_result.code,
+                                           "Binding-set sampled texture '" + std::string(debug_name) + "' transition failed: " +
+                                               transition_result.message);
                 }
                 add_unique(command->referenced_texture_views, write.resource.texture_view);
                 add_unique(command->referenced_textures, view->desc.texture);

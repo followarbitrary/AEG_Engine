@@ -3,8 +3,10 @@
  * @brief Verifies the editor preference draft model and panel contract.
  */
 #include <imgui.h>
+#include <imgui_internal.h>
 
 #include <cassert>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -84,6 +86,9 @@ int main() {
     using aeg::platform::WindowExtent;
     using aeg::platform::WindowId;
 
+    const aeg::editor::EditorPreferenceState default_preferences{};
+    assert(default_preferences.font_size_pixels == 16.0f);
+
     EditorPreferenceModel model(make_initial_state());
     assert(!model.state().dirty);
     assert(model.select_font("inter"));
@@ -139,17 +144,94 @@ int main() {
     assert(model.state().dirty);
 
     EditorImGuiHost host;
-    assert(host.initialize());
+    aeg::editor::EditorImGuiDesc host_desc{};
+    host_desc.enable_preference_fonts = true;
+    assert(host.initialize(host_desc));
+    // Display copy must come from a separately rasterized atlas font rather
+    // than scaling the 16px interface bitmap until it blurs.
+    assert(host.display_font() != nullptr);
+    assert(host.display_font_size_pixels() == 32.0f);
     EditorPreferenceModel panel_model(make_initial_state());
     TestActions panel_actions;
-    assert(host.register_panel(std::make_unique<EditorPreferencePanel>(panel_model, panel_actions)));
+    assert(host.register_panel(std::make_unique<EditorPreferencePanel>(panel_model, panel_actions, &host)));
     EditorImGuiFrameDesc frame_desc{};
     frame_desc.window = WindowId{0, 1};
-    frame_desc.display_extent = WindowExtent{1280, 720};
+    frame_desc.display_extent = WindowExtent{1578, 954};
+    const ImGuiStyle original_style = ImGui::GetStyle();
     assert(host.begin_frame(frame_desc));
     assert(host.build_panels());
+    // The selected settings design separates navigation, the editable font
+    // controls, and the preview surface into stable visual regions.
+    const auto contains_window = [](const char* fragment) {
+        for (ImGuiWindow* window : ImGui::GetCurrentContext()->Windows) {
+            if (std::strstr(window->Name, fragment) != nullptr) {
+                return true;
+            }
+        }
+        return false;
+    };
+    const auto find_window = [](const char* fragment) -> ImGuiWindow* {
+        for (ImGuiWindow* window : ImGui::GetCurrentContext()->Windows) {
+            if (std::strstr(window->Name, fragment) != nullptr) {
+                return window;
+            }
+        }
+        return nullptr;
+    };
+    assert(contains_window("PreferenceNavigation"));
+    assert(contains_window("FontPreviewSurface"));
+    assert(contains_window("PreferenceActionBar"));
+    assert(find_window("PreferenceNavigation")->Size.x <= 200.0f);
+    assert(find_window("PreferenceActionBar")->Size.y < 68.0f);
+    // The reference design starts the preview card above the left form's
+    // controls instead of letting the Fonts heading push both columns down.
+    const auto* settings = find_window("FontSettings");
+    const auto* preview = find_window("FontPreviewSurface");
+    assert(settings->Pos.x + settings->Size.x < preview->Pos.x);
+    assert(preview->Pos.y == settings->Pos.y);
+    assert(preview->Pos.y + preview->Size.y <= find_window("PreferenceActionBar")->Pos.y);
+    assert(ImGui::GetStyle().FrameRounding == original_style.FrameRounding);
+    assert(ImGui::GetStyle().WindowPadding.x == original_style.WindowPadding.x);
+    assert(ImGui::GetCurrentContext()->ColorStack.Size == 0);
+    assert(ImGui::GetCurrentContext()->StyleVarStack.Size == 0);
     assert(host.end_frame());
     assert(host.draw_data() != nullptr);
+    // An applied accessibility-sized font may enlarge text, but must not let
+    // navigation consume the workspace or move Preview below the form.
+    assert(host.set_font("", 40));
+    assert(host.begin_frame(frame_desc));
+    assert(host.build_panels());
+    assert(find_window("PreferenceNavigation")->Size.x <= 240.0f);
+    assert(find_window("FontSettings")->Pos.x + find_window("FontSettings")->Size.x <
+           find_window("FontPreviewSurface")->Pos.x);
+    assert(find_window("FontPreviewSurface")->Pos.y == find_window("FontSettings")->Pos.y);
+    assert(host.end_frame());
+    assert(host.set_font("", 16));
+    // A normal-width dialog keeps Preview on the right even when the draft
+    // font is large. Stacking is reserved for genuinely narrow windows.
+    frame_desc.display_extent = WindowExtent{980, 720};
+    assert(host.begin_frame(frame_desc));
+    assert(host.build_panels());
+    assert(find_window("FontSettings")->Pos.x + find_window("FontSettings")->Size.x <
+           find_window("FontPreviewSurface")->Pos.x);
+    assert(find_window("FontPreviewSurface")->Pos.y == find_window("FontSettings")->Pos.y);
+    assert(find_window("PreferenceActionBar")->Pos.y < 720);
+    assert(ImGui::GetCurrentContext()->ColorStack.Size == 0);
+    assert(ImGui::GetCurrentContext()->StyleVarStack.Size == 0);
+    assert(host.end_frame());
+    frame_desc.display_extent = WindowExtent{760, 720};
+    assert(host.begin_frame(frame_desc));
+    assert(host.build_panels());
+    assert(find_window("FontSettings")->Pos.y + find_window("FontSettings")->Size.y <
+           find_window("FontPreviewSurface")->Pos.y);
+    assert(host.end_frame());
+    frame_desc.display_extent = WindowExtent{500, 720};
+    assert(host.begin_frame(frame_desc));
+    assert(host.build_panels());
+    assert(find_window("PreferenceActionBar")->Size.y >= 80);
+    assert(find_window("PreferenceContent")->Pos.y + find_window("PreferenceContent")->Size.y <=
+           find_window("PreferenceActionBar")->Pos.y);
+    assert(host.end_frame());
     assert(host.shutdown());
     return 0;
 }

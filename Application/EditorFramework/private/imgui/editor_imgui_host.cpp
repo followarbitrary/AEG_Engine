@@ -5,6 +5,7 @@
 #include <imgui.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <exception>
@@ -144,6 +145,13 @@ struct EditorImGuiHost::Impl final {
     float preview_font_size_pixels{0.0f};
     /** @brief Font object used only by the Preferences preview sample. */
     ImFont* preview_font{nullptr};
+    /** @brief Native-size display font used for crisp preference headings. */
+    ImFont* display_font{nullptr};
+    /** @brief Rasterized size of the native display face. */
+    float display_font_size_pixels{0.0f};
+    std::array<ImFont*, 4> preference_fonts{};
+    ImFont* preference_icons{nullptr};
+    ImVector<ImWchar> chinese_ranges{};
     /** @brief Monotonic frame identity copied into every captured viewport packet. */
     uint64_t frame_number{0};
     /** @brief True after initialization has installed the ImGui context and bridge. */
@@ -165,7 +173,8 @@ struct EditorImGuiHost::Impl final {
         return iterator == fonts.end() ? nullptr : &*iterator;
     }
 
-    [[nodiscard]] foundation::Result add_font(std::string_view font_key, float size_pixels, ImFont*& output_font) {
+    [[nodiscard]] foundation::Result add_font(std::string_view font_key, float size_pixels, ImFont*& output_font,
+                                             bool include_chinese = true) {
         ImGuiIO& io = ImGui::GetIO();
         if (font_key.empty()) {
             ImFontConfig config{};
@@ -183,13 +192,14 @@ struct EditorImGuiHost::Impl final {
         config.FontDataOwnedByAtlas = false;
         config.FontNo = static_cast<int>(asset->face_index);
         config.SizePixels = size_pixels;
+        config.GlyphRanges = include_chinese && asset->descriptor.supports_chinese ? chinese_ranges.Data : nullptr;
         output_font = io.Fonts->AddFontFromMemoryTTF(
             const_cast<std::byte*>(asset->font_data.data()), static_cast<int>(asset->font_data.size()), size_pixels, &config);
         if (output_font == nullptr) {
             return foundation::invalid_argument("Editor font TTF data could not be loaded");
         }
 
-        if (!asset->descriptor.supports_chinese) {
+        if (include_chinese && !asset->descriptor.supports_chinese) {
             const EditorFontAsset* fallback = find_chinese_fallback();
             if (fallback != nullptr && fallback != asset) {
                 ImFontConfig fallback_config{};
@@ -199,7 +209,7 @@ struct EditorImGuiHost::Impl final {
                 fallback_config.SizePixels = size_pixels;
                 if (io.Fonts->AddFontFromMemoryTTF(
                         const_cast<std::byte*>(fallback->font_data.data()), static_cast<int>(fallback->font_data.size()),
-                        size_pixels, &fallback_config, io.Fonts->GetGlyphRangesChineseSimplifiedCommon()) == nullptr) {
+                        size_pixels, &fallback_config, chinese_ranges.Data) == nullptr) {
                     return foundation::invalid_argument("Editor Chinese fallback font could not be loaded");
                 }
             }
@@ -213,6 +223,15 @@ struct EditorImGuiHost::Impl final {
         ImGuiIO& io = ImGui::GetIO();
         font_texture = {};
         io.Fonts->Clear();
+        // The static-atlas renderer cannot request missing CJK glyphs while drawing.
+        // Include every character in the multilingual preview, not just the common subset.
+        ImFontGlyphRangesBuilder ranges;
+        ranges.AddRanges(io.Fonts->GetGlyphRangesChineseSimplifiedCommon());
+        ranges.AddText("中文字符预览：场景 组件 属性 资源 多语言文本在编辑器界面中应清晰易读。");
+        chinese_ranges.clear();
+        ranges.BuildRanges(&chinese_ranges);
+        preference_fonts.fill(nullptr);
+        preference_icons = nullptr;
 
         ImFont* primary_font = nullptr;
         if (const foundation::Result result = add_font(font_key, size_pixels, primary_font); !result) {
@@ -221,19 +240,56 @@ struct EditorImGuiHost::Impl final {
 
         ImFont* next_preview_font = nullptr;
         if (!next_preview_font_key.empty()) {
-            if (next_preview_font_key == font_key && next_preview_font_size_pixels == size_pixels) {
+            // Preview uses the draft font at actual size; Settings chrome
+            // remains on the active font until Apply or Save.
+            const float preview_raster_size = next_preview_font_size_pixels;
+            if (next_preview_font_key == font_key && preview_raster_size == size_pixels) {
                 next_preview_font = primary_font;
             } else if (const foundation::Result result =
-                           add_font(next_preview_font_key, next_preview_font_size_pixels, next_preview_font);
+                           add_font(next_preview_font_key, preview_raster_size, next_preview_font);
                        !result) {
                 return result;
             }
         }
 
-        if (primary_font == nullptr) {
+        constexpr float kDisplayFontSizePixels = 32.0f;
+        const std::string_view display_font_key = font_key;
+        ImFont* next_display_font = nullptr;
+        if (const foundation::Result result = add_font(display_font_key, kDisplayFontSizePixels, next_display_font, false); !result) {
+            return result;
+        }
+        if (desc.enable_preference_fonts) {
+            const auto settings_key = font_key;
+            const float settings_size = size_pixels;
+            const std::array<float, 4> sizes{settings_size * 0.875f, settings_size,
+                                             settings_size * 1.25f, settings_size * 1.5f};
+            for (std::size_t index = 0; index < sizes.size(); ++index) {
+                if (settings_key == font_key && sizes[index] == kDisplayFontSizePixels) {
+                    preference_fonts[index] = next_display_font;
+                } else if (const auto result = add_font(settings_key, sizes[index], preference_fonts[index], true); !result) {
+                    return result;
+                }
+            }
+            const auto icon_asset = std::find_if(fonts.begin(), fonts.end(), [](const EditorFontAsset& asset) {
+                return asset.descriptor.display_name == "Segoe MDL2 Assets";
+            });
+            if (icon_asset != fonts.end()) {
+                // Microsoft Segoe MDL2 Assets: Settings, KeyboardClassic, Font.
+                static constexpr ImWchar icon_ranges[]{0xE713, 0xE713, 0xE765, 0xE765, 0xE8D2, 0xE8D2, 0};
+                ImFontConfig config{};
+                config.FontDataOwnedByAtlas = false;
+                config.FontNo = static_cast<int>(icon_asset->face_index);
+                preference_icons = io.Fonts->AddFontFromMemoryTTF(
+                    const_cast<std::byte*>(icon_asset->font_data.data()), static_cast<int>(icon_asset->font_data.size()),
+                    20.0f, &config, icon_ranges);
+            }
+        }
+
+        if (primary_font == nullptr || next_display_font == nullptr) {
             return foundation::invalid_state("Editor primary font could not be created");
         }
         io.FontDefault = primary_font;
+        ImGui::GetStyle().FontSizeBase = size_pixels;
 
         unsigned char* font_pixels = nullptr;
         int font_width = 0;
@@ -264,6 +320,8 @@ struct EditorImGuiHost::Impl final {
             preview_font_key = next_preview_font_key;
             preview_font_size_pixels = next_preview_font == nullptr ? 0.0f : next_preview_font_size_pixels;
             preview_font = next_preview_font;
+            display_font = next_display_font;
+            display_font_size_pixels = kDisplayFontSizePixels;
             font_texture = {};
             io.Fonts->SetTexID(ImTextureRef(static_cast<ImTextureID>(0)));
             return foundation::Result::success();
@@ -312,6 +370,10 @@ foundation::Result EditorImGuiHost::initialize(const EditorImGuiDesc& desc) {
     impl_->preview_font_key.clear();
     impl_->preview_font_size_pixels = 0.0f;
     impl_->preview_font = nullptr;
+    impl_->display_font = nullptr;
+    impl_->preference_fonts.fill(nullptr);
+    impl_->preference_icons = nullptr;
+    impl_->display_font_size_pixels = 0.0f;
     impl_->context = ImGui::CreateContext();
     if (impl_->context == nullptr) {
         return foundation::out_of_memory("Dear ImGui context creation failed");
@@ -330,6 +392,8 @@ foundation::Result EditorImGuiHost::initialize(const EditorImGuiDesc& desc) {
     io.FontGlobalScale = desc.font_global_scale;
     // Treat user-provided font data errors as Result failures instead of process-level assertions.
     io.ConfigErrorRecoveryEnableAssert = false;
+    // The editor workspace owns its dock layout and rebuilds it from the registered
+    // panel model. Avoid stale ImGui settings overriding the designed layout.
     io.IniFilename = nullptr;
     io.BackendPlatformName = "AEG.Editor.ImGuiPlatformBridge";
     io.BackendRendererName = nullptr;
@@ -375,6 +439,10 @@ foundation::Result EditorImGuiHost::shutdown() {
     impl_->preview_font_key.clear();
     impl_->preview_font_size_pixels = 0.0f;
     impl_->preview_font = nullptr;
+    impl_->display_font = nullptr;
+    impl_->preference_fonts.fill(nullptr);
+    impl_->preference_icons = nullptr;
+    impl_->display_font_size_pixels = 0.0f;
     impl_->desc = {};
     impl_->initialized = false;
     return foundation::Result::success();
@@ -439,7 +507,10 @@ foundation::Result EditorImGuiHost::set_font(std::string_view font_key, float si
     }
 
     ImGui::SetCurrentContext(impl_->context);
-    return impl_->rebuild_font_atlas(font_key, size_pixels);
+    return impl_->desc.enable_preference_fonts
+               ? impl_->rebuild_font_atlas(font_key, size_pixels, impl_->preview_font_key,
+                                           impl_->preview_font_size_pixels)
+               : impl_->rebuild_font_atlas(font_key, size_pixels);
 }
 
 foundation::Result EditorImGuiHost::set_preview_font(std::string_view font_key, float size_pixels) {
@@ -487,6 +558,28 @@ float EditorImGuiHost::preview_font_size_pixels() const noexcept {
 
 const void* EditorImGuiHost::preview_font() const noexcept {
     return impl_ != nullptr ? impl_->preview_font : nullptr;
+}
+
+const void* EditorImGuiHost::display_font() const noexcept {
+    return impl_ != nullptr ? impl_->display_font : nullptr;
+}
+
+float EditorImGuiHost::display_font_size_pixels() const noexcept {
+    return impl_ != nullptr ? impl_->display_font_size_pixels : 0.0f;
+}
+
+const void* EditorImGuiHost::preference_font(float size_pixels) const noexcept {
+    constexpr std::array<float, 4> sizes{16.0f, 20.0f, 24.0f, 32.0f};
+    if (impl_ != nullptr) {
+        for (std::size_t index = 0; index < sizes.size(); ++index) {
+            if (size_pixels == sizes[index]) return impl_->preference_fonts[index];
+        }
+    }
+    return nullptr;
+}
+
+const void* EditorImGuiHost::preference_icon_font() const noexcept {
+    return impl_ != nullptr ? impl_->preference_icons : nullptr;
 }
 
 foundation::Result EditorImGuiHost::begin_frame(const EditorImGuiFrameDesc& desc) {

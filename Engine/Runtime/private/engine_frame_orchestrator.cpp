@@ -1013,7 +1013,7 @@ foundation::Result EngineFrameOrchestrator::build_render_features() {
                                                                                feature_buffers_.size()),
                 std::span<const render_graph::RenderGraphFeatureTextureBinding>(feature_textures_.data(),
                                                                                 feature_textures_.size()),
-                frame_desc_.user_data, feature_context};
+                frame_desc_.user_data, feature_context, frame_desc_.render_feature_state};
             pipeline::PipelinePlanHandle plan = pinned_pipeline.plan;
             if (const foundation::Result result =
                     render_graph::build_render_graph_features(render_graph_, std::move(plan), registry_, desc);

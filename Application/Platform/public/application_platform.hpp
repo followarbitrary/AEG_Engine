@@ -20,6 +20,16 @@ namespace aeg::application {
 /** @brief Shows an Application-owned native error dialog without exposing Win32 types. */
 [[nodiscard]] foundation::Result show_error_dialog(std::string_view title, std::string_view message);
 
+/**
+ * @brief Opens the native folder picker and returns the selected UTF-8 directory.
+ *
+ * Closing the picker without selecting a directory returns kCancelled. The
+ * initial directory may name a not-yet-created project; its nearest existing
+ * parent is used as the picker's starting location.
+ */
+[[nodiscard]] foundation::ResultValue<std::string> select_directory(
+    platform::WindowSurfaceBinding owner, std::string_view title, std::string_view initial_directory = {});
+
 /** @brief Describes one installed system font face without exposing platform API types. */
 struct SystemFontRecord final {
     /** @brief User-facing family name selected from the system font collection. */

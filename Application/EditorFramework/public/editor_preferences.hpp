@@ -22,7 +22,7 @@ struct EditorPreferenceState final {
     /** @brief Stable key of the selected editor font. */
     std::string active_font_key{};
     /** @brief Global editor font size in pixels. */
-    float font_size_pixels{18.0f};
+    float font_size_pixels{16.0f};
     /** @brief Whether the draft differs from the last accepted settings. */
     bool dirty{false};
     /** @brief Last user-visible operation error. */
@@ -64,7 +64,7 @@ private:
     /** @brief Initial font key used by Reset Defaults. */
     std::string default_font_key_{};
     /** @brief Initial font size used by Reset Defaults. */
-    float default_font_size_pixels_{18.0f};
+    float default_font_size_pixels_{16.0f};
 };
 
 /** @brief Application-owned actions invoked by the backend-neutral Preferences panel. */

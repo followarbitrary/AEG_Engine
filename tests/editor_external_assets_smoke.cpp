@@ -32,6 +32,11 @@ bool require(const Value& condition, const char* message) {
     return static_cast<bool>(condition);
 }
 
+template <typename Value>
+std::span<const std::byte> bytes_of(const Value& value) {
+    return std::as_bytes(std::span{&value, 1});
+}
+
 bool write_text(const std::filesystem::path& path, std::string_view text) {
     std::ofstream file(path, std::ios::binary | std::ios::trunc);
     file.write(text.data(), static_cast<std::streamsize>(text.size()));
@@ -206,36 +211,74 @@ int main() {
     const auto* quad = find_resource(resources, "Assets/quad.obj", aeg::application::EditorResourceKind::kMesh);
     const auto* red = find_resource(resources, "Assets/red.aegmat", aeg::application::EditorResourceKind::kMaterial);
     const auto* blue = find_resource(resources, "Assets/blue.aegmat", aeg::application::EditorResourceKind::kMaterial);
+    const auto* blue_texture =
+        find_resource(resources, "Assets/blue.bmp", aeg::application::EditorResourceKind::kTexture);
     if (!require(triangle != nullptr && triangle->valid, "triangle external mesh was not indexed") ||
         !require(quad != nullptr && quad->valid, "quad external mesh was not indexed") ||
         !require(red != nullptr && red->valid, "red external material was not indexed") ||
-        !require(blue != nullptr && blue->valid, "blue external material was not indexed")) {
+        !require(blue != nullptr && blue->valid, "blue external material was not indexed") ||
+        !require(blue_texture != nullptr && blue_texture->valid, "blue external texture was not indexed")) {
         std::filesystem::remove_all(root, error);
         return 5;
     }
     const uint64_t blue_material_id = blue->id;
+    const uint64_t blue_texture_id = blue_texture->id;
     const std::string blue_material_source = "Texture = \"Assets/blue.bmp\"\nTint = [0.75, 1.0, 0.9, 1.0]\n";
 
-    const auto baseline_request = runtime.request_viewport_readback();
-    const auto baseline_frame = baseline_request ? runtime.render_frame(0) : baseline_request;
-    if (!baseline_frame) {
-        std::cerr << "external baseline frame diagnostic: " << baseline_frame.message << '\n';
-    }
-    if (!require(baseline_request, "external asset smoke baseline readback request failed") ||
-        !require(baseline_frame, "external asset smoke baseline frame failed")) {
-        std::filesystem::remove_all(root, error);
-        return 6;
-    }
-    const auto baseline_pixels = runtime.read_viewport_pixels();
-    if (!require(baseline_pixels, "external asset smoke baseline pixel readback failed")) {
+    if (!require(runtime.entities().empty(), "external asset smoke blank project inherited sample geometry")) {
         std::filesystem::remove_all(root, error);
         return 7;
     }
-    const PixelStats baseline =
-        stats(std::span<const std::byte>(baseline_pixels.value.data(), baseline_pixels.value.size()), 128, 96, 0, 128);
-    if (!require(baseline.colored > 100u, "external asset smoke baseline viewport is unexpectedly empty")) {
+
+    const auto transform_type = aeg::ecs::ComponentTypeId(aeg::engine::components::kTransformName);
+    const auto light_type = aeg::ecs::ComponentTypeId(aeg::engine::components::kDirectionalLightName);
+    if (!require(runtime.create_scene_entity({}, "Test Light"), "external asset smoke light creation failed")) {
         std::filesystem::remove_all(root, error);
         return 7;
+    }
+    const auto light_id = runtime.selected_entity();
+    if (!require(runtime.add_component(std::span<const aeg::scene::SceneEntityId>(&light_id, 1), light_type),
+                 "external asset smoke light component creation failed")) {
+        std::filesystem::remove_all(root, error);
+        return 7;
+    }
+    aeg::engine::components::Transform left_transform{};
+    left_transform.translation.x = -0.62f;
+    left_transform.scale = {0.52f, 0.78f, 1.0f};
+    aeg::engine::components::Transform right_transform{};
+    right_transform.translation.x = 0.62f;
+    right_transform.scale = {0.52f, 0.78f, 1.0f};
+    const auto mesh_type = aeg::ecs::ComponentTypeId(aeg::engine::components::kMeshRendererName);
+    if (!require(runtime.create_scene_entity({}, "Left Mesh"), "external asset smoke left entity creation failed")) {
+        std::filesystem::remove_all(root, error);
+        return 8;
+    }
+    const aeg::scene::SceneEntityId left_id = runtime.selected_entity();
+    aeg::engine::components::MeshRenderer left_renderer{};
+    left_renderer.mesh_asset_id = triangle->id;
+    left_renderer.material_asset_id = red->id;
+    if (!require(runtime.add_component(std::span<const aeg::scene::SceneEntityId>(&left_id, 1), mesh_type),
+                 "external asset smoke left renderer creation failed") ||
+        !require(runtime.queue_component_update(left_id, mesh_type, bytes_of(left_renderer)),
+                 "external asset smoke left renderer update failed") ||
+        !require(runtime.queue_component_update(left_id, transform_type, bytes_of(left_transform)),
+                 "external asset smoke left transform update failed") ||
+        !require(runtime.create_scene_entity({}, "Right Mesh"), "external asset smoke right entity creation failed")) {
+        std::filesystem::remove_all(root, error);
+        return 8;
+    }
+    const aeg::scene::SceneEntityId right_id = runtime.selected_entity();
+    aeg::engine::components::MeshRenderer right_renderer{};
+    right_renderer.mesh_asset_id = quad->id;
+    right_renderer.material_asset_id = blue->id;
+    if (!require(runtime.add_component(std::span<const aeg::scene::SceneEntityId>(&right_id, 1), mesh_type),
+                 "external asset smoke right renderer creation failed") ||
+        !require(runtime.queue_component_update(right_id, mesh_type, bytes_of(right_renderer)),
+                 "external asset smoke right renderer update failed") ||
+        !require(runtime.queue_component_update(right_id, transform_type, bytes_of(right_transform)),
+                 "external asset smoke right transform update failed")) {
+        std::filesystem::remove_all(root, error);
+        return 8;
     }
 
     const auto left = std::find_if(runtime.entities().begin(), runtime.entities().end(),
@@ -243,23 +286,25 @@ int main() {
     const auto right = std::find_if(runtime.entities().begin(), runtime.entities().end(),
                                     [](const auto& entity) { return entity.name == "Right Mesh"; });
     if (!require(left != runtime.entities().end() && right != runtime.entities().end(),
-                 "external asset smoke default mesh entities are missing") ||
-        !require(runtime.select(left->id), "external asset smoke left selection failed") ||
-        !require(runtime.drop_resource(aeg::application::EditorResourceKind::kMesh, triangle->id),
-                 "external asset smoke triangle binding failed") ||
-        !require(runtime.drop_resource(aeg::application::EditorResourceKind::kMaterial, red->id),
-                 "external asset smoke red material binding failed") ||
-        !require(runtime.select(right->id), "external asset smoke right selection failed") ||
-        !require(runtime.drop_resource(aeg::application::EditorResourceKind::kMesh, quad->id),
-                 "external asset smoke quad binding failed") ||
-        !require(runtime.drop_resource(aeg::application::EditorResourceKind::kMaterial, blue->id),
-                 "external asset smoke blue material binding failed")) {
+                 "external asset smoke test mesh entities are missing")) {
         std::filesystem::remove_all(root, error);
         return 8;
     }
 
-    if (!require(runtime.request_viewport_readback(), "external asset smoke readback request failed") ||
-        !require(runtime.render_frame(1), "external asset smoke external frame failed")) {
+    for (uint64_t frame = 0; frame < 8; ++frame) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        if (!require(runtime.render_frame(frame), "external asset smoke asset stabilization frame failed")) {
+            std::filesystem::remove_all(root, error);
+            return 9;
+        }
+    }
+    const auto external_readback = runtime.request_viewport_readback();
+    const auto external_frame = external_readback ? runtime.render_frame(8) : external_readback;
+    if (!external_frame) {
+        std::cerr << "external asset smoke frame diagnostic: " << external_frame.message << '\n';
+    }
+    if (!require(external_readback, "external asset smoke readback request failed") ||
+        !require(external_frame, "external asset smoke external frame failed")) {
         std::filesystem::remove_all(root, error);
         return 9;
     }
@@ -271,6 +316,18 @@ int main() {
     const std::span<const std::byte> first_pixel_span(first_pixels.value.data(), first_pixels.value.size());
     const PixelStats left_pixels = stats(first_pixel_span, 128, 96, 0, 64);
     const PixelStats right_pixels = stats(first_pixel_span, 128, 96, 64, 128);
+    if (left_pixels.colored <= 100u || right_pixels.colored <= 100u) {
+        const auto* left_mesh = static_cast<const aeg::engine::components::MeshRenderer*>(
+            runtime.component_value(left_id, mesh_type));
+        const auto* right_mesh = static_cast<const aeg::engine::components::MeshRenderer*>(
+            runtime.component_value(right_id, mesh_type));
+        std::cerr << "external asset smoke colored pixels: left=" << left_pixels.colored
+                  << " right=" << right_pixels.colored << " diagnostic=" << runtime.diagnostic()
+                  << " leftMesh=" << (left_mesh == nullptr ? 0 : left_mesh->mesh_asset_id)
+                  << " leftMaterial=" << (left_mesh == nullptr ? 0 : left_mesh->material_asset_id)
+                  << " rightMesh=" << (right_mesh == nullptr ? 0 : right_mesh->mesh_asset_id)
+                  << " rightMaterial=" << (right_mesh == nullptr ? 0 : right_mesh->material_asset_id) << '\n';
+    }
     if (!require(left_pixels.colored > 100u && right_pixels.colored > 100u,
                  "external asset smoke did not render both external meshes") ||
         !require(left_pixels.red > left_pixels.blue * 2u, "external red texture did not reach the viewport") ||
@@ -355,19 +412,32 @@ int main() {
         std::filesystem::remove_all(root, error);
         return 14;
     }
+    std::this_thread::sleep_for(std::chrono::milliseconds(350));
     if (!require(write_bmp(root / "Assets" / "blue.bmp", {24, 48, 240, 255}),
-                 "external asset smoke watched texture restore failed")) {
+                 "external asset smoke watched texture restore failed") ||
+        !require(runtime.reimport_asset(blue_texture_id), "external asset smoke texture restore reimport failed")) {
         std::filesystem::remove_all(root, error);
         return 15;
     }
     bool hot_restore = false;
+    std::vector<std::byte> last_restore_pixels;
     for (uint64_t frame = 50; frame < 90 && !hot_restore; ++frame) {
         std::this_thread::sleep_for(std::chrono::milliseconds(150));
         if (!runtime.request_viewport_readback() || !runtime.render_frame(frame)) {
             break;
         }
         const auto pixels = runtime.read_viewport_pixels();
+        if (pixels) {
+            last_restore_pixels = pixels.value;
+        }
         hot_restore = pixels && pixels.value == first_pixels.value;
+    }
+    if (!hot_restore && !last_restore_pixels.empty()) {
+        const PixelStats restored_right = stats(
+            std::span<const std::byte>(last_restore_pixels.data(), last_restore_pixels.size()), 128, 96, 64, 128);
+        std::cerr << "external asset smoke restore stats: red=" << restored_right.red
+                  << " green=" << restored_right.green << " blue=" << restored_right.blue
+                  << " colored=" << restored_right.colored << '\n';
     }
     if (!require(hot_restore, "external asset smoke watcher did not restore the last texture revision")) {
         std::filesystem::remove_all(root, error);

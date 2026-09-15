@@ -4,6 +4,8 @@
  */
 #include "editor_scene_runtime.hpp"
 
+#include <render_feature_flow.hpp>
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -97,6 +99,8 @@ struct ViewportReadbackState final {
     bool requested{false};
     bool pass_built{false};
     bool pass_executed{false};
+    /** The renderer graph reached its final Present state for this frame. */
+    bool present_connected{true};
     render_graph::FrameAllocation allocation{};
     BufferDesc desc{};
     ResourceState initial_state{};
@@ -625,15 +629,45 @@ public:
             return foundation::invalid_state("viewport readback requires a valid renderer context");
         }
         auto* state = static_cast<ViewportReadbackState*>(context->user_data);
-        if (state == nullptr || !state->requested) {
+        if (state == nullptr) {
+            return foundation::invalid_state("viewport output requires a state object");
+        }
+        // This frame feature is scheduled inside the Render pipeline, before the
+        // runtime appends its terminal SceneColor composite.  For a serial state
+        // chain, read the directly declared state input so a readback observes the
+        // same frame's output rather than the prior SceneColor contents.  The
+        // visible viewport itself samples SceneColor after terminal composition.
+        pipeline::RenderGraphTexture color = builder.state_input();
+        if (!color.is_valid()) {
+            const auto scene_color = builder.find_texture(context->scene_snapshot->view.color_target);
+            if (!scene_color) {
+                return scene_color.result;
+            }
+            color = scene_color.value;
+        }
+        if (!state->present_connected) {
+            const auto clear = builder.add_graphics_pass(
+                "Editor.Viewport.NoPresent",
+                [color](pipeline::RenderPassBuilder& pass) {
+                    return pass.use_color_attachment(color, rhi::LoadOp::kClear, rhi::StoreOp::kStore,
+                                                     ClearColorValue{0.0f, 0.0f, 0.0f, 1.0f},
+                                                     ResourceUsage::kSampledRead);
+                },
+                [](pipeline::RenderPassExecutionContext& pass) {
+                    if (const Result result = pass.begin_rendering(); !result) {
+                        return result;
+                    }
+                    return pass.end_rendering();
+                });
+            if (!clear) {
+                return clear.result;
+            }
+        }
+        if (!state->requested) {
             return foundation::Result::success();
         }
         if (!state->allocation.is_valid() || state->width == 0 || state->height == 0) {
             return foundation::invalid_state("viewport readback was requested without a valid allocation");
-        }
-        const auto color = builder.find_texture(context->scene_snapshot->view.color_target);
-        if (!color) {
-            return color.result;
         }
         const auto readback = builder.import_buffer(kEditorViewportReadbackBuffer, state->allocation.buffer,
                                                     state->desc, state->initial_state);
@@ -648,7 +682,7 @@ public:
         state->pass_executed = false;
         const auto pass = builder.add_graphics_pass(
             "Editor.ViewportReadback",
-            [color = color.value, readback = readback.value, allocation,
+            [color, readback = readback.value, allocation,
              pixel_bytes](pipeline::RenderPassBuilder& pass) {
                 if (const foundation::Result result =
                         pass.read(color, ResourceUsage::kCopySource, PipelineStage::kCopy, ShaderStage::kAll);
@@ -664,7 +698,7 @@ public:
                 pass.set_side_effects();
                 return foundation::Result::success();
             },
-            [state, color = color.value, readback = readback.value, allocation, width,
+            [state, color, readback = readback.value, allocation, width,
              height](pipeline::RenderPassExecutionContext& pass) {
                 state->pass_executed = true;
                 return pass.copy_texture_to_buffer(color, rhi::TextureSubresourceLayers{rhi::Aspect::kColor, 0, 0, 1},
@@ -901,7 +935,8 @@ struct EditorSceneRuntime::Impl final {
     scene::SceneEntityId selected_entity_{kLeftMeshEntity};
     std::vector<scene::SceneEntityId> selected_entities_{kLeftMeshEntity};
     scene::SceneEntityId active_camera_scene_{kCameraEntity};
-    ecs::EntityId active_camera_runtime_{};
+    ecs::EntityId edit_camera_runtime_{};
+    ecs::EntityId runtime_camera_runtime_{};
     std::filesystem::path scene_path_{"editor_scene.aegscene"};
     std::string diagnostic_{};
     bool dirty_{false};
@@ -915,6 +950,8 @@ struct EditorSceneRuntime::Impl final {
     bool materials_ready_{false};
     bool target_has_previous_frame_{false};
     uint32_t current_slot_{0};
+    std::vector<render_graph::RenderStateLinkOverride> render_state_link_overrides_{};
+    std::vector<render_graph::RenderStateBlendOverride> render_state_blend_overrides_{};
     EditTransaction transform_edit_{};
     EditorCommand component_edit_command_{};
     bool component_edit_active_{false};
@@ -927,10 +964,15 @@ struct EditorSceneRuntime::Impl final {
     shader::ShaderManager* shader_manager_{nullptr};
     std::unique_ptr<shader::ShaderManager> shader_manager_owner_{};
     shader::ShaderPipelineLayout shader_layout_{};
+    shader::ShaderPipelineLayout state_composite_layout_{};
     BindingLayoutHandle object_layout_{};
     BindingLayoutHandle material_layout_{};
     BindingLayoutHandle lighting_layout_{};
+    BindingLayoutHandle state_composite_binding_layout_{};
     rhi::PipelineHandle pipeline_{};
+    std::array<rhi::PipelineHandle, 3> state_composite_pipelines_{};
+    /** State-composite descriptors are valid only until their frame has been submitted. */
+    std::vector<BindingSetHandle> state_composite_sets_{};
     std::array<renderer::RenderMeshResource, 2> meshes_{};
     std::array<BufferHandle, 2> mesh_vertex_buffers_{};
     std::array<BufferDesc, 2> mesh_vertex_descs_{};
@@ -954,6 +996,8 @@ struct EditorSceneRuntime::Impl final {
     TextureHandle color_texture_{};
     TextureViewHandle color_view_{};
     TextureViewHandle color_sampled_view_{};
+    /** Exact RHI state exported to the editor UI after the latest scene frame. */
+    ResourceState viewport_export_state_{sampled_state()};
     TextureDesc color_desc_{};
     TextureHandle depth_texture_{};
     TextureViewHandle depth_view_{};
@@ -968,6 +1012,10 @@ struct EditorSceneRuntime::Impl final {
 
     [[nodiscard]] Result initialize_device(Device& device);
     [[nodiscard]] Result initialize_graphics_resources();
+    /** Creates one descriptor set for a state-composite pass. */
+    [[nodiscard]] foundation::ResultValue<BindingSetHandle> create_state_composite_set();
+    /** Releases submitted state-composite descriptors before their transient source views are recycled. */
+    [[nodiscard]] Result release_state_composite_sets();
     [[nodiscard]] Result create_static_meshes();
     [[nodiscard]] Result create_object_and_lighting_resources();
     [[nodiscard]] Result create_targets();
@@ -976,8 +1024,9 @@ struct EditorSceneRuntime::Impl final {
     [[nodiscard]] Result rebuild_edit_world();
     [[nodiscard]] Result instantiate_world(scene::SceneAsset const& asset, std::shared_ptr<ecs::World>& state,
                                            std::unique_ptr<world::WorldScope>& scope, scene::SceneInstance& instance,
-                                           std::string_view name);
+                                           ecs::EntityId& camera_runtime, std::string_view name);
     [[nodiscard]] Result make_default_scene();
+    [[nodiscard]] Result make_empty_project_scene();
     [[nodiscard]] Result sync_scene_from_edit_world();
     [[nodiscard]] Result commit_edit_commands();
     [[nodiscard]] Result prepare_frame(const engine::EngineFramePreparationContext& context);
@@ -1088,7 +1137,7 @@ const std::filesystem::path& EditorSceneRuntime::project_root() const noexcept {
 
 foundation::ResultValue<renderer::RenderView> EditorSceneRuntime::Impl::make_edit_view(uint32_t width,
                                                                                        uint32_t height) const {
-    if (edit_scope_ == nullptr || edit_instance_.entity_count() == 0) {
+    if (edit_scope_ == nullptr || !edit_camera_runtime_.is_valid()) {
         return {foundation::invalid_state("Editor edit World is not initialized"), {}};
     }
     if (width == 0 || height == 0) {
@@ -1098,13 +1147,9 @@ foundation::ResultValue<renderer::RenderView> EditorSceneRuntime::Impl::make_edi
     if (!snapshot) {
         return {snapshot.result, {}};
     }
-    const auto camera = edit_instance_.runtime_entity(active_camera_scene_);
-    if (!camera) {
-        return {camera.result, {}};
-    }
     return aeg::engine::components::make_render_view(
         *snapshot.value, aeg::engine::components::RuntimeRenderViewDesc{
-                             camera.value, 0, {width, height}, 0xffffffffu, {}, {}, false, {}});
+                             edit_camera_runtime_, 0, {width, height}, 0xffffffffu, {}, {}, false, {}});
 }
 
 foundation::ResultValue<EditorSceneRuntime::Impl::ViewportRay> EditorSceneRuntime::Impl::make_viewport_ray(
@@ -1117,12 +1162,8 @@ foundation::ResultValue<EditorSceneRuntime::Impl::ViewportRay> EditorSceneRuntim
     if (!snapshot) {
         return {snapshot.result, {}};
     }
-    const auto camera = edit_instance_.runtime_entity(active_camera_scene_);
-    if (!camera) {
-        return {camera.result, {}};
-    }
-    const Transform* transform = snapshot.value->get<Transform>(camera.value);
-    const Camera* parameters = snapshot.value->get<Camera>(camera.value);
+    const Transform* transform = snapshot.value->get<Transform>(edit_camera_runtime_);
+    const Camera* parameters = snapshot.value->get<Camera>(edit_camera_runtime_);
     if (transform == nullptr || parameters == nullptr) {
         return {foundation::not_found("Editor viewport camera components are missing"), {}};
     }
@@ -1280,6 +1321,140 @@ const reflection::TypeRegistry& EditorSceneRuntime::reflection_registry() const 
     return impl_ == nullptr ? kEmptyRegistry : impl_->reflection_registry_;
 }
 
+std::vector<std::pair<std::string, pipeline::PipelinePlanHandle>> EditorSceneRuntime::pipeline_snapshots() const {
+    std::vector<std::pair<std::string, pipeline::PipelinePlanHandle>> result;
+    if (!impl_) return result;
+    if (impl_->active_scope_) {
+        auto plan = impl_->active_scope_->pipeline_host().active_plan_snapshot();
+        if (plan) result.emplace_back("Game / World", std::move(plan));
+    }
+    auto plan = impl_->frame_host_.active_plan_snapshot();
+    if (plan) result.emplace_back("Game / Renderer", std::move(plan));
+    return result;
+}
+
+foundation::Result EditorSceneRuntime::add_pipeline_runtime_ordering(PipelineTarget target, uint32_t source_node,
+                                                                      uint32_t destination_node) {
+    if (impl_ == nullptr || !impl_->initialized_) return foundation::invalid_state("Editor scene runtime is not initialized");
+    if (target == PipelineTarget::kRenderer) return impl_->frame_host_.add_runtime_ordering(source_node, destination_node);
+    if (impl_->active_scope_ == nullptr) return foundation::invalid_state("No active World pipeline is available");
+    return impl_->active_scope_->pipeline_host().add_runtime_ordering(source_node, destination_node);
+}
+
+foundation::Result EditorSceneRuntime::remove_pipeline_runtime_ordering(PipelineTarget target, uint32_t source_node,
+                                                                         uint32_t destination_node) {
+    if (impl_ == nullptr || !impl_->initialized_) return foundation::invalid_state("Editor scene runtime is not initialized");
+    if (target == PipelineTarget::kRenderer) return impl_->frame_host_.remove_runtime_ordering(source_node, destination_node);
+    if (impl_->active_scope_ == nullptr) return foundation::invalid_state("No active World pipeline is available");
+    return impl_->active_scope_->pipeline_host().remove_runtime_ordering(source_node, destination_node);
+}
+
+foundation::Result EditorSceneRuntime::add_render_state_link(uint32_t source_node, uint32_t destination_node) {
+    if (impl_ == nullptr || !impl_->initialized_) {
+        return foundation::invalid_state("Editor scene runtime is not initialized");
+    }
+    const auto plan = impl_->frame_host_.active_plan_snapshot();
+    if (!plan || source_node >= plan->nodes.size() || destination_node >= plan->nodes.size() ||
+        source_node == destination_node) {
+        return foundation::invalid_argument("Render-state link endpoints are invalid");
+    }
+    const auto contribution_for_node = [&plan](uint32_t node) -> const pipeline::PipelineFeatureContributionRecord* {
+        const uint64_t stage_index = plan->nodes[node].definition_stage_index;
+        const auto found = std::find_if(plan->feature_contributions.begin(), plan->feature_contributions.end(),
+                                        [stage_index](const auto& contribution) {
+                                            return contribution.domain == pipeline::FeatureDomain::kRender &&
+                                                   stage_index >= contribution.first_stage_index &&
+                                                   stage_index < contribution.first_stage_index + contribution.stage_count;
+                                        });
+        return found == plan->feature_contributions.end() ? nullptr : &*found;
+    };
+    const auto source_contribution = contribution_for_node(source_node);
+    const bool destination_accepts_state = plan->nodes[destination_node].phase == pipeline::EnginePhase::kPresent ||
+                                           contribution_for_node(destination_node) != nullptr;
+    if (source_contribution == nullptr || !destination_accepts_state) {
+        return foundation::invalid_argument("State Link requires a RenderFeature source and a RenderFeature or Present target");
+    }
+    const auto previous = impl_->render_state_link_overrides_;
+    const auto found = std::find_if(impl_->render_state_link_overrides_.begin(), impl_->render_state_link_overrides_.end(),
+                                    [source_node, destination_node](const auto& link) {
+                                        return link.source_node == source_node && link.destination_node == destination_node;
+                                    });
+    if (found == impl_->render_state_link_overrides_.end()) {
+        impl_->render_state_link_overrides_.push_back({source_node, destination_node, true});
+    } else {
+        found->connected = true;
+    }
+    if (render_graph::build_render_state_flow(*plan, impl_->render_state_link_overrides_).has_cycle) {
+        impl_->render_state_link_overrides_ = previous;
+        return foundation::invalid_argument("Render-state link would create a cycle");
+    }
+    return Result::success();
+}
+
+foundation::Result EditorSceneRuntime::remove_render_state_link(uint32_t source_node, uint32_t destination_node) {
+    if (impl_ == nullptr || !impl_->initialized_) {
+        return foundation::invalid_state("Editor scene runtime is not initialized");
+    }
+    const auto plan = impl_->frame_host_.active_plan_snapshot();
+    if (!plan || source_node >= plan->nodes.size() || destination_node >= plan->nodes.size() ||
+        source_node == destination_node) {
+        return foundation::invalid_argument("Render-state link endpoints are invalid");
+    }
+    const auto found = std::find_if(impl_->render_state_link_overrides_.begin(), impl_->render_state_link_overrides_.end(),
+                                    [source_node, destination_node](const auto& link) {
+                                        return link.source_node == source_node && link.destination_node == destination_node;
+                                    });
+    if (found == impl_->render_state_link_overrides_.end()) {
+        impl_->render_state_link_overrides_.push_back({source_node, destination_node, false});
+    } else {
+        found->connected = false;
+    }
+    return Result::success();
+}
+
+std::vector<render_graph::RenderStateLinkOverride> EditorSceneRuntime::render_state_link_overrides() const {
+    return impl_ == nullptr ? std::vector<render_graph::RenderStateLinkOverride>{} : impl_->render_state_link_overrides_;
+}
+
+foundation::Result EditorSceneRuntime::set_render_state_blend(uint32_t node, pipeline::RenderStateBlendMode blend_mode) {
+    if (impl_ == nullptr || !impl_->initialized_) {
+        return foundation::invalid_state("Editor scene runtime is not initialized");
+    }
+    const auto plan = impl_->frame_host_.active_plan_snapshot();
+    if (!plan || node >= plan->nodes.size() || static_cast<uint32_t>(blend_mode) >
+                                                 static_cast<uint32_t>(pipeline::RenderStateBlendMode::kAdd)) {
+        return foundation::invalid_argument("Render-state blend target is invalid");
+    }
+    const uint64_t stage_index = plan->nodes[node].definition_stage_index;
+    bool writes_state = false;
+    for (const auto& contribution : plan->feature_contributions) {
+        if (contribution.domain != pipeline::FeatureDomain::kRender || stage_index < contribution.first_stage_index ||
+            stage_index >= contribution.first_stage_index + contribution.stage_count) {
+            continue;
+        }
+        const auto feature = impl_->registry_.find_feature(contribution.feature);
+        writes_state = feature && feature.value->uses_render_state_output();
+        break;
+    }
+    if (!writes_state) {
+        return foundation::invalid_argument("Only a render-state output Feature can select a blend mode");
+    }
+    const auto found = std::find_if(impl_->render_state_blend_overrides_.begin(),
+                                    impl_->render_state_blend_overrides_.end(), [node](const auto& override) {
+                                        return override.node == node;
+                                    });
+    if (found == impl_->render_state_blend_overrides_.end()) {
+        impl_->render_state_blend_overrides_.push_back({node, blend_mode});
+    } else {
+        found->blend_mode = blend_mode;
+    }
+    return Result::success();
+}
+
+std::vector<render_graph::RenderStateBlendOverride> EditorSceneRuntime::render_state_blend_overrides() const {
+    return impl_ == nullptr ? std::vector<render_graph::RenderStateBlendOverride>{} : impl_->render_state_blend_overrides_;
+}
+
 foundation::Result EditorSceneRuntime::initialize(rhi::Device& device,
                                                   const std::filesystem::path& shader_package_path) {
     if (impl_ != nullptr && impl_->initialized_) {
@@ -1417,10 +1592,110 @@ foundation::Result EditorSceneRuntime::Impl::initialize_graphics_resources() {
         return pipeline.result;
     }
     pipeline_ = pipeline.value;
+
+#ifndef AEG_STATE_COMPOSITE_SHADER_PACKAGE_PATH
+    return foundation::invalid_state("Render-state composite shader package path is not configured for the editor");
+#else
+    auto composite_program = shader::load_shader_program(AEG_STATE_COMPOSITE_SHADER_PACKAGE_PATH);
+    if (!composite_program) {
+        return composite_program.result;
+    }
+    auto composite_layout =
+        shader_manager_->build_pipeline_layout(composite_program.value, DebugName{"Editor.StateComposite.Layout"});
+    if (!composite_layout) {
+        return composite_layout.result;
+    }
+    state_composite_layout_ = std::move(composite_layout.value);
+    const auto composite_binding_layout = shader_manager_->binding_layout(state_composite_layout_, 0);
+    if (!composite_binding_layout) {
+        return composite_binding_layout.result;
+    }
+    state_composite_binding_layout_ = composite_binding_layout.value;
+    const std::array<Format, 1> composite_color_formats{{Format::kRgba8Unorm}};
+    const auto create_composite_pipeline =
+        [this, &composite_program, &composite_color_formats](pipeline::RenderStateBlendMode mode,
+                                                              std::string_view name) -> foundation::ResultValue<rhi::PipelineHandle> {
+        rhi::BlendAttachmentDesc blend{};
+        blend.color_write_mask = rhi::ColorComponent::kAll;
+        switch (mode) {
+            case pipeline::RenderStateBlendMode::kReplace:
+                break;
+            case pipeline::RenderStateBlendMode::kOver:
+                blend.blend_enable = true;
+                blend.source_color_factor = rhi::BlendFactor::kSourceAlpha;
+                blend.destination_color_factor = rhi::BlendFactor::kOneMinusSourceAlpha;
+                blend.source_alpha_factor = rhi::BlendFactor::kOne;
+                blend.destination_alpha_factor = rhi::BlendFactor::kOneMinusSourceAlpha;
+                break;
+            case pipeline::RenderStateBlendMode::kAdd:
+                blend.blend_enable = true;
+                blend.source_color_factor = rhi::BlendFactor::kOne;
+                blend.destination_color_factor = rhi::BlendFactor::kOne;
+                blend.source_alpha_factor = rhi::BlendFactor::kOne;
+                blend.destination_alpha_factor = rhi::BlendFactor::kOne;
+                break;
+        }
+        const std::array<rhi::BlendAttachmentDesc, 1> blend_attachments{{blend}};
+        GraphicsPipelineState graphics{};
+        graphics.topology = PrimitiveTopology::kTriangleList;
+        graphics.cull_mode = CullMode::kNone;
+        graphics.color_formats = composite_color_formats;
+        graphics.blend_attachments = blend_attachments;
+        return shader_manager_->create_pipeline(
+            composite_program.value, state_composite_layout_,
+            shader::ShaderPipelineDesc{PipelineType::kGraphics, graphics, DebugName{name}});
+    };
+    constexpr std::array<pipeline::RenderStateBlendMode, 3> kCompositeModes{
+        pipeline::RenderStateBlendMode::kReplace, pipeline::RenderStateBlendMode::kOver,
+        pipeline::RenderStateBlendMode::kAdd};
+    constexpr std::array<std::string_view, 3> kCompositeNames{
+        "Editor.StateComposite.Replace", "Editor.StateComposite.Over", "Editor.StateComposite.Add"};
+    for (uint32_t index = 0; index < kCompositeModes.size(); ++index) {
+        auto composite_pipeline = create_composite_pipeline(kCompositeModes[index], kCompositeNames[index]);
+        if (!composite_pipeline) {
+            return composite_pipeline.result;
+        }
+        state_composite_pipelines_[index] = composite_pipeline.value;
+    }
+#endif
     if (const Result result = create_static_meshes(); !result) {
         return result;
     }
     return create_object_and_lighting_resources();
+}
+
+foundation::ResultValue<BindingSetHandle> EditorSceneRuntime::Impl::create_state_composite_set() {
+    if (!state_composite_binding_layout_.is_valid() || !viewport_sampler_.is_valid()) {
+        return {foundation::invalid_state("Render-state composite bindings are not initialized"), {}};
+    }
+    auto set = device_->create_binding_set(
+        BindingSetDesc{state_composite_binding_layout_, BindingSetLifetime::kPersistent,
+                       DebugName{"Editor.StateComposite.Set"}});
+    if (!set) {
+        return set;
+    }
+    try {
+        state_composite_sets_.push_back(set.value);
+    } catch (const std::bad_alloc&) {
+        static_cast<void>(device_->destroy_binding_set(set.value));
+        return {foundation::out_of_memory("Render-state composite descriptor tracking allocation failed"), {}};
+    }
+    return set;
+}
+
+foundation::Result EditorSceneRuntime::Impl::release_state_composite_sets() {
+    Result first_result = Result::success();
+    for (BindingSetHandle set : state_composite_sets_) {
+        if (!set.is_valid()) {
+            continue;
+        }
+        const Result result = device_->destroy_binding_set(set);
+        if (!result && result.code != foundation::ResultCode::kNotFound && first_result) {
+            first_result = result;
+        }
+    }
+    state_composite_sets_.clear();
+    return first_result;
 }
 
 foundation::Result EditorSceneRuntime::Impl::create_static_meshes() {
@@ -1536,7 +1811,8 @@ foundation::Result EditorSceneRuntime::Impl::create_object_and_lighting_resource
 foundation::Result EditorSceneRuntime::Impl::create_targets() {
     color_desc_ = make_target_desc(
         viewport_width_, viewport_height_, Format::kRgba8Unorm,
-        TextureCapability::kColorAttachment | TextureCapability::kSampled | TextureCapability::kTransferSource,
+        TextureCapability::kColorAttachment | TextureCapability::kSampled | TextureCapability::kTransferSource |
+            TextureCapability::kTransferDestination,
         "Editor.Scene.Color");
     auto color = device_->create_texture(color_desc_);
     if (!color) {
@@ -1595,6 +1871,7 @@ foundation::Result EditorSceneRuntime::Impl::create_targets() {
     }
     target_resize_pending_ = false;
     target_has_previous_frame_ = false;
+    viewport_export_state_ = undefined_state();
     return Result::success();
 }
 
@@ -1605,6 +1882,17 @@ foundation::Result EditorSceneRuntime::Impl::resize_targets() {
     if (const Result result = device_->wait_idle(); !result) {
         return result;
     }
+    if (const Result result = release_state_composite_sets(); !result) {
+        return result;
+    }
+    // EngineFrameOrchestrator caches graph-build state. It cannot survive a
+    // RenderGraph reset that invalidates the imported viewport resources.
+    orchestrator_.reset();
+    // The scene RenderGraph owns cached attachment and sampled views for the
+    // imported viewport targets. Those views outlive a submitted frame, so
+    // detach them before destroying the externally-owned SceneColor texture.
+    // Waiting above guarantees that no command list can still consume them.
+    render_graph_->reset();
     if (color_view_.is_valid()) {
         if (const Result result = device_->destroy_texture_view(color_view_); !result) {
             return result;
@@ -1637,7 +1925,13 @@ foundation::Result EditorSceneRuntime::Impl::resize_targets() {
     }
     viewport_width_ = requested_width_;
     viewport_height_ = requested_height_;
-    return create_targets();
+    if (const Result result = create_targets(); !result) {
+        return result;
+    }
+    if (active_scope_ == nullptr) {
+        return foundation::invalid_state("Editor scene has no active WorldScope after viewport resize");
+    }
+    return create_orchestrator_for(*active_scope_);
 }
 
 foundation::Result EditorSceneRuntime::Impl::make_default_scene() {
@@ -1717,10 +2011,18 @@ foundation::Result EditorSceneRuntime::Impl::make_default_scene() {
                reflection::TypeId(aeg::engine::components::kMeshRendererName), &right_mesh);
 }
 
+foundation::Result EditorSceneRuntime::Impl::make_empty_project_scene() {
+    scene_asset_ = scene::SceneAsset{};
+    active_camera_scene_ = {};
+    return scene_asset_.set_identity(scene::SceneAssetId{0xAE62026u, 2u}, "Main Scene", 1);
+}
+
 foundation::Result EditorSceneRuntime::Impl::instantiate_world(scene::SceneAsset const& asset,
                                                                std::shared_ptr<ecs::World>& state,
                                                                std::unique_ptr<world::WorldScope>& scope,
-                                                               scene::SceneInstance& instance, std::string_view name) {
+                                                               scene::SceneInstance& instance,
+                                                               ecs::EntityId& camera_runtime,
+                                                               std::string_view name) {
     const auto handle = world_manager_.create_world({std::string(name), true});
     if (!handle) {
         return handle.result;
@@ -1747,9 +2049,24 @@ foundation::Result EditorSceneRuntime::Impl::instantiate_world(scene::SceneAsset
         return instance_result.result;
     }
     instance = std::move(instance_result.value);
+    camera_runtime = {};
     const auto camera = instance.runtime_entity(active_camera_scene_);
     if (camera) {
-        active_camera_runtime_ = camera.value;
+        camera_runtime = camera.value;
+    } else {
+        const auto editor_camera = state->create_entity();
+        if (!editor_camera) {
+            return editor_camera.result;
+        }
+        Transform transform{};
+        transform.translation = {0.0f, 0.0f, 3.0f};
+        if (const auto result = state->emplace<Transform>(editor_camera.value, transform); !result) {
+            return result.result;
+        }
+        if (const auto result = state->emplace<Camera>(editor_camera.value, Camera{}); !result) {
+            return result.result;
+        }
+        camera_runtime = editor_camera.value;
     }
     return Result::success();
 }
@@ -1773,7 +2090,8 @@ foundation::Result EditorSceneRuntime::Impl::rebuild_edit_world() {
     orchestrator_.reset();
     edit_scope_.reset();
     edit_state_.reset();
-    const Result result = instantiate_world(scene_asset_, edit_state_, edit_scope_, edit_instance_, "Editor.EditWorld");
+    const Result result = instantiate_world(scene_asset_, edit_state_, edit_scope_, edit_instance_,
+                                            edit_camera_runtime_, "Editor.EditWorld");
     if (!result) {
         return result;
     }
@@ -1850,7 +2168,9 @@ foundation::Result EditorSceneRuntime::Impl::advance_runtime_demo() {
     }
     const auto runtime_entity = runtime_instance_.runtime_entity(kRightMeshEntity);
     if (!runtime_entity) {
-        return runtime_entity.result;
+        // The motion is only an editor-sample affordance. Project scenes do
+        // not contain the sample entity and must still be able to enter Play.
+        return runtime_entity.result.code == ResultCode::kNotFound ? Result::success() : runtime_entity.result;
     }
     runtime_demo_time_ += 1.0f / 60.0f;
     const ecs::ComponentTypeId transform_type(aeg::engine::components::kTransformName);
@@ -2467,9 +2787,6 @@ foundation::Result EditorSceneRuntime::Impl::prepare_text_assets(const ecs::Worl
 }
 
 foundation::Result EditorSceneRuntime::Impl::prepare_frame(const engine::EngineFramePreparationContext& context) {
-    if (const Result result = resize_targets(); !result) {
-        return result;
-    }
     current_slot_ = context.frame_context.frame_slot_index();
     // RenderGraph handles are frame-local. Re-import every retained GPU asset
     // into the current graph, even when its GPU payload did not change.
@@ -2804,6 +3121,12 @@ foundation::Result EditorSceneRuntime::Impl::destroy_resources() {
     if (pipeline_.is_valid()) {
         (void)device_->destroy_pipeline(pipeline_);
     }
+    for (rhi::PipelineHandle pipeline : state_composite_pipelines_) {
+        if (pipeline.is_valid()) {
+            (void)device_->destroy_pipeline(pipeline);
+        }
+    }
+    static_cast<void>(release_state_composite_sets());
     if (color_view_.is_valid()) {
         (void)device_->destroy_texture_view(color_view_);
         (void)device_->destroy_texture_view(color_sampled_view_);
@@ -2880,12 +3203,38 @@ editor::ImGuiTextureBinding EditorSceneRuntime::viewport_binding() const noexcep
         return {};
     }
     return {impl_->color_sampled_view_, impl_->viewport_sampler_, impl_->color_texture_, impl_->color_desc_,
-            sampled_state()};
+            impl_->viewport_export_state_};
 }
 
 bool EditorSceneRuntime::viewport_ready() const noexcept {
     return impl_ != nullptr && impl_->initialized_ && impl_->color_texture_.is_valid() &&
            impl_->color_sampled_view_.is_valid() && impl_->viewport_sampler_.is_valid();
+}
+
+bool EditorSceneRuntime::viewport_present_connected() const noexcept {
+    if (impl_ == nullptr || !impl_->initialized_) {
+        return true;
+    }
+    const auto plan = impl_->frame_host_.active_plan_snapshot();
+    if (!plan) {
+        return true;
+    }
+    const render_graph::RenderStateFlow state_flow =
+        render_graph::build_render_state_flow(*plan, impl_->render_state_link_overrides_);
+    if (state_flow.has_cycle) {
+        return false;
+    }
+    for (std::size_t index = 0; index < plan->feature_contributions.size(); ++index) {
+        const auto& contribution = plan->feature_contributions[index];
+        if (contribution.domain != pipeline::FeatureDomain::kRender || !state_flow.contributions[index].reaches_present) {
+            continue;
+        }
+        const auto feature = impl_->registry_.find_feature(contribution.feature);
+        if (feature && feature.value->uses_render_state_output()) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool EditorSceneRuntime::viewport_resize_pending() const noexcept {
@@ -2981,6 +3330,10 @@ foundation::ResultValue<ViewportGizmoProjection> EditorSceneRuntime::selected_gi
     if (!runtime) {
         return {runtime.result, {}};
     }
+    const auto* mesh = snapshot.value->get<MeshRenderer>(runtime.value);
+    if (mesh != nullptr && !mesh->visible) {
+        return {Result::success(), {}};
+    }
     const Transform* transform = snapshot.value->get<Transform>(runtime.value);
     if (transform == nullptr) {
         return {foundation::not_found("Selected entity has no Transform component"), {}};
@@ -3036,11 +3389,7 @@ foundation::Result EditorSceneRuntime::begin_transform_edit(ViewportGizmoMode mo
     if (!ray) {
         return ray.result;
     }
-    const auto camera = impl_->edit_instance_.runtime_entity(impl_->active_camera_scene_);
-    if (!camera) {
-        return camera.result;
-    }
-    const Transform* camera_transform = snapshot.value->get<Transform>(camera.value);
+    const Transform* camera_transform = snapshot.value->get<Transform>(impl_->edit_camera_runtime_);
     if (camera_transform == nullptr) {
         return foundation::not_found("Editor viewport camera Transform is missing");
     }
@@ -3097,21 +3446,16 @@ foundation::Result EditorSceneRuntime::begin_transform_edit(ViewportGizmoMode mo
 }
 
 foundation::Result EditorSceneRuntime::Impl::reset_scene_for_project() {
-    if (const Result result = make_default_scene(); !result) {
+    if (const Result result = make_empty_project_scene(); !result) {
         return result;
     }
-    if (project_manager_.loaded()) {
-        const std::array<scene::SceneEntityId, 1> demo_child{kLightEntity};
-        if (const Result result = scene_asset_.reparent_entities(demo_child, kCameraEntity); !result) {
-            return result;
-        }
-    }
     transform_edit_ = {};
-    selected_entity_ = kLeftMeshEntity;
-    selected_entities_.assign(1, kLeftMeshEntity);
+    selected_entity_ = {};
+    selected_entities_.clear();
     mode_ = EditorSceneRuntime::Mode::kEdit;
     runtime_scope_.reset();
     runtime_state_.reset();
+    runtime_camera_runtime_ = {};
     active_scope_ = nullptr;
     scene_path_ = project_manager_.loaded() ? project_manager_.default_scene_file()
                                             : std::filesystem::path{"editor_scene.aegscene"};
@@ -3209,14 +3553,116 @@ foundation::Result EditorSceneRuntime::render_frame(uint64_t frame_number) {
         impl_->orchestrator_ == nullptr) {
         return foundation::invalid_state("Editor scene runtime is not ready to render");
     }
+    // The RenderFeature state descriptor is copied when the frame begins. Resize
+    // the viewport before creating it so the transient state texture and the
+    // imported SceneColor target always have identical dimensions and format.
+    if (const Result result = impl_->resize_targets(); !result) {
+        return result;
+    }
     impl_->current_slot_ = impl_->frame_context_->frame_slot_index();
+    impl_->viewport_readback_.present_connected = viewport_present_connected();
     engine::EngineFrameDesc desc{};
     desc.fixed_tick = frame_number;
     desc.render_output_extent = {impl_->requested_width_, impl_->requested_height_};
+    desc.render_feature_state = {
+        .enabled = true,
+        .texture_desc = impl_->color_desc_,
+        .present_target_id = kSceneColor,
+        .present_extent = {impl_->requested_width_, impl_->requested_height_, 1},
+        .link_overrides = impl_->render_state_link_overrides_,
+        .blend_overrides = impl_->render_state_blend_overrides_,
+        .compose_terminal_states = [impl = impl_.get()](pipeline::RenderGraphBuilder& builder,
+                                                        std::span<const render_graph::RenderStateCompositeInput> inputs,
+                                                        pipeline::RenderGraphTexture destination) -> Result {
+            if (inputs.empty() || !destination.is_valid()) {
+                return foundation::invalid_argument("Render-state terminal composition requires valid state inputs");
+            }
+            const auto extent = rhi::Extent3D{impl->requested_width_, impl->requested_height_, 1};
+            for (uint32_t index = 0; index < inputs.size(); ++index) {
+                const pipeline::RenderGraphTexture source = inputs[index].texture;
+                const uint32_t pipeline_index = static_cast<uint32_t>(inputs[index].blend_mode);
+                if (pipeline_index >= impl->state_composite_pipelines_.size() ||
+                    !impl->state_composite_pipelines_[pipeline_index].is_valid()) {
+                    return foundation::invalid_state("Render-state blend pipeline is unavailable");
+                }
+                const auto binding_set_result = impl->create_state_composite_set();
+                if (!binding_set_result) {
+                    return binding_set_result.result;
+                }
+                const BindingSetHandle binding_set = binding_set_result.value;
+                const rhi::LoadOp load_op = index == 0 ? rhi::LoadOp::kClear : rhi::LoadOp::kLoad;
+                const auto pass_result = builder.add_graphics_pass(
+                    "RenderState.Composite",
+                    [source, destination, load_op](pipeline::RenderPassBuilder& pass) {
+                        if (const Result result = pass.read(source, rhi::ResourceUsage::kSampledRead,
+                                                            rhi::PipelineStage::kFragmentShader,
+                                                            rhi::ShaderStage::kFragment);
+                            !result) {
+                            return result;
+                        }
+                        if (const Result result = pass.use_color_attachment(
+                                destination, load_op, rhi::StoreOp::kStore,
+                                ClearColorValue{0.0f, 0.0f, 0.0f, 0.0f}, rhi::ResourceUsage::kSampledRead);
+                            !result) {
+                            return result;
+                        }
+                        pass.set_side_effects();
+                        return Result::success();
+                    },
+                    [impl, source, binding_set, extent, pipeline_index](pipeline::RenderPassExecutionContext& pass) {
+                        const auto sampled_view = pass.texture_view(source, TextureViewKind::kSampled,
+                                                                    {rhi::Aspect::kColor, 0, 1, 0, 1},
+                                                                    Format::kRgba8Unorm, TextureViewDimension::kTex2D);
+                        if (!sampled_view) {
+                            return sampled_view.result;
+                        }
+                        const std::array<BindingWrite, 2> writes{
+                            BindingWrite{{0, 0}, 0,
+                                         BindingResource{BindingType::kSampledTexture, sampled_view.value, {}, {}, {}, {}}},
+                            BindingWrite{{0, 1}, 0,
+                                         BindingResource{BindingType::kSampler, {}, {}, {}, impl->viewport_sampler_, {}}},
+                        };
+                        if (const Result result = impl->device_->update_binding_set(binding_set, writes); !result) {
+                            return result;
+                        }
+                        if (const Result result = pass.bind_pipeline(impl->state_composite_pipelines_[pipeline_index]);
+                            !result) {
+                            return result;
+                        }
+                        if (const Result result = pass.bind_binding_set(0, binding_set); !result) {
+                            return result;
+                        }
+                        if (const Result result = pass.begin_rendering(); !result) {
+                            return result;
+                        }
+                        if (const Result result = pass.set_viewport(
+                                rhi::Viewport{0.0f, 0.0f, static_cast<float>(extent.width),
+                                              static_cast<float>(extent.height), 0.0f, 1.0f});
+                            !result) {
+                            return result;
+                        }
+                        if (const Result result = pass.set_scissor(rhi::ScissorRect{0, 0, extent.width, extent.height});
+                            !result) {
+                            return result;
+                        }
+                        if (const Result result = pass.draw(rhi::DrawDesc{3, 1, 0, 0}); !result) {
+                            return result;
+                        }
+                        return pass.end_rendering();
+                    });
+                if (!pass_result) {
+                    return pass_result.result;
+                }
+            }
+            return Result::success();
+        },
+    };
     desc.renderer = &impl_->renderer_;
     desc.render_view_resolver = [impl = impl_.get()](const engine::EngineFrameRenderViewContext& context) {
+        const ecs::EntityId camera = impl->mode_ == Mode::kEdit ? impl->edit_camera_runtime_
+                                                                : impl->runtime_camera_runtime_;
         auto view = aeg::engine::components::make_render_view(
-            context.world_snapshot, aeg::engine::components::RuntimeRenderViewDesc{impl->active_camera_runtime_,
+            context.world_snapshot, aeg::engine::components::RuntimeRenderViewDesc{camera,
                                                                                    0,
                                                                                    context.output_extent,
                                                                                    0xffffffffu,
@@ -3239,11 +3685,20 @@ foundation::Result EditorSceneRuntime::render_frame(uint64_t frame_number) {
         return impl->prepare_frame(context);
     };
     const Result frame_result = impl_->orchestrator_->run_frame(desc);
+    const Result composite_release_result = impl_->release_state_composite_sets();
     if (!frame_result) {
         impl_->viewport_readback_.requested = false;
         impl_->viewport_readback_.allocation = {};
         return frame_result;
     }
+    if (!composite_release_result) {
+        return composite_release_result;
+    }
+    const auto viewport_state = query_texture_initial_state(*impl_->device_, impl_->color_texture_);
+    if (!viewport_state) {
+        return viewport_state.result;
+    }
+    impl_->viewport_export_state_ = viewport_state.value;
     if (impl_->viewport_readback_.requested) {
         if (!impl_->viewport_readback_.allocation.is_valid()) {
             impl_->viewport_readback_.requested = false;
@@ -4084,12 +4539,16 @@ std::vector<ecs::ComponentTypeId> EditorSceneRuntime::selected_component_types()
 }
 
 std::vector<EditorResourceDescriptor> EditorSceneRuntime::resource_descriptors() const {
-    std::vector<EditorResourceDescriptor> result{
-        {EditorResourceKind::kMesh, kMeshAssetA, "Mesh A", true, EditorAssetStatus::kImported, {}},
-        {EditorResourceKind::kMesh, kMeshAssetB, "Mesh B", true, EditorAssetStatus::kImported, {}},
-        {EditorResourceKind::kMaterial, kMaterialAssetRed, "Material Red", true, EditorAssetStatus::kImported, {}},
-        {EditorResourceKind::kMaterial, kMaterialAssetGreen, "Material Green", true, EditorAssetStatus::kImported, {}},
-    };
+    std::vector<EditorResourceDescriptor> result{};
+    if (impl_ == nullptr || !impl_->project_manager_.loaded()) {
+        result = {
+            {EditorResourceKind::kMesh, kMeshAssetA, "Mesh A", true, EditorAssetStatus::kImported, {}},
+            {EditorResourceKind::kMesh, kMeshAssetB, "Mesh B", true, EditorAssetStatus::kImported, {}},
+            {EditorResourceKind::kMaterial, kMaterialAssetRed, "Material Red", true, EditorAssetStatus::kImported, {}},
+            {EditorResourceKind::kMaterial, kMaterialAssetGreen, "Material Green", true,
+             EditorAssetStatus::kImported, {}},
+        };
+    }
     if (impl_ == nullptr) {
         return result;
     }
@@ -4349,11 +4808,26 @@ foundation::Result EditorSceneRuntime::import_project(const std::filesystem::pat
         return result;
     }
     const std::filesystem::path remembered_scene = impl_->project_manager_.recent_scene();
-    const std::filesystem::path scene_path =
-        remembered_scene.empty() ? impl_->project_manager_.default_scene_file() : remembered_scene;
-    std::error_code error;
-    if (std::filesystem::exists(scene_path, error) && !error) {
-        return open_scene(scene_path);
+    const std::filesystem::path default_scene = impl_->project_manager_.default_scene_file();
+    if (!remembered_scene.empty()) {
+        std::error_code error;
+        const bool exists = std::filesystem::exists(remembered_scene, error);
+        if (error) {
+            return foundation::invalid_state("Could not inspect the recent project scene: " + error.message());
+        }
+        if (exists) {
+            return open_scene(remembered_scene);
+        }
+    }
+    {
+        std::error_code error;
+        const bool exists = std::filesystem::exists(default_scene, error);
+        if (error) {
+            return foundation::invalid_state("Could not inspect the default project scene: " + error.message());
+        }
+        if (exists) {
+            return open_scene(default_scene);
+        }
     }
     if (const Result result = impl_->reset_scene_for_project(); !result) {
         return result;
@@ -4373,13 +4847,20 @@ foundation::Result EditorSceneRuntime::new_scene() {
     if (impl_->mode_ != Mode::kEdit) {
         return foundation::invalid_state("New Scene requires Edit mode");
     }
-    if (const Result result = impl_->make_default_scene(); !result) {
-        return result;
+    const Result scene_result = impl_->project_manager_.loaded() ? impl_->make_empty_project_scene()
+                                                                 : impl_->make_default_scene();
+    if (!scene_result) {
+        return scene_result;
+    }
+    if (!impl_->project_manager_.loaded()) {
+        impl_->active_camera_scene_ = kCameraEntity;
     }
     impl_->transform_edit_ = {};
-    impl_->selected_entity_ = kLeftMeshEntity;
+    impl_->selected_entity_ = impl_->project_manager_.loaded() ? scene::SceneEntityId{} : kLeftMeshEntity;
     impl_->selected_entities_.clear();
-    impl_->selected_entities_.push_back(kLeftMeshEntity);
+    if (impl_->selected_entity_.is_valid()) {
+        impl_->selected_entities_.push_back(impl_->selected_entity_);
+    }
     impl_->mode_ = Mode::kEdit;
     impl_->runtime_scope_.reset();
     impl_->runtime_state_.reset();
@@ -4450,7 +4931,7 @@ foundation::Result EditorSceneRuntime::open_scene(const std::filesystem::path& p
     impl_->transform_edit_ = {};
     impl_->scene_asset_ = asset.value;
     impl_->scene_path_ = resolved_path;
-    impl_->active_camera_scene_ = kCameraEntity;
+    impl_->active_camera_scene_ = {};
     const ecs::ComponentTypeId camera_type(aeg::engine::components::kCameraName);
     for (const scene::SceneComponentRecord& component : impl_->scene_asset_.components()) {
         if (component.component_type == camera_type) {
@@ -4621,7 +5102,11 @@ foundation::Result EditorSceneRuntime::play() {
     if (impl_ == nullptr || impl_->edit_scope_ == nullptr) {
         return foundation::invalid_state("Editor edit World is not initialized");
     }
-    if (impl_->mode_ == Mode::kPlay || impl_->mode_ == Mode::kPause) {
+    if (impl_->mode_ == Mode::kPlay) {
+        return Result::success();
+    }
+    if (impl_->mode_ == Mode::kPause) {
+        impl_->mode_ = Mode::kPlay;
         return Result::success();
     }
     if (impl_->transform_edit_.active) {
@@ -4637,10 +5122,11 @@ foundation::Result EditorSceneRuntime::play() {
     }
     impl_->runtime_scope_.reset();
     impl_->runtime_state_.reset();
+    impl_->runtime_camera_runtime_ = {};
     impl_->runtime_demo_time_ = 0.0f;
     if (const Result result =
             impl_->instantiate_world(impl_->scene_asset_, impl_->runtime_state_, impl_->runtime_scope_,
-                                     impl_->runtime_instance_, "Editor.RuntimeWorld");
+                                     impl_->runtime_instance_, impl_->runtime_camera_runtime_, "Editor.RuntimeWorld");
         !result) {
         return result;
     }
@@ -4674,6 +5160,7 @@ foundation::Result EditorSceneRuntime::stop() {
     impl_->orchestrator_.reset();
     impl_->runtime_scope_.reset();
     impl_->runtime_state_.reset();
+    impl_->runtime_camera_runtime_ = {};
     impl_->runtime_demo_time_ = 0.0f;
     impl_->mode_ = Mode::kEdit;
     impl_->active_scope_ = impl_->edit_scope_.get();

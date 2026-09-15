@@ -16,6 +16,13 @@ option(AEG_VULKAN_ENABLE_VALIDATION "Compile Vulkan validation-layer support" ${
 option(AEG_VULKAN_ENABLE_DEBUG_UTILS "Compile Vulkan debug-utils support" ${AEG_RHI_ENABLE_DEBUG})
 option(AEG_VULKAN_ENABLE_DEBUG_NAMES "Compile Vulkan object debug-name support" ${AEG_RHI_ENABLE_DEBUG_NAMES})
 option(AEG_MATH_ENABLE_SIMD "Enable the x86 SSE2 math implementation when available" ON)
+option(AEG_EDITOR_ENABLE_BUILTIN_PIPELINE_DEBUG
+    "Expose the editable Built-in / Editor UI pipeline in an explicit Debug build" OFF)
+
+set(AEG_EDITOR_ENABLE_BUILTIN_PIPELINE_DEBUG_VALUE 0)
+if (AEG_EDITOR_ENABLE_BUILTIN_PIPELINE_DEBUG AND CMAKE_BUILD_TYPE STREQUAL "Debug")
+    set(AEG_EDITOR_ENABLE_BUILTIN_PIPELINE_DEBUG_VALUE 1)
+endif()
 
 set(AEG_LOG_COMPILE_LEVEL "Auto" CACHE STRING
     "Compile-time minimum log level (Auto, Trace, Debug, Info, Notice, Warning, Error, Critical, Off)")
@@ -245,7 +252,7 @@ if (WIN32)
             _UNICODE
             WIN32_LEAN_AND_MEAN
     )
-    target_link_libraries(aeg_application_platform_win32 PUBLIC aeg_platform aeg_input user32 imm32 dwrite ole32)
+    target_link_libraries(aeg_application_platform_win32 PUBLIC aeg_platform aeg_input user32 imm32 dwrite ole32 shell32 uuid)
 
     if (MSVC)
         target_compile_options(aeg_application_platform_win32 PRIVATE /W4 /permissive-)
@@ -321,6 +328,9 @@ add_executable(aeg_editor_imgui_smoke
     tests/editor_imgui_smoke.cpp
 )
 target_link_libraries(aeg_editor_imgui_smoke PRIVATE aeg_editor_framework)
+target_include_directories(aeg_editor_imgui_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private
+)
 if (WIN32)
     target_compile_definitions(aeg_editor_imgui_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
@@ -785,6 +795,7 @@ add_library(aeg_render_graph STATIC
     Engine/RenderGraph/private/frame_context.cpp
     Engine/RenderGraph/private/render_graph.cpp
     Engine/RenderGraph/private/render_feature_runtime.cpp
+    Engine/RenderGraph/private/render_state_flow.cpp
 )
 target_compile_features(aeg_render_graph PUBLIC cxx_std_20)
 target_include_directories(aeg_render_graph
@@ -1017,6 +1028,18 @@ if (WIN32)
             "fragment|ps_6_0|${CMAKE_CURRENT_SOURCE_DIR}/shaders/core/opaque/unlit_mesh.frag.hlsl"
         PACKAGE_OUTPUT_VARIABLE AEG_OPAQUE_UNLIT_SHADER_PACKAGE
     )
+    set(AEG_STATE_COMPOSITE_SHADER_PACKAGE
+        "${AEG_SHADER_OUTPUT_DIR}/core_contract/presentation_fullscreen_texture_blit.aegshader")
+    aeg_add_hlsl_gameplay_shader_program(
+        TARGET aeg_core_shaders
+        NAME presentation_fullscreen_texture_blit
+        OUTPUT_DIRECTORY "${AEG_SHADER_OUTPUT_DIR}/core_contract"
+        CONTRACT_TOOL aeg_shader_contract_tool
+        STAGES
+            "vertex|vs_6_0|${CMAKE_CURRENT_SOURCE_DIR}/shaders/core/presentation/fullscreen_texture_blit.vert.hlsl"
+            "fragment|ps_6_0|${CMAKE_CURRENT_SOURCE_DIR}/shaders/core/presentation/fullscreen_texture_blit.frag.hlsl"
+        PACKAGE_OUTPUT_VARIABLE AEG_STATE_COMPOSITE_SHADER_PACKAGE
+    )
     target_compile_definitions(aeg_editor_framework PRIVATE
         AEG_EDITOR_IMGUI_SHADER_PACKAGE_PATH="${AEG_EDITOR_IMGUI_SHADER_PACKAGE}"
     )
@@ -1130,10 +1153,12 @@ if (WIN32)
         aeg_rhi
         aeg_core_shaders
     )
-    target_compile_definitions(aeg_editor_application PRIVATE
+target_compile_definitions(aeg_editor_application PRIVATE
         _CRT_SECURE_NO_WARNINGS
+        AEG_EDITOR_ENABLE_BUILTIN_PIPELINE_DEBUG=${AEG_EDITOR_ENABLE_BUILTIN_PIPELINE_DEBUG_VALUE}
         AEG_EDITOR_IMGUI_SHADER_PACKAGE_PATH="${AEG_EDITOR_IMGUI_SHADER_PACKAGE}"
         AEG_OPAQUE_UNLIT_SHADER_PACKAGE_PATH="${AEG_OPAQUE_UNLIT_SHADER_PACKAGE}"
+        AEG_STATE_COMPOSITE_SHADER_PACKAGE_PATH="${AEG_STATE_COMPOSITE_SHADER_PACKAGE}"
     )
     add_dependencies(aeg_editor_application aeg_core_shaders)
 
@@ -1150,6 +1175,10 @@ if (WIN32)
     install(FILES "${AEG_OPAQUE_UNLIT_SHADER_PACKAGE}"
         DESTINATION shaders/core
         RENAME opaque_unlit_mesh.aegshader
+    )
+    install(FILES "${AEG_STATE_COMPOSITE_SHADER_PACKAGE}"
+        DESTINATION shaders/core
+        RENAME presentation_fullscreen_texture_blit.aegshader
     )
     install(FILES "${AEG_EDITOR_IMGUI_SHADER_PACKAGE}"
         DESTINATION shaders/editor
@@ -1182,6 +1211,7 @@ if (WIN32)
     target_compile_definitions(aeg_editor_scene_runtime_smoke PRIVATE
         _CRT_SECURE_NO_WARNINGS
         AEG_OPAQUE_UNLIT_SHADER_PACKAGE_PATH="${AEG_OPAQUE_UNLIT_SHADER_PACKAGE}"
+        AEG_STATE_COMPOSITE_SHADER_PACKAGE_PATH="${AEG_STATE_COMPOSITE_SHADER_PACKAGE}"
     )
     add_dependencies(aeg_editor_scene_runtime_smoke aeg_core_shaders)
 
@@ -1207,6 +1237,7 @@ if (WIN32)
     target_compile_definitions(aeg_editor_external_assets_smoke PRIVATE
         _CRT_SECURE_NO_WARNINGS
         AEG_OPAQUE_UNLIT_SHADER_PACKAGE_PATH="${AEG_OPAQUE_UNLIT_SHADER_PACKAGE}"
+        AEG_STATE_COMPOSITE_SHADER_PACKAGE_PATH="${AEG_STATE_COMPOSITE_SHADER_PACKAGE}"
     )
     add_dependencies(aeg_editor_external_assets_smoke aeg_core_shaders)
 
@@ -1232,6 +1263,7 @@ if (WIN32)
     target_compile_definitions(aeg_editor_viewport_interaction_smoke PRIVATE
         _CRT_SECURE_NO_WARNINGS
         AEG_OPAQUE_UNLIT_SHADER_PACKAGE_PATH="${AEG_OPAQUE_UNLIT_SHADER_PACKAGE}"
+        AEG_STATE_COMPOSITE_SHADER_PACKAGE_PATH="${AEG_STATE_COMPOSITE_SHADER_PACKAGE}"
     )
     add_dependencies(aeg_editor_viewport_interaction_smoke aeg_core_shaders)
 
@@ -1257,6 +1289,7 @@ if (WIN32)
     target_compile_definitions(aeg_editor_history_smoke PRIVATE
         _CRT_SECURE_NO_WARNINGS
         AEG_OPAQUE_UNLIT_SHADER_PACKAGE_PATH="${AEG_OPAQUE_UNLIT_SHADER_PACKAGE}"
+        AEG_STATE_COMPOSITE_SHADER_PACKAGE_PATH="${AEG_STATE_COMPOSITE_SHADER_PACKAGE}"
     )
     add_dependencies(aeg_editor_history_smoke aeg_core_shaders)
 
@@ -1282,6 +1315,7 @@ if (WIN32)
     target_compile_definitions(aeg_editor_hierarchy_smoke PRIVATE
         _CRT_SECURE_NO_WARNINGS
         AEG_OPAQUE_UNLIT_SHADER_PACKAGE_PATH="${AEG_OPAQUE_UNLIT_SHADER_PACKAGE}"
+        AEG_STATE_COMPOSITE_SHADER_PACKAGE_PATH="${AEG_STATE_COMPOSITE_SHADER_PACKAGE}"
     )
     add_dependencies(aeg_editor_hierarchy_smoke aeg_core_shaders)
 
@@ -1307,6 +1341,7 @@ if (WIN32)
     target_compile_definitions(aeg_editor_inspector_smoke PRIVATE
         _CRT_SECURE_NO_WARNINGS
         AEG_OPAQUE_UNLIT_SHADER_PACKAGE_PATH="${AEG_OPAQUE_UNLIT_SHADER_PACKAGE}"
+        AEG_STATE_COMPOSITE_SHADER_PACKAGE_PATH="${AEG_STATE_COMPOSITE_SHADER_PACKAGE}"
     )
     add_dependencies(aeg_editor_inspector_smoke aeg_core_shaders)
 

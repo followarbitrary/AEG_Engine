@@ -855,7 +855,9 @@ foundation::Result ImGuiRenderer::build_render_graph(pipeline::RenderGraphBuilde
                 if (const foundation::Result result =
                         context.bind_binding_set(0, prepared->textures[draw_call.texture_index].binding_set);
                     !result) {
-                    return fail_rendering(result);
+                    return fail_rendering(foundation::Result::failure(
+                        result.code, "ImGui texture index " + std::to_string(draw_call.texture_index) + ": " +
+                                         result.message));
                 }
                 if (const foundation::Result result = context.draw_indexed(rhi::DrawIndexedDesc{
                         draw_call.index_count, 1, draw_call.first_index, draw_call.vertex_offset, 0});
@@ -911,6 +913,11 @@ foundation::Result ImGuiRenderer::release_prepared_frame() {
         return result;
     }
     if (impl_->prepared_frame == nullptr && impl_->prepared_frame_history.empty()) {
+        // The caller may be replacing an externally-owned texture even when
+        // this renderer has no current draw packet. Do not retain its logical
+        // RenderGraph resource: the RHI handle may have been recycled with a
+        // different state on the next frame.
+        impl_->imported_textures.clear();
         return foundation::Result::success();
     }
     foundation::Result first_result = foundation::Result::success();
@@ -929,6 +936,11 @@ foundation::Result ImGuiRenderer::release_prepared_frame() {
     }
     impl_->prepared_frame.reset();
     impl_->prepared_frame_history.clear();
+    // A caller releases the prepared frame before replacing an externally
+    // owned texture (for example the editor viewport after a resize). The
+    // next graph must import that replacement instead of reusing a logical
+    // resource that still describes the retired image.
+    impl_->imported_textures.clear();
     return foundation::Result::success();
 }
 

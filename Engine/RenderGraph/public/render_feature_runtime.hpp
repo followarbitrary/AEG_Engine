@@ -4,13 +4,32 @@
  */
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <span>
 
 #include "pipeline.hpp"
 #include "render_graph.hpp"
+#include "render_state_flow.hpp"
 
 namespace aeg::render_graph {
+/** @brief One terminal state texture and the blend mode requested by its owning Feature. */
+struct RenderStateCompositeInput final {
+    pipeline::RenderGraphTexture texture{};
+    pipeline::RenderStateBlendMode blend_mode{pipeline::RenderStateBlendMode::kReplace};
+};
+
+/**
+ * @brief Invoked to combine multiple terminal state textures into the Present target.
+ *
+ * The callback owns the visual blend semantics and must declare every resource
+ * access through the supplied builder. It is called only while the feature-build
+ * transaction is active.
+ */
+using RenderStateCompositeFunction = std::function<foundation::Result(
+    pipeline::RenderGraphBuilder& builder, std::span<const RenderStateCompositeInput> inputs,
+    pipeline::RenderGraphTexture destination)>;
+
 /** @brief Associates a public resource id with an existing graph buffer. */
 struct RenderGraphFeatureBufferBinding {
     pipeline::RenderResourceId id{};
@@ -21,6 +40,21 @@ struct RenderGraphFeatureBufferBinding {
 struct RenderGraphFeatureTextureBinding {
     pipeline::RenderResourceId id{};
     RenderGraphTexture texture{};
+};
+
+/** @brief Optional transient texture template used for per-feature render-state outputs. */
+struct RenderGraphFeatureStateDesc {
+    bool enabled{false};
+    rhi::TextureDesc texture_desc{};
+    /** Bound RenderResourceId receiving the terminal state at Present. */
+    pipeline::RenderResourceId present_target_id{};
+    rhi::Extent3D present_extent{};
+    /** Editor-authored state links layered over the compiled Pipeline dependencies. */
+    std::span<const RenderStateLinkOverride> link_overrides{};
+    /** Editor-authored per-Feature blend choices, resolved by compiled plan node. */
+    std::span<const RenderStateBlendOverride> blend_overrides{};
+    /** Required when more than one state branch reaches the Present target. */
+    RenderStateCompositeFunction compose_terminal_states{};
 };
 
 /**
@@ -37,6 +71,7 @@ struct RenderGraphFeatureRuntimeDesc {
     std::span<const RenderGraphFeatureTextureBinding> textures{};
     void* user_data{nullptr};
     const void* feature_data{nullptr};
+    RenderGraphFeatureStateDesc state{};
 };
 
 /**

@@ -1,12 +1,15 @@
 #include <imgui.h>
 
+#include <array>
 #include <cassert>
 #include <memory>
 #include <string>
 #include <string_view>
 
 #include "editor_imgui.hpp"
+#include "hierarchy_ui_layout.hpp"
 #include "imgui_texture_registry.hpp"
+#include "project_dialog_ui.hpp"
 
 namespace {
 class TestPlatformServices final : public aeg::platform::IPlatformServices {
@@ -67,6 +70,14 @@ public:
         }
         ImGui::Begin("Smoke");
         ImGui::TextUnformatted("AEG");
+        project_field_metrics = aeg::application::draw_project_dialog_field(
+            "Project directory", "##SmokeProjectDirectory", project_path.data(), project_path.size());
+        aeg::application::push_hierarchy_item_id(1, 1);
+        first_hierarchy_item_id = ImGui::GetID("##HierarchyEntity");
+        aeg::application::pop_hierarchy_item_id();
+        aeg::application::push_hierarchy_item_id(2, 1);
+        second_hierarchy_item_id = ImGui::GetID("##HierarchyEntity");
+        aeg::application::pop_hierarchy_item_id();
         ImGui::End();
         ImGui::GetForegroundDrawList()->AddRectFilled(ImVec2(10.0f, 10.0f), ImVec2(100.0f, 100.0f), IM_COL32_WHITE);
         ++build_count;
@@ -74,6 +85,10 @@ public:
 
     uint32_t build_count{0};
     bool clipboard_roundtrip{false};
+    std::array<char, 64> project_path{};
+    aeg::application::ProjectDialogFieldMetrics project_field_metrics{};
+    ImGuiID first_hierarchy_item_id{0};
+    ImGuiID second_hierarchy_item_id{0};
 };
 }  // namespace
 
@@ -118,6 +133,8 @@ int main() {
     assert(host.end_frame());
     assert(panel_pointer->build_count == 1);
     assert(panel_pointer->clipboard_roundtrip);
+    assert(panel_pointer->project_field_metrics.label_right <= panel_pointer->project_field_metrics.input_left);
+    assert(panel_pointer->first_hierarchy_item_id != panel_pointer->second_hierarchy_item_id);
     assert(platform_services.clipboard_text == "bridge");
     assert(platform_services.cursor_window == window);
     assert(platform_services.cursor_shape == platform::CursorShape::kHand);

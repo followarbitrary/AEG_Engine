@@ -23,6 +23,7 @@
 #include "pipeline.hpp"
 #include "reflection.hpp"
 #include "render_graph.hpp"
+#include "render_state_flow.hpp"
 #include "renderer.hpp"
 #include "rhi.hpp"
 #include "scene_asset.hpp"
@@ -109,6 +110,10 @@ struct ComponentUpdateView final {
 /** @brief Owns the minimum editor scene lifecycle and its offscreen Renderer preview. */
 class EditorSceneRuntime final {
 public:
+    enum class PipelineTarget : uint8_t {
+        kWorld,
+        kRenderer,
+    };
     enum class Mode : uint8_t {
         kEdit,
         kPlay,
@@ -127,6 +132,21 @@ public:
 
     /** @brief Renders the active World into the current viewport target. */
     [[nodiscard]] foundation::Result render_frame(uint64_t frame_number);
+    [[nodiscard]] std::vector<std::pair<std::string, pipeline::PipelinePlanHandle>> pipeline_snapshots() const;
+    /** @brief Stages an Editor-authored ordering override for the selected live game pipeline. */
+    [[nodiscard]] foundation::Result add_pipeline_runtime_ordering(PipelineTarget target, uint32_t source_node,
+                                                                   uint32_t destination_node);
+    /** @brief Removes an Editor-authored ordering override from the selected live game pipeline. */
+    [[nodiscard]] foundation::Result remove_pipeline_runtime_ordering(PipelineTarget target, uint32_t source_node,
+                                                                      uint32_t destination_node);
+    /** Adds an editor-owned State Link without changing the compiled Pipeline schedule. */
+    [[nodiscard]] foundation::Result add_render_state_link(uint32_t source_node, uint32_t destination_node);
+    /** Masks either an editor-owned or a compiled State Link without changing task scheduling. */
+    [[nodiscard]] foundation::Result remove_render_state_link(uint32_t source_node, uint32_t destination_node);
+    [[nodiscard]] std::vector<render_graph::RenderStateLinkOverride> render_state_link_overrides() const;
+    /** Overrides the terminal blend of the RenderFeature owning this renderer-plan node. */
+    [[nodiscard]] foundation::Result set_render_state_blend(uint32_t node, pipeline::RenderStateBlendMode blend_mode);
+    [[nodiscard]] std::vector<render_graph::RenderStateBlendOverride> render_state_blend_overrides() const;
     /** @brief Schedules a GPU readback of the next rendered viewport frame. */
     [[nodiscard]] foundation::Result request_viewport_readback();
     /** @brief Returns the most recently requested viewport pixels in RGBA8 order. */
@@ -136,6 +156,8 @@ public:
 
     [[nodiscard]] editor::ImGuiTextureBinding viewport_binding() const noexcept;
     [[nodiscard]] bool viewport_ready() const noexcept;
+    /** @brief True when a render Feature can reach the active Renderer Pipeline Present stage. */
+    [[nodiscard]] bool viewport_present_connected() const noexcept;
     [[nodiscard]] bool viewport_resize_pending() const noexcept;
 
     /** @brief Intersects the edit World mesh bounds with a camera ray. */

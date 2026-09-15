@@ -2761,6 +2761,7 @@ foundation::ResultValue<PipelinePlan> PipelineCompiler::compile(const PipelineCo
                 stage.parallelizable,
                 stage_bindings[original_stage_index],
                 resolved_stage_phases[original_stage_index],
+                original_stage_index,
             });
             continue;
         }
@@ -2781,6 +2782,7 @@ foundation::ResultValue<PipelinePlan> PipelineCompiler::compile(const PipelineCo
                 stage.parallelizable,
                 stage_bindings[original_stage_index],
                 resolved_stage_phases[original_stage_index],
+                original_stage_index,
             });
         }
     }
@@ -3324,6 +3326,76 @@ foundation::Result PipelineScopeHost::rebuild(const PipelineRegistry& registry, 
     }
     pending_plan_.reset();
     active_plan_ = std::move(plan);
+    return foundation::Result::success();
+}
+
+namespace {
+foundation::Result rebuild_runtime_schedule(PipelinePlan& plan) {
+    std::vector<std::vector<uint32_t>> outgoing(plan.nodes.size());
+    std::vector<uint32_t> indegree(plan.nodes.size(), 0);
+    for (const PipelineDependency& dependency : plan.dependencies) {
+        if (dependency.source_node >= plan.nodes.size() || dependency.destination_node >= plan.nodes.size()) {
+            return invalid_state("runtime ordering references an invalid pipeline node");
+        }
+        outgoing[dependency.source_node].push_back(dependency.destination_node);
+        ++indegree[dependency.destination_node];
+    }
+    plan.topological_order.clear();
+    plan.batches.clear();
+    std::priority_queue<uint32_t, std::vector<uint32_t>, std::greater<>> ready;
+    for (uint32_t index = 0; index < indegree.size(); ++index) if (indegree[index] == 0) ready.push(index);
+    while (!ready.empty()) {
+        std::vector<uint32_t> current_batch;
+        while (!ready.empty()) { current_batch.push_back(ready.top()); ready.pop(); }
+        PipelineExecutionBatch batch;
+        batch.node_indices = current_batch;
+        batch.parallelizable = std::all_of(current_batch.begin(), current_batch.end(), [&](uint32_t node_index) {
+            return is_parallel_safe(plan.nodes[node_index]);
+        });
+        plan.topological_order.insert(plan.topological_order.end(), current_batch.begin(), current_batch.end());
+        plan.batches.push_back(std::move(batch));
+        for (const uint32_t source : current_batch) for (const uint32_t destination : outgoing[source]) {
+            if (--indegree[destination] == 0) ready.push(destination);
+        }
+    }
+    if (plan.topological_order.size() != plan.nodes.size()) {
+        return invalid_argument("runtime ordering would create a pipeline cycle");
+    }
+    return foundation::Result::success();
+}
+}  // namespace
+
+foundation::Result PipelineScopeHost::add_runtime_ordering(uint32_t source_node, uint32_t destination_node) {
+    std::unique_lock plan_lock(plan_mutex_);
+    const PipelinePlanHandle base = pending_plan_ != nullptr ? pending_plan_ : active_plan_;
+    if (base == nullptr) return invalid_state("scope host has no compiled pipeline plan");
+    if (source_node >= base->nodes.size() || destination_node >= base->nodes.size() || source_node == destination_node) {
+        return invalid_argument("runtime ordering nodes are invalid");
+    }
+    if (std::any_of(base->dependencies.begin(), base->dependencies.end(), [&](const PipelineDependency& edge) {
+            return edge.source_node == source_node && edge.destination_node == destination_node;
+        })) return foundation::Result::success();
+    auto next = std::make_shared<PipelinePlan>(*base);
+    next->dependencies.push_back(PipelineDependency{source_node, destination_node, PipelineDependencyKind::kOrdering, {}, true});
+    if (const foundation::Result result = rebuild_runtime_schedule(*next); !result) return result;
+    next->revision = base->revision + 1;
+    pending_plan_ = std::move(next);
+    return foundation::Result::success();
+}
+
+foundation::Result PipelineScopeHost::remove_runtime_ordering(uint32_t source_node, uint32_t destination_node) {
+    std::unique_lock plan_lock(plan_mutex_);
+    const PipelinePlanHandle base = pending_plan_ != nullptr ? pending_plan_ : active_plan_;
+    if (base == nullptr) return invalid_state("scope host has no compiled pipeline plan");
+    auto next = std::make_shared<PipelinePlan>(*base);
+    const auto edge = std::find_if(next->dependencies.begin(), next->dependencies.end(), [&](const PipelineDependency& value) {
+        return value.source_node == source_node && value.destination_node == destination_node;
+    });
+    if (edge == next->dependencies.end()) return not_found("pipeline connection does not exist");
+    next->dependencies.erase(edge);
+    if (const foundation::Result result = rebuild_runtime_schedule(*next); !result) return result;
+    next->revision = base->revision + 1;
+    pending_plan_ = std::move(next);
     return foundation::Result::success();
 }
 
