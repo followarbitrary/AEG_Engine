@@ -18,6 +18,12 @@ namespace aeg::editor {
 [[nodiscard]] foundation::Result validate_editor_font_data(std::span<const std::byte> font_data,
                                                            uint32_t face_index = 0);
 
+/** @brief Identifies whether a font is shipped with the editor or supplied by a user. */
+enum class EditorFontSource : uint8_t {
+    kBundled,
+    kUser,
+};
+
 /** @brief Usage category exposed by the editor font preference model. */
 enum class EditorFontKind : uint8_t {
     kInterface,
@@ -40,9 +46,24 @@ struct EditorFontDescriptor final {
     bool is_default{false};
     /** @brief Whether preference actions must keep this font installed. */
     bool is_protected{false};
+    /** @brief Family name reported by the font face. */
+    std::string family_name{};
+    /** @brief Style name reported by the font face. */
+    std::string style_name{};
+    /** @brief Origin of this font asset. */
+    EditorFontSource source{EditorFontSource::kBundled};
+    /** @brief Whether this asset was imported from the user font directory. */
+    bool is_user_font{false};
 
     /** @brief Returns whether the descriptor contains stable preference metadata. */
     [[nodiscard]] bool is_valid() const noexcept { return !key.empty() && !display_name.empty(); }
+};
+
+/** @brief Extracts backend-neutral metadata from a supported TrueType/OpenType face. */
+class EditorFontInspector final {
+public:
+    [[nodiscard]] foundation::ResultValue<EditorFontDescriptor> inspect(std::span<const std::byte> font_data,
+                                                                        uint32_t face_index = 0) const;
 };
 
 /** @brief Owned font bytes and metadata for one editor font family. */
@@ -63,8 +84,7 @@ class EditorFontCatalog final {
 public:
     /** @brief Registers a bundled font by copying its file bytes into the catalog. */
     [[nodiscard]] foundation::Result register_font(const EditorFontDescriptor& descriptor,
-                                                   std::span<const std::byte> font_data,
-                                                   uint32_t face_index = 0);
+                                                   std::span<const std::byte> font_data, uint32_t face_index = 0);
     /** @brief Removes a registered font from the catalog. */
     [[nodiscard]] foundation::Result unregister_font(std::string_view font_key);
 

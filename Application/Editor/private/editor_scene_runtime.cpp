@@ -4,8 +4,6 @@
  */
 #include "editor_scene_runtime.hpp"
 
-#include <render_feature_flow.hpp>
-
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -15,6 +13,7 @@
 #include <limits>
 #include <new>
 #include <optional>
+#include <render_feature_flow.hpp>
 #include <span>
 #include <unordered_map>
 #include <unordered_set>
@@ -260,14 +259,6 @@ constexpr std::array<uint16_t, 6> kQuadIndices{{0, 1, 2, 0, 2, 3}};
     return bytes;
 }
 
-[[nodiscard]] bool finite_vec3(const math::Vec3& value) noexcept {
-    return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
-}
-
-[[nodiscard]] bool finite_quat(const math::Quat& value) noexcept {
-    return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z) && std::isfinite(value.w);
-}
-
 [[nodiscard]] TextureDesc make_asset_texture_desc(uint32_t width, uint32_t height, std::string_view name) {
     TextureDesc desc{};
     desc.extent = {width, height, 1};
@@ -294,99 +285,6 @@ constexpr std::array<uint16_t, 6> kQuadIndices{{0, 1, 2, 0, 2, 3}};
     desc.initial_queue = QueueClass::kGraphics;
     desc.name = DebugName{name};
     return desc;
-}
-
-[[nodiscard]] bool finite_matrix(const math::Mat4& value) noexcept {
-    for (std::size_t column = 0; column < 4; ++column) {
-        for (std::size_t row = 0; row < 4; ++row) {
-            if (!std::isfinite(value.at(row, column))) {
-                return false;
-            }
-        }
-    }
-    return true;
-}
-
-[[nodiscard]] math::Quat rotation_from_matrix(const math::Mat4& value) noexcept {
-    const float m00 = value.at(0, 0);
-    const float m01 = value.at(0, 1);
-    const float m02 = value.at(0, 2);
-    const float m10 = value.at(1, 0);
-    const float m11 = value.at(1, 1);
-    const float m12 = value.at(1, 2);
-    const float m20 = value.at(2, 0);
-    const float m21 = value.at(2, 1);
-    const float m22 = value.at(2, 2);
-    const float trace = m00 + m11 + m22;
-    math::Quat result{};
-    if (trace > 0.0f) {
-        const float scale = std::sqrt(trace + 1.0f) * 2.0f;
-        result.w = 0.25f * scale;
-        result.x = (m21 - m12) / scale;
-        result.y = (m02 - m20) / scale;
-        result.z = (m10 - m01) / scale;
-    } else if (m00 > m11 && m00 > m22) {
-        const float scale = std::sqrt(std::max(0.0f, 1.0f + m00 - m11 - m22)) * 2.0f;
-        result.w = (m21 - m12) / scale;
-        result.x = 0.25f * scale;
-        result.y = (m01 + m10) / scale;
-        result.z = (m02 + m20) / scale;
-    } else if (m11 > m22) {
-        const float scale = std::sqrt(std::max(0.0f, 1.0f + m11 - m00 - m22)) * 2.0f;
-        result.w = (m02 - m20) / scale;
-        result.x = (m01 + m10) / scale;
-        result.y = 0.25f * scale;
-        result.z = (m12 + m21) / scale;
-    } else {
-        const float scale = std::sqrt(std::max(0.0f, 1.0f + m22 - m00 - m11)) * 2.0f;
-        result.w = (m10 - m01) / scale;
-        result.x = (m02 + m20) / scale;
-        result.y = (m12 + m21) / scale;
-        result.z = 0.25f * scale;
-    }
-    return math::normalize(result);
-}
-
-[[nodiscard]] bool decompose_affine_transform(const math::Mat4& matrix, Transform& result) noexcept {
-    if (!finite_matrix(matrix)) {
-        return false;
-    }
-    math::Vec3 basis_x{matrix.at(0, 0), matrix.at(1, 0), matrix.at(2, 0)};
-    math::Vec3 basis_y{matrix.at(0, 1), matrix.at(1, 1), matrix.at(2, 1)};
-    math::Vec3 basis_z{matrix.at(0, 2), matrix.at(1, 2), matrix.at(2, 2)};
-    float scale_x = math::length(basis_x);
-    float scale_y = math::length(basis_y);
-    float scale_z = math::length(basis_z);
-    if (!std::isfinite(scale_x) || !std::isfinite(scale_y) || !std::isfinite(scale_z) || scale_x <= math::kEpsilon ||
-        scale_y <= math::kEpsilon || scale_z <= math::kEpsilon) {
-        return false;
-    }
-    basis_x /= scale_x;
-    basis_y /= scale_y;
-    basis_z /= scale_z;
-    const float orthogonality = std::max({std::abs(math::dot(basis_x, basis_y)), std::abs(math::dot(basis_x, basis_z)),
-                                          std::abs(math::dot(basis_y, basis_z))});
-    if (!std::isfinite(orthogonality) || orthogonality > 2.0e-3f) {
-        return false;
-    }
-    if (math::dot(math::cross(basis_x, basis_y), basis_z) < 0.0f) {
-        scale_x = -scale_x;
-        basis_x = -basis_x;
-    }
-    math::Mat4 rotation = math::identity();
-    rotation.at(0, 0) = basis_x.x;
-    rotation.at(1, 0) = basis_x.y;
-    rotation.at(2, 0) = basis_x.z;
-    rotation.at(0, 1) = basis_y.x;
-    rotation.at(1, 1) = basis_y.y;
-    rotation.at(2, 1) = basis_y.z;
-    rotation.at(0, 2) = basis_z.x;
-    rotation.at(1, 2) = basis_z.y;
-    rotation.at(2, 2) = basis_z.z;
-    result.translation = {matrix.at(0, 3), matrix.at(1, 3), matrix.at(2, 3)};
-    result.rotation = rotation_from_matrix(rotation);
-    result.scale = {scale_x, scale_y, scale_z};
-    return finite_vec3(result.translation) && finite_quat(result.rotation) && finite_vec3(result.scale);
 }
 
 [[nodiscard]] foundation::ResultValue<renderer::RenderLightingConstants> make_editor_lighting_constants(
@@ -419,7 +317,7 @@ constexpr std::array<uint16_t, 6> kQuadIndices{{0, 1, 2, 0, 2, 3}};
         }
         Transform value{};
         std::memcpy(&value, bytes.data(), sizeof(value));
-        if (!finite_vec3(value.translation) || !finite_quat(value.rotation) || !finite_vec3(value.scale)) {
+        if (!math::is_finite(value.translation) || !math::is_finite(value.rotation) || !math::is_finite(value.scale)) {
             return foundation::invalid_argument("Transform contains non-finite editor values");
         }
         return Result::success();
@@ -430,9 +328,9 @@ constexpr std::array<uint16_t, 6> kQuadIndices{{0, 1, 2, 0, 2, 3}};
         }
         Camera value{};
         std::memcpy(&value, bytes.data(), sizeof(value));
-        if (!std::isfinite(value.vertical_fov_radians) || value.vertical_fov_radians <= 0.0f ||
-            value.vertical_fov_radians >= math::kPi || !std::isfinite(value.near_plane) ||
-            !std::isfinite(value.far_plane) || value.near_plane <= 0.0f || value.far_plane <= value.near_plane) {
+        if (!math::is_finite(value.vertical_fov_radians) || value.vertical_fov_radians <= 0.0f ||
+            value.vertical_fov_radians >= math::kPi || !math::is_finite(value.near_plane) ||
+            !math::is_finite(value.far_plane) || value.near_plane <= 0.0f || value.far_plane <= value.near_plane) {
             return foundation::invalid_argument("Camera projection parameters are invalid");
         }
         return Result::success();
@@ -444,11 +342,11 @@ constexpr std::array<uint16_t, 6> kQuadIndices{{0, 1, 2, 0, 2, 3}};
         MeshRenderer value{};
         std::memcpy(&value, bytes.data(), sizeof(value));
         const auto in_unit_range = [](float scalar) {
-            return std::isfinite(scalar) && scalar >= 0.0f && scalar <= 1.0f;
+            return math::is_finite(scalar) && scalar >= 0.0f && scalar <= 1.0f;
         };
         if (!in_unit_range(value.tint.x) || !in_unit_range(value.tint.y) || !in_unit_range(value.tint.z) ||
-            !in_unit_range(value.tint_alpha) || !finite_vec3(value.bounds_center) ||
-            !std::isfinite(value.bounds_radius) || value.bounds_radius < 0.0f) {
+            !in_unit_range(value.tint_alpha) || !math::is_finite(value.bounds_center) ||
+            !math::is_finite(value.bounds_radius) || value.bounds_radius < 0.0f) {
             return foundation::invalid_argument("MeshRenderer material or bounds parameters are invalid");
         }
         return Result::success();
@@ -459,10 +357,10 @@ constexpr std::array<uint16_t, 6> kQuadIndices{{0, 1, 2, 0, 2, 3}};
         }
         TextRenderer value{};
         std::memcpy(&value, bytes.data(), sizeof(value));
-        if (value.text.size() > 4096 || !std::isfinite(value.world_size) || value.world_size <= 0.0f ||
-            !finite_vec3(value.color) || value.color.x < 0.0f || value.color.x > 1.0f || value.color.y < 0.0f ||
-            value.color.y > 1.0f || value.color.z < 0.0f || value.color.z > 1.0f || !std::isfinite(value.color_alpha) ||
-            value.color_alpha < 0.0f || value.color_alpha > 1.0f) {
+        if (value.text.size() > 4096 || !math::is_finite(value.world_size) || value.world_size <= 0.0f ||
+            !math::is_finite(value.color) || value.color.x < 0.0f || value.color.x > 1.0f || value.color.y < 0.0f ||
+            value.color.y > 1.0f || value.color.z < 0.0f || value.color.z > 1.0f ||
+            !math::is_finite(value.color_alpha) || value.color_alpha < 0.0f || value.color_alpha > 1.0f) {
             return foundation::invalid_argument("TextRenderer contains invalid editor values");
         }
         return Result::success();
@@ -474,11 +372,11 @@ constexpr std::array<uint16_t, 6> kQuadIndices{{0, 1, 2, 0, 2, 3}};
         DirectionalLight value{};
         std::memcpy(&value, bytes.data(), sizeof(value));
         const auto in_unit_range = [](float scalar) {
-            return std::isfinite(scalar) && scalar >= 0.0f && scalar <= 1.0f;
+            return math::is_finite(scalar) && scalar >= 0.0f && scalar <= 1.0f;
         };
         math::Vec3 normalized_direction{};
-        if (!finite_vec3(value.direction) || !in_unit_range(value.color.x) || !in_unit_range(value.color.y) ||
-            !in_unit_range(value.color.z) || !std::isfinite(value.intensity) || value.intensity < 0.0f ||
+        if (!math::is_finite(value.direction) || !in_unit_range(value.color.x) || !in_unit_range(value.color.y) ||
+            !in_unit_range(value.color.z) || !math::is_finite(value.intensity) || value.intensity < 0.0f ||
             (value.intensity > 0.0f && !math::try_normalize(value.direction, normalized_direction))) {
             return foundation::invalid_argument("Directional Light contains invalid editor values");
         }
@@ -564,15 +462,15 @@ constexpr std::array<uint16_t, 6> kQuadIndices{{0, 1, 2, 0, 2, 3}};
                                        const math::Vec3& plane_point, const math::Vec3& plane_normal,
                                        math::Vec3& hit) noexcept {
     const float denominator = math::dot(direction, plane_normal);
-    if (!std::isfinite(denominator) || std::abs(denominator) <= math::kEpsilon) {
+    if (!math::is_finite(denominator) || std::abs(denominator) <= math::kEpsilon) {
         return false;
     }
     const float distance = math::dot(plane_point - origin, plane_normal) / denominator;
-    if (!std::isfinite(distance)) {
+    if (!math::is_finite(distance)) {
         return false;
     }
     hit = origin + direction * distance;
-    return finite_vec3(hit);
+    return math::is_finite(hit);
 }
 
 /** @brief Tests the actual editor Quad instead of using a loose projected sphere. */
@@ -589,24 +487,25 @@ constexpr std::array<uint16_t, 6> kQuadIndices{{0, 1, 2, 0, 2, 3}};
     }
     const math::Vec3 local_origin = math::transform_point(inverse_world, ray_origin);
     const math::Vec3 local_direction = math::transform_vector(inverse_world, ray_direction);
-    if (!finite_vec3(local_origin) || !finite_vec3(local_direction) || std::abs(local_direction.z) <= math::kEpsilon) {
+    if (!math::is_finite(local_origin) || !math::is_finite(local_direction) ||
+        std::abs(local_direction.z) <= math::kEpsilon) {
         return false;
     }
 
     const float local_distance = -local_origin.z / local_direction.z;
-    if (!std::isfinite(local_distance) || local_distance < 0.0f) {
+    if (!math::is_finite(local_distance) || local_distance < 0.0f) {
         return false;
     }
     const math::Vec3 local_hit = local_origin + local_direction * local_distance;
     constexpr float kQuadExtent = 1.0f;
-    if (!finite_vec3(local_hit) || local_hit.x < -kQuadExtent || local_hit.x > kQuadExtent ||
+    if (!math::is_finite(local_hit) || local_hit.x < -kQuadExtent || local_hit.x > kQuadExtent ||
         local_hit.y < -kQuadExtent || local_hit.y > kQuadExtent) {
         return false;
     }
 
     const math::Vec3 world_hit = math::transform_point(world, local_hit);
     distance = math::dot(world_hit - ray_origin, ray_direction);
-    return finite_vec3(world_hit) && std::isfinite(distance) && distance >= 0.0f;
+    return math::is_finite(world_hit) && math::is_finite(distance) && distance >= 0.0f;
 }
 
 class EditorViewportReadbackFeature final : public pipeline::RenderFeature {
@@ -682,8 +581,7 @@ public:
         state->pass_executed = false;
         const auto pass = builder.add_graphics_pass(
             "Editor.ViewportReadback",
-            [color, readback = readback.value, allocation,
-             pixel_bytes](pipeline::RenderPassBuilder& pass) {
+            [color, readback = readback.value, allocation, pixel_bytes](pipeline::RenderPassBuilder& pass) {
                 if (const foundation::Result result =
                         pass.read(color, ResourceUsage::kCopySource, PipelineStage::kCopy, ShaderStage::kAll);
                     !result) {
@@ -1168,7 +1066,7 @@ foundation::ResultValue<EditorSceneRuntime::Impl::ViewportRay> EditorSceneRuntim
     if (transform == nullptr || parameters == nullptr) {
         return {foundation::not_found("Editor viewport camera components are missing"), {}};
     }
-    if (!std::isfinite(pixel.x) || !std::isfinite(pixel.y) || pixel.x < 0.0f || pixel.y < 0.0f ||
+    if (!math::is_finite(pixel.x) || !math::is_finite(pixel.y) || pixel.x < 0.0f || pixel.y < 0.0f ||
         pixel.x >= static_cast<float>(width) || pixel.y >= static_cast<float>(height)) {
         return {foundation::invalid_argument("Viewport pixel is outside the image bounds"), {}};
     }
@@ -1324,14 +1222,17 @@ const reflection::TypeRegistry& EditorSceneRuntime::reflection_registry() const 
 
 std::vector<std::pair<std::string, pipeline::PipelinePlanHandle>> EditorSceneRuntime::pipeline_snapshots() const {
     std::vector<std::pair<std::string, pipeline::PipelinePlanHandle>> result;
-    if (!impl_) return result;
+    if (!impl_)
+        return result;
     if (impl_->active_scope_) {
         auto plan = impl_->active_scope_->pipeline_host().active_plan_snapshot();
-        if (plan) result.emplace_back("Game / World", std::move(plan));
+        if (plan)
+            result.emplace_back("Game / World", std::move(plan));
     }
     if (!impl_->project_manager_.loaded()) {
         auto plan = impl_->frame_host_.active_plan_snapshot();
-        if (plan) result.emplace_back("Game / Renderer", std::move(plan));
+        if (plan)
+            result.emplace_back("Game / Renderer", std::move(plan));
     } else if (impl_->project_renderer_pipeline_) {
         result.emplace_back("Game / Renderer", impl_->project_renderer_pipeline_);
     }
@@ -1379,9 +1280,8 @@ foundation::Result EditorSceneRuntime::create_project_renderer_pipeline() {
         restore_opaque();
         return foundation::invalid_state("The renderer has no compiled Pipeline plan");
     }
-    const auto present = std::find_if(runtime_plan->nodes.begin(), runtime_plan->nodes.end(), [](const auto& node) {
-        return node.phase == pipeline::EnginePhase::kPresent;
-    });
+    const auto present = std::find_if(runtime_plan->nodes.begin(), runtime_plan->nodes.end(),
+                                      [](const auto& node) { return node.phase == pipeline::EnginePhase::kPresent; });
     if (present == runtime_plan->nodes.end()) {
         restore_opaque();
         return foundation::invalid_state("The renderer Pipeline has no Present output stage");
@@ -1403,18 +1303,24 @@ foundation::Result EditorSceneRuntime::create_project_renderer_pipeline() {
 }
 
 foundation::Result EditorSceneRuntime::add_pipeline_runtime_ordering(PipelineTarget target, uint32_t source_node,
-                                                                      uint32_t destination_node) {
-    if (impl_ == nullptr || !impl_->initialized_) return foundation::invalid_state("Editor scene runtime is not initialized");
-    if (target == PipelineTarget::kRenderer) return impl_->frame_host_.add_runtime_ordering(source_node, destination_node);
-    if (impl_->active_scope_ == nullptr) return foundation::invalid_state("No active World pipeline is available");
+                                                                     uint32_t destination_node) {
+    if (impl_ == nullptr || !impl_->initialized_)
+        return foundation::invalid_state("Editor scene runtime is not initialized");
+    if (target == PipelineTarget::kRenderer)
+        return impl_->frame_host_.add_runtime_ordering(source_node, destination_node);
+    if (impl_->active_scope_ == nullptr)
+        return foundation::invalid_state("No active World pipeline is available");
     return impl_->active_scope_->pipeline_host().add_runtime_ordering(source_node, destination_node);
 }
 
 foundation::Result EditorSceneRuntime::remove_pipeline_runtime_ordering(PipelineTarget target, uint32_t source_node,
-                                                                         uint32_t destination_node) {
-    if (impl_ == nullptr || !impl_->initialized_) return foundation::invalid_state("Editor scene runtime is not initialized");
-    if (target == PipelineTarget::kRenderer) return impl_->frame_host_.remove_runtime_ordering(source_node, destination_node);
-    if (impl_->active_scope_ == nullptr) return foundation::invalid_state("No active World pipeline is available");
+                                                                        uint32_t destination_node) {
+    if (impl_ == nullptr || !impl_->initialized_)
+        return foundation::invalid_state("Editor scene runtime is not initialized");
+    if (target == PipelineTarget::kRenderer)
+        return impl_->frame_host_.remove_runtime_ordering(source_node, destination_node);
+    if (impl_->active_scope_ == nullptr)
+        return foundation::invalid_state("No active World pipeline is available");
     return impl_->active_scope_->pipeline_host().remove_runtime_ordering(source_node, destination_node);
 }
 
@@ -1429,25 +1335,28 @@ foundation::Result EditorSceneRuntime::add_render_state_link(uint32_t source_nod
     }
     const auto contribution_for_node = [&plan](uint32_t node) -> const pipeline::PipelineFeatureContributionRecord* {
         const uint64_t stage_index = plan->nodes[node].definition_stage_index;
-        const auto found = std::find_if(plan->feature_contributions.begin(), plan->feature_contributions.end(),
-                                        [stage_index](const auto& contribution) {
-                                            return contribution.domain == pipeline::FeatureDomain::kRender &&
-                                                   stage_index >= contribution.first_stage_index &&
-                                                   stage_index < contribution.first_stage_index + contribution.stage_count;
-                                        });
+        const auto found =
+            std::find_if(plan->feature_contributions.begin(), plan->feature_contributions.end(),
+                         [stage_index](const auto& contribution) {
+                             return contribution.domain == pipeline::FeatureDomain::kRender &&
+                                    stage_index >= contribution.first_stage_index &&
+                                    stage_index < contribution.first_stage_index + contribution.stage_count;
+                         });
         return found == plan->feature_contributions.end() ? nullptr : &*found;
     };
     const auto source_contribution = contribution_for_node(source_node);
     const bool destination_accepts_state = plan->nodes[destination_node].phase == pipeline::EnginePhase::kPresent ||
                                            contribution_for_node(destination_node) != nullptr;
     if (source_contribution == nullptr || !destination_accepts_state) {
-        return foundation::invalid_argument("State Link requires a RenderFeature source and a RenderFeature or Present target");
+        return foundation::invalid_argument(
+            "State Link requires a RenderFeature source and a RenderFeature or Present target");
     }
     const auto previous = impl_->render_state_link_overrides_;
-    const auto found = std::find_if(impl_->render_state_link_overrides_.begin(), impl_->render_state_link_overrides_.end(),
-                                    [source_node, destination_node](const auto& link) {
-                                        return link.source_node == source_node && link.destination_node == destination_node;
-                                    });
+    const auto found =
+        std::find_if(impl_->render_state_link_overrides_.begin(), impl_->render_state_link_overrides_.end(),
+                     [source_node, destination_node](const auto& link) {
+                         return link.source_node == source_node && link.destination_node == destination_node;
+                     });
     if (found == impl_->render_state_link_overrides_.end()) {
         impl_->render_state_link_overrides_.push_back({source_node, destination_node, true});
     } else {
@@ -1469,10 +1378,11 @@ foundation::Result EditorSceneRuntime::remove_render_state_link(uint32_t source_
         source_node == destination_node) {
         return foundation::invalid_argument("Render-state link endpoints are invalid");
     }
-    const auto found = std::find_if(impl_->render_state_link_overrides_.begin(), impl_->render_state_link_overrides_.end(),
-                                    [source_node, destination_node](const auto& link) {
-                                        return link.source_node == source_node && link.destination_node == destination_node;
-                                    });
+    const auto found =
+        std::find_if(impl_->render_state_link_overrides_.begin(), impl_->render_state_link_overrides_.end(),
+                     [source_node, destination_node](const auto& link) {
+                         return link.source_node == source_node && link.destination_node == destination_node;
+                     });
     if (found == impl_->render_state_link_overrides_.end()) {
         impl_->render_state_link_overrides_.push_back({source_node, destination_node, false});
     } else {
@@ -1482,16 +1392,18 @@ foundation::Result EditorSceneRuntime::remove_render_state_link(uint32_t source_
 }
 
 std::vector<render_graph::RenderStateLinkOverride> EditorSceneRuntime::render_state_link_overrides() const {
-    return impl_ == nullptr ? std::vector<render_graph::RenderStateLinkOverride>{} : impl_->render_state_link_overrides_;
+    return impl_ == nullptr ? std::vector<render_graph::RenderStateLinkOverride>{}
+                            : impl_->render_state_link_overrides_;
 }
 
-foundation::Result EditorSceneRuntime::set_render_state_blend(uint32_t node, pipeline::RenderStateBlendMode blend_mode) {
+foundation::Result EditorSceneRuntime::set_render_state_blend(uint32_t node,
+                                                              pipeline::RenderStateBlendMode blend_mode) {
     if (impl_ == nullptr || !impl_->initialized_) {
         return foundation::invalid_state("Editor scene runtime is not initialized");
     }
     const auto plan = impl_->frame_host_.active_plan_snapshot();
-    if (!plan || node >= plan->nodes.size() || static_cast<uint32_t>(blend_mode) >
-                                                 static_cast<uint32_t>(pipeline::RenderStateBlendMode::kAdd)) {
+    if (!plan || node >= plan->nodes.size() ||
+        static_cast<uint32_t>(blend_mode) > static_cast<uint32_t>(pipeline::RenderStateBlendMode::kAdd)) {
         return foundation::invalid_argument("Render-state blend target is invalid");
     }
     const uint64_t stage_index = plan->nodes[node].definition_stage_index;
@@ -1508,10 +1420,9 @@ foundation::Result EditorSceneRuntime::set_render_state_blend(uint32_t node, pip
     if (!writes_state) {
         return foundation::invalid_argument("Only a render-state output Feature can select a blend mode");
     }
-    const auto found = std::find_if(impl_->render_state_blend_overrides_.begin(),
-                                    impl_->render_state_blend_overrides_.end(), [node](const auto& override) {
-                                        return override.node == node;
-                                    });
+    const auto found =
+        std::find_if(impl_->render_state_blend_overrides_.begin(), impl_->render_state_blend_overrides_.end(),
+                     [node](const auto& override) { return override.node == node; });
     if (found == impl_->render_state_blend_overrides_.end()) {
         impl_->render_state_blend_overrides_.push_back({node, blend_mode});
     } else {
@@ -1521,7 +1432,8 @@ foundation::Result EditorSceneRuntime::set_render_state_blend(uint32_t node, pip
 }
 
 std::vector<render_graph::RenderStateBlendOverride> EditorSceneRuntime::render_state_blend_overrides() const {
-    return impl_ == nullptr ? std::vector<render_graph::RenderStateBlendOverride>{} : impl_->render_state_blend_overrides_;
+    return impl_ == nullptr ? std::vector<render_graph::RenderStateBlendOverride>{}
+                            : impl_->render_state_blend_overrides_;
 }
 
 foundation::Result EditorSceneRuntime::initialize(rhi::Device& device,
@@ -1681,9 +1593,9 @@ foundation::Result EditorSceneRuntime::Impl::initialize_graphics_resources() {
     }
     state_composite_binding_layout_ = composite_binding_layout.value;
     const std::array<Format, 1> composite_color_formats{{Format::kRgba8Unorm}};
-    const auto create_composite_pipeline =
-        [this, &composite_program, &composite_color_formats](pipeline::RenderStateBlendMode mode,
-                                                              std::string_view name) -> foundation::ResultValue<rhi::PipelineHandle> {
+    const auto create_composite_pipeline = [this, &composite_program, &composite_color_formats](
+                                               pipeline::RenderStateBlendMode mode,
+                                               std::string_view name) -> foundation::ResultValue<rhi::PipelineHandle> {
         rhi::BlendAttachmentDesc blend{};
         blend.color_write_mask = rhi::ColorComponent::kAll;
         switch (mode) {
@@ -1714,9 +1626,9 @@ foundation::Result EditorSceneRuntime::Impl::initialize_graphics_resources() {
             composite_program.value, state_composite_layout_,
             shader::ShaderPipelineDesc{PipelineType::kGraphics, graphics, DebugName{name}});
     };
-    constexpr std::array<pipeline::RenderStateBlendMode, 3> kCompositeModes{
-        pipeline::RenderStateBlendMode::kReplace, pipeline::RenderStateBlendMode::kOver,
-        pipeline::RenderStateBlendMode::kAdd};
+    constexpr std::array<pipeline::RenderStateBlendMode, 3> kCompositeModes{pipeline::RenderStateBlendMode::kReplace,
+                                                                            pipeline::RenderStateBlendMode::kOver,
+                                                                            pipeline::RenderStateBlendMode::kAdd};
     constexpr std::array<std::string_view, 3> kCompositeNames{
         "Editor.StateComposite.Replace", "Editor.StateComposite.Over", "Editor.StateComposite.Add"};
     for (uint32_t index = 0; index < kCompositeModes.size(); ++index) {
@@ -1737,9 +1649,8 @@ foundation::ResultValue<BindingSetHandle> EditorSceneRuntime::Impl::create_state
     if (!state_composite_binding_layout_.is_valid() || !viewport_sampler_.is_valid()) {
         return {foundation::invalid_state("Render-state composite bindings are not initialized"), {}};
     }
-    auto set = device_->create_binding_set(
-        BindingSetDesc{state_composite_binding_layout_, BindingSetLifetime::kPersistent,
-                       DebugName{"Editor.StateComposite.Set"}});
+    auto set = device_->create_binding_set(BindingSetDesc{
+        state_composite_binding_layout_, BindingSetLifetime::kPersistent, DebugName{"Editor.StateComposite.Set"}});
     if (!set) {
         return set;
     }
@@ -1878,11 +1789,10 @@ foundation::Result EditorSceneRuntime::Impl::create_object_and_lighting_resource
 }
 
 foundation::Result EditorSceneRuntime::Impl::create_targets() {
-    color_desc_ = make_target_desc(
-        viewport_width_, viewport_height_, Format::kRgba8Unorm,
-        TextureCapability::kColorAttachment | TextureCapability::kSampled | TextureCapability::kTransferSource |
-            TextureCapability::kTransferDestination,
-        "Editor.Scene.Color");
+    color_desc_ = make_target_desc(viewport_width_, viewport_height_, Format::kRgba8Unorm,
+                                   TextureCapability::kColorAttachment | TextureCapability::kSampled |
+                                       TextureCapability::kTransferSource | TextureCapability::kTransferDestination,
+                                   "Editor.Scene.Color");
     auto color = device_->create_texture(color_desc_);
     if (!color) {
         return color.result;
@@ -2091,8 +2001,7 @@ foundation::Result EditorSceneRuntime::Impl::instantiate_world(scene::SceneAsset
                                                                std::shared_ptr<ecs::World>& state,
                                                                std::unique_ptr<world::WorldScope>& scope,
                                                                scene::SceneInstance& instance,
-                                                               ecs::EntityId& camera_runtime,
-                                                               std::string_view name) {
+                                                               ecs::EntityId& camera_runtime, std::string_view name) {
     const auto handle = world_manager_.create_world({std::string(name), true});
     if (!handle) {
         return handle.result;
@@ -3296,7 +3205,8 @@ bool EditorSceneRuntime::viewport_present_connected() const noexcept {
     }
     for (std::size_t index = 0; index < plan->feature_contributions.size(); ++index) {
         const auto& contribution = plan->feature_contributions[index];
-        if (contribution.domain != pipeline::FeatureDomain::kRender || !state_flow.contributions[index].reaches_present) {
+        if (contribution.domain != pipeline::FeatureDomain::kRender ||
+            !state_flow.contributions[index].reaches_present) {
             continue;
         }
         const auto feature = impl_->registry_.find_feature(contribution.feature);
@@ -3332,7 +3242,7 @@ foundation::ResultValue<ViewportPickResult> EditorSceneRuntime::pick_viewport(Vi
             return;
         }
         const Transform* transform = snapshot.value->get<Transform>(runtime_entity);
-        if (transform == nullptr || !finite_vec3(transform->translation) || !finite_vec3(transform->scale)) {
+        if (transform == nullptr || !math::is_finite(transform->translation) || !math::is_finite(transform->scale)) {
             return;
         }
         const float scale =
@@ -3355,7 +3265,7 @@ foundation::ResultValue<ViewportPickResult> EditorSceneRuntime::pick_viewport(Vi
             const float b = math::dot(offset, ray.value.direction);
             const float c = math::dot(offset, offset) - radius * radius;
             const float discriminant = b * b - c;
-            if (!std::isfinite(discriminant) || discriminant < 0.0f) {
+            if (!math::is_finite(discriminant) || discriminant < 0.0f) {
                 return;
             }
             distance = -b - std::sqrt(discriminant);
@@ -3363,7 +3273,7 @@ foundation::ResultValue<ViewportPickResult> EditorSceneRuntime::pick_viewport(Vi
                 distance = -b + std::sqrt(discriminant);
             }
         }
-        if (!std::isfinite(distance) || distance < 0.0f || distance >= nearest) {
+        if (!math::is_finite(distance) || distance < 0.0f || distance >= nearest) {
             return;
         }
         const auto scene_entity =
@@ -3409,19 +3319,19 @@ foundation::ResultValue<ViewportGizmoProjection> EditorSceneRuntime::selected_gi
         return {foundation::not_found("Selected entity has no Transform component"), {}};
     }
     const float distance = math::length(transform->translation - view.value.camera.position);
-    const float length = std::max(0.4f, std::isfinite(distance) ? distance * 0.18f : 0.75f);
+    const float length = std::max(0.4f, math::is_finite(distance) ? distance * 0.18f : 0.75f);
     const math::Mat4 view_projection = view.value.camera.view_projection();
     const auto project = [width, height, &view_projection](math::Vec3 point, ViewportPoint& result) {
         const math::Vec4 clip = view_projection * math::Vec4{point.x, point.y, point.z, 1.0f};
-        if (!std::isfinite(clip.x) || !std::isfinite(clip.y) || !std::isfinite(clip.z) || !std::isfinite(clip.w) ||
-            clip.w <= math::kEpsilon) {
+        if (!math::is_finite(clip.x) || !math::is_finite(clip.y) || !math::is_finite(clip.z) ||
+            !math::is_finite(clip.w) || clip.w <= math::kEpsilon) {
             return false;
         }
         const float ndc_x = clip.x / clip.w;
         const float ndc_y = clip.y / clip.w;
         result = {((ndc_x + 1.0f) * 0.5f) * static_cast<float>(width),
                   ((1.0f - ndc_y) * 0.5f) * static_cast<float>(height)};
-        return std::isfinite(result.x) && std::isfinite(result.y);
+        return math::is_finite(result.x) && math::is_finite(result.y);
     };
 
     ViewportGizmoProjection result{};
@@ -3664,15 +3574,15 @@ foundation::Result EditorSceneRuntime::render_frame(uint64_t frame_number) {
                 const auto pass_result = builder.add_graphics_pass(
                     "RenderState.Composite",
                     [source, destination, load_op](pipeline::RenderPassBuilder& pass) {
-                        if (const Result result = pass.read(source, rhi::ResourceUsage::kSampledRead,
-                                                            rhi::PipelineStage::kFragmentShader,
-                                                            rhi::ShaderStage::kFragment);
+                        if (const Result result =
+                                pass.read(source, rhi::ResourceUsage::kSampledRead, rhi::PipelineStage::kFragmentShader,
+                                          rhi::ShaderStage::kFragment);
                             !result) {
                             return result;
                         }
-                        if (const Result result = pass.use_color_attachment(
-                                destination, load_op, rhi::StoreOp::kStore,
-                                ClearColorValue{0.0f, 0.0f, 0.0f, 0.0f}, rhi::ResourceUsage::kSampledRead);
+                        if (const Result result = pass.use_color_attachment(destination, load_op, rhi::StoreOp::kStore,
+                                                                            ClearColorValue{0.0f, 0.0f, 0.0f, 0.0f},
+                                                                            rhi::ResourceUsage::kSampledRead);
                             !result) {
                             return result;
                         }
@@ -3680,17 +3590,21 @@ foundation::Result EditorSceneRuntime::render_frame(uint64_t frame_number) {
                         return Result::success();
                     },
                     [impl, source, binding_set, extent, pipeline_index](pipeline::RenderPassExecutionContext& pass) {
-                        const auto sampled_view = pass.texture_view(source, TextureViewKind::kSampled,
-                                                                    {rhi::Aspect::kColor, 0, 1, 0, 1},
-                                                                    Format::kRgba8Unorm, TextureViewDimension::kTex2D);
+                        const auto sampled_view =
+                            pass.texture_view(source, TextureViewKind::kSampled, {rhi::Aspect::kColor, 0, 1, 0, 1},
+                                              Format::kRgba8Unorm, TextureViewDimension::kTex2D);
                         if (!sampled_view) {
                             return sampled_view.result;
                         }
                         const std::array<BindingWrite, 2> writes{
-                            BindingWrite{{0, 0}, 0,
-                                         BindingResource{BindingType::kSampledTexture, sampled_view.value, {}, {}, {}, {}}},
-                            BindingWrite{{0, 1}, 0,
-                                         BindingResource{BindingType::kSampler, {}, {}, {}, impl->viewport_sampler_, {}}},
+                            BindingWrite{
+                                {0, 0},
+                                0,
+                                BindingResource{BindingType::kSampledTexture, sampled_view.value, {}, {}, {}, {}}},
+                            BindingWrite{
+                                {0, 1},
+                                0,
+                                BindingResource{BindingType::kSampler, {}, {}, {}, impl->viewport_sampler_, {}}},
                         };
                         if (const Result result = impl->device_->update_binding_set(binding_set, writes); !result) {
                             return result;
@@ -3705,9 +3619,9 @@ foundation::Result EditorSceneRuntime::render_frame(uint64_t frame_number) {
                         if (const Result result = pass.begin_rendering(); !result) {
                             return result;
                         }
-                        if (const Result result = pass.set_viewport(
-                                rhi::Viewport{0.0f, 0.0f, static_cast<float>(extent.width),
-                                              static_cast<float>(extent.height), 0.0f, 1.0f});
+                        if (const Result result =
+                                pass.set_viewport(rhi::Viewport{0.0f, 0.0f, static_cast<float>(extent.width),
+                                                                static_cast<float>(extent.height), 0.0f, 1.0f});
                             !result) {
                             return result;
                         }
@@ -3729,17 +3643,12 @@ foundation::Result EditorSceneRuntime::render_frame(uint64_t frame_number) {
     };
     desc.renderer = &impl_->renderer_;
     desc.render_view_resolver = [impl = impl_.get()](const engine::EngineFrameRenderViewContext& context) {
-        const ecs::EntityId camera = impl->mode_ == Mode::kEdit ? impl->edit_camera_runtime_
-                                                                : impl->runtime_camera_runtime_;
+        const ecs::EntityId camera =
+            impl->mode_ == Mode::kEdit ? impl->edit_camera_runtime_ : impl->runtime_camera_runtime_;
         auto view = aeg::engine::components::make_render_view(
-            context.world_snapshot, aeg::engine::components::RuntimeRenderViewDesc{camera,
-                                                                                   0,
-                                                                                   context.output_extent,
-                                                                                   0xffffffffu,
-                                                                                   kSceneColor,
-                                                                                   kSceneDepth,
-                                                                                   false,
-                                                                                   {}});
+            context.world_snapshot,
+            aeg::engine::components::RuntimeRenderViewDesc{
+                camera, 0, context.output_extent, 0xffffffffu, kSceneColor, kSceneDepth, false, {}});
         if (view) {
             view.value.color_target_final_usage = ResourceUsage::kSampledRead;
         }
@@ -3956,7 +3865,7 @@ foundation::Result EditorSceneRuntime::Impl::reparent_entities(std::span<const s
                     return foundation::invalid_state("Hierarchy parent transform is degenerate");
                 }
                 Transform next{};
-                if (!decompose_affine_transform(inverse_parent * old_world.value, next)) {
+                if (!math::try_decompose_affine_transform(inverse_parent * old_world.value, next)) {
                     return foundation::invalid_state(
                         "Hierarchy reparent would produce a non-representable or degenerate Transform");
                 }
@@ -4615,8 +4524,12 @@ std::vector<EditorResourceDescriptor> EditorSceneRuntime::resource_descriptors()
             {EditorResourceKind::kMesh, kMeshAssetA, "Mesh A", true, EditorAssetStatus::kImported, {}},
             {EditorResourceKind::kMesh, kMeshAssetB, "Mesh B", true, EditorAssetStatus::kImported, {}},
             {EditorResourceKind::kMaterial, kMaterialAssetRed, "Material Red", true, EditorAssetStatus::kImported, {}},
-            {EditorResourceKind::kMaterial, kMaterialAssetGreen, "Material Green", true,
-             EditorAssetStatus::kImported, {}},
+            {EditorResourceKind::kMaterial,
+             kMaterialAssetGreen,
+             "Material Green",
+             true,
+             EditorAssetStatus::kImported,
+             {}},
         };
     }
     if (impl_ == nullptr) {
@@ -4920,8 +4833,8 @@ foundation::Result EditorSceneRuntime::new_scene() {
     if (impl_->mode_ != Mode::kEdit) {
         return foundation::invalid_state("New Scene requires Edit mode");
     }
-    const Result scene_result = impl_->project_manager_.loaded() ? impl_->make_empty_project_scene()
-                                                                 : impl_->make_default_scene();
+    const Result scene_result =
+        impl_->project_manager_.loaded() ? impl_->make_empty_project_scene() : impl_->make_default_scene();
     if (!scene_result) {
         return scene_result;
     }

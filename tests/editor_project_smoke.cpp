@@ -34,6 +34,12 @@ int main() {
         !require(std::filesystem::is_directory(root / "Saved"), "editor project smoke Saved directory is missing") ||
         !require(std::filesystem::is_directory(root / "Binaries"),
                  "editor project smoke Binaries directory is missing") ||
+        !require(std::filesystem::exists(root / "CMakeLists.txt"), "editor project smoke CMakeLists.txt is missing") ||
+        !require(std::filesystem::exists(root / "Source" / "GameModule.cpp") &&
+                     std::filesystem::exists(root / "Source" / "GameModule.metadata.json"),
+                 "editor project smoke game module sources are missing") ||
+        !require(std::filesystem::exists(root / "Assets" / "Pipelines" / "Default.aegpipe"),
+                 "editor project smoke default pipeline asset is missing") ||
         !require(manager.assets_directory().filename() == "Assets",
                  "editor project smoke Assets path is not project-relative") ||
         !require(manager.scenes_directory().filename() == "Scenes",
@@ -42,16 +48,15 @@ int main() {
                      manager.default_scene_file().parent_path().filename() == "Scenes" &&
                      manager.default_scene_file().parent_path().parent_path().filename() == "Assets",
                  "editor project smoke default scene path is incorrect") ||
-        !require(std::filesystem::exists(root / "project.aegproject"),
-                 "editor project smoke project file is missing")) {
+        !require(std::filesystem::exists(root / "Project.aegproj"), "editor project smoke project file is missing")) {
         std::filesystem::remove_all(root, error);
         return 1;
     }
 
-    std::ifstream project_contents(root / "project.aegproject");
+    std::ifstream project_contents(root / "Project.aegproj");
     const std::string project_text((std::istreambuf_iterator<char>(project_contents)),
                                    std::istreambuf_iterator<char>());
-    if (!require(project_text.starts_with("format_version = 1"), "editor project smoke did not write TOML") ||
+    if (!require(project_text.starts_with("format_version = 2"), "editor project smoke did not write TOML") ||
         !require(project_text.find("[paths]") != std::string::npos &&
                      project_text.find("cache = \"Cache\"") != std::string::npos,
                  "editor project smoke TOML paths are incomplete")) {
@@ -62,7 +67,7 @@ int main() {
 
     std::ofstream(root / "Assets" / "example.obj") << "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n";
     aeg::application::EditorProjectManager imported;
-    if (!require(static_cast<bool>(imported.import_project(root / "project.aegproject")),
+    if (!require(static_cast<bool>(imported.import_project(root / "Project.aegproj")),
                  "editor project smoke project-file import failed") ||
         !require(imported.descriptor().root == manager.descriptor().root,
                  "editor project smoke imported root differs") ||
@@ -72,7 +77,7 @@ int main() {
         return 2;
     }
 
-    std::filesystem::remove(root / "project.aegproject", error);
+    std::filesystem::remove(root / "Project.aegproj", error);
     if (!require(!imported.import_project(root), "editor project smoke accepted a project without project file")) {
         std::filesystem::remove_all(root, error);
         return 3;

@@ -5,6 +5,7 @@
 #pragma once
 
 #include <cstdint>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -53,6 +54,8 @@ public:
     [[nodiscard]] foundation::Result set_error(std::string_view message);
     /** @brief Clears the current diagnostic. */
     void clear_error() noexcept;
+    /** @brief Replaces the draft font descriptors while preserving its selected key. */
+    [[nodiscard]] foundation::Result set_draft_fonts(std::span<const EditorFontDescriptor> fonts);
 
 private:
     void refresh_dirty() noexcept;
@@ -71,6 +74,15 @@ private:
 class IEditorPreferenceActions {
 public:
     virtual ~IEditorPreferenceActions() = default;
+
+    /** @brief Requests the Application-owned font file picker and staged import. */
+    [[nodiscard]] virtual foundation::Result request_import_font() {
+        return foundation::invalid_state("Editor font import is unavailable");
+    }
+    /** @brief Requests removal of one user font after the panel confirms it. */
+    [[nodiscard]] virtual foundation::Result request_remove_font(std::string_view) {
+        return foundation::invalid_state("Editor font removal is unavailable");
+    }
 
     /** @brief Requests a transient preview in the independent Preferences window without applying the editor state. */
     [[nodiscard]] virtual foundation::Result preview(const EditorPreferenceState& state) = 0;

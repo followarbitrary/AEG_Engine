@@ -21,6 +21,8 @@
 #include <utility>
 #include <vector>
 
+#include "../public/pipeline_builder_backend.hpp"
+#include "../public/pipeline_configuration.hpp"
 #include "concurrency.hpp"
 
 namespace aeg::pipeline {
@@ -1431,6 +1433,9 @@ foundation::Result PipelineTaskContext::publish_artifact(ArtifactId id, Artifact
 
 PipelineBuilder::PipelineBuilder(const PipelineDescriptor& descriptor) : descriptor_(descriptor) {}
 
+PipelineBuilder::PipelineBuilder(PipelineBuilderBackend& backend, const PipelineDescriptor& descriptor)
+    : descriptor_(descriptor), declaration_backend_(&backend) {}
+
 PipelineBuilder::PipelineBuilder(const PipelineDefinition& definition)
     : descriptor_(definition.descriptor),
       stages_(definition.stages),
@@ -1492,6 +1497,9 @@ uint32_t PipelineBuilder::find_feature_point(FeaturePointId id) const noexcept {
 }
 
 PipelineStageHandle PipelineBuilder::add_stage(const StageDescriptor& descriptor) {
+    if (declaration_backend_ != nullptr) {
+        return declaration_backend_->add_stage(descriptor);
+    }
     if (!status_) {
         return {};
     }
@@ -1527,6 +1535,9 @@ PipelineStageHandle PipelineBuilder::add_stage(const StageDescriptor& descriptor
 }
 
 PipelineTaskHandle PipelineBuilder::add_task(const TaskDescriptor& descriptor) {
+    if (declaration_backend_ != nullptr) {
+        return declaration_backend_->add_task(descriptor);
+    }
     if (!status_) {
         return {};
     }
@@ -1556,6 +1567,9 @@ PipelineTaskHandle PipelineBuilder::add_task(const TaskDescriptor& descriptor) {
 }
 
 PipelineArtifactHandle PipelineBuilder::declare_artifact(const ArtifactDescriptor& descriptor) {
+    if (declaration_backend_ != nullptr) {
+        return declaration_backend_->declare_artifact(descriptor);
+    }
     if (!status_) {
         return {};
     }
@@ -1598,6 +1612,9 @@ PipelineArtifactHandle PipelineBuilder::declare_artifact(const ArtifactDescripto
 }
 
 PipelineFeaturePointHandle PipelineBuilder::add_feature_point(const FeaturePointDescriptor& descriptor) {
+    if (declaration_backend_ != nullptr) {
+        return declaration_backend_->add_feature_point(descriptor);
+    }
     if (!status_) {
         return {};
     }
@@ -1648,6 +1665,9 @@ PipelineFeaturePointHandle PipelineBuilder::add_feature_point(const FeaturePoint
 }
 
 foundation::Result PipelineBuilder::bind_feature(const FeatureBindingDescriptor& binding) {
+    if (declaration_backend_ != nullptr) {
+        return declaration_backend_->bind_feature(binding);
+    }
     if (!status_) {
         return status_;
     }
@@ -1700,6 +1720,9 @@ foundation::Result PipelineBuilder::bind_feature(const FeatureBindingDescriptor&
 }
 
 foundation::Result PipelineBuilder::bind_task(PipelineTaskHandle task, PipelineStageHandle stage) {
+    if (declaration_backend_ != nullptr) {
+        return declaration_backend_->bind_task(task, stage);
+    }
     if (!status_) {
         return status_;
     }
@@ -1794,22 +1817,37 @@ foundation::Result PipelineBuilder::add_binding(PipelineStageHandle stage, const
 }
 
 foundation::Result PipelineBuilder::reads(PipelineStageHandle stage, const ArtifactBinding& binding) {
+    if (declaration_backend_ != nullptr) {
+        return declaration_backend_->reads(stage, binding);
+    }
     return add_binding(stage, binding, ArtifactAccess::kRead);
 }
 
 foundation::Result PipelineBuilder::writes(PipelineStageHandle stage, const ArtifactBinding& binding) {
+    if (declaration_backend_ != nullptr) {
+        return declaration_backend_->writes(stage, binding);
+    }
     return add_binding(stage, binding, ArtifactAccess::kWrite);
 }
 
 foundation::Result PipelineBuilder::reads_writes(PipelineStageHandle stage, const ArtifactBinding& binding) {
+    if (declaration_backend_ != nullptr) {
+        return declaration_backend_->reads_writes(stage, binding);
+    }
     return add_binding(stage, binding, ArtifactAccess::kReadWrite);
 }
 
 foundation::Result PipelineBuilder::publish_snapshot(PipelineStageHandle stage, const ArtifactBinding& binding) {
+    if (declaration_backend_ != nullptr) {
+        return declaration_backend_->publish_snapshot(stage, binding);
+    }
     return add_binding(stage, binding, ArtifactAccess::kPublishSnapshot);
 }
 
 foundation::Result PipelineBuilder::runs_before(PipelineStageHandle stage, StageId other) {
+    if (declaration_backend_ != nullptr) {
+        return declaration_backend_->runs_before(stage, other);
+    }
     if (!status_) {
         return status_;
     }
@@ -1826,6 +1864,9 @@ foundation::Result PipelineBuilder::runs_before(PipelineStageHandle stage, Stage
 }
 
 foundation::Result PipelineBuilder::runs_after(PipelineStageHandle stage, StageId other) {
+    if (declaration_backend_ != nullptr) {
+        return declaration_backend_->runs_after(stage, other);
+    }
     if (!status_) {
         return status_;
     }
@@ -1842,6 +1883,9 @@ foundation::Result PipelineBuilder::runs_after(PipelineStageHandle stage, StageI
 }
 
 foundation::Result PipelineBuilder::expose_artifact(ArtifactId artifact, PipelineScope target_scope) {
+    if (declaration_backend_ != nullptr) {
+        return declaration_backend_->expose_artifact(artifact, target_scope);
+    }
     if (!status_) {
         return status_;
     }
@@ -1869,6 +1913,9 @@ foundation::Result PipelineBuilder::expose_artifact(ArtifactId artifact, Pipelin
 }
 
 foundation::ResultValue<PipelineDefinition> PipelineBuilder::finish() {
+    if (declaration_backend_ != nullptr) {
+        return {invalid_state("forwarding pipeline builder cannot be finalized"), {}};
+    }
     if (finished_) {
         return {invalid_state("pipeline builder has already been finalized"), {}};
     }
@@ -1998,6 +2045,9 @@ const FeatureDescriptor& default_stream_feature_descriptor() {
 }  // namespace
 
 foundation::Result FeatureBuildContext::reject(foundation::ResultCode code, std::string message) {
+    if (feature_backend_ != nullptr) {
+        return feature_backend_->reject(code, std::move(message));
+    }
     if (builder_ == nullptr) {
         return foundation::Result::failure(code, std::move(message));
     }
@@ -2006,13 +2056,22 @@ foundation::Result FeatureBuildContext::reject(foundation::ResultCode code, std:
 }
 
 uint32_t FeatureBuildContext::stage_count() const noexcept {
+    if (feature_backend_ != nullptr) {
+        return feature_backend_->stage_count();
+    }
     return builder_ == nullptr ? 0 : static_cast<uint32_t>(builder_->stages_.size());
 }
 
 void FeatureBuildContext::on_stage_added(PipelineStageHandle stage) {
-    if (builder_ == nullptr || !stage) {
+    if (!stage) {
         return;
     }
+    if (feature_backend_ != nullptr) {
+        feature_backend_->on_stage_added(stage, feature_point_);
+        return;
+    }
+    if (builder_ == nullptr)
+        return;
     switch (feature_point_.position) {
         case FeaturePointPosition::kBefore:
             static_cast<void>(builder_->runs_before(stage, feature_point_.anchor_stage));
@@ -2025,6 +2084,16 @@ void FeatureBuildContext::on_stage_added(PipelineStageHandle stage) {
 }
 
 void FeatureBuildContext::record_contribution(FeatureDomain domain, uint32_t first_stage_index) {
+    const uint32_t count = stage_count();
+    if (first_stage_index > count) {
+        static_cast<void>(
+            reject(foundation::ResultCode::kInvalidState, "feature contribution starts after the current stage count"));
+        return;
+    }
+    if (feature_backend_ != nullptr) {
+        feature_backend_->record_contribution(domain, first_stage_index, count - first_stage_index);
+        return;
+    }
     if (contribution_records_ == nullptr || builder_ == nullptr) {
         return;
     }
@@ -3329,6 +3398,100 @@ foundation::Result PipelineScopeHost::rebuild(const PipelineRegistry& registry, 
     return foundation::Result::success();
 }
 
+FeatureBuildContext FeatureBuildContext::from_backend(FeatureDeclarationBackend& backend,
+                                                      const FeatureBuildDescriptor& descriptor) noexcept {
+    FeatureBuildContext result(backend);
+    result.scope_ = descriptor.scope;
+    result.pipeline_id_ = descriptor.pipeline;
+    result.feature_id_ = descriptor.feature;
+    result.feature_instance_id_ = descriptor.instance;
+    result.part_id_ = descriptor.part;
+    result.feature_point_ = descriptor.point;
+    result.active_domain_ = descriptor.domain;
+    result.configuration_ = descriptor.configuration;
+    return result;
+}
+
+PipelineStageHandle FeatureBuildContext::add_stage(const StageDescriptor& descriptor) {
+    return feature_backend_ != nullptr
+               ? feature_backend_->add_stage(descriptor)
+               : (builder_ != nullptr ? builder_->add_stage(descriptor) : PipelineStageHandle{});
+}
+
+PipelineTaskHandle FeatureBuildContext::add_task(const TaskDescriptor& descriptor) {
+    return feature_backend_ != nullptr ? feature_backend_->add_task(descriptor)
+                                       : (builder_ != nullptr ? builder_->add_task(descriptor) : PipelineTaskHandle{});
+}
+
+PipelineArtifactHandle FeatureBuildContext::declare_artifact(const ArtifactDescriptor& descriptor) {
+    return feature_backend_ != nullptr
+               ? feature_backend_->declare_artifact(descriptor)
+               : (builder_ != nullptr ? builder_->declare_artifact(descriptor) : PipelineArtifactHandle{});
+}
+
+foundation::Result FeatureBuildContext::bind_task(PipelineTaskHandle task, PipelineStageHandle stage) {
+    return feature_backend_ != nullptr ? feature_backend_->bind_task(task, stage)
+                                       : (builder_ != nullptr ? builder_->bind_task(task, stage)
+                                                              : foundation::invalid_state("feature builder is empty"));
+}
+
+foundation::Result FeatureBuildContext::reads(PipelineStageHandle stage, const ArtifactBinding& binding) {
+    return feature_backend_ != nullptr ? feature_backend_->reads(stage, binding)
+                                       : (builder_ != nullptr ? builder_->reads(stage, binding)
+                                                              : foundation::invalid_state("feature builder is empty"));
+}
+
+foundation::Result FeatureBuildContext::writes(PipelineStageHandle stage, const ArtifactBinding& binding) {
+    return feature_backend_ != nullptr ? feature_backend_->writes(stage, binding)
+                                       : (builder_ != nullptr ? builder_->writes(stage, binding)
+                                                              : foundation::invalid_state("feature builder is empty"));
+}
+
+foundation::Result FeatureBuildContext::reads_writes(PipelineStageHandle stage, const ArtifactBinding& binding) {
+    return feature_backend_ != nullptr ? feature_backend_->reads_writes(stage, binding)
+                                       : (builder_ != nullptr ? builder_->reads_writes(stage, binding)
+                                                              : foundation::invalid_state("feature builder is empty"));
+}
+
+foundation::Result FeatureBuildContext::publish_snapshot(PipelineStageHandle stage, const ArtifactBinding& binding) {
+    return feature_backend_ != nullptr ? feature_backend_->publish_snapshot(stage, binding)
+                                       : (builder_ != nullptr ? builder_->publish_snapshot(stage, binding)
+                                                              : foundation::invalid_state("feature builder is empty"));
+}
+
+foundation::Result FeatureBuildContext::runs_before(PipelineStageHandle stage, StageId other) {
+    return feature_backend_ != nullptr ? feature_backend_->runs_before(stage, other)
+                                       : (builder_ != nullptr ? builder_->runs_before(stage, other)
+                                                              : foundation::invalid_state("feature builder is empty"));
+}
+
+foundation::Result FeatureBuildContext::runs_after(PipelineStageHandle stage, StageId other) {
+    return feature_backend_ != nullptr ? feature_backend_->runs_after(stage, other)
+                                       : (builder_ != nullptr ? builder_->runs_after(stage, other)
+                                                              : foundation::invalid_state("feature builder is empty"));
+}
+
+foundation::Result FeatureBuildContext::expose_artifact(ArtifactId artifact, PipelineScope target_scope) {
+    return feature_backend_ != nullptr ? feature_backend_->expose_artifact(artifact, target_scope)
+                                       : (builder_ != nullptr ? builder_->expose_artifact(artifact, target_scope)
+                                                              : foundation::invalid_state("feature builder is empty"));
+}
+
+foundation::Result PipelineScopeHost::set_configuration(
+    std::shared_ptr<const PipelineInstanceConfiguration> configuration) {
+    if (!configuration || !configuration->instance.is_valid() || !configuration->pipeline.is_valid())
+        return invalid_argument("pipeline instance configuration is invalid");
+    std::unique_lock lock(plan_mutex_);
+    if (active_)
+        return invalid_state("cannot replace configuration while the scope host is active");
+    if (instance_.is_valid() && configuration->instance != instance_)
+        return invalid_argument("pipeline configuration instance does not match host");
+    if (pipeline_.is_valid() && configuration->pipeline != pipeline_)
+        return invalid_argument("pipeline configuration pipeline does not match host");
+    configuration_ = std::move(configuration);
+    return foundation::Result::success();
+}
+
 namespace {
 foundation::Result rebuild_runtime_schedule(PipelinePlan& plan) {
     std::vector<std::vector<uint32_t>> outgoing(plan.nodes.size());
@@ -3343,10 +3506,15 @@ foundation::Result rebuild_runtime_schedule(PipelinePlan& plan) {
     plan.topological_order.clear();
     plan.batches.clear();
     std::priority_queue<uint32_t, std::vector<uint32_t>, std::greater<>> ready;
-    for (uint32_t index = 0; index < indegree.size(); ++index) if (indegree[index] == 0) ready.push(index);
+    for (uint32_t index = 0; index < indegree.size(); ++index)
+        if (indegree[index] == 0)
+            ready.push(index);
     while (!ready.empty()) {
         std::vector<uint32_t> current_batch;
-        while (!ready.empty()) { current_batch.push_back(ready.top()); ready.pop(); }
+        while (!ready.empty()) {
+            current_batch.push_back(ready.top());
+            ready.pop();
+        }
         PipelineExecutionBatch batch;
         batch.node_indices = current_batch;
         batch.parallelizable = std::all_of(current_batch.begin(), current_batch.end(), [&](uint32_t node_index) {
@@ -3354,9 +3522,11 @@ foundation::Result rebuild_runtime_schedule(PipelinePlan& plan) {
         });
         plan.topological_order.insert(plan.topological_order.end(), current_batch.begin(), current_batch.end());
         plan.batches.push_back(std::move(batch));
-        for (const uint32_t source : current_batch) for (const uint32_t destination : outgoing[source]) {
-            if (--indegree[destination] == 0) ready.push(destination);
-        }
+        for (const uint32_t source : current_batch)
+            for (const uint32_t destination : outgoing[source]) {
+                if (--indegree[destination] == 0)
+                    ready.push(destination);
+            }
     }
     if (plan.topological_order.size() != plan.nodes.size()) {
         return invalid_argument("runtime ordering would create a pipeline cycle");
@@ -3368,16 +3538,21 @@ foundation::Result rebuild_runtime_schedule(PipelinePlan& plan) {
 foundation::Result PipelineScopeHost::add_runtime_ordering(uint32_t source_node, uint32_t destination_node) {
     std::unique_lock plan_lock(plan_mutex_);
     const PipelinePlanHandle base = pending_plan_ != nullptr ? pending_plan_ : active_plan_;
-    if (base == nullptr) return invalid_state("scope host has no compiled pipeline plan");
-    if (source_node >= base->nodes.size() || destination_node >= base->nodes.size() || source_node == destination_node) {
+    if (base == nullptr)
+        return invalid_state("scope host has no compiled pipeline plan");
+    if (source_node >= base->nodes.size() || destination_node >= base->nodes.size() ||
+        source_node == destination_node) {
         return invalid_argument("runtime ordering nodes are invalid");
     }
     if (std::any_of(base->dependencies.begin(), base->dependencies.end(), [&](const PipelineDependency& edge) {
             return edge.source_node == source_node && edge.destination_node == destination_node;
-        })) return foundation::Result::success();
+        }))
+        return foundation::Result::success();
     auto next = std::make_shared<PipelinePlan>(*base);
-    next->dependencies.push_back(PipelineDependency{source_node, destination_node, PipelineDependencyKind::kOrdering, {}, true});
-    if (const foundation::Result result = rebuild_runtime_schedule(*next); !result) return result;
+    next->dependencies.push_back(
+        PipelineDependency{source_node, destination_node, PipelineDependencyKind::kOrdering, {}, true});
+    if (const foundation::Result result = rebuild_runtime_schedule(*next); !result)
+        return result;
     next->revision = base->revision + 1;
     pending_plan_ = std::move(next);
     return foundation::Result::success();
@@ -3386,14 +3561,18 @@ foundation::Result PipelineScopeHost::add_runtime_ordering(uint32_t source_node,
 foundation::Result PipelineScopeHost::remove_runtime_ordering(uint32_t source_node, uint32_t destination_node) {
     std::unique_lock plan_lock(plan_mutex_);
     const PipelinePlanHandle base = pending_plan_ != nullptr ? pending_plan_ : active_plan_;
-    if (base == nullptr) return invalid_state("scope host has no compiled pipeline plan");
+    if (base == nullptr)
+        return invalid_state("scope host has no compiled pipeline plan");
     auto next = std::make_shared<PipelinePlan>(*base);
-    const auto edge = std::find_if(next->dependencies.begin(), next->dependencies.end(), [&](const PipelineDependency& value) {
-        return value.source_node == source_node && value.destination_node == destination_node;
-    });
-    if (edge == next->dependencies.end()) return not_found("pipeline connection does not exist");
+    const auto edge =
+        std::find_if(next->dependencies.begin(), next->dependencies.end(), [&](const PipelineDependency& value) {
+            return value.source_node == source_node && value.destination_node == destination_node;
+        });
+    if (edge == next->dependencies.end())
+        return not_found("pipeline connection does not exist");
     next->dependencies.erase(edge);
-    if (const foundation::Result result = rebuild_runtime_schedule(*next); !result) return result;
+    if (const foundation::Result result = rebuild_runtime_schedule(*next); !result)
+        return result;
     next->revision = base->revision + 1;
     pending_plan_ = std::move(next);
     return foundation::Result::success();

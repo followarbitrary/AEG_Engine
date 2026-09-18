@@ -48,6 +48,7 @@
 #include "logging.hpp"
 #include "pipeline.hpp"
 #include "pipeline_overview_layout.hpp"
+#include "preferences/editor_preference_controller.hpp"
 #include "project_dialog_ui.hpp"
 #include "render_graph.hpp"
 #include "render_state_flow.hpp"
@@ -59,6 +60,10 @@
 namespace {
 using aeg::application::ComponentUpdateView;
 using aeg::application::EditorAssetStatus;
+using aeg::application::EditorFontRepository;
+using aeg::application::EditorPreferenceController;
+using aeg::application::EditorPreferenceControllerDesc;
+using aeg::application::EditorPreferenceStore;
 using aeg::application::EditorResourceDescriptor;
 using aeg::application::EditorResourceKind;
 using aeg::application::EditorSceneRuntime;
@@ -143,7 +148,8 @@ bool report_result(const Result& result, std::string_view operation) noexcept {
     }));
     if (error_dialogs_enabled) {
         static_cast<void>(aeg::editor::guard_editor_operation([] {
-            return aeg::application::show_error_dialog("Aether Engine Error",
+            return aeg::application::show_error_dialog(
+                "Aether Engine Error",
                 "The editor could not complete the requested operation. Details are available in the log.");
         }));
     }
@@ -209,6 +215,16 @@ std::filesystem::path editor_log_path() {
     std::error_code error;
     const auto temporary = std::filesystem::temp_directory_path(error);
     return error ? std::filesystem::path{} : temporary / "AEG-Engine" / "Editor" / "logs" / "aeg-editor.log";
+}
+
+std::filesystem::path editor_preference_root() {
+    const char* local_app_data = std::getenv("LOCALAPPDATA");
+    if (local_app_data != nullptr && *local_app_data != '\0') {
+        return std::filesystem::path(std::string(local_app_data)) / "AEG-Engine" / "Editor";
+    }
+    std::error_code error;
+    const auto temporary = std::filesystem::temp_directory_path(error);
+    return error ? std::filesystem::path{} : temporary / "AEG-Engine" / "Editor";
 }
 
 struct ResourceDragPayload final {
@@ -2187,6 +2203,8 @@ public:
         kApply,
         kSave,
         kCancel,
+        kImport,
+        kRemove,
     };
 
     struct PendingRequest final {
@@ -2194,6 +2212,12 @@ public:
         std::string font_key{};
         float font_size_pixels{16.0f};
     };
+
+    [[nodiscard]] Result request_import_font() override { return schedule(Operation::kImport, {}, 0.0f); }
+
+    [[nodiscard]] Result request_remove_font(std::string_view font_key) override {
+        return schedule(Operation::kRemove, font_key, 0.0f);
+    }
 
     [[nodiscard]] Result preview(const EditorPreferenceState& state) override {
         return schedule(Operation::kPreview, state.active_font_key, state.font_size_pixels);
@@ -2224,7 +2248,9 @@ public:
 
 private:
     [[nodiscard]] Result schedule(Operation operation, std::string_view font_key, float size_pixels) {
-        if (font_key.empty()) {
+        if ((operation == Operation::kPreview || operation == Operation::kApply || operation == Operation::kSave ||
+             operation == Operation::kCancel || operation == Operation::kRemove) &&
+            font_key.empty()) {
             return aeg::foundation::invalid_argument("Editor preference font key is empty");
         }
         try {
@@ -2259,7 +2285,8 @@ public:
         startup_project_ = startup_project;
         const std::filesystem::path log_path = editor_log_path();
         std::error_code log_directory_error;
-        if (!log_path.empty()) std::filesystem::create_directories(log_path.parent_path(), log_directory_error);
+        if (!log_path.empty())
+            std::filesystem::create_directories(log_path.parent_path(), log_directory_error);
         aeg::logging::Config logging_config{};
         logging_config.file_enabled = !log_path.empty() && !log_directory_error;
         logging_config.file_path = log_path;
@@ -2323,17 +2350,19 @@ public:
             }
         }
         if (!startup_project_.empty()) {
-            const auto project_result = aeg::editor::guard_editor_operation([&] {
-                return scene_runtime_->import_project(startup_project_);
-            });
+            const auto project_result =
+                aeg::editor::guard_editor_operation([&] { return scene_runtime_->import_project(startup_project_); });
             if (!project_result) {
                 notify_runtime_result(project_result, "open_startup_project");
-                if (fatal_runtime_error_) return false;
+                if (fatal_runtime_error_)
+                    return false;
             } else {
-                const auto pipeline_result = aeg::editor::guard_editor_operation([&] { return restore_pipeline_document(); });
+                const auto pipeline_result =
+                    aeg::editor::guard_editor_operation([&] { return restore_pipeline_document(); });
                 if (!pipeline_result) {
                     notify_runtime_result(pipeline_result, "restore_startup_pipeline_document");
-                    if (fatal_runtime_error_) return false;
+                    if (fatal_runtime_error_)
+                        return false;
                 }
             }
         }
@@ -2364,7 +2393,8 @@ public:
         auto system_font_result = EditorSystemFontCatalog{}.load();
         if (!system_font_result) {
             notify_runtime_result(system_font_result.result, "load_system_fonts");
-            if (fatal_runtime_error_) return false;
+            if (fatal_runtime_error_)
+                return false;
             // An empty catalog selects ImGui's embedded default font.
         } else {
             font_catalog_ = std::move(system_font_result.value.catalog);
@@ -2402,6 +2432,12 @@ public:
         imgui_renderer_ = std::make_unique<ImGuiRenderer>(*device_, texture_registry_);
         if (!report_result(imgui_renderer_->initialize(), "initialize_imgui_renderer")) {
             return false;
+        }
+        if (preference_controller_ != nullptr && preference_model_ != nullptr) {
+            const EditorPreferenceState& initial_state = preference_model_->state();
+            if (!report_result(preference_controller_->preview(initial_state), "restore_editor_preference_font")) {
+                return false;
+            }
         }
         if (!report_result(aeg::renderer::register_render_pipeline(registry_), "register_render_pipeline")) {
             return false;
@@ -2502,359 +2538,362 @@ public:
         preferences_open_requested_ = open_preferences_regression;
         uint32_t attempted_frames = 0;
         while (!close_requested() && !console_interrupt.interrupted()) {
-          try {
-            // A bounded automated run must finish even when every attempted
-            // frame reports a recoverable error before it can be presented.
-            if (frame_limit != 0 && attempted_frames >= frame_limit) {
-                break;
-            }
-            ++attempted_frames;
+            try {
+                // A bounded automated run must finish even when every attempted
+                // frame reports a recoverable error before it can be presented.
+                if (frame_limit != 0 && attempted_frames >= frame_limit) {
+                    break;
+                }
+                ++attempted_frames;
 
-            Result event_result = Result::success();
-            const Result poll_result = window_system_->poll_events([this, &event_result](const WindowEvent& event) {
-                if (window_ != nullptr && event.window == window_->id()) {
-                    if (event.type == WindowEventType::kWindowResized) {
-                        resize_pending_ = true;
-                    }
-                    if (event.type == WindowEventType::kWindowCloseRequested) {
-                        close_confirmation_requested_ = true;
+                Result event_result = Result::success();
+                const Result poll_result = window_system_->poll_events([this, &event_result](const WindowEvent& event) {
+                    if (window_ != nullptr && event.window == window_->id()) {
+                        if (event.type == WindowEventType::kWindowResized) {
+                            resize_pending_ = true;
+                        }
+                        if (event.type == WindowEventType::kWindowCloseRequested) {
+                            close_confirmation_requested_ = true;
+                            return;
+                        }
+                        if (!main_window_input_enabled_) {
+                            return;
+                        }
+                        if (event_result) {
+                            event_result = input_system_.submit_event(event);
+                        }
+                        if (event_result) {
+                            event_result = imgui_host_.submit_event(event);
+                        }
                         return;
                     }
-                    if (!main_window_input_enabled_) {
-                        return;
+                    if (preferences_window_ != nullptr && event.window == preferences_window_->id()) {
+                        if (event.type == WindowEventType::kWindowCloseRequested) {
+                            preferences_close_requested_ = true;
+                            return;
+                        }
+                        if (event.type == WindowEventType::kWindowResized) {
+                            preferences_resize_pending_ = true;
+                        }
+                        if (event_result && preferences_imgui_host_.is_initialized()) {
+                            event_result = preferences_imgui_host_.submit_event(event);
+                        }
                     }
-                    if (event_result) {
-                        event_result = input_system_.submit_event(event);
-                    }
-                    if (event_result) {
-                        event_result = imgui_host_.submit_event(event);
-                    }
-                    return;
-                }
-                if (preferences_window_ != nullptr && event.window == preferences_window_->id()) {
-                    if (event.type == WindowEventType::kWindowCloseRequested) {
-                        preferences_close_requested_ = true;
-                        return;
-                    }
-                    if (event.type == WindowEventType::kWindowResized) {
-                        preferences_resize_pending_ = true;
-                    }
-                    if (event_result && preferences_imgui_host_.is_initialized()) {
-                        event_result = preferences_imgui_host_.submit_event(event);
-                    }
-                }
-            });
-            if (!poll_result) {
-                notify_runtime_result(poll_result, "poll_editor_events");
-                if (fatal_runtime_error_) {
-                    return 1;
-                }
-            }
-            if (!event_result) {
-                notify_runtime_result(event_result, "submit_editor_event");
-                if (fatal_runtime_error_) {
-                    return 1;
-                }
-            }
-            if (preferences_close_requested_) {
-                const bool closing_regression_preferences =
-                    preferences_regression_mode_ && preferences_window_ != nullptr;
-                const Result close_result = close_preferences();
-                if (!close_result) {
-                    notify_runtime_result(close_result, "close_preferences");
-                    if (regression_mode_) {
-                        return 1;
-                    }
+                });
+                if (!poll_result) {
+                    notify_runtime_result(poll_result, "poll_editor_events");
                     if (fatal_runtime_error_) {
                         return 1;
                     }
                 }
-                if (closing_regression_preferences) {
-                    if (preferences_window_ != nullptr || !main_window_input_enabled_) {
-                        return 1;
-                    }
-                    preferences_regression_closed_ = true;
-                }
-            }
-            if (preferences_open_requested_) {
-                preferences_open_requested_ = false;
-                const Result open_result = open_preferences();
-                if (!open_result) {
-                    notify_runtime_result(open_result, "open_preferences");
-                    if (regression_mode_) {
-                        return 1;
-                    }
+                if (!event_result) {
+                    notify_runtime_result(event_result, "submit_editor_event");
                     if (fatal_runtime_error_) {
                         return 1;
                     }
                 }
-                if (open_result && preferences_regression_mode_) {
-                    if (preferences_window_ == nullptr || main_window_input_enabled_) {
-                        return 1;
+                if (preferences_close_requested_) {
+                    const bool closing_regression_preferences =
+                        preferences_regression_mode_ && preferences_window_ != nullptr;
+                    const Result close_result = close_preferences();
+                    if (!close_result) {
+                        notify_runtime_result(close_result, "close_preferences");
+                        if (regression_mode_) {
+                            return 1;
+                        }
+                        if (fatal_runtime_error_) {
+                            return 1;
+                        }
                     }
-                    preferences_regression_opened_ = true;
-                    if (preferences_regression_closed_) {
-                        preferences_regression_reopened_ = true;
+                    if (closing_regression_preferences) {
+                        if (preferences_window_ != nullptr || !main_window_input_enabled_) {
+                            return 1;
+                        }
+                        preferences_regression_closed_ = true;
                     }
                 }
-            }
-            if (close_requested()) {
-                break;
-            }
-
-            if (resize_regression_ && (frame_count_ == 10 || frame_count_ == 30 || frame_count_ == 50)) {
-                const aeg::platform::WindowExtent extent = make_regression_extent(frame_count_);
-                const Result resize_result = window_->set_extent(extent);
-                if (!resize_result) {
-                    notify_runtime_result(resize_result, "resize_regression_window");
+                if (preferences_open_requested_) {
+                    preferences_open_requested_ = false;
+                    const Result open_result = open_preferences();
+                    if (!open_result) {
+                        notify_runtime_result(open_result, "open_preferences");
+                        if (regression_mode_) {
+                            return 1;
+                        }
+                        if (fatal_runtime_error_) {
+                            return 1;
+                        }
+                    }
+                    if (open_result && preferences_regression_mode_) {
+                        if (preferences_window_ == nullptr || main_window_input_enabled_) {
+                            return 1;
+                        }
+                        preferences_regression_opened_ = true;
+                        if (preferences_regression_closed_) {
+                            preferences_regression_reopened_ = true;
+                        }
+                    }
                 }
-                resize_pending_ = true;
-            }
+                if (close_requested()) {
+                    break;
+                }
 
-            if (resize_pending_) {
-                const Result recreate_result = recreate_swapchain();
-                if (!recreate_result) {
-                    notify_runtime_result(recreate_result, "recreate_swapchain");
+                if (resize_regression_ && (frame_count_ == 10 || frame_count_ == 30 || frame_count_ == 50)) {
+                    const aeg::platform::WindowExtent extent = make_regression_extent(frame_count_);
+                    const Result resize_result = window_->set_extent(extent);
+                    if (!resize_result) {
+                        notify_runtime_result(resize_result, "resize_regression_window");
+                    }
+                    resize_pending_ = true;
+                }
+
+                if (resize_pending_) {
+                    const Result recreate_result = recreate_swapchain();
+                    if (!recreate_result) {
+                        notify_runtime_result(recreate_result, "recreate_swapchain");
+                        if (fatal_runtime_error_) {
+                            return 1;
+                        }
+                        std::this_thread::sleep_for(std::chrono::milliseconds(16));
+                        continue;
+                    }
+                }
+
+                const Result begin_input_result = input_system_.begin_frame();
+                if (!begin_input_result) {
+                    notify_runtime_result(begin_input_result, "begin_input_frame");
                     if (fatal_runtime_error_) {
                         return 1;
                     }
                     std::this_thread::sleep_for(std::chrono::milliseconds(16));
                     continue;
                 }
-            }
+                const auto finish_input_frame = [this]() noexcept { input_system_.end_frame(); };
 
-            const Result begin_input_result = input_system_.begin_frame();
-            if (!begin_input_result) {
-                notify_runtime_result(begin_input_result, "begin_input_frame");
-                if (fatal_runtime_error_) {
-                    return 1;
+                if (window_->state().minimized) {
+                    finish_input_frame();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(16));
+                    continue;
                 }
-                std::this_thread::sleep_for(std::chrono::milliseconds(16));
-                continue;
-            }
-            const auto finish_input_frame = [this]() noexcept { input_system_.end_frame(); };
 
-            if (window_->state().minimized) {
-                finish_input_frame();
-                std::this_thread::sleep_for(std::chrono::milliseconds(16));
-                continue;
-            }
-
-            const auto now = std::chrono::steady_clock::now();
-            float delta_seconds = std::chrono::duration<float>(now - last_frame_time_).count();
-            last_frame_time_ = now;
-            if (!(delta_seconds > 0.0f) || delta_seconds > 0.25f) {
-                delta_seconds = 1.0f / 60.0f;
-            }
-
-            if (scene_runtime_ != nullptr) {
-                Result scene_frame_result = Result::success();
-                if (scene_runtime_->viewport_resize_pending()) {
-                    // The previous viewport image is referenced by the editor UI draw packet.
-                    // Release its frame-local descriptors before SceneRuntime replaces it.
-                    if (imgui_renderer_ != nullptr) {
-                        scene_frame_result = imgui_renderer_->release_prepared_frame();
-                        if (!scene_frame_result) {
-                            notify_runtime_result(scene_frame_result, "release_scene_viewport_frame");
-                        }
-                    }
-                    if (scene_frame_result && render_graph_ != nullptr) {
-                        // The editor graph also caches logical imports of SceneColor. Rebuild
-                        // its orchestrator after dropping those records so a resized target is
-                        // observed as a fresh imported resource with its current RHI state.
-                        orchestrator_.reset();
-                        render_graph_->reset();
-                        try {
-                            orchestrator_ = std::make_unique<aeg::engine::EngineFrameOrchestrator>(
-                                registry_, scheduler_, *frame_context_, *render_graph_);
-                        } catch (const std::bad_alloc&) {
-                            scene_frame_result = aeg::foundation::out_of_memory(
-                                "Editor frame orchestrator recreation allocation failed");
-                        }
-                        if (scene_frame_result) {
-                            scene_frame_result = orchestrator_->register_pipeline(frame_host_);
-                        }
-                        if (scene_frame_result) {
-                            scene_frame_result = orchestrator_->initialize();
-                        }
-                        if (!scene_frame_result) {
-                            notify_runtime_result(scene_frame_result, "rebuild_editor_frame_graph");
-                        }
-                    }
+                const auto now = std::chrono::steady_clock::now();
+                float delta_seconds = std::chrono::duration<float>(now - last_frame_time_).count();
+                last_frame_time_ = now;
+                if (!(delta_seconds > 0.0f) || delta_seconds > 0.25f) {
+                    delta_seconds = 1.0f / 60.0f;
                 }
-                if (scene_frame_result) {
-                    scene_frame_result = scene_runtime_->render_frame(frame_count_);
-                }
-                if (!scene_frame_result) {
-                    notify_runtime_result(scene_frame_result, "render_editor_scene");
-                    if (fatal_runtime_error_) {
-                        finish_input_frame();
-                        return 1;
-                    }
-                } else if (scene_runtime_->viewport_ready()) {
-                    const ImGuiTextureBinding binding = scene_runtime_->viewport_binding();
-                    if (!viewport_texture_handle_.is_valid()) {
-                        const auto register_result = texture_registry_.register_texture(binding);
-                        if (!register_result) {
-                            notify_runtime_result(register_result.result, "register_scene_viewport_texture");
-                            if (fatal_runtime_error_) {
-                                finish_input_frame();
-                                return 1;
+
+                if (scene_runtime_ != nullptr) {
+                    Result scene_frame_result = Result::success();
+                    if (scene_runtime_->viewport_resize_pending()) {
+                        // The previous viewport image is referenced by the editor UI draw packet.
+                        // Release its frame-local descriptors before SceneRuntime replaces it.
+                        if (imgui_renderer_ != nullptr) {
+                            scene_frame_result = imgui_renderer_->release_prepared_frame();
+                            if (!scene_frame_result) {
+                                notify_runtime_result(scene_frame_result, "release_scene_viewport_frame");
                             }
-                        } else {
-                            viewport_texture_handle_ = register_result.value;
                         }
-                    } else if (const Result update_result =
-                                   texture_registry_.update_texture(viewport_texture_handle_, binding);
-                               !update_result) {
-                        notify_runtime_result(update_result, "update_scene_viewport_texture");
+                        if (scene_frame_result && render_graph_ != nullptr) {
+                            // The editor graph also caches logical imports of SceneColor. Rebuild
+                            // its orchestrator after dropping those records so a resized target is
+                            // observed as a fresh imported resource with its current RHI state.
+                            orchestrator_.reset();
+                            render_graph_->reset();
+                            try {
+                                orchestrator_ = std::make_unique<aeg::engine::EngineFrameOrchestrator>(
+                                    registry_, scheduler_, *frame_context_, *render_graph_);
+                            } catch (const std::bad_alloc&) {
+                                scene_frame_result = aeg::foundation::out_of_memory(
+                                    "Editor frame orchestrator recreation allocation failed");
+                            }
+                            if (scene_frame_result) {
+                                scene_frame_result = orchestrator_->register_pipeline(frame_host_);
+                            }
+                            if (scene_frame_result) {
+                                scene_frame_result = orchestrator_->initialize();
+                            }
+                            if (!scene_frame_result) {
+                                notify_runtime_result(scene_frame_result, "rebuild_editor_frame_graph");
+                            }
+                        }
+                    }
+                    if (scene_frame_result) {
+                        scene_frame_result = scene_runtime_->render_frame(frame_count_);
+                    }
+                    if (!scene_frame_result) {
+                        notify_runtime_result(scene_frame_result, "render_editor_scene");
                         if (fatal_runtime_error_) {
                             finish_input_frame();
                             return 1;
                         }
+                    } else if (scene_runtime_->viewport_ready()) {
+                        const ImGuiTextureBinding binding = scene_runtime_->viewport_binding();
+                        if (!viewport_texture_handle_.is_valid()) {
+                            const auto register_result = texture_registry_.register_texture(binding);
+                            if (!register_result) {
+                                notify_runtime_result(register_result.result, "register_scene_viewport_texture");
+                                if (fatal_runtime_error_) {
+                                    finish_input_frame();
+                                    return 1;
+                                }
+                            } else {
+                                viewport_texture_handle_ = register_result.value;
+                            }
+                        } else if (const Result update_result =
+                                       texture_registry_.update_texture(viewport_texture_handle_, binding);
+                                   !update_result) {
+                            notify_runtime_result(update_result, "update_scene_viewport_texture");
+                            if (fatal_runtime_error_) {
+                                finish_input_frame();
+                                return 1;
+                            }
+                        }
                     }
                 }
-            }
 
-            const aeg::platform::WindowState window_state = window_->state();
-            const EditorImGuiFrameDesc imgui_frame_desc{
-                window_->id(), window_state.extent, delta_seconds, 1.0f, 1.0f,
-            };
-            bool imgui_frame_active = false;
-            const Result begin_imgui_result = imgui_host_.begin_frame(imgui_frame_desc);
-            if (!begin_imgui_result) {
-                notify_runtime_result(begin_imgui_result, "begin_imgui_frame");
+                const aeg::platform::WindowState window_state = window_->state();
+                const EditorImGuiFrameDesc imgui_frame_desc{
+                    window_->id(), window_state.extent, delta_seconds, 1.0f, 1.0f,
+                };
+                bool imgui_frame_active = false;
+                const Result begin_imgui_result = imgui_host_.begin_frame(imgui_frame_desc);
+                if (!begin_imgui_result) {
+                    notify_runtime_result(begin_imgui_result, "begin_imgui_frame");
+                    finish_input_frame();
+                    if (fatal_runtime_error_) {
+                        return 1;
+                    }
+                    continue;
+                }
+                imgui_frame_active = true;
+                build_editor_menu();
+                workspace_.set_preferences_open(preferences_window_ != nullptr || preferences_open_requested_);
+                workspace_.set_playing(scene_runtime_->mode() != EditorSceneRuntime::Mode::kEdit);
+                const Result build_workspace_result = workspace_.build_ui();
+                if (!build_workspace_result) {
+                    notify_runtime_result(build_workspace_result, "build_editor_workspace");
+                    static_cast<void>(imgui_host_.abort_frame());
+                    finish_input_frame();
+                    if (fatal_runtime_error_) {
+                        return 1;
+                    }
+                    continue;
+                }
+                if (scene_runtime_ != nullptr && scene_runtime_->mode() != last_scene_mode_) {
+                    input_system_.reset();
+                    last_scene_mode_ = scene_runtime_->mode();
+                }
+                const Result end_imgui_result = imgui_host_.end_frame();
+                if (!end_imgui_result) {
+                    notify_runtime_result(end_imgui_result, "end_imgui_frame");
+                    finish_input_frame();
+                    if (fatal_runtime_error_) {
+                        return 1;
+                    }
+                    continue;
+                }
+                imgui_frame_active = false;
+
+                ImGuiDrawPacket draw_packet;
+                const Result capture_draw_result = imgui_host_.capture_draw_packet(draw_packet);
+                if (!capture_draw_result) {
+                    notify_runtime_result(capture_draw_result, "capture_imgui_draw_packet");
+                    finish_input_frame();
+                    if (fatal_runtime_error_) {
+                        return 1;
+                    }
+                    continue;
+                }
+
+                const Result frame_result = run_engine_frame(draw_packet);
+                if (imgui_frame_active) {
+                    static_cast<void>(imgui_host_.end_frame());
+                }
+                const Result preferences_frame_result = run_preferences_frame(delta_seconds);
                 finish_input_frame();
-                if (fatal_runtime_error_) {
+                if (!frame_result) {
+                    if (frame_result.code == ResultCode::kOutOfDate || frame_result.code == ResultCode::kSurfaceLost) {
+                        resize_pending_ = true;
+                        continue;
+                    }
+                    notify_runtime_result(frame_result, "run_editor_frame");
+                    if (regression_mode_) {
+                        return 1;
+                    }
+                    if (fatal_runtime_error_) {
+                        return 1;
+                    }
+                    continue;
+                }
+                if (!preferences_frame_result) {
+                    if (preferences_frame_result.code == ResultCode::kOutOfDate ||
+                        preferences_frame_result.code == ResultCode::kSurfaceLost) {
+                        preferences_resize_pending_ = true;
+                        continue;
+                    }
+                    notify_runtime_result(preferences_frame_result, "run_preferences_frame");
+                    if (regression_mode_) {
+                        return 1;
+                    }
+                    if (fatal_runtime_error_) {
+                        return 1;
+                    }
+                    continue;
+                }
+                ++frame_count_;
+                if (preferences_regression_mode_ && !preferences_regression_preview_requested_ && frame_count_ == 1 &&
+                    preference_model_ != nullptr) {
+                    std::string preview_font_key;
+                    for (const aeg::editor::EditorFontDescriptor& font : preference_model_->state().fonts) {
+                        if (font.key != preference_model_->state().active_font_key) {
+                            preview_font_key = font.key;
+                            break;
+                        }
+                    }
+                    if (preview_font_key.empty()) {
+                        return 1;
+                    }
+                    if (!preference_model_->select_font(preview_font_key) || !preference_model_->set_font_size(20.0f) ||
+                        !preference_actions_.preview(preference_model_->state())) {
+                        return 1;
+                    }
+                    preferences_regression_preview_requested_ = true;
+                }
+                if (preferences_regression_mode_ && frame_count_ == 30 && preferences_window_ != nullptr) {
+                    preferences_close_requested_ = true;
+                }
+                if (preferences_regression_mode_ && frame_count_ == 40 && preferences_regression_closed_ &&
+                    !preferences_regression_reopened_ && preferences_window_ == nullptr) {
+                    preferences_open_requested_ = true;
+                }
+                if (preferences_regression_mode_ && frame_count_ == 52 && preferences_regression_reopened_ &&
+                    preferences_window_ != nullptr) {
+                    preferences_close_requested_ = true;
+                }
+                if (!process_pending_preference()) {
                     return 1;
                 }
-                continue;
-            }
-            imgui_frame_active = true;
-            build_editor_menu();
-            workspace_.set_preferences_open(preferences_window_ != nullptr || preferences_open_requested_);
-            workspace_.set_playing(scene_runtime_->mode() != EditorSceneRuntime::Mode::kEdit);
-            const Result build_workspace_result = workspace_.build_ui();
-            if (!build_workspace_result) {
-                notify_runtime_result(build_workspace_result, "build_editor_workspace");
+            } catch (...) {
+                // A user action or platform callback may throw after opening UI
+                // scopes. Discard that frame before the next iteration can render.
+                const Result failure = aeg::editor::guard_editor_operation([]() -> Result { throw; });
                 static_cast<void>(imgui_host_.abort_frame());
-                finish_input_frame();
-                if (fatal_runtime_error_) {
-                    return 1;
-                }
-                continue;
-            }
-            if (scene_runtime_ != nullptr && scene_runtime_->mode() != last_scene_mode_) {
-                input_system_.reset();
-                last_scene_mode_ = scene_runtime_->mode();
-            }
-            const Result end_imgui_result = imgui_host_.end_frame();
-            if (!end_imgui_result) {
-                notify_runtime_result(end_imgui_result, "end_imgui_frame");
-                finish_input_frame();
-                if (fatal_runtime_error_) {
-                    return 1;
-                }
-                continue;
-            }
-            imgui_frame_active = false;
-
-            ImGuiDrawPacket draw_packet;
-            const Result capture_draw_result = imgui_host_.capture_draw_packet(draw_packet);
-            if (!capture_draw_result) {
-                notify_runtime_result(capture_draw_result, "capture_imgui_draw_packet");
-                finish_input_frame();
-                if (fatal_runtime_error_) {
-                    return 1;
-                }
-                continue;
-            }
-
-            const Result frame_result = run_engine_frame(draw_packet);
-            if (imgui_frame_active) {
-                static_cast<void>(imgui_host_.end_frame());
-            }
-            const Result preferences_frame_result = run_preferences_frame(delta_seconds);
-            finish_input_frame();
-            if (!frame_result) {
-                if (frame_result.code == ResultCode::kOutOfDate || frame_result.code == ResultCode::kSurfaceLost) {
-                    resize_pending_ = true;
-                    continue;
-                }
-                notify_runtime_result(frame_result, "run_editor_frame");
-                if (regression_mode_) {
-                    return 1;
-                }
-                if (fatal_runtime_error_) {
-                    return 1;
-                }
-                continue;
-            }
-            if (!preferences_frame_result) {
-                if (preferences_frame_result.code == ResultCode::kOutOfDate ||
-                    preferences_frame_result.code == ResultCode::kSurfaceLost) {
-                    preferences_resize_pending_ = true;
-                    continue;
-                }
-                notify_runtime_result(preferences_frame_result, "run_preferences_frame");
-                if (regression_mode_) {
-                    return 1;
-                }
-                if (fatal_runtime_error_) {
-                    return 1;
-                }
-                continue;
-            }
-            ++frame_count_;
-            if (preferences_regression_mode_ && !preferences_regression_preview_requested_ && frame_count_ == 1 &&
-                preference_model_ != nullptr) {
-                std::string preview_font_key;
-                for (const aeg::editor::EditorFontDescriptor& font : preference_model_->state().fonts) {
-                    if (font.key != preference_model_->state().active_font_key) {
-                        preview_font_key = font.key;
-                        break;
+                static_cast<void>(preferences_imgui_host_.abort_frame());
+                input_system_.end_frame();
+                for (FrameContext* frame : {frame_context_.get(), preferences_frame_context_.get()}) {
+                    if (frame != nullptr && frame->is_frame_active()) {
+                        const auto abort_result =
+                            aeg::editor::guard_editor_operation([&] { return frame->abort_frame(); });
+                        if (!abort_result)
+                            notify_runtime_result(abort_result, "abort_interrupted_frame");
                     }
                 }
-                if (preview_font_key.empty()) {
+                notify_runtime_result(failure, "editor_operation_exception");
+                if (fatal_runtime_error_ || regression_mode_)
                     return 1;
-                }
-                if (!preference_model_->select_font(preview_font_key) || !preference_model_->set_font_size(20.0f) ||
-                    !preference_actions_.preview(preference_model_->state())) {
-                    return 1;
-                }
-                preferences_regression_preview_requested_ = true;
+                std::this_thread::sleep_for(std::chrono::milliseconds(16));
             }
-            if (preferences_regression_mode_ && frame_count_ == 30 && preferences_window_ != nullptr) {
-                preferences_close_requested_ = true;
-            }
-            if (preferences_regression_mode_ && frame_count_ == 40 && preferences_regression_closed_ &&
-                !preferences_regression_reopened_ && preferences_window_ == nullptr) {
-                preferences_open_requested_ = true;
-            }
-            if (preferences_regression_mode_ && frame_count_ == 52 && preferences_regression_reopened_ &&
-                preferences_window_ != nullptr) {
-                preferences_close_requested_ = true;
-            }
-            if (!process_pending_preference()) {
-                return 1;
-            }
-          } catch (...) {
-            // A user action or platform callback may throw after opening UI
-            // scopes. Discard that frame before the next iteration can render.
-            const Result failure = aeg::editor::guard_editor_operation([]() -> Result { throw; });
-            static_cast<void>(imgui_host_.abort_frame());
-            static_cast<void>(preferences_imgui_host_.abort_frame());
-            input_system_.end_frame();
-            for (FrameContext* frame : {frame_context_.get(), preferences_frame_context_.get()}) {
-                if (frame != nullptr && frame->is_frame_active()) {
-                    const auto abort_result = aeg::editor::guard_editor_operation([&] { return frame->abort_frame(); });
-                    if (!abort_result) notify_runtime_result(abort_result, "abort_interrupted_frame");
-                }
-            }
-            notify_runtime_result(failure, "editor_operation_exception");
-            if (fatal_runtime_error_ || regression_mode_) return 1;
-            std::this_thread::sleep_for(std::chrono::milliseconds(16));
-          }
         }
         if (preferences_regression_mode_ &&
             (!preferences_regression_opened_ || !preferences_regression_closed_ || !preferences_regression_reopened_ ||
@@ -3477,7 +3516,8 @@ private:
             return;
         }
         static_cast<void>(aeg::editor::guard_editor_operation([] {
-            return aeg::application::show_error_dialog("Aether Engine Error",
+            return aeg::application::show_error_dialog(
+                "Aether Engine Error",
                 "The editor could not complete the requested operation. Details are available in the log.");
         }));
     }
@@ -3624,7 +3664,8 @@ private:
 
         aeg::editor::EditorImGuiDesc imgui_desc{};
         imgui_desc.platform_services = &window_system_->platform_services();
-        imgui_desc.font_catalog = &font_catalog_;
+        imgui_desc.font_catalog =
+            preference_controller_ != nullptr ? &preference_controller_->catalog() : &font_catalog_;
         imgui_desc.default_font_key = imgui_host_.active_font_key();
         imgui_desc.font_size_pixels = imgui_host_.active_font_size_pixels();
         imgui_desc.enable_preference_fonts = true;
@@ -3977,18 +4018,37 @@ private:
         return result;
     }
 
-    /** @brief Creates the editor-only Preferences model from the system font snapshot. */
+    /** @brief Creates the Application-owned Preferences controller from bundled and user fonts. */
     [[nodiscard]] bool initialize_preference_model() {
         try {
-            EditorPreferenceState state{};
-            const std::span<const aeg::editor::EditorFontAsset> assets = font_catalog_.assets();
-            state.fonts.reserve(assets.size());
-            for (const aeg::editor::EditorFontAsset& asset : assets) {
-                state.fonts.push_back(asset.descriptor);
+            const std::filesystem::path preference_root = editor_preference_root();
+            if (preference_root.empty()) {
+                static_cast<void>(
+                    report_result(aeg::foundation::invalid_state("Editor preference directory cannot be resolved"),
+                                  "resolve_editor_preference_directory"));
+                return false;
             }
-            state.active_font_key = default_font_key_;
-            state.font_size_pixels = imgui_host_.active_font_size_pixels();
-            preference_model_ = std::make_unique<EditorPreferenceModel>(std::move(state));
+            preference_repository_ = std::make_unique<EditorFontRepository>();
+            if (!report_result(preference_repository_->initialize(preference_root / "Fonts"),
+                               "initialize_editor_font_repository")) {
+                return false;
+            }
+            preference_store_ = std::make_unique<EditorPreferenceStore>(preference_root / "preferences.bin");
+            preference_controller_ = std::make_unique<EditorPreferenceController>(EditorPreferenceControllerDesc{
+                preference_repository_.get(), preference_store_.get(), &imgui_host_,
+                [this](std::string_view key, float size) { return refresh_editor_preference_font(key, size); },
+                [this]() -> aeg::foundation::ResultValue<std::optional<std::filesystem::path>> {
+                    if (window_system_ == nullptr || window_ == nullptr) {
+                        return {aeg::foundation::invalid_state("Editor font dialog owner is unavailable"), {}};
+                    }
+                    return aeg::application::open_font_file_dialog(*window_system_, window_->id());
+                }});
+            if (!report_result(preference_controller_->initialize(font_catalog_, default_font_key_,
+                                                                  imgui_host_.active_font_size_pixels()),
+                               "initialize_editor_preference_controller")) {
+                return false;
+            }
+            preference_model_ = preference_controller_->model();
             return preference_model_ != nullptr;
         } catch (const std::bad_alloc&) {
             static_cast<void>(report_result(aeg::foundation::out_of_memory("Editor preference model allocation failed"),
@@ -4004,13 +4064,57 @@ private:
             return true;
         }
 
+        if (preference_controller_ != nullptr && preference_model_ != nullptr) {
+            const EditorPreferenceState state = preference_model_->state();
+            Result controller_result = Result::success();
+            switch (request.operation) {
+                case EditorPreferenceActions::Operation::kPreview:
+                    controller_result = preference_controller_->preview(state);
+                    break;
+                case EditorPreferenceActions::Operation::kApply:
+                    controller_result = preference_controller_->apply(state);
+                    break;
+                case EditorPreferenceActions::Operation::kSave:
+                    controller_result = preference_controller_->save(state);
+                    break;
+                case EditorPreferenceActions::Operation::kCancel:
+                    controller_result = preference_controller_->cancel(state);
+                    break;
+                case EditorPreferenceActions::Operation::kImport:
+                    controller_result = preference_controller_->request_import_font();
+                    break;
+                case EditorPreferenceActions::Operation::kRemove:
+                    controller_result = preference_controller_->request_remove_font(request.font_key);
+                    break;
+            }
+            if (!controller_result) {
+                notify_runtime_result(controller_result, "process_editor_preference");
+                static_cast<void>(preference_model_->set_error(
+                    "The editor font change could not be completed. The previous font has been kept."));
+                return !fatal_runtime_error_;
+            }
+            if (request.operation == EditorPreferenceActions::Operation::kPreview) {
+                preferences_regression_preview_completed_ = preferences_regression_mode_;
+                return true;
+            }
+            if (request.operation == EditorPreferenceActions::Operation::kSave ||
+                request.operation == EditorPreferenceActions::Operation::kCancel) {
+                const Result close_result = close_preferences();
+                if (!close_result) {
+                    notify_runtime_result(close_result, "close_preferences");
+                    return !fatal_runtime_error_;
+                }
+            }
+            return true;
+        }
+
         if (request.operation == EditorPreferenceActions::Operation::kPreview) {
             const Result preview_result = preview_preference_font(request.font_key, request.font_size_pixels);
             if (!preview_result) {
                 notify_runtime_result(preview_result, "preview_editor_font");
                 if (preference_model_ != nullptr) {
-                    static_cast<void>(
-                        preference_model_->set_error("This font could not be previewed. The previous font has been kept."));
+                    static_cast<void>(preference_model_->set_error(
+                        "This font could not be previewed. The previous font has been kept."));
                 }
                 return !fatal_runtime_error_;
             }
@@ -4110,6 +4214,25 @@ private:
             return result;
         }
         return refresh_font_texture();
+    }
+
+    /** @brief Refreshes the main and (when open) isolated Preferences font atlas. */
+    [[nodiscard]] Result refresh_editor_preference_font(std::string_view font_key, float font_size_pixels) {
+        if (const Result result = refresh_font_texture(); !result) {
+            return result;
+        }
+        if (!preferences_imgui_host_.is_initialized() || preference_controller_ == nullptr) {
+            return Result::success();
+        }
+        if (const Result result =
+                preferences_imgui_host_.replace_font_catalog(preference_controller_->catalog(), font_key);
+            !result) {
+            return result;
+        }
+        if (const Result result = preferences_imgui_host_.set_preview_font(font_key, font_size_pixels); !result) {
+            return result;
+        }
+        return refresh_preferences_font_texture();
     }
 
     /** @brief Rebuilds and replaces the engine-owned GPU font texture for the current CPU atlas. */
@@ -4738,8 +4861,12 @@ private:
     EditorFontCatalog font_catalog_{};
     /** @brief Stable key selected as the initial system font. */
     std::string default_font_key_{};
-    /** @brief Editor-only Preferences draft state. */
-    std::unique_ptr<EditorPreferenceModel> preference_model_{};
+    /** @brief Application-owned user font repository and versioned Preference store. */
+    std::unique_ptr<EditorFontRepository> preference_repository_{};
+    std::unique_ptr<EditorPreferenceStore> preference_store_{};
+    std::unique_ptr<EditorPreferenceController> preference_controller_{};
+    /** @brief Borrowed draft model owned by the Application Preference controller. */
+    EditorPreferenceModel* preference_model_{nullptr};
     /** @brief Safe-frame command queue owned by the Application layer. */
     EditorPreferenceActions preference_actions_{};
     /** @brief Independent Preferences font atlas texture owned through Engine Resource/RHI APIs. */

@@ -7,9 +7,13 @@
 #include <algorithm>
 #include <cstdlib>
 #include <fstream>
+#include <functional>
+#include <iomanip>
+#include <sstream>
 #include <system_error>
 
 #include "project_context.hpp"
+#include "project_scaffold.hpp"
 
 namespace aeg::application {
 namespace {
@@ -32,6 +36,19 @@ constexpr std::string_view kLegacyProjectHeader{"AEG_PROJECT\t1"};
 
 [[nodiscard]] bool valid_project_name(std::string_view name) noexcept {
     return !name.empty() && name.find_first_of("\t\r\n") == std::string_view::npos;
+}
+
+[[nodiscard]] std::string project_uuid_for(const std::filesystem::path& root) {
+    const std::string seed = root.generic_string();
+    const uint64_t first = std::hash<std::string>{}(seed);
+    const uint64_t second = std::hash<std::string>{}(seed + "#aeg-project");
+    std::ostringstream hex;
+    hex << std::hex << std::setfill('0') << std::setw(16) << first << std::setw(16) << second;
+    std::string raw = hex.str();
+    raw[12] = '4';
+    raw[16] = '8';
+    return raw.substr(0, 8) + "-" + raw.substr(8, 4) + "-" + raw.substr(12, 4) + "-" + raw.substr(16, 4) + "-" +
+           raw.substr(20, 12);
 }
 
 [[nodiscard]] bool valid_relative_path(const std::filesystem::path& path) {
@@ -63,58 +80,10 @@ constexpr std::string_view kLegacyProjectHeader{"AEG_PROJECT\t1"};
 }  // namespace
 
 foundation::Result EditorProjectManager::new_project(const std::filesystem::path& root, std::string_view name) {
-    if (root.empty()) {
-        return foundation::invalid_argument("Project root path is empty");
-    }
-    std::error_code error;
-    const std::filesystem::path canonical_root = canonical_or_absolute(root, error);
-    if (error || canonical_root.empty()) {
-        return foundation::invalid_argument("Project root path is invalid");
-    }
-    if (std::filesystem::exists(canonical_root / "project.aegproject")) {
-        return foundation::invalid_state("A project already exists at this path");
-    }
-    const std::string project_name = valid_project_name(name) ? std::string(name) : canonical_root.filename().string();
-    if (!valid_project_name(project_name)) {
-        return foundation::invalid_argument("Project name is invalid");
-    }
-    const project::ProjectConfig config{
-        1, project_name, "windows-x64-vulkan", "Assets/Scenes/Main.aegscene", {"Assets", "Cache", "Saved", "Binaries"}};
-    std::filesystem::create_directories(canonical_root / config.paths.assets, error);
-    std::filesystem::create_directories(canonical_root / config.startup_scene.parent_path(), error);
-    std::filesystem::create_directories(canonical_root / config.paths.cache, error);
-    std::filesystem::create_directories(canonical_root / config.paths.saved, error);
-    std::filesystem::create_directories(canonical_root / config.paths.binaries, error);
-    std::filesystem::create_directories(canonical_root / ".aeg", error);
-    if (error) {
-        return foundation::Result::failure(foundation::ResultCode::kUnknown,
-                                           "Cannot create the game project directories");
-    }
-    EditorProjectDescriptor next = make_descriptor(canonical_root, config);
-    if (const foundation::Result result = write_project_file(next); !result) {
-        return result;
-    }
-    descriptor_ = std::move(next);
-    const auto recent = recent_projects();
-    std::vector<EditorRecentProject> entries = recent ? std::move(recent.value) : std::vector<EditorRecentProject>{};
-    entries.erase(std::remove_if(entries.begin(), entries.end(),
-                                 [this](const EditorRecentProject& entry) { return entry.root == descriptor_.root; }),
-                  entries.end());
-    entries.insert(entries.begin(), EditorRecentProject{descriptor_.root, descriptor_.name});
-    if (entries.size() > 8) {
-        entries.resize(8);
-    }
-    std::error_code recent_error;
-    std::filesystem::create_directories(global_recent_projects_file().parent_path(), recent_error);
-    if (!recent_error) {
-        std::ofstream recent_file(global_recent_projects_file(), std::ios::trunc);
-        if (recent_file) {
-            for (const EditorRecentProject& entry : entries) {
-                recent_file << entry.root.string() << '\t' << entry.name << '\n';
-            }
-        }
-    }
-    return foundation::Result::success();
+    const auto created = project::create_project({root, std::string(name), "GameModule"});
+    if (!created)
+        return created.result;
+    return import_project(created.value);
 }
 
 foundation::Result EditorProjectManager::import_project(const std::filesystem::path& root_or_project_file) {
@@ -123,7 +92,7 @@ foundation::Result EditorProjectManager::import_project(const std::filesystem::p
     }
     std::error_code error;
     std::filesystem::path root = root_or_project_file;
-    if (root.extension() == ".aegproject") {
+    if (root.extension() == ".aegproj" || root.extension() == ".aegproject") {
         root = root.parent_path();
     }
     root = canonical_or_absolute(root, error);
@@ -163,6 +132,9 @@ foundation::Result EditorProjectManager::close_project() noexcept {
 }
 
 std::filesystem::path EditorProjectManager::project_file() const {
+    if (std::filesystem::exists(descriptor_.root / "Project.aegproj")) {
+        return descriptor_.root / "Project.aegproj";
+    }
     return descriptor_.root / "project.aegproject";
 }
 
@@ -261,7 +233,9 @@ foundation::ResultValue<std::vector<EditorRecentProject>> EditorProjectManager::
 foundation::Result EditorProjectManager::read_project_file(const std::filesystem::path& root,
                                                            EditorProjectDescriptor& descriptor) const {
     project::ProjectFileCodec codec;
-    const auto modern_project = codec.load(root / "project.aegproject");
+    const auto discovered = project::discover_project_file(root);
+    const std::filesystem::path project_path = discovered ? discovered.value : root / "project.aegproject";
+    const auto modern_project = codec.load(project_path);
     if (modern_project) {
         EditorProjectDescriptor parsed = make_descriptor(root, modern_project.value.config);
         std::error_code error;
@@ -273,9 +247,9 @@ foundation::Result EditorProjectManager::read_project_file(const std::filesystem
         return foundation::Result::success();
     }
 
-    std::ifstream file(root / "project.aegproject");
+    std::ifstream file(project_path);
     if (!file) {
-        return foundation::not_found("Project file project.aegproject is missing");
+        return foundation::not_found("Project file Project.aegproj or project.aegproject is missing");
     }
     std::string header;
     std::string name;
@@ -322,7 +296,7 @@ foundation::Result EditorProjectManager::write_project_file(const EditorProjectD
     config.name = descriptor.name;
     config.startup_scene = descriptor.default_scene;
     config.paths.assets = descriptor.assets_directory;
-    return project::ProjectFileCodec{}.save(descriptor.root / "project.aegproject", config);
+    return project::ProjectFileCodec{}.save(descriptor.root / "Project.aegproj", config);
 }
 
 }  // namespace aeg::application

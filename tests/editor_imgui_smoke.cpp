@@ -71,7 +71,8 @@ public:
 
     [[nodiscard]] aeg::foundation::ResultValue<aeg::platform::WindowMetrics> query_window_metrics(
         aeg::platform::WindowId) const override {
-        if (throw_metrics) throw std::runtime_error("recoverable metrics failure");
+        if (throw_metrics)
+            throw std::runtime_error("recoverable metrics failure");
         return {aeg::foundation::Result::success(), aeg::platform::WindowMetrics{{1280, 720}, 1.0f, 1.0f}};
     }
 
@@ -143,6 +144,12 @@ int main() {
     assert(host.capture_font_atlas(font_atlas));
     assert(font_atlas.is_valid());
     assert(host.set_font_texture(texture_result.value));
+    editor::EditorFontCatalog replacement_catalog;
+    assert(host.replace_font_catalog(replacement_catalog));
+    assert(host.set_font_texture(texture_result.value));
+    editor::ImGuiFontAtlasData replacement_atlas;
+    assert(host.capture_font_atlas(replacement_atlas));
+    assert(replacement_atlas.is_valid());
     auto panel = std::make_unique<SmokePanel>();
     SmokePanel* panel_pointer = panel.get();
     const foundation::ResultValue<editor::EditorPanelId> panel_result = host.register_panel(std::move(panel));
@@ -161,6 +168,7 @@ int main() {
     frame_desc.window = window;
     frame_desc.display_extent = platform::WindowExtent{1280, 720};
     assert(host.begin_frame(frame_desc));
+    assert(!host.replace_font_catalog(replacement_catalog));
     assert(host.build_panels());
     assert(host.end_frame());
 

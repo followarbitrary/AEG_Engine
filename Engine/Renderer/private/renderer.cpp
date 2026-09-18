@@ -23,28 +23,9 @@ using foundation::not_found;
 using foundation::out_of_memory;
 using foundation::unknown_exception;
 
-[[nodiscard]] bool is_finite(const math::Vec3& value) noexcept {
-    return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
-}
-
-[[nodiscard]] bool is_finite(const math::Vec4& value) noexcept {
-    return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z) && std::isfinite(value.w);
-}
-
 [[nodiscard]] bool is_unit_range_color(const math::Vec3& value) noexcept {
-    return is_finite(value) && value.x >= 0.0f && value.x <= 1.0f && value.y >= 0.0f && value.y <= 1.0f &&
+    return math::is_finite(value) && value.x >= 0.0f && value.x <= 1.0f && value.y >= 0.0f && value.y <= 1.0f &&
            value.z >= 0.0f && value.z <= 1.0f;
-}
-
-[[nodiscard]] bool is_finite(const math::Mat4& value) noexcept {
-    for (uint32_t column = 0; column < 4; ++column) {
-        for (uint32_t row = 0; row < 4; ++row) {
-            if (!std::isfinite(value.at(row, column))) {
-                return false;
-            }
-        }
-    }
-    return true;
 }
 
 [[nodiscard]] float maximum_scale(const math::Mat4& matrix) noexcept {
@@ -67,7 +48,7 @@ using foundation::unknown_exception;
         return false;
     }
     const float radius = instance.bounds_radius * maximum_scale(instance.world_transform);
-    return std::isfinite(radius) && frustum.intersects_sphere(center, radius);
+    return math::is_finite(radius) && frustum.intersects_sphere(center, radius);
 }
 
 [[nodiscard]] bool light_inside_view(const RenderLight& light, const RenderView& view,
@@ -92,10 +73,9 @@ void increment(uint32_t& value) noexcept {
 }
 
 [[nodiscard]] bool is_valid_light_component(const RenderLightComponent& component) noexcept {
-    return std::isfinite(component.intensity) && std::isfinite(component.range) && component.intensity >= 0.0f &&
+    return math::is_finite(component.intensity) && math::is_finite(component.range) && component.intensity >= 0.0f &&
            component.range >= 0.0f && is_unit_range_color(component.color) &&
-           std::isfinite(component.inner_cone_cosine) &&
-           std::isfinite(component.outer_cone_cosine);
+           math::is_finite(component.inner_cone_cosine) && math::is_finite(component.outer_cone_cosine);
 }
 
 [[nodiscard]] foundation::Result append_default_meshes(const RenderExtractContext& context) {
@@ -216,18 +196,18 @@ bool RenderLightingConstants::is_valid() const noexcept {
     const math::Vec3 directional_color_value{directional_color.x, directional_color.y, directional_color.z};
     const math::Vec3 ambient_color_value{ambient_color.x, ambient_color.y, ambient_color.z};
     const float intensity = directional_direction_intensity.w;
-    return is_finite(directional_direction_intensity) && is_finite(directional_color) && is_finite(ambient_color) &&
-           std::isfinite(intensity) && intensity >= 0.0f && is_unit_range_color(directional_color_value) &&
-           is_unit_range_color(ambient_color_value) && directional_color.w == 1.0f && ambient_color.w == 1.0f &&
+    return math::is_finite(directional_direction_intensity) && math::is_finite(directional_color) &&
+           math::is_finite(ambient_color) && math::is_finite(intensity) && intensity >= 0.0f &&
+           is_unit_range_color(directional_color_value) && is_unit_range_color(ambient_color_value) &&
+           directional_color.w == 1.0f && ambient_color.w == 1.0f &&
            (intensity == 0.0f || math::length_squared(direction) > math::kEpsilon * math::kEpsilon);
 }
 
 bool RenderLightingResource::is_valid() const noexcept {
-    if (!binding_set.is_valid() || binding_group != 2 || !lighting_buffer.is_valid() ||
-        !lighting_resource.is_valid() || lighting_buffer_desc.size == 0 || lighting_size < sizeof(RenderLightingConstants) ||
+    if (!binding_set.is_valid() || binding_group != 2 || !lighting_buffer.is_valid() || !lighting_resource.is_valid() ||
+        lighting_buffer_desc.size == 0 || lighting_size < sizeof(RenderLightingConstants) ||
         !rhi::has_flag(lighting_buffer_desc.capabilities, rhi::BufferCapability::kUniform) ||
-        lighting_offset > lighting_buffer_desc.size ||
-        lighting_size > lighting_buffer_desc.size - lighting_offset) {
+        lighting_offset > lighting_buffer_desc.size || lighting_size > lighting_buffer_desc.size - lighting_offset) {
         return false;
     }
     return true;
@@ -290,11 +270,11 @@ foundation::Result RenderSceneSnapshotBuilder::add_instance(const RenderInstance
     if (!instance.object.is_valid() || !instance.mesh.is_valid() || !instance.material.is_valid()) {
         return invalid_argument("render instance identity or asset identity is invalid");
     }
-    if (!std::isfinite(instance.bounds_radius) || instance.bounds_radius < 0.0f) {
+    if (!math::is_finite(instance.bounds_radius) || instance.bounds_radius < 0.0f) {
         return invalid_argument("render instance bounds radius is invalid");
     }
-    if (!is_finite(instance.world_transform) || !is_finite(instance.previous_world_transform) ||
-        !is_finite(instance.bounds_center)) {
+    if (!math::is_finite(instance.world_transform) || !math::is_finite(instance.previous_world_transform) ||
+        !math::is_finite(instance.bounds_center)) {
         return invalid_argument("render instance contains a non-finite transform or bounds value");
     }
     if (instance_ids_.find(instance.object) != instance_ids_.end()) {
@@ -336,10 +316,10 @@ foundation::Result RenderSceneSnapshotBuilder::add_light(const RenderLight& ligh
     if (finished_) {
         return invalid_state("render scene snapshot builder has already been finalized");
     }
-    if (!light.light.is_valid() || !std::isfinite(light.intensity) || !std::isfinite(light.range) ||
-        light.intensity < 0.0f || light.range < 0.0f || !is_finite(light.position) || !is_finite(light.direction) ||
-        !is_unit_range_color(light.color) || !std::isfinite(light.inner_cone_cosine) ||
-        !std::isfinite(light.outer_cone_cosine)) {
+    if (!light.light.is_valid() || !math::is_finite(light.intensity) || !math::is_finite(light.range) ||
+        light.intensity < 0.0f || light.range < 0.0f || !math::is_finite(light.position) ||
+        !math::is_finite(light.direction) || !is_unit_range_color(light.color) ||
+        !math::is_finite(light.inner_cone_cosine) || !math::is_finite(light.outer_cone_cosine)) {
         return invalid_argument("render light identity or scalar values are invalid");
     }
     if (light_ids_.find(light.light) != light_ids_.end()) {
@@ -373,13 +353,13 @@ foundation::Result RenderSceneSnapshotBuilder::add_light(const RenderLight& ligh
     return foundation::Result::success();
 }
 
-foundation::ResultValue<RenderLightingResource> RenderResourceResolver::resolve_lighting(
-    const RenderSceneSnapshot&, const RenderView&) const {
+foundation::ResultValue<RenderLightingResource> RenderResourceResolver::resolve_lighting(const RenderSceneSnapshot&,
+                                                                                         const RenderView&) const {
     return {not_found("render resource resolver does not provide a frame lighting resource"), {}};
 }
 
-foundation::ResultValue<RenderLightingConstants> make_render_lighting_constants(
-    std::span<const RenderLight> lights, math::Vec3 ambient_color) {
+foundation::ResultValue<RenderLightingConstants> make_render_lighting_constants(std::span<const RenderLight> lights,
+                                                                                math::Vec3 ambient_color) {
     if (!is_unit_range_color(ambient_color)) {
         return {invalid_argument("render lighting ambient color must be finite and within [0, 1]"), {}};
     }
@@ -394,7 +374,7 @@ foundation::ResultValue<RenderLightingConstants> make_render_lighting_constants(
         if (++directional_count > 1) {
             return {invalid_state("minimal opaque lighting accepts at most one Directional Light"), {}};
         }
-        if (!std::isfinite(light.intensity) || light.intensity < 0.0f || !is_finite(light.direction) ||
+        if (!math::is_finite(light.intensity) || light.intensity < 0.0f || !math::is_finite(light.direction) ||
             !is_unit_range_color(light.color)) {
             return {invalid_argument("Directional Light contains an invalid direction, color, or intensity"), {}};
         }
@@ -567,9 +547,10 @@ foundation::ResultValue<std::shared_ptr<const RenderSceneSnapshot>> Renderer::ex
 }
 
 bool RenderView::is_valid() const noexcept {
-    return id.is_valid() && world.is_valid() && output_extent.is_valid() && is_finite(camera.view) &&
-           is_finite(camera.projection) && is_finite(camera.position) && std::isfinite(camera.near_plane) &&
-           std::isfinite(camera.far_plane) && camera.near_plane > 0.0f && camera.far_plane > camera.near_plane;
+    return id.is_valid() && world.is_valid() && output_extent.is_valid() && math::is_finite(camera.view) &&
+           math::is_finite(camera.projection) && math::is_finite(camera.position) &&
+           math::is_finite(camera.near_plane) && math::is_finite(camera.far_plane) && camera.near_plane > 0.0f &&
+           camera.far_plane > camera.near_plane;
 }
 
 foundation::Result Renderer::prepare_view(RenderView& view, pipeline::RenderResourceId default_color_target) const {

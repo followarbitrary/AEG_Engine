@@ -4,26 +4,26 @@
  */
 #pragma once
 
-#include <array>
-#include <compare>
 #include <cstdint>
 #include <filesystem>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include "asset_identity.hpp"
 #include "result.hpp"
 
 namespace aeg::tooling {
-/** @brief A canonical 128-bit UUID stored without platform-specific types. */
-struct Uuid final {
-    std::array<uint8_t, 16> bytes{};
-
-    [[nodiscard]] static foundation::ResultValue<Uuid> parse(std::string_view text);
-    [[nodiscard]] std::string to_string() const;
-
-    auto operator<=>(const Uuid&) const = default;
-};
+/**
+ * @brief Compatibility aliases for the Engine-owned runtime identity types.
+ *
+ * Tooling persists and validates these values, but does not define a second
+ * UUID or AssetKind ABI. Keeping one identity type prevents metadata, cooked
+ * packages and runtime lookups from drifting apart.
+ */
+using Uuid = asset::Uuid;
+using AssetId = asset::AssetId;
+using AssetKind = asset::AssetKind;
 
 /** @brief Identity of one source file and its import settings. */
 struct SourceId final {
@@ -33,25 +33,6 @@ struct SourceId final {
     [[nodiscard]] std::string to_string() const;
 
     auto operator<=>(const SourceId&) const = default;
-};
-
-/** @brief Identity of one independently addressable cooked product. */
-struct AssetId final {
-    Uuid value{};
-
-    [[nodiscard]] static foundation::ResultValue<AssetId> parse(std::string_view text);
-    [[nodiscard]] std::string to_string() const;
-
-    auto operator<=>(const AssetId&) const = default;
-};
-
-/** @brief Runtime asset data category emitted by a cooker. */
-enum class AssetKind : uint8_t {
-    kMesh,
-    kTexture,
-    kMaterial,
-    kScene,
-    kFont,
 };
 
 /** @brief One stable product identity generated from a source file. */

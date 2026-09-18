@@ -17,6 +17,8 @@ namespace aeg::application::project {
 enum class ProjectDirectory : uint8_t {
     kRoot,
     kAssets,
+    kSource,
+    kBuild,
     kCache,
     kSaved,
     kBinaries,
@@ -25,23 +27,41 @@ enum class ProjectDirectory : uint8_t {
 /** @brief Project-relative directory names persisted in the project file. */
 struct ProjectPathConfig final {
     std::filesystem::path assets{"Assets"};
+    std::filesystem::path source{"Source"};
+    std::filesystem::path build{"Build"};
     std::filesystem::path cache{"Cache"};
     std::filesystem::path saved{"Saved"};
     std::filesystem::path binaries{"Binaries"};
 };
 
+struct ProjectModuleConfig final {
+    std::string id{};
+    std::string target{"GameModule"};
+};
+
+struct ProjectEngineConfig final {
+    std::string association{"AEG"};
+    std::string sdk_requirement{"1.0"};
+};
+
 /** @brief Stable settings loaded from one .aegproject TOML file. */
 struct ProjectConfig final {
-    uint32_t format_version{1};
+    uint32_t format_version{2};
     std::string name{};
+    std::string project_uuid{};
     std::string target{"windows-x64-vulkan"};
+    ProjectEngineConfig engine{};
+    ProjectModuleConfig module{};
     std::filesystem::path startup_scene{"Assets/Scenes/Main.aegscene"};
+    std::vector<std::filesystem::path> startup_pipelines{};
     ProjectPathConfig paths{};
 };
 
 /** @brief Parsed project configuration together with its retained TOML document. */
 struct ProjectFile final {
     ProjectConfig config{};
+    std::shared_ptr<const void> retained_source{};
+    bool legacy{false};
 };
 
 /** @brief Resolves and validates the directories of one project session. */
@@ -57,6 +77,8 @@ public:
 private:
     std::filesystem::path root_{};
     std::filesystem::path assets_{};
+    std::filesystem::path source_{};
+    std::filesystem::path build_{};
     std::filesystem::path cache_{};
     std::filesystem::path saved_{};
     std::filesystem::path binaries_{};
@@ -74,7 +96,12 @@ class ProjectFileCodec final {
 public:
     [[nodiscard]] foundation::ResultValue<ProjectFile> load(const std::filesystem::path& file) const;
     [[nodiscard]] foundation::Result save(const std::filesystem::path& file, const ProjectConfig& config) const;
+    [[nodiscard]] foundation::Result save(const std::filesystem::path& file, const ProjectFile& project) const;
 };
+
+/** @brief Finds the canonical Project.aegproj or legacy project.aegproject under a root. */
+[[nodiscard]] foundation::ResultValue<std::filesystem::path> discover_project_file(
+    const std::filesystem::path& root_or_file);
 
 /** @brief A project-owned subsystem that participates in session startup and teardown. */
 class ProjectLifecycleParticipant {
@@ -98,6 +125,7 @@ public:
 
 private:
     ProjectContext context_{};
+    ProjectFile project_file_{};
     std::vector<std::shared_ptr<ProjectLifecycleParticipant>> participants_{};
     std::vector<std::shared_ptr<ProjectLifecycleParticipant>> active_participants_{};
     bool loaded_{false};

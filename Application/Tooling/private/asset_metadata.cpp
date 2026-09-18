@@ -22,24 +22,6 @@ namespace aeg::tooling {
 namespace {
 constexpr uint32_t kCurrentMetaVersion = 1;
 
-[[nodiscard]] int decode_hex_digit(char character) noexcept {
-    if (character >= '0' && character <= '9') {
-        return character - '0';
-    }
-    if (character >= 'a' && character <= 'f') {
-        return character - 'a' + 10;
-    }
-    if (character >= 'A' && character <= 'F') {
-        return character - 'A' + 10;
-    }
-    return -1;
-}
-
-[[nodiscard]] char encode_hex_digit(uint8_t value) noexcept {
-    constexpr std::string_view kDigits{"0123456789abcdef"};
-    return kDigits[value & 0x0fU];
-}
-
 [[nodiscard]] foundation::Result validate_meta(const AssetMeta& meta) {
     if (meta.version != kCurrentMetaVersion || meta.importer.empty()) {
         return foundation::invalid_argument("Asset meta version and importer must be valid");
@@ -111,6 +93,12 @@ constexpr uint32_t kCurrentMetaVersion = 1;
     if (name == "font") {
         return {foundation::Result::success(), AssetKind::kFont};
     }
+    if (name == "pipeline") {
+        return {foundation::Result::success(), AssetKind::kPipeline};
+    }
+    if (name == "shader") {
+        return {foundation::Result::success(), AssetKind::kShader};
+    }
     return {foundation::unsupported("Unsupported asset product kind"), {}};
 }
 
@@ -126,41 +114,14 @@ constexpr uint32_t kCurrentMetaVersion = 1;
             return "scene";
         case AssetKind::kFont:
             return "font";
+        case AssetKind::kPipeline:
+            return "pipeline";
+        case AssetKind::kShader:
+            return "shader";
     }
     return "unknown";
 }
 }  // namespace
-
-foundation::ResultValue<Uuid> Uuid::parse(std::string_view text) {
-    if (text.size() != 36 || text[8] != '-' || text[13] != '-' || text[18] != '-' || text[23] != '-') {
-        return {foundation::invalid_argument("UUID must use canonical 8-4-4-4-12 hexadecimal form"), {}};
-    }
-
-    Uuid uuid{};
-    for (std::size_t output = 0; output < uuid.bytes.size(); ++output) {
-        const std::size_t index = output * 2 + (output >= 4) + (output >= 6) + (output >= 8) + (output >= 10);
-        const int high = decode_hex_digit(text[index]);
-        const int low = decode_hex_digit(text[index + 1]);
-        if (high < 0 || low < 0) {
-            return {foundation::invalid_argument("UUID contains a non-hexadecimal digit"), {}};
-        }
-        uuid.bytes[output] = static_cast<uint8_t>((high << 4) | low);
-    }
-    return {foundation::Result::success(), uuid};
-}
-
-std::string Uuid::to_string() const {
-    std::string text;
-    text.reserve(36);
-    for (std::size_t index = 0; index < bytes.size(); ++index) {
-        if (index == 4 || index == 6 || index == 8 || index == 10) {
-            text.push_back('-');
-        }
-        text.push_back(encode_hex_digit(static_cast<uint8_t>(bytes[index] >> 4U)));
-        text.push_back(encode_hex_digit(bytes[index]));
-    }
-    return text;
-}
 
 foundation::ResultValue<SourceId> SourceId::parse(std::string_view text) {
     const auto uuid = Uuid::parse(text);
@@ -169,16 +130,6 @@ foundation::ResultValue<SourceId> SourceId::parse(std::string_view text) {
 }
 
 std::string SourceId::to_string() const {
-    return value.to_string();
-}
-
-foundation::ResultValue<AssetId> AssetId::parse(std::string_view text) {
-    const auto uuid = Uuid::parse(text);
-    return uuid ? foundation::ResultValue<AssetId>{foundation::Result::success(), AssetId{uuid.value}}
-                : foundation::ResultValue<AssetId>{uuid.result, {}};
-}
-
-std::string AssetId::to_string() const {
     return value.to_string();
 }
 

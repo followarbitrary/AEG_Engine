@@ -196,8 +196,8 @@ foundation::ResultValue<std::shared_ptr<platform::IWindow>> Win32WindowSystem::c
         const int x = desc.position_specified ? desc.position.x : CW_USEDEFAULT;
         const int y = desc.position_specified ? desc.position.y : CW_USEDEFAULT;
         HWND handle = CreateWindowExW(0, kWindowClassName, title_result.value.c_str(), window_style(desc), x, y,
-                                      static_cast<int>(native_width), static_cast<int>(native_height),
-                                      nullptr, nullptr, instance_, window.get());
+                                      static_cast<int>(native_width), static_cast<int>(native_height), nullptr, nullptr,
+                                      instance_, window.get());
         if (handle == nullptr) {
             return {backend_error("CreateWindowExW failed"), {}};
         }
@@ -697,6 +697,79 @@ foundation::ResultValue<std::string> select_directory(platform::WindowSurfaceBin
                : to_utf8(selected_path);
 } catch (const std::bad_alloc&) {
     return {foundation::Result::failure(foundation::ResultCode::kOutOfMemory), {}};
+} catch (const std::exception& exception) {
+    return {exception_result(exception), {}};
+} catch (...) {
+    return {foundation::Result::failure(foundation::ResultCode::kUnknown), {}};
+}
+
+foundation::ResultValue<std::optional<std::filesystem::path>> open_font_file_dialog(
+    platform::IWindowSystem& window_system, platform::WindowId owner_window) try {
+    if (!owner_window.is_valid()) {
+        return {foundation::invalid_argument("Font picker owner window is invalid"), {}};
+    }
+    const auto owner_result = window_system.find_window(owner_window);
+    if (!owner_result)
+        return {owner_result.result, {}};
+    const auto binding = owner_result.value->surface_binding();
+    if (!binding.is_valid()) {
+        return {foundation::invalid_state("Font picker owner window has no native binding"), {}};
+    }
+
+    const HRESULT initialize_result = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (FAILED(initialize_result)) {
+        return {
+            foundation::Result::failure(foundation::ResultCode::kBackendError, "Font picker COM initialization failed"),
+            {}};
+    }
+    const ComApartmentCloser apartment_closer{};
+    Microsoft::WRL::ComPtr<IFileOpenDialog> dialog;
+    HRESULT result = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_IFileOpenDialog,
+                                      reinterpret_cast<void**>(dialog.GetAddressOf()));
+    if (FAILED(result) || dialog == nullptr) {
+        return {foundation::Result::failure(foundation::ResultCode::kBackendError, "Font picker creation failed"), {}};
+    }
+    static constexpr COMDLG_FILTERSPEC filters[] = {
+        {L"Font files", L"*.ttf;*.otf"},
+        {L"TrueType fonts", L"*.ttf"},
+        {L"OpenType fonts", L"*.otf"},
+    };
+    result = dialog->SetFileTypes(static_cast<UINT>(std::size(filters)), filters);
+    if (SUCCEEDED(result))
+        result = dialog->SetDefaultExtension(L"ttf");
+    if (SUCCEEDED(result)) {
+        DWORD options = 0;
+        result = dialog->GetOptions(&options);
+        if (SUCCEEDED(result)) {
+            result = dialog->SetOptions(options | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST);
+        }
+    }
+    if (SUCCEEDED(result))
+        result = dialog->SetTitle(L"Import editor font");
+    if (SUCCEEDED(result))
+        result = dialog->Show(static_cast<HWND>(binding.window_handle));
+    if (result == HRESULT_FROM_WIN32(ERROR_CANCELLED)) {
+        return {foundation::Result::success(), std::nullopt};
+    }
+    if (FAILED(result)) {
+        return {foundation::Result::failure(foundation::ResultCode::kBackendError, "Font picker could not be shown"),
+                {}};
+    }
+    Microsoft::WRL::ComPtr<IShellItem> selected_item;
+    PWSTR selected_path = nullptr;
+    result = dialog->GetResult(selected_item.GetAddressOf());
+    if (SUCCEEDED(result) && selected_item != nullptr) {
+        result = selected_item->GetDisplayName(SIGDN_FILESYSPATH, &selected_path);
+    }
+    const std::unique_ptr<wchar_t, ComMemoryDeleter> selected_path_owner{selected_path};
+    if (FAILED(result) || selected_path == nullptr) {
+        return {foundation::Result::failure(foundation::ResultCode::kBackendError,
+                                            "Font picker did not return a filesystem path"),
+                {}};
+    }
+    return {foundation::Result::success(), std::filesystem::path(selected_path)};
+} catch (const std::bad_alloc&) {
+    return {foundation::out_of_memory("Font picker allocation failed"), {}};
 } catch (const std::exception& exception) {
     return {exception_result(exception), {}};
 } catch (...) {

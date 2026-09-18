@@ -3,7 +3,6 @@
  * @brief Implements the editor Preferences draft model and panel.
  */
 #include "editor_preferences.hpp"
-#include "editor_error.hpp"
 
 #include <imgui.h>
 
@@ -13,6 +12,7 @@
 #include <string>
 #include <utility>
 
+#include "editor_error.hpp"
 #include "editor_imgui.hpp"
 
 namespace aeg::editor {
@@ -25,16 +25,16 @@ constexpr float kMaximumEditorFontSizePixels = 48.0f;
 }
 
 [[nodiscard]] const EditorFontDescriptor* find_font(const EditorPreferenceState& state,
-                                                      std::string_view font_key) noexcept {
-    const auto iterator = std::find_if(state.fonts.begin(), state.fonts.end(), [font_key](const auto& font) {
-        return font.key == font_key;
-    });
+                                                    std::string_view font_key) noexcept {
+    const auto iterator = std::find_if(state.fonts.begin(), state.fonts.end(),
+                                       [font_key](const auto& font) { return font.key == font_key; });
     return iterator == state.fonts.end() ? nullptr : &*iterator;
 }
 
 }  // namespace
 
-EditorPreferenceModel::EditorPreferenceModel(EditorPreferenceState applied) : applied_(std::move(applied)), draft_(applied_) {
+EditorPreferenceModel::EditorPreferenceModel(EditorPreferenceState applied)
+    : applied_(std::move(applied)), draft_(applied_) {
     default_font_key_ = applied_.active_font_key;
     default_font_size_pixels_ = applied_.font_size_pixels;
     draft_.dirty = false;
@@ -116,9 +116,28 @@ void EditorPreferenceModel::clear_error() noexcept {
     draft_.error_message.clear();
 }
 
+foundation::Result EditorPreferenceModel::set_draft_fonts(std::span<const EditorFontDescriptor> fonts) {
+    try {
+        std::vector<EditorFontDescriptor> replacement(fonts.begin(), fonts.end());
+        if (!draft_.active_font_key.empty() &&
+            std::none_of(replacement.begin(), replacement.end(),
+                         [this](const auto& font) { return font.key == draft_.active_font_key; })) {
+            return foundation::not_found("Selected editor font is not present in the replacement catalog");
+        }
+        draft_.fonts = std::move(replacement);
+        refresh_dirty();
+        return foundation::Result::success();
+    } catch (const std::bad_alloc&) {
+        return foundation::out_of_memory("Editor preference font list allocation failed");
+    }
+}
+
 void EditorPreferenceModel::refresh_dirty() noexcept {
+    const bool fonts_changed = draft_.fonts.size() != applied_.fonts.size() ||
+                               !std::equal(draft_.fonts.begin(), draft_.fonts.end(), applied_.fonts.begin(),
+                                           [](const auto& left, const auto& right) { return left.key == right.key; });
     draft_.dirty = draft_.active_font_key != applied_.active_font_key ||
-                   draft_.font_size_pixels != applied_.font_size_pixels;
+                   draft_.font_size_pixels != applied_.font_size_pixels || fonts_changed;
 }
 
 EditorPreferencePanel::EditorPreferencePanel(EditorPreferenceModel& model, IEditorPreferenceActions& actions,
@@ -126,7 +145,8 @@ EditorPreferencePanel::EditorPreferencePanel(EditorPreferenceModel& model, IEdit
     : model_(&model), actions_(&actions), preview_host_(preview_host) {}
 
 void EditorPreferencePanel::build_ui() {
-    if (model_ == nullptr || actions_ == nullptr) return;
+    if (model_ == nullptr || actions_ == nullptr)
+        return;
 
     // Settings has its own ImGui context. Keep this theme scoped, including the
     // zero-padding root; unbordered children only honor padding with the flag below.
@@ -180,14 +200,14 @@ void EditorPreferencePanel::build_ui() {
     };
     const auto text = [&font](float size, const char* value, bool muted = false) {
         ImGui::PushFont(font(size), font(size)->LegacySize);
-        if (muted) ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        if (muted)
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
         ImGui::TextWrapped("%s", value);
-        if (muted) ImGui::PopStyleColor();
+        if (muted)
+            ImGui::PopStyleColor();
         ImGui::PopFont();
     };
-    const auto gap = [](float pixels) {
-        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + pixels);
-    };
+    const auto gap = [](float pixels) { ImGui::SetCursorPosY(ImGui::GetCursorPosY() + pixels); };
     const auto preview_draft = [this]() {
         if (!guard_editor_operation([&] { return actions_->preview(model_->state()); }))
             static_cast<void>(model_->set_error("The font preview could not be updated. Please try again."));
@@ -206,8 +226,9 @@ void EditorPreferencePanel::build_ui() {
     ImGui::SetNextWindowPos(viewport->WorkPos);
     ImGui::SetNextWindowSize(viewport->WorkSize);
     constexpr ImGuiWindowFlags fixed_window = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse |
-        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings |
-        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
+                                              ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
+                                              ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollbar |
+                                              ImGuiWindowFlags_NoScrollWithMouse;
     constexpr ImGuiChildFlags padded = ImGuiChildFlags_AlwaysUseWindowPadding;
     ImGui::PushFont(font(20), font(20)->LegacySize);
     if (ImGui::Begin("Preferences", nullptr, fixed_window)) {
@@ -215,8 +236,7 @@ void EditorPreferencePanel::build_ui() {
         const bool compact_footer = viewport->WorkSize.x < 560 * unit;
         const float footer_height = compact_footer ? control_height * 2 + 40 : control_height + 24;
         const float content_height = std::max(100.0f, ImGui::GetContentRegionAvail().y - footer_height);
-        const float navigation_width = std::min(viewport->WorkSize.x * 0.24f,
-                                                176 * std::min(unit, 1.35f));
+        const float navigation_width = std::min(viewport->WorkSize.x * 0.24f, 176 * std::min(unit, 1.35f));
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 0));
         if (ImGui::BeginChild("PreferenceContent", ImVec2(0, content_height), 0, ImGuiWindowFlags_NoScrollbar)) {
             ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(11 / 255.0f, 20 / 255.0f, 27 / 255.0f, 1));
@@ -236,7 +256,8 @@ void EditorPreferencePanel::build_ui() {
                     if (icons != nullptr)
                         draw->AddText(const_cast<ImFont*>(static_cast<const ImFont*>(icons)), 20,
                                       ImVec2(p.x + 8, p.y + (size.y - 20) / 2), IM_COL32(184, 214, 230, 255), icon);
-                    draw->AddText(font(20), font(20)->LegacySize, ImVec2(p.x + 36, p.y + (size.y - font(20)->LegacySize) / 2),
+                    draw->AddText(font(20), font(20)->LegacySize,
+                                  ImVec2(p.x + 36, p.y + (size.y - font(20)->LegacySize) / 2),
                                   ImGui::GetColorU32(ImGuiCol_Text), label);
                     ImGui::PopID();
                 };
@@ -245,8 +266,8 @@ void EditorPreferencePanel::build_ui() {
                 category("Input", "\xEE\x9D\xA5", Page::kInput);
                 const auto p = ImGui::GetWindowPos();
                 ImGui::GetWindowDrawList()->AddLine(ImVec2(p.x + navigation_width - 1, p.y),
-                    ImVec2(p.x + navigation_width - 1, p.y + ImGui::GetWindowHeight()),
-                    ImGui::GetColorU32(ImGuiCol_Border));
+                                                    ImVec2(p.x + navigation_width - 1, p.y + ImGui::GetWindowHeight()),
+                                                    ImGui::GetColorU32(ImGuiCol_Border));
             }
             ImGui::EndChild();
             ImGui::PopStyleVar();
@@ -264,18 +285,22 @@ void EditorPreferencePanel::build_ui() {
                 const float body_height = ImGui::GetContentRegionAvail().y;
                 const ImVec2 origin = ImGui::GetCursorPos();
                 const float stacked_settings_height = 320 * unit;
-                if (ImGui::BeginChild("FontSettings", ImVec2(settings_width, stacked ? stacked_settings_height : body_height), 0)) {
+                if (ImGui::BeginChild("FontSettings",
+                                      ImVec2(settings_width, stacked ? stacked_settings_height : body_height), 0)) {
                     gap(8);
                     text(32, page_ == Page::kFonts ? "Fonts" : page_ == Page::kGeneral ? "General" : "Input");
-                    text(16, page_ == Page::kFonts ? "Editor UI typography. Game runtime fonts are independent."
-                        : page_ == Page::kGeneral ? "Editor-wide behaviour and application defaults."
-                                                : "Keyboard, mouse, and viewport interaction settings.", true);
+                    text(16,
+                         page_ == Page::kFonts     ? "Editor UI typography. Game runtime fonts are independent."
+                         : page_ == Page::kGeneral ? "Editor-wide behaviour and application defaults."
+                                                   : "Keyboard, mouse, and viewport interaction settings.",
+                         true);
                     gap(2);
                     ImGui::Separator();
                     gap(12);
                     if (page_ == Page::kFonts) {
                         const auto* selected_font = find_font(state, state.active_font_key);
-                        const char* name = selected_font != nullptr ? selected_font->display_name.c_str() : "Unavailable";
+                        const char* name =
+                            selected_font != nullptr ? selected_font->display_name.c_str() : "Unavailable";
                         const float label_width = std::min(100 * unit, settings_width * 0.32f);
                         if (ImGui::BeginTable("FontControls", 2, ImGuiTableFlags_SizingFixedFit)) {
                             ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthFixed, label_width);
@@ -291,9 +316,11 @@ void EditorPreferencePanel::build_ui() {
                                     ImGui::PushID(entry.key.c_str());
                                     const bool selected = entry.key == state.active_font_key;
                                     if (ImGui::Selectable(entry.display_name.c_str(), selected)) {
-                                        if (model_->select_font(entry.key)) preview_draft();
+                                        if (model_->select_font(entry.key))
+                                            preview_draft();
                                     }
-                                    if (selected) ImGui::SetItemDefaultFocus();
+                                    if (selected)
+                                        ImGui::SetItemDefaultFocus();
                                     ImGui::PopID();
                                 }
                                 ImGui::EndCombo();
@@ -305,14 +332,15 @@ void EditorPreferencePanel::build_ui() {
                             ImGui::TableSetColumnIndex(1);
                             ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 0));
                             const float step_width = control_height;
-                            const float value_width = std::clamp(ImGui::GetContentRegionAvail().x - 2 * step_width - 36 * unit, 48 * unit, 72 * unit);
+                            const float value_width = std::clamp(
+                                ImGui::GetContentRegionAvail().x - 2 * step_width - 36 * unit, 48 * unit, 72 * unit);
                             if (ImGui::Button("-", ImVec2(step_width, control_height)))
                                 update_font_size(std::max(kMinimumEditorFontSizePixels, state.font_size_pixels - 1));
                             ImGui::SameLine();
                             ImGui::SetNextItemWidth(value_width);
                             float size = state.font_size_pixels;
                             if (ImGui::DragFloat("##FontSize", &size, 0.1f, kMinimumEditorFontSizePixels,
-                                                kMaximumEditorFontSizePixels, "%.1f", ImGuiSliderFlags_AlwaysClamp))
+                                                 kMaximumEditorFontSizePixels, "%.1f", ImGuiSliderFlags_AlwaysClamp))
                                 update_font_size(size);
                             ImGui::SameLine();
                             if (ImGui::Button("+", ImVec2(step_width, control_height)))
@@ -341,20 +369,55 @@ void EditorPreferencePanel::build_ui() {
                             ImGui::EndTable();
                         }
                         gap(8);
+                        if (ImGui::Button("Add Font", ImVec2(104 * unit, control_height))) {
+                            if (!guard_editor_operation([&] { return actions_->request_import_font(); }))
+                                static_cast<void>(model_->set_error("The font file could not be imported."));
+                        }
+                        const bool removable = selected_font != nullptr && selected_font->is_user_font &&
+                                               !selected_font->is_protected &&
+                                               selected_font->key != state.active_font_key;
+                        ImGui::SameLine();
+                        ImGui::BeginDisabled(!removable);
+                        if (ImGui::Button("Remove Font", ImVec2(116 * unit, control_height))) {
+                            ImGui::OpenPopup("Confirm Font Removal");
+                        }
+                        ImGui::EndDisabled();
+                        if (ImGui::BeginPopupModal("Confirm Font Removal", nullptr,
+                                                   ImGuiWindowFlags_AlwaysAutoResize)) {
+                            ImGui::TextWrapped("Remove the selected user font from the editor?");
+                            if (ImGui::Button("Remove", ImVec2(92 * unit, control_height))) {
+                                if (!guard_editor_operation(
+                                        [&] { return actions_->request_remove_font(selected_font->key); }))
+                                    static_cast<void>(model_->set_error("The font could not be removed."));
+                                ImGui::CloseCurrentPopup();
+                            }
+                            ImGui::SameLine();
+                            if (ImGui::Button("Keep", ImVec2(92 * unit, control_height)))
+                                ImGui::CloseCurrentPopup();
+                            ImGui::EndPopup();
+                        }
+                        gap(8);
                         ImGui::Separator();
                         gap(4);
-                        const bool expanded = ImGui::TreeNodeEx("Advanced Typography Settings", ImGuiTreeNodeFlags_SpanAvailWidth);
+                        const bool expanded =
+                            ImGui::TreeNodeEx("Advanced Typography Settings", ImGuiTreeNodeFlags_SpanAvailWidth);
                         ImGui::Indent(expanded ? 20 : 32);
                         text(16, "Fine-tune editor text rendering and layout behaviour.", true);
                         if (expanded) {
                             gap(8);
-                            text(16, "Size is measured in pixels (10-48). Preview changes are isolated until Apply or Save.", true);
+                            text(
+                                16,
+                                "Size is measured in pixels (10-48). Preview changes are isolated until Apply or Save.",
+                                true);
                         }
                         ImGui::Unindent(expanded ? 20 : 32);
-                        if (expanded) ImGui::TreePop();
+                        if (expanded)
+                            ImGui::TreePop();
                     } else {
-                        text(20, page_ == Page::kGeneral ? "No additional general preferences are available yet."
-                                                       : "No editable input bindings are available yet.", true);
+                        text(20,
+                             page_ == Page::kGeneral ? "No additional general preferences are available yet."
+                                                     : "No editable input bindings are available yet.",
+                             true);
                     }
                     if (!state.error_message.empty()) {
                         gap(16);
@@ -365,17 +428,21 @@ void EditorPreferencePanel::build_ui() {
                 }
                 ImGui::EndChild();
                 if (page_ == Page::kFonts) {
-                    if (stacked) ImGui::SetCursorPos(ImVec2(origin.x, origin.y + stacked_settings_height + 16));
-                    else ImGui::SetCursorPos(ImVec2(origin.x + settings_width + 24, origin.y));
+                    if (stacked)
+                        ImGui::SetCursorPos(ImVec2(origin.x, origin.y + stacked_settings_height + 16));
+                    else
+                        ImGui::SetCursorPos(ImVec2(origin.x + settings_width + 24, origin.y));
                     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(20, 20));
-                    if (ImGui::BeginChild("FontPreviewSurface", ImVec2(stacked ? available_width : 0, stacked ? 520 : body_height),
+                    if (ImGui::BeginChild("FontPreviewSurface",
+                                          ImVec2(stacked ? available_width : 0, stacked ? 520 : body_height),
                                           ImGuiChildFlags_Borders | padded)) {
                         const char* caption = "Actual size / 100%";
                         const float heading_y = ImGui::GetCursorPosY();
                         text(24, "Preview");
                         const float caption_width = font(16)->CalcTextSizeA(font(16)->LegacySize, 10000, 0, caption).x;
                         if (ImGui::GetContentRegionAvail().x > caption_width + 120) {
-                            ImGui::SetCursorPos(ImVec2(ImGui::GetWindowContentRegionMax().x - caption_width, heading_y + 6));
+                            ImGui::SetCursorPos(
+                                ImVec2(ImGui::GetWindowContentRegionMax().x - caption_width, heading_y + 6));
                             ImGui::PushFont(font(16), font(16)->LegacySize);
                             ImGui::TextDisabled("%s", caption);
                             ImGui::PopFont();
@@ -385,18 +452,23 @@ void EditorPreferencePanel::build_ui() {
                         gap(12);
                         text(16, "Editor UI Text", true);
                         const void* face = preview_host_ != nullptr ? preview_host_->preview_font() : nullptr;
-                        ImFont* preview = face != nullptr ? const_cast<ImFont*>(static_cast<const ImFont*>(face)) : font(20);
+                        ImFont* preview =
+                            face != nullptr ? const_cast<ImFont*>(static_cast<const ImFont*>(face)) : font(20);
                         const float sample_size = preview->LegacySize;
                         const auto sample = [preview, sample_size](const char* value, bool muted = false) {
                             ImGui::PushFont(preview, sample_size);
-                            if (muted) ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+                            if (muted)
+                                ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
                             ImGui::TextWrapped("%s", value);
-                            if (muted) ImGui::PopStyleColor();
+                            if (muted)
+                                ImGui::PopStyleColor();
                             ImGui::PopFont();
                         };
                         gap(2);
                         const float paragraph_top = ImGui::GetCursorPosY();
-                        sample("Clarity and rhythm matter when reading scene data, component values, and code inside the editor.");
+                        sample(
+                            "Clarity and rhythm matter when reading scene data, component values, and code inside the "
+                            "editor.");
                         ImGui::SetCursorPosY(std::max(ImGui::GetCursorPosY() + 12, paragraph_top + 56));
                         ImGui::Separator();
                         gap(12);
@@ -415,15 +487,19 @@ void EditorPreferencePanel::build_ui() {
                         // Include three lines, row gaps, padding and a possible
                         // horizontal scrollbar. A large font must not add a
                         // redundant vertical scrollbar inside this code block.
-                        const float first_line_width = preview->CalcTextSizeA(sample_size, 10000, 0,
-                            "for (const auto& entity : world.entities()) {").x;
+                        const float first_line_width =
+                            preview
+                                ->CalcTextSizeA(sample_size, 10000, 0, "for (const auto& entity : world.entities()) {")
+                                .x;
                         const bool needs_horizontal_scroll = first_line_width + 90 > ImGui::GetContentRegionAvail().x;
-                        const float code_height = std::max(104.0f, sample_size * 3 + 48 +
-                            (needs_horizontal_scroll ? ImGui::GetStyle().ScrollbarSize + 6 : 0));
-                        if (ImGui::BeginChild("FontPreviewCode", ImVec2(0, code_height), ImGuiChildFlags_Borders | padded,
-                                              ImGuiWindowFlags_HorizontalScrollbar)) {
+                        const float code_height =
+                            std::max(104.0f, sample_size * 3 + 48 +
+                                                 (needs_horizontal_scroll ? ImGui::GetStyle().ScrollbarSize + 6 : 0));
+                        if (ImGui::BeginChild("FontPreviewCode", ImVec2(0, code_height),
+                                              ImGuiChildFlags_Borders | padded, ImGuiWindowFlags_HorizontalScrollbar)) {
                             ImGui::PushFont(preview, sample_size);
-                            const auto code_line = [](const char* number, const char* prefix, const char* keyword, const char* suffix) {
+                            const auto code_line = [](const char* number, const char* prefix, const char* keyword,
+                                                      const char* suffix) {
                                 ImGui::TextDisabled("%s", number);
                                 ImGui::SameLine(66);
                                 ImGui::TextUnformatted(prefix);
@@ -438,7 +514,8 @@ void EditorPreferencePanel::build_ui() {
                             ImGui::PopFont();
                             const ImVec2 p = ImGui::GetWindowPos();
                             ImGui::GetWindowDrawList()->AddLine(ImVec2(p.x + 50, p.y + 14),
-                                ImVec2(p.x + 50, p.y + code_height - 14), ImGui::GetColorU32(ImGuiCol_Border));
+                                                                ImVec2(p.x + 50, p.y + code_height - 14),
+                                                                ImGui::GetColorU32(ImGuiCol_Border));
                         }
                         ImGui::EndChild();
                         ImGui::PopStyleVar(2);
@@ -456,15 +533,19 @@ void EditorPreferencePanel::build_ui() {
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(12, 0));
         if (ImGui::BeginChild("PreferenceActionBar", ImVec2(0, footer_height), padded, ImGuiWindowFlags_NoScrollbar)) {
             const ImVec2 p = ImGui::GetWindowPos();
-            ImGui::GetWindowDrawList()->AddLine(p, ImVec2(p.x + ImGui::GetWindowWidth(), p.y), ImGui::GetColorU32(ImGuiCol_Border));
+            ImGui::GetWindowDrawList()->AddLine(p, ImVec2(p.x + ImGui::GetWindowWidth(), p.y),
+                                                ImGui::GetColorU32(ImGuiCol_Border));
             ImGui::PushFont(font(16), font(16)->LegacySize);
             if (ImGui::Button("Reset to Defaults", ImVec2(128 * unit, control_height))) {
-                if (model_->reset_defaults()) preview_draft();
+                if (model_->reset_defaults())
+                    preview_draft();
             }
             const float button_width = 72 * unit;
             const float actions_x = ImGui::GetWindowContentRegionMax().x - (button_width * 3 + 24);
-            if (compact_footer) ImGui::SetCursorPos(ImVec2(actions_x, control_height + 24));
-            else ImGui::SameLine(actions_x);
+            if (compact_footer)
+                ImGui::SetCursorPos(ImVec2(actions_x, control_height + 24));
+            else
+                ImGui::SameLine(actions_x);
             if (ImGui::Button("Cancel", ImVec2(button_width, control_height))) {
                 if (!guard_editor_operation([&] { return actions_->cancel(model_->applied_state()); }))
                     static_cast<void>(model_->set_error("The preferences could not be cancelled. Please try again."));

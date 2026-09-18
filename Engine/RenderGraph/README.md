@@ -18,3 +18,9 @@
 
 RenderGraph 只管理 Render Domain 的图，不承担通用业务 Pipeline 的阶段调度。它
 通过 RHI 的后端无关接口提交工作，不能在公共接口中暴露 Vulkan 或 D3D12 类型。
+# Custom RenderPass contract
+
+游戏模块中的 RenderPass 继承 `aeg::pipeline::RenderPass`，由 `RenderPassRegistry` 按稳定
+`RenderPassTypeId` 创建。Pass 的 setup/execute 回调只能使用 `RenderPassBuilder`、
+`RenderPassExecutionContext` 和当前 `RenderPassConfiguration`；资源状态、依赖和同步由
+RenderGraph 统一管理。Pass 不得保存 Device、原生命令缓冲或跨帧 Graph Handle。

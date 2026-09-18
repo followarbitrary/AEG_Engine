@@ -1,0 +1,6 @@
+// Canonical AEGP payload contract. The checked runtime codec keeps the same
+// fixed-width fields and tags while avoiding a per-game union arm.
+namespace aeg.asset.fb;
+table PipelineAsset { schema_version:uint; payload:[ubyte] (required); }
+root_type PipelineAsset;
+file_identifier "AEGP";

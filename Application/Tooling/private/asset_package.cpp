@@ -41,14 +41,6 @@ struct EncodedIndexEntry final {
     uint64_t byte_count{};
 };
 
-[[nodiscard]] bool is_known_kind(uint32_t value) noexcept {
-    return value <= static_cast<uint32_t>(AssetKind::kFont);
-}
-
-[[nodiscard]] bool is_valid_range(uint64_t offset, uint64_t size, uint64_t total) noexcept {
-    return offset <= total && size <= total - offset;
-}
-
 [[nodiscard]] uint64_t align_up(uint64_t value, uint32_t alignment) noexcept {
     const uint64_t mask = static_cast<uint64_t>(alignment - 1U);
     return (value + mask) & ~mask;
@@ -59,19 +51,6 @@ void write_le(std::vector<std::byte>& output, std::size_t offset, Value value) {
     for (std::size_t index = 0; index < sizeof(Value); ++index) {
         output[offset + index] = std::byte((static_cast<uint64_t>(value) >> (index * 8U)) & 0xffU);
     }
-}
-
-template <typename Value>
-[[nodiscard]] bool read_le(std::span<const std::byte> input, std::size_t offset, Value& output) noexcept {
-    if (offset > input.size() || sizeof(Value) > input.size() - offset) {
-        return false;
-    }
-    uint64_t value = 0;
-    for (std::size_t index = 0; index < sizeof(Value); ++index) {
-        value |= static_cast<uint64_t>(std::to_integer<uint8_t>(input[offset + index])) << (index * 8U);
-    }
-    output = static_cast<Value>(value);
-    return true;
 }
 
 [[nodiscard]] foundation::Result write_file(const std::filesystem::path& file, std::span<const std::byte> bytes) {
@@ -104,22 +83,6 @@ template <typename Value>
     return foundation::Result::success();
 }
 
-[[nodiscard]] foundation::ResultValue<std::vector<std::byte>> read_file(const std::filesystem::path& file) {
-    std::ifstream stream(file, std::ios::binary | std::ios::ate);
-    if (!stream) {
-        return {foundation::not_found("Asset package file is missing"), {}};
-    }
-    const std::streamsize size = stream.tellg();
-    if (size < 0) {
-        return {foundation::Result::failure(foundation::ResultCode::kUnknown, "Cannot inspect asset package size"), {}};
-    }
-    std::vector<std::byte> bytes(static_cast<std::size_t>(size));
-    stream.seekg(0);
-    stream.read(reinterpret_cast<char*>(bytes.data()), size);
-    return stream ? foundation::ResultValue<std::vector<std::byte>>{foundation::Result::success(), std::move(bytes)}
-                  : foundation::ResultValue<std::vector<std::byte>>{
-                        foundation::Result::failure(foundation::ResultCode::kUnknown, "Cannot read asset package"), {}};
-}
 }  // namespace
 
 foundation::Result AssetPackageWriter::write(const std::filesystem::path& file,
@@ -181,75 +144,4 @@ foundation::Result AssetPackageWriter::write(const std::filesystem::path& file,
     return write_file(file, bytes);
 }
 
-foundation::ResultValue<AssetPackageReader> AssetPackageReader::open(const std::filesystem::path& file) {
-    const auto bytes = read_file(file);
-    if (!bytes) {
-        return {bytes.result, {}};
-    }
-    if (bytes.value.size() < kHeaderBytes ||
-        !std::equal(kPackageMagic.begin(), kPackageMagic.end(), bytes.value.begin())) {
-        return {foundation::invalid_argument("Asset package header is invalid"), {}};
-    }
-
-    const std::span<const std::byte> input(bytes.value);
-    uint32_t version = 0;
-    uint32_t header_bytes = 0;
-    uint64_t file_bytes = 0;
-    uint64_t index_offset = 0;
-    uint64_t index_bytes = 0;
-    uint64_t entry_count = 0;
-    uint32_t entry_bytes = 0;
-    if (!read_le(input, 8, version) || !read_le(input, 12, header_bytes) || !read_le(input, 16, file_bytes) ||
-        !read_le(input, 24, index_offset) || !read_le(input, 32, index_bytes) || !read_le(input, 40, entry_count) ||
-        !read_le(input, 48, entry_bytes) || version != kPackageVersion || header_bytes != kHeaderBytes ||
-        entry_bytes != kIndexEntryBytes || file_bytes != input.size() || entry_count > kMaxEntryCount ||
-        index_bytes != entry_count * kIndexEntryBytes || !is_valid_range(index_offset, index_bytes, file_bytes)) {
-        return {foundation::invalid_argument("Asset package index metadata is invalid"), {}};
-    }
-
-    AssetPackageReader reader{};
-    reader.bytes_ = bytes.value;
-    reader.index_.reserve(static_cast<std::size_t>(entry_count));
-    for (uint64_t index_number = 0; index_number < entry_count; ++index_number) {
-        const std::size_t offset = static_cast<std::size_t>(index_offset + index_number * kIndexEntryBytes);
-        IndexEntry entry{};
-        for (std::size_t byte_index = 0; byte_index < entry.id.value.bytes.size(); ++byte_index) {
-            entry.id.value.bytes[byte_index] = std::to_integer<uint8_t>(input[offset + byte_index]);
-        }
-        uint32_t kind = 0;
-        uint32_t alignment = 0;
-        if (!read_le(input, offset + 16, kind) || !read_le(input, offset + 20, entry.schema_version) ||
-            !read_le(input, offset + 24, entry.offset) || !read_le(input, offset + 32, entry.byte_count) ||
-            !read_le(input, offset + 40, alignment) || !is_known_kind(kind) || alignment != kPayloadAlignment ||
-            entry.offset % kPayloadAlignment != 0 || !is_valid_range(entry.offset, entry.byte_count, index_offset)) {
-            return {foundation::invalid_argument("Asset package entry is invalid"), {}};
-        }
-        entry.kind = static_cast<AssetKind>(kind);
-        reader.index_.push_back(entry);
-    }
-    if (!std::is_sorted(reader.index_.begin(), reader.index_.end(),
-                        [](const IndexEntry& left, const IndexEntry& right) { return left.id < right.id; }) ||
-        std::adjacent_find(reader.index_.begin(), reader.index_.end(),
-                           [](const IndexEntry& left, const IndexEntry& right) { return left.id == right.id; }) !=
-            reader.index_.end()) {
-        return {foundation::invalid_argument("Asset package index IDs are not unique and sorted"), {}};
-    }
-    return {foundation::Result::success(), std::move(reader)};
-}
-
-std::size_t AssetPackageReader::entry_count() const noexcept {
-    return index_.size();
-}
-
-foundation::ResultValue<PackagedAsset> AssetPackageReader::read(AssetId id) const {
-    const auto found = std::lower_bound(index_.begin(), index_.end(), id,
-                                        [](const IndexEntry& entry, AssetId needle) { return entry.id < needle; });
-    if (found == index_.end() || found->id != id) {
-        return {foundation::not_found("Asset UUID is not present in package"), {}};
-    }
-    const std::size_t offset = static_cast<std::size_t>(found->offset);
-    const std::size_t size = static_cast<std::size_t>(found->byte_count);
-    return {foundation::Result::success(),
-            {found->kind, found->schema_version, {bytes_.begin() + offset, bytes_.begin() + offset + size}}};
-}
 }  // namespace aeg::tooling

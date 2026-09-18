@@ -353,4 +353,23 @@ Vec4& operator/=(Vec4& value, float scalar) noexcept;
 [[nodiscard]] bool nearly_equal(Vec4 lhs, Vec4 rhs, float tolerance = kEpsilon) noexcept;
 [[nodiscard]] bool nearly_equal(Quat lhs, Quat rhs, float tolerance = kEpsilon) noexcept;
 [[nodiscard]] bool nearly_equal(const Mat4& lhs, const Mat4& rhs, float tolerance = kEpsilon) noexcept;
+
+/** @brief Returns whether every semantic component is finite. */
+[[nodiscard]] bool is_finite(float value) noexcept;
+[[nodiscard]] bool is_finite(Vec2 value) noexcept;
+[[nodiscard]] bool is_finite(Vec3 value) noexcept;
+[[nodiscard]] bool is_finite(Vec4 value) noexcept;
+[[nodiscard]] bool is_finite(Quat value) noexcept;
+[[nodiscard]] bool is_finite(const Mat4& value) noexcept;
+
+/**
+ * @brief Decomposes a finite affine matrix into translation, rotation and scale.
+ *
+ * Returns false for singular,
+ * non-orthogonal or non-finite matrices. Reflection
+ * is represented by a negative X scale so the resulting rotation
+ * remains
+ * right-handed.
+ */
+[[nodiscard]] bool try_decompose_affine_transform(const Mat4& matrix, Transform& result) noexcept;
 }  // namespace aeg::math

@@ -167,6 +167,8 @@ int main() {
 
     if (!require(modules.register_module([] { return std::make_unique<DependentModule>(); }),
                  "dependent module registration failed") ||
+        !require(modules.list_modules().size() == 2U && modules.list_modules()[0].id < modules.list_modules()[1].id,
+                 "module metadata snapshot is not stably ordered") ||
         !require(!modules.unregister_module(kBaseModule), "dependent module did not block base unload") ||
         !require(modules.unregister_module(kDependentModule), "dependent module unload failed") ||
         !require(modules.unregister_module(kBaseModule), "base module unload failed") ||

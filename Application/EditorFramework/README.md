@@ -33,6 +33,13 @@ EditorFramework 不直接调用 Win32 或其他操作系统 API。
 Sampled View 和 Sampler，再将这些句柄注册到 `ImGuiTextureRegistry`，最后调用
 `set_font_texture()`。字体图集上传和生命周期仍由上层 Resource/RHI 负责。
 
+编辑器字体解析使用仓库内的 FreeType 和 Dear ImGui FreeType adapter。`EditorFontInspector`
+只向 Framework 暴露 family/style、字符集摘要和稳定元数据；TTF 与 CFF OTF 都在 CPU
+侧构建 atlas，中文缺字由目录中的 fallback 字体补齐。用户字体目录、导入事务、偏好文件
+以及 Win32 文件选择器属于 `Application/Editor` 与 `Application/Platform`；Framework
+只接收复制后的后端无关 `EditorFontCatalog`。Preference 的 Preview 不改变应用的 applied
+状态，Apply/Cancel 的提交和回滚由 Application Controller 完成。
+
 `ImGuiRenderer` 将宿主捕获的 `ImGuiDrawPacket` 上传到 RHI 资源，并由
 `ImGuiRenderFeature` 在 `RenderPipeline.BeforePresent` 阶段声明 RenderGraph 资源和
 Graphics Pass。实际命令只能通过 RenderGraph 的 `RenderPassExecutionContext` 录制；

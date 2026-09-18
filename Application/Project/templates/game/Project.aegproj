@@ -1,0 +1,26 @@
+format_version = 2
+
+[project]
+name = "MyGameProject"
+uuid = "00000000-0000-0000-0000-000000000001"
+
+[engine]
+association = "AEG"
+sdk_requirement = "1.0"
+
+[module]
+id = "GameModule"
+target = "GameModule"
+
+[build]
+target = "windows-x64-vulkan"
+startup_scene = "Assets/Scenes/Main.aegscene"
+startup_pipelines = ["Assets/Pipelines/Default.aegpipe"]
+
+[paths]
+assets = "Assets"
+source = "Source"
+build = "Build"
+cache = "Cache"
+saved = "Saved"
+binaries = "Binaries"

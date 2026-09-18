@@ -71,7 +71,7 @@ struct MaterialHeader final {
     return value;
 }
 
-[[nodiscard]] uint64_t hash_file(const std::filesystem::path& path, uint64_t seed) noexcept {
+[[nodiscard]] uint64_t hash_file(const std::filesystem::path& path, uint64_t seed) {
     std::ifstream stream(path, std::ios::binary);
     if (!stream) {
         return 0;
@@ -619,7 +619,9 @@ foundation::Result EditorAssetPipeline::synchronize(std::span<const EditorAssetR
     records_.assign(records.begin(), records.end());
     for (const EditorAssetRecord& record : records_) {
         if (record.status == EditorAssetStatus::kImported && record.kind != EditorAssetKind::kUnknown) {
-            work_.push_back({record, false});
+            const uint64_t revision = next_revision_++;
+            latest_revisions_[record.id] = revision;
+            work_.push_back({record, false, revision});
         }
     }
     condition_.notify_one();
@@ -636,7 +638,9 @@ foundation::Result EditorAssetPipeline::queue_record(const EditorAssetRecord& re
         })) {
         return Result::success();
     }
-    work_.push_back({record, force});
+    const uint64_t revision = next_revision_++;
+    latest_revisions_[record.id] = revision;
+    work_.push_back({record, force, revision});
     condition_.notify_one();
     return Result::success();
 }
@@ -648,22 +652,30 @@ foundation::Result EditorAssetPipeline::request_reimport(uint64_t asset_id) {
     if (found == records_.end()) {
         return foundation::not_found("Asset ID is not present in the import pipeline");
     }
-    work_.push_back({*found, true});
+    const uint64_t revision = next_revision_++;
+    latest_revisions_[found->id] = revision;
+    work_.push_back({*found, true, revision});
     condition_.notify_one();
     return Result::success();
 }
 
 foundation::Result EditorAssetPipeline::load_fast_path(uint64_t asset_id, CpuAsset& output) const {
     try {
+        output = {};
         EditorAssetRecord record{};
         {
             std::scoped_lock lock(mutex_);
-            const auto found = std::find_if(records_.begin(), records_.end(),
-                                            [asset_id](const EditorAssetRecord& value) { return value.id == asset_id; });
+            const auto found =
+                std::find_if(records_.begin(), records_.end(),
+                             [asset_id](const EditorAssetRecord& value) { return value.id == asset_id; });
             if (found == records_.end()) {
                 return foundation::not_found("Asset ID is not present in the import pipeline");
             }
             record = *found;
+        }
+        if (record.status == EditorAssetStatus::kFailed || record.status == EditorAssetStatus::kMissing ||
+            record.status == EditorAssetStatus::kUnsupported) {
+            return foundation::not_found("Asset is not importable");
         }
         return decode_record(project_root_, derived_root_, record, output, true);
     } catch (const std::bad_alloc&) {
@@ -710,115 +722,122 @@ void EditorAssetPipeline::shutdown() noexcept {
     records_.clear();
     work_.clear();
     completed_.clear();
+    latest_revisions_.clear();
 }
 
 void EditorAssetPipeline::worker_loop() {
     while (!stopping_) {
-      try {
-        WorkItem item{};
-        {
-            std::unique_lock lock(mutex_);
-            condition_.wait(lock, [this] { return stopping_ || !work_.empty(); });
-            if (stopping_) {
-                return;
+        try {
+            WorkItem item{};
+            {
+                std::unique_lock lock(mutex_);
+                condition_.wait(lock, [this] { return stopping_ || !work_.empty(); });
+                if (stopping_) {
+                    return;
+                }
+                item = std::move(work_.front());
+                work_.erase(work_.begin());
             }
-            item = std::move(work_.front());
-            work_.erase(work_.begin());
-        }
-        CpuAsset asset{};
-        const Result result = decode_record(project_root_, derived_root_, item.record, asset, true);
-        if (!result) {
-            asset = {};
-            asset.asset_id = item.record.id;
-            asset.source_hash = item.record.content_hash;
-            asset.kind = item.record.kind;
-            asset.diagnostic = result.message;
-        } else if (!asset.from_baked_format) {
-            const auto source_hash_matches = [this, &item] {
-                const std::filesystem::path source = project_root_ / item.record.relative_path;
-                return hash_file(source, static_cast<uint8_t>(item.record.kind)) == item.record.content_hash;
-            };
-            // A queued job may outlive one or more editor-side source edits.
-            // Never publish bytes decoded from a newer file under an older
-            // Asset ID/hash pair.
-            if (!source_hash_matches()) {
-                continue;
-            }
-            const Result bake_result = write_baked(derived_root_, asset);
-            if (!bake_result) {
-                asset.diagnostic = "Import succeeded but AEG bake failed: " + bake_result.message;
-            } else {
+            CpuAsset asset{};
+            // Forced reimports must execute the source importer so stale baked data
+            // cannot mask importer failures (including injected allocation failures).
+            const Result result = decode_record(project_root_, derived_root_, item.record, asset, !item.force);
+            if (!result) {
+                asset = {};
+                asset.asset_id = item.record.id;
+                asset.source_hash = item.record.content_hash;
+                asset.kind = item.record.kind;
+                asset.diagnostic = result.message;
+            } else if (!asset.from_baked_format) {
+                const auto source_hash_matches = [this, &item] {
+                    const std::filesystem::path source = project_root_ / item.record.relative_path;
+                    return hash_file(source, static_cast<uint8_t>(item.record.kind)) == item.record.content_hash;
+                };
+                // A queued job may outlive one or more editor-side source edits.
+                // Never publish bytes decoded from a newer file under an older
+                // Asset ID/hash pair.
                 if (!source_hash_matches()) {
                     continue;
                 }
-                CpuAsset baked{};
-                const Result baked_read = read_baked(baked_path(derived_root_, item.record), item.record, baked);
-                if (baked_read) {
-                    asset = std::move(baked);
+                const Result bake_result = write_baked(derived_root_, asset);
+                if (!bake_result) {
+                    asset.diagnostic = "Import succeeded but AEG bake failed: " + bake_result.message;
                 } else {
-                    asset.diagnostic =
-                        "Import succeeded but baked AEG data could not be reloaded: " + baked_read.message;
+                    if (!source_hash_matches()) {
+                        continue;
+                    }
+                    CpuAsset baked{};
+                    const Result baked_read = read_baked(baked_path(derived_root_, item.record), item.record, baked);
+                    if (baked_read) {
+                        asset = std::move(baked);
+                    } else {
+                        asset.diagnostic =
+                            "Import succeeded but baked AEG data could not be reloaded: " + baked_read.message;
+                    }
                 }
             }
-        }
-        if (!asset.from_baked_format) {
-            const std::filesystem::path source = project_root_ / item.record.relative_path;
-            if (hash_file(source, static_cast<uint8_t>(item.record.kind)) != item.record.content_hash) {
-                continue;
+            if (!asset.from_baked_format) {
+                const std::filesystem::path source = project_root_ / item.record.relative_path;
+                if (hash_file(source, static_cast<uint8_t>(item.record.kind)) != item.record.content_hash) {
+                    continue;
+                }
             }
+            {
+                std::scoped_lock lock(mutex_);
+                const auto revision = latest_revisions_.find(item.record.id);
+                if (revision == latest_revisions_.end() || revision->second != item.revision) {
+                    continue;
+                }
+                completed_.push_back(std::move(asset));
+            }
+        } catch (...) {
+            background_failure_.store(true);
         }
-        {
-            std::scoped_lock lock(mutex_);
-            completed_.push_back(std::move(asset));
-        }
-      } catch (...) {
-        background_failure_.store(true);
-      }
     }
 }
 
 void EditorAssetPipeline::watcher_loop() {
     while (!stopping_) {
-      try {
-        std::this_thread::sleep_for(std::chrono::milliseconds(120));
-        if (stopping_) {
-            return;
-        }
-        std::vector<EditorAssetRecord> changed;
-        {
-            std::scoped_lock lock(mutex_);
-            for (EditorAssetRecord& record : records_) {
-                const std::filesystem::path path = project_root_ / record.relative_path;
-                std::error_code error;
-                if (!std::filesystem::is_regular_file(path, error) || error) {
-                    if (record.status != EditorAssetStatus::kMissing || record.content_hash != 0) {
-                        record.status = EditorAssetStatus::kMissing;
-                        record.error = "Asset file is missing from the project Assets directory.";
-                        record.modified_ticks = 0;
-                        record.content_hash = 0;
-                        changed.push_back(record);
-                    }
-                    continue;
-                }
-                const auto ticks = std::filesystem::last_write_time(path, error);
-                if (error) {
-                    continue;
-                }
-                const int64_t current_ticks = static_cast<int64_t>(ticks.time_since_epoch().count());
-                if (current_ticks == record.modified_ticks) {
-                    continue;
-                }
-                record.modified_ticks = current_ticks;
-                record.content_hash = hash_file(path, static_cast<uint8_t>(record.kind));
-                changed.push_back(record);
+        try {
+            std::this_thread::sleep_for(std::chrono::milliseconds(120));
+            if (stopping_) {
+                return;
             }
+            std::vector<EditorAssetRecord> changed;
+            {
+                std::scoped_lock lock(mutex_);
+                for (EditorAssetRecord& record : records_) {
+                    const std::filesystem::path path = project_root_ / record.relative_path;
+                    std::error_code error;
+                    if (!std::filesystem::is_regular_file(path, error) || error) {
+                        if (record.status != EditorAssetStatus::kMissing || record.content_hash != 0) {
+                            record.status = EditorAssetStatus::kMissing;
+                            record.error = "Asset file is missing from the project Assets directory.";
+                            record.modified_ticks = 0;
+                            record.content_hash = 0;
+                            changed.push_back(record);
+                        }
+                        continue;
+                    }
+                    const auto ticks = std::filesystem::last_write_time(path, error);
+                    if (error) {
+                        continue;
+                    }
+                    const int64_t current_ticks = static_cast<int64_t>(ticks.time_since_epoch().count());
+                    if (current_ticks == record.modified_ticks) {
+                        continue;
+                    }
+                    record.modified_ticks = current_ticks;
+                    record.content_hash = hash_file(path, static_cast<uint8_t>(record.kind));
+                    changed.push_back(record);
+                }
+            }
+            for (const EditorAssetRecord& record : changed) {
+                static_cast<void>(queue_record(record, true));
+            }
+        } catch (...) {
+            background_failure_.store(true);
         }
-        for (const EditorAssetRecord& record : changed) {
-            static_cast<void>(queue_record(record, true));
-        }
-      } catch (...) {
-        background_failure_.store(true);
-      }
     }
 }
 
@@ -826,7 +845,8 @@ foundation::Result EditorAssetPipeline::decode_record(const std::filesystem::pat
                                                       const std::filesystem::path& derived_root,
                                                       const EditorAssetRecord& record, CpuAsset& output,
                                                       bool allow_baked) {
-    if (record.status == EditorAssetStatus::kMissing || record.status == EditorAssetStatus::kUnsupported) {
+    if (record.status == EditorAssetStatus::kMissing || record.status == EditorAssetStatus::kUnsupported ||
+        record.status == EditorAssetStatus::kFailed) {
         return foundation::not_found("Asset is not importable");
     }
     if (allow_baked) {

@@ -1,0 +1,10 @@
+namespace aeg.asset.fb;
+
+table TexturePayload {
+  width:uint;
+  height:uint;
+  channels:ubyte;
+  pixels:[ubyte] (required);
+}
+
+root_type TexturePayload;

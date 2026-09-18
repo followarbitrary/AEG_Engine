@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <vector>
 
+#include "../../../Engine/Asset/public/asset_package_reader.hpp"
 #include "asset_metadata.hpp"
 
 namespace aeg::tooling {
@@ -20,12 +21,8 @@ struct AssetPackageEntry final {
     std::vector<std::byte> bytes{};
 };
 
-/** @brief A decoded package entry returned with owned payload bytes. */
-struct PackagedAsset final {
-    AssetKind kind{AssetKind::kMesh};
-    uint32_t schema_version{};
-    std::vector<std::byte> bytes{};
-};
+/** @brief Compatibility name for the Engine-owned runtime package reader result. */
+using PackagedAsset = asset::PackagedAsset;
 
 /** @brief Writes one deterministic, indexed `.aegbin` package. */
 class AssetPackageWriter final {
@@ -34,24 +31,6 @@ public:
                                            std::vector<AssetPackageEntry> entries) const;
 };
 
-/** @brief Validates and serves entries from one loaded `.aegbin` package. */
-class AssetPackageReader final {
-public:
-    [[nodiscard]] static foundation::ResultValue<AssetPackageReader> open(const std::filesystem::path& file);
-
-    [[nodiscard]] std::size_t entry_count() const noexcept;
-    [[nodiscard]] foundation::ResultValue<PackagedAsset> read(AssetId id) const;
-
-private:
-    struct IndexEntry final {
-        AssetId id{};
-        AssetKind kind{AssetKind::kMesh};
-        uint32_t schema_version{};
-        uint64_t offset{};
-        uint64_t byte_count{};
-    };
-
-    std::vector<std::byte> bytes_{};
-    std::vector<IndexEntry> index_{};
-};
+/** @brief Compatibility name for the Engine-owned runtime package reader. */
+using AssetPackageReader = asset::AssetPackageReader;
 }  // namespace aeg::tooling

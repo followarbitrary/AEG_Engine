@@ -38,10 +38,15 @@ public:
     [[nodiscard]] foundation::Result set_font_texture(ImGuiTextureHandle texture);
     /** @brief Copies the engine-owned RGBA8 font atlas for upload through Resource/RHI APIs. */
     [[nodiscard]] foundation::Result capture_font_atlas(ImGuiFontAtlasData& atlas) const;
+    /** @brief Replaces the application-provided font catalog at a safe frame boundary. */
+    [[nodiscard]] foundation::Result replace_font_catalog(const EditorFontCatalog& catalog,
+                                                          std::string_view fallback_active_font_key = {});
     /** @brief Rebuilds the CPU font atlas before the next frame; failures retain the current fonts and texture. */
     [[nodiscard]] foundation::Result set_font(std::string_view font_key, float size_pixels);
     /** @brief Changes only the preview font; failures retain the current atlas, preview and texture. */
     [[nodiscard]] foundation::Result set_preview_font(std::string_view font_key, float size_pixels);
+    /** @brief Clears the isolated Preferences preview font and restores the active atlas state. */
+    [[nodiscard]] foundation::Result clear_preview_font();
     /** @brief Returns the stable key of the currently selected font. */
     [[nodiscard]] std::string_view active_font_key() const noexcept;
     /** @brief Returns the base pixel size used by the currently selected font. */

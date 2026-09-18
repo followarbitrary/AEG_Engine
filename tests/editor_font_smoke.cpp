@@ -2,11 +2,12 @@
  * @file editor_font_smoke.cpp
  * @brief Verifies editor font selection using installed system fonts.
  */
+#include <imgui.h>
+
 #include <cassert>
 #include <cstddef>
 #include <filesystem>
 #include <fstream>
-#include <imgui.h>
 #include <limits>
 #include <string>
 #include <vector>
@@ -31,7 +32,8 @@ struct AtlasAllocationWatch {
 
     static void free(void* allocation, void* context) {
         auto& watch = *static_cast<AtlasAllocationWatch*>(context);
-        if (allocation == watch.texture_data) watch.texture_released = true;
+        if (allocation == watch.texture_data)
+            watch.texture_released = true;
         watch.release(allocation, watch.user_data);
     }
 };
@@ -143,7 +145,7 @@ int main() {
         // characters outside ImGui's simplified-common subset.
         assert(collection_host.set_preview_font("collection_primary", 16));
         auto* sample = const_cast<ImFont*>(static_cast<const ImFont*>(collection_host.preview_font()));
-        assert(sample->LegacySize == 16.0f); // Preview is actual size, never magnified.
+        assert(sample->LegacySize == 16.0f);  // Preview is actual size, never magnified.
         for (ImWchar codepoint : {ImWchar(0x5668), ImWchar(0x6670), ImWchar(0x8BFB)}) {
             assert(sample->GetFontBaked(sample->LegacySize)->FindGlyphNoFallback(codepoint) != nullptr);
         }
@@ -161,13 +163,8 @@ int main() {
         assert(collection_host.shutdown());
     }
 
-    const EditorFontDescriptor invalid_descriptor{"invalid_font_data",
-                                                  "Invalid Test Font",
-                                                  EditorFontKind::kInterface,
-                                                  false,
-                                                  false,
-                                                  false,
-                                                  false};
+    const EditorFontDescriptor invalid_descriptor{
+        "invalid_font_data", "Invalid Test Font", EditorFontKind::kInterface, false, false, false, false};
     std::vector<std::byte> invalid_font_data = read_font_file(records_result.value.front());
     assert(invalid_font_data.size() >= 12);
     const auto read_u16_be = [&invalid_font_data](std::size_t offset) {
@@ -192,6 +189,40 @@ int main() {
     assert(valid_asset != nullptr);
     const auto valid_font_data = valid_asset->font_data;
     const auto valid_face_index = valid_asset->face_index;
+    const auto inspected = aeg::editor::EditorFontInspector{}.inspect(valid_font_data, valid_face_index);
+    assert(inspected);
+    assert(!inspected.value.family_name.empty());
+    assert(!inspected.value.style_name.empty());
+    assert(!aeg::editor::EditorFontInspector{}.inspect(std::span<const std::byte>{}));
+    // The vendored Source Code Pro OTF exercises the CFF outline path through
+    // the same backend-neutral inspector and ImGui FreeType loader.
+    const auto otf_path = std::filesystem::path(AEG_ENGINE_SOURCE_ROOT) / "ThirdParty" / "Fonts" / "SourceCodePro" /
+                          "SourceCodePro-Regular.otf";
+    std::ifstream otf_stream(otf_path, std::ios::binary);
+    assert(otf_stream.good());
+    otf_stream.seekg(0, std::ios::end);
+    const auto otf_end = otf_stream.tellg();
+    assert(otf_end > 0);
+    std::vector<std::byte> otf_data(static_cast<std::size_t>(otf_end));
+    otf_stream.seekg(0, std::ios::beg);
+    otf_stream.read(reinterpret_cast<char*>(otf_data.data()), static_cast<std::streamsize>(otf_data.size()));
+    assert(otf_stream.good() || otf_stream.eof());
+    auto otf_descriptor = aeg::editor::EditorFontInspector{}.inspect(otf_data);
+    assert(otf_descriptor);
+    otf_descriptor.value.key = "cff_otf";
+    otf_descriptor.value.supports_chinese = false;
+    EditorFontCatalog otf_catalog;
+    assert(otf_catalog.register_font(otf_descriptor.value, otf_data));
+    EditorImGuiHost otf_host;
+    EditorImGuiDesc otf_desc{};
+    otf_desc.font_catalog = &otf_catalog;
+    otf_desc.default_font_key = "cff_otf";
+    otf_desc.font_size_pixels = 18.0f;
+    assert(otf_host.initialize(otf_desc));
+    ImGuiFontAtlasData otf_atlas;
+    assert(otf_host.capture_font_atlas(otf_atlas));
+    assert(otf_atlas.is_valid());
+    assert(otf_host.shutdown());
     assert(catalog.register_font(invalid_face_descriptor, valid_font_data, std::numeric_limits<uint32_t>::max()));
 
     EditorImGuiHost host;

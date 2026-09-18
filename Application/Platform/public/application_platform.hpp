@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -73,6 +74,10 @@ install_console_interrupt_controller();
 [[nodiscard]] foundation::ResultValue<std::string> select_directory(platform::WindowSurfaceBinding owner,
                                                                     std::string_view title,
                                                                     std::string_view initial_directory = {});
+
+/** @brief Opens a native TrueType/OpenType picker owned by an Application window. */
+[[nodiscard]] foundation::ResultValue<std::optional<std::filesystem::path>> open_font_file_dialog(
+    platform::IWindowSystem& window_system, platform::WindowId owner_window);
 
 /** @brief Describes one installed system font face without exposing platform API types. */
 struct SystemFontRecord final {

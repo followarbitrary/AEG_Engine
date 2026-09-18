@@ -14,6 +14,7 @@
 
 #include "pipeline.hpp"
 #include "reflection.hpp"
+#include "render_pass.hpp"
 #include "result.hpp"
 
 namespace aeg::module {
@@ -40,6 +41,7 @@ class ModuleRegistrationContext final {
 public:
     [[nodiscard]] pipeline::ModuleId module_id() const noexcept { return module_id_; }
     [[nodiscard]] pipeline::PipelineRegistry& pipeline_registry() const noexcept { return pipeline_registry_; }
+    [[nodiscard]] pipeline::RenderPassRegistry* render_pass_registry() const noexcept { return render_pass_registry_; }
     [[nodiscard]] reflection::TypeRegistry* reflection_registry() const noexcept { return reflection_registry_; }
 
     /** @brief Registers a custom global Phase owned by the current module. */
@@ -48,6 +50,8 @@ public:
     [[nodiscard]] foundation::Result register_pipeline(pipeline::PipelineFactory factory);
     /** @brief Registers a Feature definition owned by the current module. */
     [[nodiscard]] foundation::Result register_feature(pipeline::FeatureFactory factory);
+    /** @brief Registers a RenderPass type owned by the current module. */
+    [[nodiscard]] foundation::Result register_render_pass(pipeline::RenderPassFactory factory);
     /** @brief Binds a Feature to a Pipeline extension point under module ownership. */
     [[nodiscard]] foundation::Result bind_feature(const pipeline::FeatureBindingDescriptor& binding);
     /** @brief Registers reflected type metadata and records it for module unload. */
@@ -55,17 +59,23 @@ public:
 
 private:
     ModuleRegistrationContext(pipeline::PipelineRegistry& pipeline_registry,
-                              reflection::TypeRegistry* reflection_registry, pipeline::ModuleId module_id) noexcept
-        : pipeline_registry_(pipeline_registry), reflection_registry_(reflection_registry), module_id_(module_id) {}
+                              reflection::TypeRegistry* reflection_registry,
+                              pipeline::RenderPassRegistry* render_pass_registry, pipeline::ModuleId module_id) noexcept
+        : pipeline_registry_(pipeline_registry),
+          reflection_registry_(reflection_registry),
+          render_pass_registry_(render_pass_registry),
+          module_id_(module_id) {}
 
     [[nodiscard]] foundation::Result rollback() noexcept;
 
     pipeline::PipelineRegistry& pipeline_registry_;
     reflection::TypeRegistry* reflection_registry_{nullptr};
+    pipeline::RenderPassRegistry* render_pass_registry_{nullptr};
     pipeline::ModuleId module_id_{};
     std::vector<pipeline::PhaseId> phases_{};
     std::vector<pipeline::PipelineId> pipelines_{};
     std::vector<pipeline::FeatureId> features_{};
+    std::vector<pipeline::RenderPassTypeId> render_passes_{};
     std::vector<pipeline::FeatureInstanceId> feature_bindings_{};
     std::vector<reflection::TypeId> types_{};
 
@@ -88,8 +98,11 @@ using ModuleFactory = std::function<std::unique_ptr<Module>()>;
 class ModuleRegistry final {
 public:
     explicit ModuleRegistry(pipeline::PipelineRegistry& pipeline_registry,
-                            reflection::TypeRegistry* reflection_registry = nullptr) noexcept
-        : pipeline_registry_(pipeline_registry), reflection_registry_(reflection_registry) {}
+                            reflection::TypeRegistry* reflection_registry = nullptr,
+                            pipeline::RenderPassRegistry* render_pass_registry = nullptr) noexcept
+        : pipeline_registry_(pipeline_registry),
+          reflection_registry_(reflection_registry),
+          render_pass_registry_(render_pass_registry) {}
     ~ModuleRegistry() = default;
 
     ModuleRegistry(const ModuleRegistry&) = delete;
@@ -105,6 +118,8 @@ public:
     [[nodiscard]] bool contains(pipeline::ModuleId id) const noexcept;
     /** @brief Returns immutable metadata for one registered module. */
     [[nodiscard]] foundation::ResultValue<ModuleDescriptor> find_module(pipeline::ModuleId id) const;
+    /** @brief Returns a stable snapshot of registered module metadata for tooling and diagnostics. */
+    [[nodiscard]] std::vector<ModuleDescriptor> list_modules() const;
 
 private:
     struct Registration final {
@@ -113,6 +128,7 @@ private:
         std::vector<pipeline::PhaseId> phases{};
         std::vector<pipeline::PipelineId> pipelines{};
         std::vector<pipeline::FeatureId> features{};
+        std::vector<pipeline::RenderPassTypeId> render_passes{};
         std::vector<pipeline::FeatureInstanceId> feature_bindings{};
         std::vector<reflection::TypeId> types{};
     };
@@ -122,6 +138,7 @@ private:
 
     pipeline::PipelineRegistry& pipeline_registry_;
     reflection::TypeRegistry* reflection_registry_{nullptr};
+    pipeline::RenderPassRegistry* render_pass_registry_{nullptr};
     mutable std::shared_mutex mutex_;
     std::unordered_map<pipeline::ModuleId, Registration, pipeline::StableIdHash<pipeline::ModuleIdTag>>
         registrations_{};

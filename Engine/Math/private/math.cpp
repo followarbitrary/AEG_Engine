@@ -42,7 +42,7 @@ constexpr float kPlaneNormalizationTolerance = 1.0e-3f;
         return false;
     }
 
-    const float normal_length = std::sqrt(equation.x * equation.x + equation.y * equation.y + equation.z * equation.z);
+    const float normal_length = std::sqrt(length_squared(Vec3{equation.x, equation.y, equation.z}));
     if (!is_valid_scalar(normal_length) || normal_length <= kEpsilon) {
         return false;
     }
@@ -174,7 +174,7 @@ bool Plane::is_valid() const noexcept {
         return false;
     }
 
-    const float normal_length = std::sqrt(equation.x * equation.x + equation.y * equation.y + equation.z * equation.z);
+    const float normal_length = std::sqrt(length_squared(Vec3{equation.x, equation.y, equation.z}));
     return is_valid_scalar(normal_length) && normal_length > kEpsilon;
 }
 
@@ -535,10 +535,14 @@ Vec4 normalize(Vec4 value) noexcept {
 }
 
 Quat operator*(Quat lhs, Quat rhs) noexcept {
+#if AEG_MATH_HAS_SSE2
+    return detail::multiply_quat(lhs, rhs);
+#else
     return Quat{lhs.w * rhs.x + lhs.x * rhs.w + lhs.y * rhs.z - lhs.z * rhs.y,
                 lhs.w * rhs.y - lhs.x * rhs.z + lhs.y * rhs.w + lhs.z * rhs.x,
                 lhs.w * rhs.z + lhs.x * rhs.y - lhs.y * rhs.x + lhs.z * rhs.w,
                 lhs.w * rhs.w - lhs.x * rhs.x - lhs.y * rhs.y - lhs.z * rhs.z};
+#endif
 }
 
 bool operator==(Quat lhs, Quat rhs) noexcept {
@@ -546,7 +550,11 @@ bool operator==(Quat lhs, Quat rhs) noexcept {
 }
 
 float length_squared(Quat value) noexcept {
+#if AEG_MATH_HAS_SSE2
+    return detail::horizontal_sum(detail::multiply(detail::load(value), detail::load(value)));
+#else
     return value.x * value.x + value.y * value.y + value.z * value.z + value.w * value.w;
+#endif
 }
 
 Quat normalize(Quat value) noexcept {
@@ -555,11 +563,19 @@ Quat normalize(Quat value) noexcept {
         return Quat{};
     }
     const float scale_value = 1.0f / std::sqrt(squared_length);
+#if AEG_MATH_HAS_SSE2
+    return detail::scale_quat(value, scale_value);
+#else
     return Quat{value.x * scale_value, value.y * scale_value, value.z * scale_value, value.w * scale_value};
+#endif
 }
 
 Quat conjugate(Quat value) noexcept {
+#if AEG_MATH_HAS_SSE2
+    return detail::conjugate_quat(value);
+#else
     return Quat{-value.x, -value.y, -value.z, value.w};
+#endif
 }
 
 Quat inverse(Quat value) noexcept {
@@ -569,7 +585,11 @@ Quat inverse(Quat value) noexcept {
     }
     const Quat result = conjugate(value);
     const float scale_value = 1.0f / squared_length;
+#if AEG_MATH_HAS_SSE2
+    return detail::scale_quat(result, scale_value);
+#else
     return Quat{result.x * scale_value, result.y * scale_value, result.z * scale_value, result.w * scale_value};
+#endif
 }
 
 Quat quat_from_axis_angle(Vec3 axis, float radians) noexcept {
@@ -964,6 +984,112 @@ bool nearly_equal(const Mat4& lhs, const Mat4& rhs, float tolerance) noexcept {
         }
     }
     return true;
+}
+
+bool is_finite(float value) noexcept {
+    return is_valid_scalar(value);
+}
+
+bool is_finite(Vec2 value) noexcept {
+    return is_valid_vector(value);
+}
+
+bool is_finite(Vec3 value) noexcept {
+    return is_valid_vector(value);
+}
+
+bool is_finite(Vec4 value) noexcept {
+    return is_valid_vector(value);
+}
+
+bool is_finite(Quat value) noexcept {
+    return is_valid_quat(value);
+}
+
+bool is_finite(const Mat4& value) noexcept {
+    for (std::size_t column = 0; column < 4; ++column) {
+        for (std::size_t row = 0; row < 4; ++row) {
+            if (!is_valid_scalar(value.at(row, column)))
+                return false;
+        }
+    }
+    return true;
+}
+
+bool try_decompose_affine_transform(const Mat4& matrix, Transform& result) noexcept {
+    if (!is_finite(matrix))
+        return false;
+    Vec3 basis_x{matrix.at(0, 0), matrix.at(1, 0), matrix.at(2, 0)};
+    Vec3 basis_y{matrix.at(0, 1), matrix.at(1, 1), matrix.at(2, 1)};
+    Vec3 basis_z{matrix.at(0, 2), matrix.at(1, 2), matrix.at(2, 2)};
+    float scale_x = length(basis_x);
+    float scale_y = length(basis_y);
+    float scale_z = length(basis_z);
+    if (!is_finite(scale_x) || !is_finite(scale_y) || !is_finite(scale_z) || scale_x <= kEpsilon ||
+        scale_y <= kEpsilon || scale_z <= kEpsilon) {
+        return false;
+    }
+    basis_x /= scale_x;
+    basis_y /= scale_y;
+    basis_z /= scale_z;
+    const float orthogonality =
+        std::max({std::abs(dot(basis_x, basis_y)), std::abs(dot(basis_x, basis_z)), std::abs(dot(basis_y, basis_z))});
+    if (!is_finite(orthogonality) || orthogonality > 2.0e-3f)
+        return false;
+    if (dot(cross(basis_x, basis_y), basis_z) < 0.0f) {
+        scale_x = -scale_x;
+        basis_x = -basis_x;
+    }
+    Mat4 rotation = identity();
+    rotation.at(0, 0) = basis_x.x;
+    rotation.at(1, 0) = basis_x.y;
+    rotation.at(2, 0) = basis_x.z;
+    rotation.at(0, 1) = basis_y.x;
+    rotation.at(1, 1) = basis_y.y;
+    rotation.at(2, 1) = basis_y.z;
+    rotation.at(0, 2) = basis_z.x;
+    rotation.at(1, 2) = basis_z.y;
+    rotation.at(2, 2) = basis_z.z;
+    result.translation = {matrix.at(0, 3), matrix.at(1, 3), matrix.at(2, 3)};
+    const float m00 = rotation.at(0, 0);
+    const float m01 = rotation.at(0, 1);
+    const float m02 = rotation.at(0, 2);
+    const float m10 = rotation.at(1, 0);
+    const float m11 = rotation.at(1, 1);
+    const float m12 = rotation.at(1, 2);
+    const float m20 = rotation.at(2, 0);
+    const float m21 = rotation.at(2, 1);
+    const float m22 = rotation.at(2, 2);
+    const float trace = m00 + m11 + m22;
+    Quat quaternion{};
+    if (trace > 0.0f) {
+        const float scale = std::sqrt(trace + 1.0f) * 2.0f;
+        quaternion.w = 0.25f * scale;
+        quaternion.x = (m21 - m12) / scale;
+        quaternion.y = (m02 - m20) / scale;
+        quaternion.z = (m10 - m01) / scale;
+    } else if (m00 > m11 && m00 > m22) {
+        const float scale = std::sqrt(std::max(0.0f, 1.0f + m00 - m11 - m22)) * 2.0f;
+        quaternion.w = (m21 - m12) / scale;
+        quaternion.x = 0.25f * scale;
+        quaternion.y = (m01 + m10) / scale;
+        quaternion.z = (m02 + m20) / scale;
+    } else if (m11 > m22) {
+        const float scale = std::sqrt(std::max(0.0f, 1.0f + m11 - m00 - m22)) * 2.0f;
+        quaternion.w = (m02 - m20) / scale;
+        quaternion.x = (m01 + m10) / scale;
+        quaternion.y = 0.25f * scale;
+        quaternion.z = (m12 + m21) / scale;
+    } else {
+        const float scale = std::sqrt(std::max(0.0f, 1.0f + m22 - m00 - m11)) * 2.0f;
+        quaternion.w = (m10 - m01) / scale;
+        quaternion.x = (m02 + m20) / scale;
+        quaternion.y = (m12 + m21) / scale;
+        quaternion.z = 0.25f * scale;
+    }
+    result.rotation = normalize(quaternion);
+    result.scale = {scale_x, scale_y, scale_z};
+    return is_finite(result.translation) && is_finite(result.rotation) && is_finite(result.scale);
 }
 
 Mat4 Transform::to_matrix() const noexcept {

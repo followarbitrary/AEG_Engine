@@ -118,3 +118,13 @@ Runtime 可以依赖 Foundation、Math、ECS、Reflection、Serialization、Pipe
 RenderGraph 和 Renderer 的公共接口，但不得包含它们的 private 头文件，也不得直接暴露
 Vulkan、Win32 或其他 native API。Scene 依赖 Runtime 组件公开的数据契约和 Reflection
 schema，不反向要求 Runtime 依赖 Scene。
+# Pipeline composition runtime
+
+`PipelineCompositionRuntime` 负责把多个 `PipelineScopeHost` 绑定成一个可切换组合。
+组合先通过 `stage()` 校验 Host 数量、Owner 和唯一名称，再在安全帧边界调用 `apply_pending()`
+进行整体交换。任何 staging 失败都不会修改当前 active 组合，也不会逐 Host 发布部分状态。
+停止预览时调用 `stop_and_retire()`；它在同一安全边界停用仍处于 active 状态的 Host，
+并清空待应用及当前组合，避免编辑器停止后继续执行旧 Plan。
+
+Host 的 Pipeline/Feature 实例配置使用不可变快照；RenderPass 只能通过现有 RenderGraph
+构图入口加入执行图。模块卸载必须等待组合、帧和回调引用全部退休后进行。

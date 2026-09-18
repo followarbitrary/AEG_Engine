@@ -33,6 +33,10 @@ std::atomic_uint64_t publication_sequence{0};
             return ".aegscene";
         case AssetKind::kFont:
             return ".aegfont";
+        case AssetKind::kPipeline:
+            return ".aegpipebin";
+        case AssetKind::kShader:
+            return ".aegshaderbin";
     }
     return ".aegasset";
 }
@@ -49,17 +53,23 @@ std::atomic_uint64_t publication_sequence{0};
             return "scene";
         case AssetKind::kFont:
             return "font";
+        case AssetKind::kPipeline:
+            return "pipeline";
+        case AssetKind::kShader:
+            return "shader";
     }
     return {};
 }
 
 [[nodiscard]] foundation::ResultValue<AssetKind> parse_kind(std::string_view value) {
-    constexpr std::array<std::pair<std::string_view, AssetKind>, 5> kKinds{{
+    constexpr std::array<std::pair<std::string_view, AssetKind>, 7> kKinds{{
         {"mesh", AssetKind::kMesh},
         {"texture", AssetKind::kTexture},
         {"material", AssetKind::kMaterial},
         {"scene", AssetKind::kScene},
         {"font", AssetKind::kFont},
+        {"pipeline", AssetKind::kPipeline},
+        {"shader", AssetKind::kShader},
     }};
     for (const auto& [name, kind] : kKinds) {
         if (value == name) {
@@ -229,8 +239,8 @@ foundation::ResultValue<CookedArtifactBundle> CookedArtifactStore::load_current(
             !std::getline(stream, file_line)) {
             return {foundation::invalid_argument("cooked bundle manifest is truncated"), {}};
         }
-        if (!id_line.starts_with("id = \"") || !id_line.ends_with("\"") ||
-            !kind_line.starts_with("kind = \"") || !kind_line.ends_with("\"")) {
+        if (!id_line.starts_with("id = \"") || !id_line.ends_with("\"") || !kind_line.starts_with("kind = \"") ||
+            !kind_line.ends_with("\"")) {
             return {foundation::invalid_argument("cooked bundle manifest contains invalid artifact metadata"), {}};
         }
         const auto id_text = id_line.substr(6, id_line.size() - 7);

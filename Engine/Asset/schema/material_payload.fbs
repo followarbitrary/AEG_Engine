@@ -1,0 +1,14 @@
+namespace aeg.asset.fb;
+
+table MaterialTextureBinding {
+  binding_id:ulong;
+  texture_uuid:[ubyte] (required);
+}
+
+table MaterialPayload {
+  schema_version:uint;
+  shader_uuid:[ubyte] (required);
+  textures:[MaterialTextureBinding];
+}
+
+root_type MaterialPayload;

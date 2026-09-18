@@ -1,11 +1,13 @@
-namespace aeg.tooling.fb;
+namespace aeg.asset.fb;
 
 enum AssetKind : ubyte {
     Mesh,
     Texture,
     Material,
     Scene,
-    Font
+    Font,
+    Pipeline,
+    Shader
 }
 
 table AssetReference {

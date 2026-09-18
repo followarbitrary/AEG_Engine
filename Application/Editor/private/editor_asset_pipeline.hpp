@@ -13,6 +13,7 @@
 #include <span>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "editor_asset_database.hpp"
@@ -71,6 +72,7 @@ private:
     struct WorkItem final {
         EditorAssetRecord record{};
         bool force{false};
+        uint64_t revision{0};
     };
 
     [[nodiscard]] foundation::Result queue_record(const EditorAssetRecord& record, bool force);
@@ -91,6 +93,8 @@ private:
     std::vector<EditorAssetRecord> records_{};
     std::vector<WorkItem> work_{};
     std::vector<CpuAsset> completed_{};
+    std::unordered_map<uint64_t, uint64_t> latest_revisions_{};
+    uint64_t next_revision_{1};
     // Worker and watcher exceptions must be surfaced to the editor thread;
     // letting one escape a std::thread entry point terminates the process.
     std::atomic<bool> background_failure_{false};

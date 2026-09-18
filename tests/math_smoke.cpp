@@ -4,6 +4,7 @@
  */
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include <math.hpp>
 
 namespace {
@@ -43,6 +44,13 @@ int main() {
                "quaternion rotation failed")) {
         return 2;
     }
+    if (!check(aeg::math::nearly_equal(aeg::math::rotate(quarter_turn * quarter_turn, Vec3{1.0f, 0.0f, 0.0f}),
+                                       Vec3{-1.0f, 0.0f, 0.0f}, kTolerance),
+               "quaternion multiplication failed") ||
+        !check(aeg::math::nearly_equal(quarter_turn * aeg::math::inverse(quarter_turn), Quat{}, kTolerance),
+               "quaternion inverse failed")) {
+        return 2;
+    }
 
     const Transform transform{Vec3{2.0f, 3.0f, 4.0f}, quarter_turn, Vec3{2.0f, 3.0f, 4.0f}};
     if (!check(aeg::math::nearly_equal(transform.transform_point(Vec3{1.0f, 0.0f, 0.0f}), Vec3{2.0f, 5.0f, 4.0f},
@@ -55,6 +63,25 @@ int main() {
     }
 
     const Mat4 transform_matrix = transform.to_matrix();
+    Transform decomposed{};
+    if (!check(aeg::math::is_finite(transform_matrix), "finite matrix validation failed") ||
+        !check(aeg::math::try_decompose_affine_transform(transform_matrix, decomposed),
+               "affine decomposition failed") ||
+        !check(aeg::math::is_finite(decomposed.translation) && aeg::math::is_finite(decomposed.rotation) &&
+                   aeg::math::is_finite(decomposed.scale),
+               "decomposed transform validation failed") ||
+        !check(aeg::math::nearly_equal(decomposed.to_matrix(), transform_matrix, kTolerance),
+               "affine decomposition round trip failed")) {
+        return 4;
+    }
+    Mat4 non_finite_matrix = transform_matrix;
+    non_finite_matrix.at(0, 0) = std::numeric_limits<float>::quiet_NaN();
+    if (!check(!aeg::math::is_finite(non_finite_matrix), "non-finite matrix validation failed") ||
+        !check(!aeg::math::try_decompose_affine_transform(non_finite_matrix, decomposed),
+               "non-finite affine decomposition should fail")) {
+        return 4;
+    }
+
     Mat4 inverse_matrix{};
     if (!check(aeg::math::try_inverse(transform_matrix, inverse_matrix), "matrix inverse failed") ||
         !check(aeg::math::nearly_equal(transform_matrix * inverse_matrix, identity, kTolerance),

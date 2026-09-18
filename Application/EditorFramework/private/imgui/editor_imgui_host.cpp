@@ -3,6 +3,7 @@
  * @brief Implements the engine-owned Dear ImGui context and panel host.
  */
 #include <imgui.h>
+#include <imgui_freetype.h>
 #include <imgui_internal.h>
 
 #include <algorithm>
@@ -18,8 +19,8 @@
 #include <utility>
 #include <vector>
 
-#include "editor_imgui.hpp"
 #include "editor_error.hpp"
+#include "editor_imgui.hpp"
 #include "imgui_platform_bridge.hpp"
 
 namespace aeg::editor {
@@ -142,6 +143,8 @@ struct EditorImGuiHost::Impl final {
     ImGuiFontAtlasData font_atlas{};
     /** @brief Detached atlases referenced by draw data until the next frame boundary. */
     std::vector<FontAtlasPtr> retired_font_atlases{};
+    /** @brief Font bytes retained with retired atlases until the next frame boundary. */
+    std::vector<std::vector<EditorFontAsset>> retired_font_catalogs{};
     /** @brief Engine-managed texture identity currently bound to the atlas. */
     ImGuiTextureHandle font_texture{};
     /** @brief Stable preference key of the active font. */
@@ -184,8 +187,8 @@ struct EditorImGuiHost::Impl final {
         return iterator == fonts.end() ? nullptr : &*iterator;
     }
 
-    [[nodiscard]] foundation::Result add_font(ImFontAtlas& atlas, std::string_view font_key, float size_pixels, ImFont*& output_font,
-                                             bool include_chinese = true) {
+    [[nodiscard]] foundation::Result add_font(ImFontAtlas& atlas, std::string_view font_key, float size_pixels,
+                                              ImFont*& output_font, bool include_chinese = true) {
         if (font_key.empty()) {
             ImFontConfig config{};
             config.SizePixels = size_pixels;
@@ -206,8 +209,8 @@ struct EditorImGuiHost::Impl final {
         config.FontNo = static_cast<int>(asset->face_index);
         config.SizePixels = size_pixels;
         config.GlyphRanges = include_chinese && asset->descriptor.supports_chinese ? chinese_ranges.Data : nullptr;
-        output_font = atlas.AddFontFromMemoryTTF(
-            const_cast<std::byte*>(asset->font_data.data()), static_cast<int>(asset->font_data.size()), size_pixels, &config);
+        output_font = atlas.AddFontFromMemoryTTF(const_cast<std::byte*>(asset->font_data.data()),
+                                                 static_cast<int>(asset->font_data.size()), size_pixels, &config);
         if (output_font == nullptr) {
             return foundation::invalid_argument("Editor font TTF data could not be loaded");
         }
@@ -223,9 +226,9 @@ struct EditorImGuiHost::Impl final {
                 fallback_config.MergeMode = true;
                 fallback_config.FontNo = static_cast<int>(fallback->face_index);
                 fallback_config.SizePixels = size_pixels;
-                if (atlas.AddFontFromMemoryTTF(
-                        const_cast<std::byte*>(fallback->font_data.data()), static_cast<int>(fallback->font_data.size()),
-                        size_pixels, &fallback_config, chinese_ranges.Data) == nullptr) {
+                if (atlas.AddFontFromMemoryTTF(const_cast<std::byte*>(fallback->font_data.data()),
+                                               static_cast<int>(fallback->font_data.size()), size_pixels,
+                                               &fallback_config, chinese_ranges.Data) == nullptr) {
                     return foundation::invalid_argument("Editor Chinese fallback font could not be loaded");
                 }
             }
@@ -244,6 +247,9 @@ struct EditorImGuiHost::Impl final {
             if (candidate == nullptr) {
                 return foundation::out_of_memory("Dear ImGui font atlas allocation failed");
             }
+            // Keep rasterization on the CPU while accepting both TrueType and
+            // CFF OpenType outlines. GPU upload remains owned by Application.
+            candidate->SetFontLoader(ImGuiFreeType::GetFontLoader());
             // The static-atlas renderer cannot request missing CJK glyphs while drawing.
             // Include every character in the multilingual preview, not just the common subset.
             // Source configurations retain this storage across atlas rebuilds.
@@ -278,18 +284,22 @@ struct EditorImGuiHost::Impl final {
             constexpr float kDisplayFontSizePixels = 32.0f;
             const std::string_view display_font_key = font_key;
             ImFont* next_display_font = nullptr;
-            if (const foundation::Result result = add_font(*candidate, display_font_key, kDisplayFontSizePixels, next_display_font, false); !result) {
+            if (const foundation::Result result =
+                    add_font(*candidate, display_font_key, kDisplayFontSizePixels, next_display_font, false);
+                !result) {
                 return result;
             }
             if (desc.enable_preference_fonts) {
                 const auto settings_key = font_key;
                 const float settings_size = size_pixels;
-                const std::array<float, 4> sizes{settings_size * 0.875f, settings_size,
-                                                 settings_size * 1.25f, settings_size * 1.5f};
+                const std::array<float, 4> sizes{settings_size * 0.875f, settings_size, settings_size * 1.25f,
+                                                 settings_size * 1.5f};
                 for (std::size_t index = 0; index < sizes.size(); ++index) {
                     if (settings_key == font_key && sizes[index] == kDisplayFontSizePixels) {
                         next_preference_fonts[index] = next_display_font;
-                    } else if (const auto result = add_font(*candidate, settings_key, sizes[index], next_preference_fonts[index], true); !result) {
+                    } else if (const auto result =
+                                   add_font(*candidate, settings_key, sizes[index], next_preference_fonts[index], true);
+                               !result) {
                         return result;
                     }
                 }
@@ -297,7 +307,8 @@ struct EditorImGuiHost::Impl final {
                     return asset.descriptor.display_name == "Segoe MDL2 Assets";
                 });
                 if (icon_asset != fonts.end()) {
-                    if (const auto result = validate_editor_font_data(icon_asset->font_data, icon_asset->face_index); !result) {
+                    if (const auto result = validate_editor_font_data(icon_asset->font_data, icon_asset->face_index);
+                        !result) {
                         return result;
                     }
                     // Microsoft Segoe MDL2 Assets: Settings, KeyboardClassic, Font.
@@ -306,8 +317,8 @@ struct EditorImGuiHost::Impl final {
                     config.FontDataOwnedByAtlas = false;
                     config.FontNo = static_cast<int>(icon_asset->face_index);
                     next_preference_icons = candidate->AddFontFromMemoryTTF(
-                        const_cast<std::byte*>(icon_asset->font_data.data()), static_cast<int>(icon_asset->font_data.size()),
-                        20.0f, &config, icon_ranges);
+                        const_cast<std::byte*>(icon_asset->font_data.data()),
+                        static_cast<int>(icon_asset->font_data.size()), 20.0f, &config, icon_ranges);
                     if (next_preference_icons == nullptr) {
                         return foundation::invalid_argument("Editor preference icon font could not be loaded");
                     }
@@ -477,6 +488,7 @@ foundation::Result EditorImGuiHost::shutdown() {
     ImGui::DestroyContext(impl_->context);
     impl_->context = nullptr;
     impl_->retired_font_atlases.clear();
+    impl_->retired_font_catalogs.clear();
     impl_->pending_events.clear();
     impl_->frame_events.clear();
     impl_->panels.clear();
@@ -541,6 +553,61 @@ foundation::Result EditorImGuiHost::capture_font_atlas(ImGuiFontAtlasData& atlas
     }
 }
 
+foundation::Result EditorImGuiHost::replace_font_catalog(const EditorFontCatalog& catalog,
+                                                         std::string_view fallback_active_font_key) {
+    if (!impl_->initialized) {
+        return foundation::invalid_state("EditorImGuiHost is not initialized");
+    }
+    if (impl_->frame_active) {
+        return foundation::invalid_state("Editor font catalog cannot change during an active frame");
+    }
+
+    try {
+        // Reserve before changing the live catalog. Once the new atlas is
+        // committed, this vector keeps old byte storage alive for finalized
+        // draw data that still references its atlas.
+        impl_->retired_font_catalogs.reserve(impl_->retired_font_catalogs.size() + 1);
+        const auto assets = catalog.assets();
+        std::vector<EditorFontAsset> replacement(assets.begin(), assets.end());
+        std::vector<EditorFontAsset> previous = std::move(impl_->fonts);
+        impl_->fonts = std::move(replacement);
+
+        std::string target_active_key = impl_->active_font_key;
+        if (!target_active_key.empty() && impl_->find_font(target_active_key) == nullptr) {
+            if (fallback_active_font_key.empty() || impl_->find_font(fallback_active_font_key) == nullptr) {
+                impl_->fonts = std::move(previous);
+                return foundation::not_found("Active editor font is not present in the replacement catalog");
+            }
+            target_active_key = std::string(fallback_active_font_key);
+        }
+        if (target_active_key.empty() && !fallback_active_font_key.empty() &&
+            impl_->find_font(fallback_active_font_key) != nullptr) {
+            target_active_key = std::string(fallback_active_font_key);
+        }
+
+        std::string next_preview_key = impl_->preview_font_key;
+        if (!next_preview_key.empty() && impl_->find_font(next_preview_key) == nullptr) {
+            next_preview_key.clear();
+        }
+        ImGui::SetCurrentContext(impl_->context);
+        const foundation::Result rebuilt = [&] {
+            if (impl_->desc.enable_preference_fonts) {
+                return impl_->rebuild_font_atlas(target_active_key, impl_->active_font_size_pixels, next_preview_key,
+                                                 impl_->preview_font_size_pixels);
+            }
+            return impl_->rebuild_font_atlas(target_active_key, impl_->active_font_size_pixels);
+        }();
+        if (!rebuilt) {
+            impl_->fonts = std::move(previous);
+            return rebuilt;
+        }
+        impl_->retired_font_catalogs.emplace_back(std::move(previous));
+        return foundation::Result::success();
+    } catch (const std::bad_alloc&) {
+        return foundation::out_of_memory("Editor font catalog replacement allocation failed");
+    }
+}
+
 foundation::Result EditorImGuiHost::set_font(std::string_view font_key, float size_pixels) {
     if (!impl_->initialized) {
         return foundation::invalid_state("EditorImGuiHost is not initialized");
@@ -583,6 +650,17 @@ foundation::Result EditorImGuiHost::set_preview_font(std::string_view font_key, 
     return impl_->rebuild_font_atlas(impl_->active_font_key, impl_->active_font_size_pixels, font_key, size_pixels);
 }
 
+foundation::Result EditorImGuiHost::clear_preview_font() {
+    if (!impl_->initialized) {
+        return foundation::invalid_state("EditorImGuiHost is not initialized");
+    }
+    if (impl_->frame_active) {
+        return foundation::invalid_state("Editor preview font cannot change during an active frame");
+    }
+    ImGui::SetCurrentContext(impl_->context);
+    return impl_->rebuild_font_atlas(impl_->active_font_key, impl_->active_font_size_pixels);
+}
+
 std::string_view EditorImGuiHost::active_font_key() const noexcept {
     if (impl_ == nullptr) {
         return {};
@@ -621,7 +699,8 @@ const void* EditorImGuiHost::preference_font(float size_pixels) const noexcept {
     constexpr std::array<float, 4> sizes{16.0f, 20.0f, 24.0f, 32.0f};
     if (impl_ != nullptr) {
         for (std::size_t index = 0; index < sizes.size(); ++index) {
-            if (size_pixels == sizes[index]) return impl_->preference_fonts[index];
+            if (size_pixels == sizes[index])
+                return impl_->preference_fonts[index];
         }
     }
     return nullptr;
@@ -633,57 +712,58 @@ const void* EditorImGuiHost::preference_icon_font() const noexcept {
 
 foundation::Result EditorImGuiHost::begin_frame(const EditorImGuiFrameDesc& desc) {
     return guard_editor_operation([&]() -> foundation::Result {
-    if (!impl_->initialized) {
-        return foundation::invalid_state("EditorImGuiHost is not initialized");
-    }
-    if (impl_->frame_active) {
-        return foundation::invalid_state("EditorImGuiHost frame is already active");
-    }
-
-    ImGui::SetCurrentContext(impl_->context);
-    detail::ImGuiPlatformBridge::set_window(impl_->platform_bridge, desc.window);
-    platform::WindowExtent display_extent = desc.display_extent;
-    float framebuffer_scale_x = desc.framebuffer_scale_x;
-    float framebuffer_scale_y = desc.framebuffer_scale_y;
-    if (impl_->platform_bridge.services != nullptr) {
-        const foundation::ResultValue<platform::WindowMetrics> metrics_result =
-            impl_->platform_bridge.services->query_window_metrics(desc.window);
-        if (!metrics_result) {
-            return metrics_result.result;
+        if (!impl_->initialized) {
+            return foundation::invalid_state("EditorImGuiHost is not initialized");
         }
-        display_extent = metrics_result.value.display_extent;
-        framebuffer_scale_x = metrics_result.value.framebuffer_scale_x;
-        framebuffer_scale_y = metrics_result.value.framebuffer_scale_y;
-    }
-    if (!display_extent.is_valid() || !std::isfinite(desc.delta_seconds) || desc.delta_seconds <= 0.0f ||
-        !std::isfinite(framebuffer_scale_x) || !std::isfinite(framebuffer_scale_y) || framebuffer_scale_x <= 0.0f ||
-        framebuffer_scale_y <= 0.0f) {
-        return foundation::invalid_argument("Editor ImGui frame description is invalid");
-    }
-    ImGuiIO& io = ImGui::GetIO();
-    if (io.Fonts == nullptr || !io.Fonts->IsBuilt() || io.FontDefault == nullptr) {
-        return foundation::invalid_state("Editor font atlas is not ready for rendering");
-    }
-    io.DisplaySize = ImVec2(static_cast<float>(display_extent.width), static_cast<float>(display_extent.height));
-    io.DisplayFramebufferScale = ImVec2(framebuffer_scale_x, framebuffer_scale_y);
-    io.DeltaTime = desc.delta_seconds;
-
-    {
-        std::scoped_lock lock(impl_->event_mutex);
-        impl_->frame_events.clear();
-        impl_->frame_events.swap(impl_->pending_events);
-    }
-    for (const platform::WindowEvent& event : impl_->frame_events) {
-        if (!impl_->platform_bridge.viewports_enabled && event.window != desc.window) {
-            continue;
+        if (impl_->frame_active) {
+            return foundation::invalid_state("EditorImGuiHost frame is already active");
         }
-        detail::ImGuiPlatformBridge::submit_event(io, event, impl_->platform_bridge);
-    }
-    ImGui::NewFrame();
-    impl_->retired_font_atlases.clear();
-    ++impl_->frame_number;
-    impl_->frame_active = true;
-    return foundation::Result::success();
+
+        ImGui::SetCurrentContext(impl_->context);
+        detail::ImGuiPlatformBridge::set_window(impl_->platform_bridge, desc.window);
+        platform::WindowExtent display_extent = desc.display_extent;
+        float framebuffer_scale_x = desc.framebuffer_scale_x;
+        float framebuffer_scale_y = desc.framebuffer_scale_y;
+        if (impl_->platform_bridge.services != nullptr) {
+            const foundation::ResultValue<platform::WindowMetrics> metrics_result =
+                impl_->platform_bridge.services->query_window_metrics(desc.window);
+            if (!metrics_result) {
+                return metrics_result.result;
+            }
+            display_extent = metrics_result.value.display_extent;
+            framebuffer_scale_x = metrics_result.value.framebuffer_scale_x;
+            framebuffer_scale_y = metrics_result.value.framebuffer_scale_y;
+        }
+        if (!display_extent.is_valid() || !std::isfinite(desc.delta_seconds) || desc.delta_seconds <= 0.0f ||
+            !std::isfinite(framebuffer_scale_x) || !std::isfinite(framebuffer_scale_y) || framebuffer_scale_x <= 0.0f ||
+            framebuffer_scale_y <= 0.0f) {
+            return foundation::invalid_argument("Editor ImGui frame description is invalid");
+        }
+        ImGuiIO& io = ImGui::GetIO();
+        if (io.Fonts == nullptr || !io.Fonts->IsBuilt() || io.FontDefault == nullptr) {
+            return foundation::invalid_state("Editor font atlas is not ready for rendering");
+        }
+        io.DisplaySize = ImVec2(static_cast<float>(display_extent.width), static_cast<float>(display_extent.height));
+        io.DisplayFramebufferScale = ImVec2(framebuffer_scale_x, framebuffer_scale_y);
+        io.DeltaTime = desc.delta_seconds;
+
+        {
+            std::scoped_lock lock(impl_->event_mutex);
+            impl_->frame_events.clear();
+            impl_->frame_events.swap(impl_->pending_events);
+        }
+        for (const platform::WindowEvent& event : impl_->frame_events) {
+            if (!impl_->platform_bridge.viewports_enabled && event.window != desc.window) {
+                continue;
+            }
+            detail::ImGuiPlatformBridge::submit_event(io, event, impl_->platform_bridge);
+        }
+        ImGui::NewFrame();
+        impl_->retired_font_atlases.clear();
+        impl_->retired_font_catalogs.clear();
+        ++impl_->frame_number;
+        impl_->frame_active = true;
+        return foundation::Result::success();
     });
 }
 
@@ -714,8 +794,10 @@ foundation::Result EditorImGuiHost::build_panels() {
                 ImGui::ErrorRecoveryTryToRecoverState(&checkpoint);
                 return foundation::Result::success();
             });
-            if (!result) return result;
-            if (!recovery) return recovery;
+            if (!result)
+                return result;
+            if (!recovery)
+                return recovery;
         }
     }
     return foundation::Result::success();
@@ -730,20 +812,22 @@ foundation::Result EditorImGuiHost::end_frame() {
     }
 
     return guard_editor_operation([&] {
-    ImGui::SetCurrentContext(impl_->context);
-    ImGui::Render();
-    if (impl_->platform_bridge.viewports_enabled) {
-        ImGui::UpdatePlatformWindows();
-    }
-    detail::ImGuiPlatformBridge::update_cursor(ImGui::GetIO(), impl_->platform_bridge);
-    impl_->frame_active = false;
-    return foundation::Result::success();
+        ImGui::SetCurrentContext(impl_->context);
+        ImGui::Render();
+        if (impl_->platform_bridge.viewports_enabled) {
+            ImGui::UpdatePlatformWindows();
+        }
+        detail::ImGuiPlatformBridge::update_cursor(ImGui::GetIO(), impl_->platform_bridge);
+        impl_->frame_active = false;
+        return foundation::Result::success();
     });
 }
 
 foundation::Result EditorImGuiHost::abort_frame() noexcept {
-    if (impl_ == nullptr || !impl_->initialized) return foundation::Result::success();
-    if (impl_->building_panels) return foundation::Result::failure(foundation::ResultCode::kInvalidState);
+    if (impl_ == nullptr || !impl_->initialized)
+        return foundation::Result::success();
+    if (impl_->building_panels)
+        return foundation::Result::failure(foundation::ResultCode::kInvalidState);
     return guard_editor_operation([&] {
         ImGui::SetCurrentContext(impl_->context);
         if (impl_->context->WithinFrameScope) {
@@ -789,7 +873,8 @@ foundation::Result EditorImGuiHost::capture_draw_packets(std::vector<ImGuiDrawPa
         for (int index = 0; index < platform_io.Viewports.Size; ++index) {
             const ImGuiViewport* viewport = platform_io.Viewports[index];
             const platform::WindowId window = viewport_window_id(impl_->platform_bridge, viewport);
-            if (viewport == nullptr || !window.is_valid() || viewport->DrawData == nullptr || !viewport->DrawData->Valid) {
+            if (viewport == nullptr || !window.is_valid() || viewport->DrawData == nullptr ||
+                !viewport->DrawData->Valid) {
                 continue;
             }
             ImGuiDrawPacket packet;

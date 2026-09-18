@@ -1,0 +1,18 @@
+namespace aeg.asset.fb;
+
+table SceneAssetReference {
+  scene_entity_uuid:[ubyte] (required);
+  component_type:string (required);
+  component_version:uint;
+  field_id:ulong;
+  asset_uuid:[ubyte] (required);
+  kind:ubyte;
+}
+
+table ScenePayload {
+  schema_version:uint;
+  serialized_scene:[ubyte] (required);
+  references:[SceneAssetReference];
+}
+
+root_type ScenePayload;

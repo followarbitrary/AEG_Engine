@@ -65,6 +65,11 @@ Application/Platform 的 private 头文件，也不得直接调用 Win32、Vulka
 native API。ImGui 只能作为 CPU UI construction layer 使用，UI GPU 资源必须通过 Engine
 Resource/RHI/RenderGraph 创建、绑定、上传和退休。
 
+编辑器字体业务由 Application/Editor 负责：用户字体目录、FreeType 文件检查、文件选择器、
+Preference Store、Apply/Cancel 事务和 atlas 纹理刷新都不得下沉到 Engine。`ThirdParty`
+中的 FreeType 仅作为编辑器 CPU 解析/atlas 构建依赖；游戏运行时不得隐式读取编辑器字体
+目录，也不得把编辑器字体状态写入游戏项目配置。
+
 编辑器字体设置只影响编辑器自身；Preferences 的 preview font 是独立 Host 内的暂态状态，
 不得修改主编辑器的 applied font，也不得影响正在开发的游戏运行时字体资源。native 错误
 dialog 不得使用 ImGui 组件嵌套显示。

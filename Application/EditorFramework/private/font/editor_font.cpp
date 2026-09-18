@@ -4,10 +4,15 @@
  */
 #include "editor_font.hpp"
 
+#include <ft2build.h>
+#include FT_FREETYPE_H
+
 #include <algorithm>
 #include <array>
+#include <iomanip>
 #include <limits>
 #include <new>
+#include <sstream>
 #include <utility>
 
 namespace aeg::editor {
@@ -20,8 +25,7 @@ using FontBytes = std::span<const std::byte>;
 
 // Callers establish the byte range before reading big-endian SFNT values.
 [[nodiscard]] uint16_t read_u16(FontBytes data, std::size_t offset) noexcept {
-    return static_cast<uint16_t>(static_cast<uint16_t>(data[offset]) << 8u) |
-           static_cast<uint16_t>(data[offset + 1]);
+    return static_cast<uint16_t>(static_cast<uint16_t>(data[offset]) << 8u) | static_cast<uint16_t>(data[offset + 1]);
 }
 
 [[nodiscard]] uint32_t read_u32(FontBytes data, std::size_t offset) noexcept {
@@ -61,10 +65,9 @@ using FontBytes = std::span<const std::byte>;
     }
     mapping = mapping.first(length);
     if (format == 0) {
-        return mapping.size() >= 262 && std::all_of(mapping.begin() + 6, mapping.begin() + 262,
-                                                    [glyph_count](std::byte glyph) {
-                                                        return static_cast<uint8_t>(glyph) < glyph_count;
-                                                    });
+        return mapping.size() >= 262 &&
+               std::all_of(mapping.begin() + 6, mapping.begin() + 262,
+                           [glyph_count](std::byte glyph) { return static_cast<uint8_t>(glyph) < glyph_count; });
     }
     if (format == 6) {
         if (!contains(mapping, 0, 10) || !contains(mapping, 10, static_cast<std::size_t>(read_u16(mapping, 8)) * 2)) {
@@ -125,16 +128,17 @@ using FontBytes = std::span<const std::byte>;
         }
         const std::size_t range_record = 16 + segments * 6 + index * 2;
         const uint16_t range_offset = read_u16(mapping, range_record);
-        if (range_offset != 0 && ((range_offset & 1u) != 0 || range_record + range_offset < 16 + segments * 8 ||
-                                 !contains(mapping, range_record + range_offset,
-                                           (static_cast<std::size_t>(end) - start + 1) * 2))) {
+        if (range_offset != 0 &&
+            ((range_offset & 1u) != 0 || range_record + range_offset < 16 + segments * 8 ||
+             !contains(mapping, range_record + range_offset, (static_cast<std::size_t>(end) - start + 1) * 2))) {
             return false;
         }
         const uint16_t delta = read_u16(mapping, 16 + segments * 4 + index * 2);
         for (uint32_t codepoint = start; codepoint <= end; ++codepoint) {
             // Match stb's mapping behavior, including its direct range-offset glyph reads.
-            const uint16_t glyph = range_offset == 0 ? static_cast<uint16_t>(codepoint + delta)
-                                                    : read_u16(mapping, range_record + range_offset + (codepoint - start) * 2);
+            const uint16_t glyph = range_offset == 0
+                                       ? static_cast<uint16_t>(codepoint + delta)
+                                       : read_u16(mapping, range_record + range_offset + (codepoint - start) * 2);
             if (glyph >= glyph_count) {
                 return false;
             }
@@ -207,8 +211,12 @@ struct GlyphValidator final {
                 if (repeats > point_count - point) {
                     return false;
                 }
-                coordinate_bytes += repeats * (((flags & 2u) != 0 ? 1u : (flags & 16u) != 0 ? 0u : 2u) +
-                                                ((flags & 4u) != 0 ? 1u : (flags & 32u) != 0 ? 0u : 2u));
+                coordinate_bytes += repeats * (((flags & 2u) != 0    ? 1u
+                                                : (flags & 16u) != 0 ? 0u
+                                                                     : 2u) +
+                                               ((flags & 4u) != 0    ? 1u
+                                                : (flags & 32u) != 0 ? 0u
+                                                                     : 2u));
                 point += repeats;
             }
             if (!contains(glyph, cursor, coordinate_bytes)) {
@@ -232,7 +240,8 @@ struct GlyphValidator final {
             }
             const std::size_t arguments = (flags & 1u) != 0 ? 4 : 2;
             const std::size_t transform = (flags & 8u) != 0 ? 2 : (flags & 64u) != 0 ? 4 : (flags & 128u) != 0 ? 8 : 0;
-            if (!contains(glyph, cursor, arguments + transform) || !validate(component, static_cast<uint8_t>(nesting + 1))) {
+            if (!contains(glyph, cursor, arguments + transform) ||
+                !validate(component, static_cast<uint8_t>(nesting + 1))) {
                 return false;
             }
             cursor += arguments + transform;
@@ -245,15 +254,88 @@ struct GlyphValidator final {
         return true;
     }
 };
+
+[[nodiscard]] std::string font_content_key(FontBytes data, uint32_t face_index) {
+    uint64_t hash = 14695981039346656037ull;
+    for (const std::byte byte : data) {
+        hash ^= static_cast<uint8_t>(byte);
+        hash *= 1099511628211ull;
+    }
+    hash ^= face_index;
+    hash *= 1099511628211ull;
+    std::ostringstream stream;
+    stream << "font_" << std::hex << std::setfill('0') << std::setw(16) << hash;
+    return stream.str();
+}
+
+[[nodiscard]] foundation::ResultValue<EditorFontDescriptor> inspect_with_freetype(FontBytes data, uint32_t face_index) {
+    if (data.empty() || data.size() > static_cast<std::size_t>(std::numeric_limits<long>::max())) {
+        return {foundation::invalid_argument("Editor font bytes are empty or exceed FreeType limits"), {}};
+    }
+    FT_Library library = nullptr;
+    if (FT_Init_FreeType(&library) != 0 || library == nullptr) {
+        return {foundation::invalid_state("FreeType library initialization failed"), {}};
+    }
+    FT_Face face = nullptr;
+    const FT_Error face_error =
+        FT_New_Memory_Face(library, reinterpret_cast<const FT_Byte*>(data.data()), static_cast<FT_Long>(data.size()),
+                           static_cast<FT_Long>(face_index), &face);
+    if (face_error != 0 || face == nullptr) {
+        FT_Done_FreeType(library);
+        return {foundation::unsupported("Editor font face could not be parsed by FreeType"), {}};
+    }
+    const auto cleanup = [&] {
+        FT_Done_Face(face);
+        FT_Done_FreeType(library);
+    };
+    if (face->family_name == nullptr || face->style_name == nullptr || face->family_name[0] == '\0' ||
+        face->style_name[0] == '\0' || face->num_glyphs <= 0 || face->num_charmaps <= 0 ||
+        (face->face_flags & FT_FACE_FLAG_SCALABLE) == 0) {
+        cleanup();
+        return {foundation::unsupported("Editor font has no scalable outline face or character map"), {}};
+    }
+    FT_Select_Charmap(face, FT_ENCODING_UNICODE);
+    constexpr std::array<FT_ULong, 6> required_ascii{'A', 'a', '0', ' ', '.', '?'};
+    for (const FT_ULong codepoint : required_ascii) {
+        if (FT_Get_Char_Index(face, codepoint) == 0) {
+            cleanup();
+            return {foundation::unsupported("Editor font does not contain the required editor character set"), {}};
+        }
+    }
+    constexpr std::array<FT_ULong, 3> chinese{0x4E2D, 0x6587, 0x573A};
+    const bool supports_chinese = std::all_of(
+        chinese.begin(), chinese.end(), [face](FT_ULong codepoint) { return FT_Get_Char_Index(face, codepoint) != 0; });
+    const bool supports_ligatures = FT_Get_Char_Index(face, 0xFB01) != 0 || FT_Get_Char_Index(face, 0xFB02) != 0;
+    EditorFontDescriptor descriptor{};
+    descriptor.family_name = face->family_name;
+    descriptor.style_name = face->style_name;
+    descriptor.display_name = descriptor.family_name + " " + descriptor.style_name;
+    descriptor.key = font_content_key(data, face_index);
+    descriptor.supports_chinese = supports_chinese;
+    descriptor.supports_ligatures = supports_ligatures;
+    descriptor.source = EditorFontSource::kBundled;
+    cleanup();
+    return {foundation::Result::success(), std::move(descriptor)};
+}
 }  // namespace
 
+foundation::ResultValue<EditorFontDescriptor> EditorFontInspector::inspect(FontBytes data, uint32_t face_index) const {
+    return inspect_with_freetype(data, face_index);
+}
+
 foundation::Result validate_editor_font_data(FontBytes data, uint32_t face_index) {
+    // FreeType accepts both TrueType glyf and CFF OpenType outlines. Keep the
+    // legacy bounded parser below as a conservative fallback for malformed
+    // faces whose detailed diagnostics are still useful to existing callers.
+    if (const auto inspected = inspect_with_freetype(data, face_index); inspected) {
+        return foundation::Result::success();
+    }
     if (!contains(data, 0, 12) || data.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
         face_index > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
         return foundation::invalid_argument("Editor font bytes or face index exceed the rasterizer limits");
     }
     std::size_t face_offset = 0;
-    if (read_u32(data, 0) == 0x74746366u) { // ttcf
+    if (read_u32(data, 0) == 0x74746366u) {  // ttcf
         const uint32_t version = read_u32(data, 4);
         const std::size_t faces = read_u32(data, 8);
         if ((version != 0x00010000u && version != 0x00020000u) || faces > (data.size() - 12) / 4 ||
@@ -268,16 +350,16 @@ foundation::Result validate_editor_font_data(FontBytes data, uint32_t face_index
         return foundation::invalid_argument("Editor standalone font has no requested collection face");
     }
     const uint32_t signature = read_u32(data, face_offset);
-    if (signature != 0x00010000u && signature != 0x74727565u) { // TrueType or Apple 'true'
+    if (signature != 0x00010000u && signature != 0x74727565u) {  // TrueType or Apple 'true'
         return foundation::unsupported("Editor font must contain supported TrueType outlines");
     }
     const std::size_t table_count = read_u16(data, face_offset + 4);
     if (table_count == 0 || !contains(data, face_offset + 12, table_count * 16)) {
         return foundation::invalid_argument("Editor font table directory is incomplete");
     }
-    constexpr std::array<uint32_t, 7> required_tags{
-        0x636D6170u, 0x676C7966u, 0x68656164u, 0x68686561u, 0x686D7478u, 0x6C6F6361u, 0x6D617870u};
-    std::array<FontBytes, required_tags.size()> tables{}; // cmap, glyf, head, hhea, hmtx, loca, maxp
+    constexpr std::array<uint32_t, 7> required_tags{0x636D6170u, 0x676C7966u, 0x68656164u, 0x68686561u,
+                                                    0x686D7478u, 0x6C6F6361u, 0x6D617870u};
+    std::array<FontBytes, required_tags.size()> tables{};  // cmap, glyf, head, hhea, hmtx, loca, maxp
     for (std::size_t index = 0; index < table_count; ++index) {
         const std::size_t record = face_offset + 12 + index * 16;
         const std::size_t offset = read_u32(data, record + 8);
@@ -309,8 +391,8 @@ foundation::Result validate_editor_font_data(FontBytes data, uint32_t face_index
     }
     std::size_t previous_location = 0;
     for (std::size_t index = 0; index <= glyph_count; ++index) {
-        const std::size_t location = location_format == 0 ? static_cast<std::size_t>(read_u16(loca, index * 2)) * 2
-                                                        : read_u32(loca, index * 4);
+        const std::size_t location =
+            location_format == 0 ? static_cast<std::size_t>(read_u16(loca, index * 2)) * 2 : read_u32(loca, index * 4);
         if (location < previous_location || location > glyf.size() ||
             (location != previous_location && location - previous_location < 10)) {
             return foundation::invalid_argument("Editor font glyph extends outside its outline table");
@@ -324,7 +406,8 @@ foundation::Result validate_editor_font_data(FontBytes data, uint32_t face_index
         GlyphValidator glyphs{glyf, loca, location_format, std::vector<uint8_t>(glyph_count)};
         for (std::size_t index = 0; index < glyph_count; ++index) {
             if (!glyphs.validate(index)) {
-                return foundation::unsupported("Editor font glyph payload is incomplete or unsupported by the rasterizer");
+                return foundation::unsupported(
+                    "Editor font glyph payload is incomplete or unsupported by the rasterizer");
             }
         }
     } catch (const std::bad_alloc&) {
@@ -334,8 +417,7 @@ foundation::Result validate_editor_font_data(FontBytes data, uint32_t face_index
 }
 
 foundation::Result EditorFontCatalog::register_font(const EditorFontDescriptor& descriptor,
-                                                    std::span<const std::byte> font_data,
-                                                    uint32_t face_index) {
+                                                    std::span<const std::byte> font_data, uint32_t face_index) {
     if (!descriptor.is_valid()) {
         return foundation::invalid_argument("Editor font descriptor is incomplete");
     }

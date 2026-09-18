@@ -56,15 +56,11 @@ struct ImGuiTextureHandleHash final {
     return pipeline::RenderGraphTexture{texture.index, texture.generation, texture.graph_id};
 }
 
-[[nodiscard]] bool is_finite(float value) noexcept {
-    return std::isfinite(value);
-}
-
-[[nodiscard]] bool is_finite(const ImGuiDrawPacket& packet) noexcept {
-    return is_finite(packet.display_pos_x) && is_finite(packet.display_pos_y) && is_finite(packet.display_width) &&
-           is_finite(packet.display_height) && is_finite(packet.framebuffer_scale_x) &&
-           is_finite(packet.framebuffer_scale_y) && packet.framebuffer_scale_x > 0.0f &&
-           packet.framebuffer_scale_y > 0.0f;
+[[nodiscard]] bool is_valid_draw_packet(const ImGuiDrawPacket& packet) noexcept {
+    return math::is_finite(packet.display_pos_x) && math::is_finite(packet.display_pos_y) &&
+           math::is_finite(packet.display_width) && math::is_finite(packet.display_height) &&
+           math::is_finite(packet.framebuffer_scale_x) && math::is_finite(packet.framebuffer_scale_y) &&
+           packet.framebuffer_scale_x > 0.0f && packet.framebuffer_scale_y > 0.0f;
 }
 
 [[nodiscard]] foundation::Result first_failure(const foundation::Result& current, const foundation::Result& next) {
@@ -94,7 +90,7 @@ struct ImGuiTextureHandleHash final {
     const float min_y = std::floor((command.clip_min_y - packet.display_pos_y) * packet.framebuffer_scale_y);
     const float max_x = std::ceil((command.clip_max_x - packet.display_pos_x) * packet.framebuffer_scale_x);
     const float max_y = std::ceil((command.clip_max_y - packet.display_pos_y) * packet.framebuffer_scale_y);
-    if (!is_finite(min_x) || !is_finite(min_y) || !is_finite(max_x) || !is_finite(max_y)) {
+    if (!math::is_finite(min_x) || !math::is_finite(min_y) || !math::is_finite(max_x) || !math::is_finite(max_y)) {
         return {foundation::invalid_argument("ImGui draw command clip rectangle is not finite"), {}};
     }
 
@@ -155,10 +151,7 @@ struct ImGuiTextureHandleHash final {
 
 [[nodiscard]] rhi::ResourceState make_imgui_sampled_state() noexcept {
     return rhi::ResourceState{
-        rhi::ResourceUsage::kSampledRead,
-        rhi::ShaderStage::kFragment,
-        rhi::QueueClass::kGraphics,
-        false,
+        rhi::ResourceUsage::kSampledRead,    rhi::ShaderStage::kFragment, rhi::QueueClass::kGraphics, false,
         rhi::PipelineStage::kFragmentShader,
     };
 }
@@ -434,7 +427,7 @@ foundation::Result ImGuiRenderer::prepare_frame(render_graph::FrameContext& fram
         target.extent.height > static_cast<uint32_t>(std::numeric_limits<int32_t>::max())) {
         return foundation::invalid_argument("ImGui render target description is invalid");
     }
-    if (!is_finite(packet)) {
+    if (!is_valid_draw_packet(packet)) {
         return foundation::invalid_argument("ImGui draw packet contains invalid display parameters");
     }
 
@@ -620,8 +613,8 @@ foundation::Result ImGuiRenderer::prepare_frame(render_graph::FrameContext& fram
         const auto imported_iterator = impl_->imported_textures.find(texture.identity);
         if (imported_iterator == impl_->imported_textures.end()) {
             const foundation::ResultValue<render_graph::RenderGraphTexture> resource_result =
-                graph.import_texture(texture.binding.texture, texture.binding.sampled_view, texture.binding.texture_desc,
-                                     texture.binding.initial_state);
+                graph.import_texture(texture.binding.texture, texture.binding.sampled_view,
+                                     texture.binding.texture_desc, texture.binding.initial_state);
             if (!resource_result) {
                 cleanup();
                 return resource_result.result;
@@ -629,8 +622,8 @@ foundation::Result ImGuiRenderer::prepare_frame(render_graph::FrameContext& fram
             try {
                 const auto inserted = impl_->imported_textures.emplace(
                     texture.identity,
-                    Impl::ImportedTexture{resource_result.value, texture.binding.texture,
-                                          texture.binding.sampled_view, make_cached_texture_desc(texture.binding.texture_desc),
+                    Impl::ImportedTexture{resource_result.value, texture.binding.texture, texture.binding.sampled_view,
+                                          make_cached_texture_desc(texture.binding.texture_desc),
                                           make_imgui_sampled_state(), true});
                 imported = &inserted.first->second;
             } catch (const std::bad_alloc&) {
@@ -641,16 +634,14 @@ foundation::Result ImGuiRenderer::prepare_frame(render_graph::FrameContext& fram
             imported = &imported_iterator->second;
             const bool graph_resource_valid = graph.contains_texture(imported->resource);
             const bool external_resource_matches = imported->texture == texture.binding.texture &&
-                                                    imported->sampled_view == texture.binding.sampled_view &&
-                                                    texture_desc_matches(imported->desc, texture.binding.texture_desc);
+                                                   imported->sampled_view == texture.binding.sampled_view &&
+                                                   texture_desc_matches(imported->desc, texture.binding.texture_desc);
             if (!graph_resource_valid) {
-                const rhi::ResourceState initial_state =
-                    external_resource_matches && imported->state_initialized
-                        ? imported->state
-                        : texture.binding.initial_state;
-                const foundation::ResultValue<render_graph::RenderGraphTexture> resource_result =
-                    graph.import_texture(texture.binding.texture, texture.binding.sampled_view,
-                                         texture.binding.texture_desc, initial_state);
+                const rhi::ResourceState initial_state = external_resource_matches && imported->state_initialized
+                                                             ? imported->state
+                                                             : texture.binding.initial_state;
+                const foundation::ResultValue<render_graph::RenderGraphTexture> resource_result = graph.import_texture(
+                    texture.binding.texture, texture.binding.sampled_view, texture.binding.texture_desc, initial_state);
                 if (!resource_result) {
                     cleanup();
                     return resource_result.result;
@@ -862,8 +853,8 @@ foundation::Result ImGuiRenderer::build_render_graph(pipeline::RenderGraphBuilde
                         context.bind_binding_set(0, prepared->textures[draw_call.texture_index].binding_set);
                     !result) {
                     return fail_rendering(foundation::Result::failure(
-                        result.code, "ImGui texture index " + std::to_string(draw_call.texture_index) + ": " +
-                                         result.message));
+                        result.code,
+                        "ImGui texture index " + std::to_string(draw_call.texture_index) + ": " + result.message));
                 }
                 if (const foundation::Result result = context.draw_indexed(rhi::DrawIndexedDesc{
                         draw_call.index_count, 1, draw_call.first_index, draw_call.vertex_offset, 0});
@@ -913,42 +904,42 @@ foundation::Result ImGuiRenderer::shutdown() {
 
 foundation::Result ImGuiRenderer::release_prepared_frame() {
     try {
-      if (impl_ == nullptr || !impl_->initialized) {
-          return foundation::Result::success();
-      }
-      if (const foundation::Result result = impl_->device.wait_idle(); !result) {
-          return result;
-      }
-      if (impl_->prepared_frame == nullptr && impl_->prepared_frame_history.empty()) {
-        // The caller may be replacing an externally-owned texture even when
-        // this renderer has no current draw packet. Do not retain its logical
-        // RenderGraph resource: the RHI handle may have been recycled with a
-        // different state on the next frame.
-          impl_->imported_textures.clear();
-          return foundation::Result::success();
-      }
-      foundation::Result first_result = foundation::Result::success();
-      for (const std::weak_ptr<Impl::PreparedFrame>& frame_weak : impl_->prepared_frame_history) {
-        const std::shared_ptr<Impl::PreparedFrame> frame = frame_weak.lock();
-        if (frame == nullptr) {
-            continue;
+        if (impl_ == nullptr || !impl_->initialized) {
+            return foundation::Result::success();
         }
-        const foundation::Result result = frame->release_rhi_resources();
-        if (!result && first_result) {
-            first_result = result;
+        if (const foundation::Result result = impl_->device.wait_idle(); !result) {
+            return result;
         }
-      }
-      if (!first_result) {
-          return first_result;
-      }
-      impl_->prepared_frame.reset();
-      impl_->prepared_frame_history.clear();
-    // A caller releases the prepared frame before replacing an externally
-    // owned texture (for example the editor viewport after a resize). The
-    // next graph must import that replacement instead of reusing a logical
-    // resource that still describes the retired image.
-      impl_->imported_textures.clear();
-      return foundation::Result::success();
+        if (impl_->prepared_frame == nullptr && impl_->prepared_frame_history.empty()) {
+            // The caller may be replacing an externally-owned texture even when
+            // this renderer has no current draw packet. Do not retain its logical
+            // RenderGraph resource: the RHI handle may have been recycled with a
+            // different state on the next frame.
+            impl_->imported_textures.clear();
+            return foundation::Result::success();
+        }
+        foundation::Result first_result = foundation::Result::success();
+        for (const std::weak_ptr<Impl::PreparedFrame>& frame_weak : impl_->prepared_frame_history) {
+            const std::shared_ptr<Impl::PreparedFrame> frame = frame_weak.lock();
+            if (frame == nullptr) {
+                continue;
+            }
+            const foundation::Result result = frame->release_rhi_resources();
+            if (!result && first_result) {
+                first_result = result;
+            }
+        }
+        if (!first_result) {
+            return first_result;
+        }
+        impl_->prepared_frame.reset();
+        impl_->prepared_frame_history.clear();
+        // A caller releases the prepared frame before replacing an externally
+        // owned texture (for example the editor viewport after a resize). The
+        // next graph must import that replacement instead of reusing a logical
+        // resource that still describes the retired image.
+        impl_->imported_textures.clear();
+        return foundation::Result::success();
     } catch (const std::bad_alloc&) {
         return foundation::out_of_memory("ImGui prepared-frame cleanup allocation failed");
     } catch (const std::exception& exception) {
@@ -1022,9 +1013,9 @@ foundation::Result register_imgui_render_feature(pipeline::PipelineRegistry& reg
 }
 
 foundation::Result unregister_imgui_render_feature(pipeline::PipelineRegistry& registry) {
-    const pipeline::FeatureInstanceId instance = pipeline::make_feature_instance_id(
-        kImGuiRenderFeatureId, pipeline::PipelineId("RenderPipeline"), pipeline::PipelineScope::kFrame,
-        kImGuiFeaturePointId);
+    const pipeline::FeatureInstanceId instance =
+        pipeline::make_feature_instance_id(kImGuiRenderFeatureId, pipeline::PipelineId("RenderPipeline"),
+                                           pipeline::PipelineScope::kFrame, kImGuiFeaturePointId);
     foundation::Result first_result = registry.unbind_feature(instance);
     if (!first_result && first_result.code == foundation::ResultCode::kNotFound) {
         first_result = foundation::Result::success();

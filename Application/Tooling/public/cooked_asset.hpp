@@ -9,19 +9,14 @@
 #include <span>
 #include <vector>
 
+#include "../../../Engine/Asset/public/cooked_asset.hpp"
 #include "asset_metadata.hpp"
 
 namespace aeg::tooling {
-/** @brief One verified cooked payload and its runtime dependency identities. */
-struct CookedAsset final {
-    AssetId id{};
-    AssetKind kind{AssetKind::kMesh};
-    uint32_t schema_version{};
-    std::vector<AssetId> runtime_dependencies{};
-    std::vector<std::byte> payload{};
-};
+/** @brief Compatibility name for the Engine-owned cooked asset ABI. */
+using CookedAsset = asset::CookedAsset;
 
-/** @brief Encodes and verifies the versioned FlatBuffers cooked envelope. */
+/** @brief Tooling facade for the Engine-owned cooked envelope codec. */
 class CookedAssetCodec final {
 public:
     [[nodiscard]] foundation::ResultValue<std::vector<std::byte>> encode(const CookedAsset& asset) const;

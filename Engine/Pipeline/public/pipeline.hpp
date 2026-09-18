@@ -21,6 +21,7 @@
 
 #include "concurrency.hpp"
 #include "pipeline_types.hpp"
+#include "render_program.hpp"
 #include "rhi_struct.hpp"
 
 namespace aeg::rhi {
@@ -34,10 +35,15 @@ class ArtifactScopeBridge;
 class PipelineFeature;
 class RenderGraphBuilder;
 class RenderGraphBuilderBackend;
+class PipelineBuilderBackend;
+class FeatureDeclarationBackend;
+struct FeatureBuildDescriptor;
+struct PipelineInstanceConfiguration;
 class RenderPassBuilder;
 class RenderPassBuilderBackend;
 class RenderPassExecutionContext;
 class RenderPassExecutionContextBackend;
+struct RenderPassConfiguration;
 
 using RenderPassSetupFunction = std::function<foundation::Result(RenderPassBuilder&)>;
 using RenderPassExecuteFunction = std::function<foundation::Result(RenderPassExecutionContext&)>;
@@ -123,6 +129,10 @@ public:
         RenderGraphTexture texture, rhi::LoadOp depth_load_op, rhi::StoreOp depth_store_op, float clear_depth,
         uint32_t clear_stencil, rhi::ResourceUsage final_usage, rhi::SubresourceRange subresources) = 0;
     virtual void set_side_effects(bool enabled) noexcept = 0;
+    [[nodiscard]] virtual foundation::Result declare_render_program(const RenderProgramRequest&,
+                                                                    const RenderPassConfiguration&) {
+        return foundation::unsupported("render program preparation is unavailable");
+    }
 };
 
 /** @brief Backend adapter for render-pass command recording. */
@@ -182,6 +192,10 @@ public:
                                                            rhi::SubresourceRange subresources,
                                                            rhi::ClearColorValue color, float depth,
                                                            uint32_t stencil) = 0;
+    [[nodiscard]] virtual foundation::Result bind_render_program(const RenderProgramRequest&,
+                                                                 const RenderPassConfiguration&) {
+        return foundation::unsupported("render program binding is unavailable");
+    }
 };
 
 /** @brief Backend adapter for logical resources and render-pass creation. */
@@ -343,6 +357,8 @@ public:
         uint32_t clear_stencil = 0, rhi::ResourceUsage final_usage = rhi::ResourceUsage::kDepthStencilWrite,
         rhi::SubresourceRange subresources = {});
     void set_side_effects(bool enabled = true) noexcept;
+    [[nodiscard]] foundation::Result declare_render_program(const RenderProgramRequest& request,
+                                                            const RenderPassConfiguration& configuration);
 
 private:
     RenderPassBuilderBackend* backend_{nullptr};
@@ -405,6 +421,8 @@ public:
     [[nodiscard]] foundation::Result clear_texture(RenderGraphTexture texture, rhi::SubresourceRange subresources = {},
                                                    rhi::ClearColorValue color = {}, float depth = 1.0f,
                                                    uint32_t stencil = 0);
+    [[nodiscard]] foundation::Result bind_render_program(const RenderProgramRequest& request,
+                                                         const RenderPassConfiguration& configuration);
 
 private:
     RenderPassExecutionContextBackend* backend_{nullptr};
@@ -728,6 +746,8 @@ private:
 class PipelineBuilder final {
 public:
     explicit PipelineBuilder(const PipelineDescriptor& descriptor);
+    /** @brief Creates a forwarding builder for a module-local declaration backend. */
+    PipelineBuilder(PipelineBuilderBackend& backend, const PipelineDescriptor& descriptor);
     ~PipelineBuilder() = default;
 
     PipelineBuilder(const PipelineBuilder&) = delete;
@@ -795,6 +815,7 @@ private:
     std::vector<PipelineOrderingRecord> orderings_{};
     std::vector<PipelineExposureRecord> exposures_{};
     bool finished_{false};
+    PipelineBuilderBackend* declaration_backend_{nullptr};
 
     friend class FeatureBuildContext;
     friend class PipelineCompiler;
@@ -839,6 +860,10 @@ public:
     [[nodiscard]] FeaturePartId part_id() const noexcept { return part_id_; }
     [[nodiscard]] FeaturePointId feature_point() const noexcept { return feature_point_.id; }
     [[nodiscard]] FeatureDomain domain() const noexcept { return active_domain_; }
+    /** @brief Immutable instance configuration visible during declaration. */
+    [[nodiscard]] std::shared_ptr<const PipelineInstanceConfiguration> configuration() const noexcept {
+        return configuration_;
+    }
     [[nodiscard]] const FeaturePointDescriptor& feature_point_descriptor() const noexcept { return feature_point_; }
     [[nodiscard]] FeaturePointFlags feature_point_flags() const noexcept { return feature_point_.flags; }
     [[nodiscard]] bool domain_is_active(FeatureDomain domain) const noexcept {
@@ -869,6 +894,10 @@ public:
     FeatureBuildContext(const FeatureBuildContext&) noexcept = default;
     FeatureBuildContext& operator=(const FeatureBuildContext&) noexcept = default;
 
+    /** @brief Creates a feature context backed by a module-local declaration seam. */
+    [[nodiscard]] static FeatureBuildContext from_backend(FeatureDeclarationBackend& backend,
+                                                          const FeatureBuildDescriptor& descriptor) noexcept;
+
 private:
     FeatureBuildContext(PipelineBuilder& builder, PipelineScope scope, PipelineId pipeline_id, FeatureId feature_id,
                         FeatureInstanceId feature_instance_id, FeaturePartId part_id,
@@ -884,11 +913,26 @@ private:
           active_domain_(active_domain),
           contribution_records_(contribution_records) {}
 
+    explicit FeatureBuildContext(FeatureDeclarationBackend& backend) noexcept : feature_backend_(&backend) {}
+
+    [[nodiscard]] PipelineStageHandle add_stage(const StageDescriptor& descriptor);
+    [[nodiscard]] PipelineTaskHandle add_task(const TaskDescriptor& descriptor);
+    [[nodiscard]] PipelineArtifactHandle declare_artifact(const ArtifactDescriptor& descriptor);
+    [[nodiscard]] foundation::Result bind_task(PipelineTaskHandle task, PipelineStageHandle stage);
+    [[nodiscard]] foundation::Result reads(PipelineStageHandle stage, const ArtifactBinding& binding);
+    [[nodiscard]] foundation::Result writes(PipelineStageHandle stage, const ArtifactBinding& binding);
+    [[nodiscard]] foundation::Result reads_writes(PipelineStageHandle stage, const ArtifactBinding& binding);
+    [[nodiscard]] foundation::Result publish_snapshot(PipelineStageHandle stage, const ArtifactBinding& binding);
+    [[nodiscard]] foundation::Result runs_before(PipelineStageHandle stage, StageId other);
+    [[nodiscard]] foundation::Result runs_after(PipelineStageHandle stage, StageId other);
+    [[nodiscard]] foundation::Result expose_artifact(ArtifactId artifact, PipelineScope target_scope);
+
     [[nodiscard]] foundation::Result reject(foundation::ResultCode code, std::string message);
     void on_stage_added(PipelineStageHandle stage);
     void record_contribution(FeatureDomain domain, uint32_t first_stage_index);
 
     PipelineBuilder* builder_{nullptr};
+    FeatureDeclarationBackend* feature_backend_{nullptr};
     PipelineScope scope_{PipelineScope::kEngine};
     PipelineId pipeline_id_{};
     FeatureId feature_id_{};
@@ -896,6 +940,7 @@ private:
     FeaturePartId part_id_{};
     FeaturePointDescriptor feature_point_{};
     FeatureDomain active_domain_{FeatureDomain::kLogic};
+    std::shared_ptr<const PipelineInstanceConfiguration> configuration_{};
     std::vector<PipelineFeatureContributionRecord>* contribution_records_{nullptr};
 
     friend class PipelineCompiler;
@@ -1017,15 +1062,6 @@ protected:
 template <typename... Parts>
 class CompositeFeature : public PipelineFeature {
 public:
-    static_assert(sizeof...(Parts) > 0, "CompositeFeature requires at least one part");
-    static_assert((std::is_base_of_v<PipelineFeature, Parts> && ...),
-                  "CompositeFeature parts must derive from PipelineFeature");
-    static_assert((requires { Parts::kDomain; } && ...), "CompositeFeature parts must expose a domain tag");
-    static_assert((requires { typename Parts::BuilderType; } && ...),
-                  "CompositeFeature parts must expose a domain builder type");
-    static_assert(((Parts::kDomain != FeatureDomain::kComposite) && ...),
-                  "CompositeFeature cannot contain another CompositeFeature");
-
     static constexpr FeatureDomain kDomain = FeatureDomain::kComposite;
     static constexpr FeatureDomainMask kDomainMask = (to_mask(Parts::kDomain) | ...);
 
@@ -1300,6 +1336,12 @@ public:
     [[nodiscard]] const ArtifactScopeBridge* scope_bridge() const noexcept { return scope_bridge_; }
 
     [[nodiscard]] foundation::Result bind_pipeline(PipelineId pipeline);
+    [[nodiscard]] foundation::Result set_configuration(
+        std::shared_ptr<const PipelineInstanceConfiguration> configuration);
+    [[nodiscard]] std::shared_ptr<const PipelineInstanceConfiguration> configuration() const noexcept {
+        std::shared_lock lock(plan_mutex_);
+        return configuration_;
+    }
     [[nodiscard]] foundation::Result rebuild(const PipelineRegistry& registry,
                                              CapabilityMask available_capabilities = 0);
     /** @brief Stages an Editor-authored dependency override that becomes active at the next safe execution boundary. */
@@ -1329,6 +1371,7 @@ private:
     const ArtifactScopeBridge* scope_bridge_{nullptr};
     mutable std::shared_mutex plan_mutex_;
     mutable PipelinePlanHandle active_plan_{};
+    std::shared_ptr<const PipelineInstanceConfiguration> configuration_{};
     mutable PipelinePlanHandle pending_plan_{};
     mutable std::vector<PipelinePlanHandle> retired_plans_{};
     mutable bool active_{false};
@@ -1357,7 +1400,7 @@ inline PipelineStageHandle RenderGraphBuilder::add_stage(const StageDescriptor& 
     if (declaration_context_ == nullptr || !declaration_context_->domain_is_active(kDomain)) {
         return {};
     }
-    const PipelineStageHandle stage = declaration_context_->builder_->add_stage(descriptor);
+    const PipelineStageHandle stage = declaration_context_->add_stage(descriptor);
     if (stage) {
         declaration_context_->on_stage_added(stage);
     }
@@ -1366,7 +1409,7 @@ inline PipelineStageHandle RenderGraphBuilder::add_stage(const StageDescriptor& 
 
 inline PipelineTaskHandle RenderGraphBuilder::add_task(const TaskDescriptor& descriptor) {
     return declaration_context_ != nullptr && declaration_context_->domain_is_active(kDomain)
-               ? declaration_context_->builder_->add_task(descriptor)
+               ? declaration_context_->add_task(descriptor)
                : PipelineTaskHandle{};
 }
 
@@ -1379,35 +1422,35 @@ inline PipelineArtifactHandle RenderGraphBuilder::declare_artifact(const Artifac
                                                        "feature point does not allow artifact creation"));
         return {};
     }
-    return declaration_context_->builder_->declare_artifact(descriptor);
+    return declaration_context_->declare_artifact(descriptor);
 }
 
 inline foundation::Result RenderGraphBuilder::bind_task(PipelineTaskHandle task, PipelineStageHandle stage) {
     if (declaration_context_ == nullptr || !declaration_context_->domain_is_active(kDomain)) {
         return render_graph_builder_invalid_state();
     }
-    return declaration_context_->builder_->bind_task(task, stage);
+    return declaration_context_->bind_task(task, stage);
 }
 
 inline foundation::Result RenderGraphBuilder::reads(PipelineStageHandle stage, const ArtifactBinding& binding) {
     if (declaration_context_ == nullptr || !declaration_context_->domain_is_active(kDomain)) {
         return render_graph_builder_invalid_state();
     }
-    return declaration_context_->builder_->reads(stage, binding);
+    return declaration_context_->reads(stage, binding);
 }
 
 inline foundation::Result RenderGraphBuilder::writes(PipelineStageHandle stage, const ArtifactBinding& binding) {
     if (declaration_context_ == nullptr || !declaration_context_->domain_is_active(kDomain)) {
         return render_graph_builder_invalid_state();
     }
-    return declaration_context_->builder_->writes(stage, binding);
+    return declaration_context_->writes(stage, binding);
 }
 
 inline foundation::Result RenderGraphBuilder::reads_writes(PipelineStageHandle stage, const ArtifactBinding& binding) {
     if (declaration_context_ == nullptr || !declaration_context_->domain_is_active(kDomain)) {
         return render_graph_builder_invalid_state();
     }
-    return declaration_context_->builder_->reads_writes(stage, binding);
+    return declaration_context_->reads_writes(stage, binding);
 }
 
 inline foundation::Result RenderGraphBuilder::publish_snapshot(PipelineStageHandle stage,
@@ -1419,28 +1462,28 @@ inline foundation::Result RenderGraphBuilder::publish_snapshot(PipelineStageHand
         return declaration_context_->reject(foundation::ResultCode::kUnsupported,
                                             "feature point does not allow snapshot publication");
     }
-    return declaration_context_->builder_->publish_snapshot(stage, binding);
+    return declaration_context_->publish_snapshot(stage, binding);
 }
 
 inline foundation::Result RenderGraphBuilder::runs_before(PipelineStageHandle stage, StageId other) {
     if (declaration_context_ == nullptr || !declaration_context_->domain_is_active(kDomain)) {
         return render_graph_builder_invalid_state();
     }
-    return declaration_context_->builder_->runs_before(stage, other);
+    return declaration_context_->runs_before(stage, other);
 }
 
 inline foundation::Result RenderGraphBuilder::runs_after(PipelineStageHandle stage, StageId other) {
     if (declaration_context_ == nullptr || !declaration_context_->domain_is_active(kDomain)) {
         return render_graph_builder_invalid_state();
     }
-    return declaration_context_->builder_->runs_after(stage, other);
+    return declaration_context_->runs_after(stage, other);
 }
 
 inline foundation::Result RenderGraphBuilder::expose_artifact(ArtifactId artifact, PipelineScope target_scope) {
     if (declaration_context_ == nullptr || !declaration_context_->domain_is_active(kDomain)) {
         return render_graph_builder_invalid_state();
     }
-    return declaration_context_->builder_->expose_artifact(artifact, target_scope);
+    return declaration_context_->expose_artifact(artifact, target_scope);
 }
 
 inline PipelineScope RenderGraphBuilder::scope() const noexcept {
@@ -1774,6 +1817,12 @@ inline void RenderPassBuilder::set_side_effects(bool enabled) noexcept {
     }
 }
 
+inline foundation::Result RenderPassBuilder::declare_render_program(const RenderProgramRequest& request,
+                                                                    const RenderPassConfiguration& configuration) {
+    return backend_ == nullptr ? foundation::invalid_state("render-pass builder backend is not attached")
+                               : backend_->declare_render_program(request, configuration);
+}
+
 inline RenderGraphPass RenderPassExecutionContext::pass() const noexcept {
     return backend_->pass();
 }
@@ -1901,12 +1950,18 @@ inline foundation::Result RenderPassExecutionContext::clear_texture(RenderGraphT
     return backend_->clear_texture(texture, subresources, color, depth, stencil);
 }
 
+inline foundation::Result RenderPassExecutionContext::bind_render_program(
+    const RenderProgramRequest& request, const RenderPassConfiguration& configuration) {
+    return backend_ == nullptr ? foundation::invalid_state("render-pass execution backend is not attached")
+                               : backend_->bind_render_program(request, configuration);
+}
+
 template <FeatureDomain Domain>
 PipelineStageHandle DomainGraphBuilder<Domain>::add_stage(const StageDescriptor& descriptor) {
     if (!is_usable()) {
         return {};
     }
-    const PipelineStageHandle stage = context_->builder_->add_stage(descriptor);
+    const PipelineStageHandle stage = context_->add_stage(descriptor);
     if (stage) {
         context_->on_stage_added(stage);
     }
@@ -1915,7 +1970,7 @@ PipelineStageHandle DomainGraphBuilder<Domain>::add_stage(const StageDescriptor&
 
 template <FeatureDomain Domain>
 PipelineTaskHandle DomainGraphBuilder<Domain>::add_task(const TaskDescriptor& descriptor) {
-    return is_usable() ? context_->builder_->add_task(descriptor) : PipelineTaskHandle{};
+    return is_usable() ? context_->add_task(descriptor) : PipelineTaskHandle{};
 }
 
 template <FeatureDomain Domain>
@@ -1928,34 +1983,34 @@ PipelineArtifactHandle DomainGraphBuilder<Domain>::declare_artifact(const Artifa
             context_->reject(foundation::ResultCode::kUnsupported, "feature point does not allow artifact creation"));
         return {};
     }
-    return context_->builder_->declare_artifact(descriptor);
+    return context_->declare_artifact(descriptor);
 }
 
 template <FeatureDomain Domain>
 foundation::Result DomainGraphBuilder<Domain>::bind_task(PipelineTaskHandle task, PipelineStageHandle stage) {
     return is_usable()
-               ? context_->builder_->bind_task(task, stage)
+               ? context_->bind_task(task, stage)
                : context_->reject(foundation::ResultCode::kInvalidState, "feature builder domain is not active");
 }
 
 template <FeatureDomain Domain>
 foundation::Result DomainGraphBuilder<Domain>::reads(PipelineStageHandle stage, const ArtifactBinding& binding) {
     return is_usable()
-               ? context_->builder_->reads(stage, binding)
+               ? context_->reads(stage, binding)
                : context_->reject(foundation::ResultCode::kInvalidState, "feature builder domain is not active");
 }
 
 template <FeatureDomain Domain>
 foundation::Result DomainGraphBuilder<Domain>::writes(PipelineStageHandle stage, const ArtifactBinding& binding) {
     return is_usable()
-               ? context_->builder_->writes(stage, binding)
+               ? context_->writes(stage, binding)
                : context_->reject(foundation::ResultCode::kInvalidState, "feature builder domain is not active");
 }
 
 template <FeatureDomain Domain>
 foundation::Result DomainGraphBuilder<Domain>::reads_writes(PipelineStageHandle stage, const ArtifactBinding& binding) {
     return is_usable()
-               ? context_->builder_->reads_writes(stage, binding)
+               ? context_->reads_writes(stage, binding)
                : context_->reject(foundation::ResultCode::kInvalidState, "feature builder domain is not active");
 }
 
@@ -1969,27 +2024,27 @@ foundation::Result DomainGraphBuilder<Domain>::publish_snapshot(PipelineStageHan
         return context_->reject(foundation::ResultCode::kUnsupported,
                                 "feature point does not allow snapshot publication");
     }
-    return context_->builder_->publish_snapshot(stage, binding);
+    return context_->publish_snapshot(stage, binding);
 }
 
 template <FeatureDomain Domain>
 foundation::Result DomainGraphBuilder<Domain>::runs_before(PipelineStageHandle stage, StageId other) {
     return is_usable()
-               ? context_->builder_->runs_before(stage, other)
+               ? context_->runs_before(stage, other)
                : context_->reject(foundation::ResultCode::kInvalidState, "feature builder domain is not active");
 }
 
 template <FeatureDomain Domain>
 foundation::Result DomainGraphBuilder<Domain>::runs_after(PipelineStageHandle stage, StageId other) {
     return is_usable()
-               ? context_->builder_->runs_after(stage, other)
+               ? context_->runs_after(stage, other)
                : context_->reject(foundation::ResultCode::kInvalidState, "feature builder domain is not active");
 }
 
 template <FeatureDomain Domain>
 foundation::Result DomainGraphBuilder<Domain>::expose_artifact(ArtifactId artifact, PipelineScope target_scope) {
     return is_usable()
-               ? context_->builder_->expose_artifact(artifact, target_scope)
+               ? context_->expose_artifact(artifact, target_scope)
                : context_->reject(foundation::ResultCode::kInvalidState, "feature builder domain is not active");
 }
 }  // namespace aeg::pipeline

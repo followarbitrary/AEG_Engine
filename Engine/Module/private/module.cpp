@@ -9,6 +9,8 @@
 #include <new>
 #include <string>
 
+#include "../../Pipeline/public/render_pass.hpp"
+
 namespace aeg::module {
 namespace {
 using foundation::invalid_argument;
@@ -137,6 +139,51 @@ foundation::Result ModuleRegistrationContext::register_feature(pipeline::Feature
     return foundation::Result::success();
 }
 
+foundation::Result ModuleRegistrationContext::register_render_pass(pipeline::RenderPassFactory factory) {
+    if (render_pass_registry_ == nullptr) {
+        return unsupported("module registry has no render pass registry");
+    }
+    if (!factory) {
+        return invalid_argument("module render pass factory is empty");
+    }
+    std::unique_ptr<pipeline::RenderPass> preview;
+    try {
+        preview = factory();
+    } catch (const std::exception& exception) {
+        return foundation::Result::failure(foundation::ResultCode::kUnknown,
+                                           std::string("module render pass factory threw: ") + exception.what());
+    } catch (...) {
+        return foundation::Result::failure(foundation::ResultCode::kUnknown,
+                                           "module render pass factory threw an unknown exception");
+    }
+    if (!preview) {
+        return invalid_argument("module render pass factory returned null");
+    }
+    const auto descriptor = preview->descriptor();
+    if (descriptor.owner_module != module_id_) {
+        return invalid_argument("render pass owner module does not match registration context");
+    }
+    const auto preview_holder = std::make_shared<std::unique_ptr<pipeline::RenderPass>>(std::move(preview));
+    const auto factory_holder = std::make_shared<pipeline::RenderPassFactory>(std::move(factory));
+    const foundation::Result result = render_pass_registry_->register_pass(
+        [preview_holder, factory_holder]() mutable -> std::unique_ptr<pipeline::RenderPass> {
+            if (*preview_holder != nullptr) {
+                return std::move(*preview_holder);
+            }
+            return (*factory_holder)();
+        });
+    if (!result) {
+        return result;
+    }
+    if (const foundation::Result record_result =
+            push_id(render_passes_, descriptor.type, "module render pass ownership allocation failed");
+        !record_result) {
+        static_cast<void>(render_pass_registry_->unregister_pass(descriptor.type));
+        return record_result;
+    }
+    return foundation::Result::success();
+}
+
 foundation::Result ModuleRegistrationContext::bind_feature(const pipeline::FeatureBindingDescriptor& binding) {
     pipeline::FeatureBindingDescriptor normalized = binding;
     if (!normalized.instance.is_valid()) {
@@ -191,6 +238,14 @@ foundation::Result ModuleRegistrationContext::rollback() noexcept {
         const foundation::Result result = pipeline_registry_.unregister_feature(*iterator);
         if (!result && first_error) {
             first_error = result;
+        }
+    }
+    if (render_pass_registry_ != nullptr) {
+        for (auto iterator = render_passes_.rbegin(); iterator != render_passes_.rend(); ++iterator) {
+            const foundation::Result result = render_pass_registry_->unregister_pass(*iterator);
+            if (!result && first_error) {
+                first_error = result;
+            }
         }
     }
     for (auto iterator = phases_.rbegin(); iterator != phases_.rend(); ++iterator) {
@@ -258,7 +313,7 @@ foundation::Result ModuleRegistry::register_module(ModuleFactory factory) {
         }
     }
 
-    ModuleRegistrationContext context(pipeline_registry_, reflection_registry_, descriptor.id);
+    ModuleRegistrationContext context(pipeline_registry_, reflection_registry_, render_pass_registry_, descriptor.id);
     foundation::Result registration_result;
     try {
         registration_result = module->register_module(context);
@@ -285,6 +340,7 @@ foundation::Result ModuleRegistry::register_module(ModuleFactory factory) {
         registration.phases = context.phases_;
         registration.pipelines = context.pipelines_;
         registration.features = context.features_;
+        registration.render_passes = context.render_passes_;
         registration.feature_bindings = context.feature_bindings_;
         registration.types = context.types_;
         std::unique_lock lock(mutex_);
@@ -319,6 +375,15 @@ foundation::Result ModuleRegistry::unregister_owned(const Registration& registra
         const foundation::Result result = pipeline_registry_.unregister_feature(*iterator);
         if (!result && first_error) {
             first_error = result;
+        }
+    }
+    if (render_pass_registry_ != nullptr) {
+        for (auto iterator = registration.render_passes.rbegin(); iterator != registration.render_passes.rend();
+             ++iterator) {
+            const foundation::Result result = render_pass_registry_->unregister_pass(*iterator);
+            if (!result && first_error) {
+                first_error = result;
+            }
         }
     }
     for (auto iterator = registration.phases.rbegin(); iterator != registration.phases.rend(); ++iterator) {
@@ -402,5 +467,16 @@ foundation::ResultValue<ModuleDescriptor> ModuleRegistry::find_module(pipeline::
         return {not_found("module is not registered"), {}};
     }
     return {foundation::Result::success(), iterator->second.descriptor};
+}
+
+std::vector<ModuleDescriptor> ModuleRegistry::list_modules() const {
+    std::shared_lock lock(mutex_);
+    std::vector<ModuleDescriptor> result;
+    result.reserve(registrations_.size());
+    for (const auto& [id, registration] : registrations_)
+        result.push_back(registration.descriptor);
+    std::sort(result.begin(), result.end(),
+              [](const ModuleDescriptor& a, const ModuleDescriptor& b) { return a.id.value() < b.id.value(); });
+    return result;
 }
 }  // namespace aeg::module

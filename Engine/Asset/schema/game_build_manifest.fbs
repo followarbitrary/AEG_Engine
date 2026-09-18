@@ -1,0 +1,17 @@
+namespace aeg.asset;
+
+table GameBuildManifest {
+  schema_version:uint;
+  project_uuid:string;
+  module_id:string;
+  build_id:string;
+  module_contract_digest:string;
+  package_digest:string;
+  startup_scene:[ubyte] (required);
+  startup_pipelines:[[ubyte]];
+  target:string;
+  configuration:string;
+  package_name:string;
+}
+
+root_type GameBuildManifest;
