@@ -5,6 +5,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
@@ -32,9 +33,21 @@ struct EditorWorkspaceActionDescriptor final {
     [[nodiscard]] bool is_valid() const noexcept { return !key.empty() && !title.empty() && callback != nullptr; }
 };
 
+/** @brief Application callbacks used by the client-drawn window controls. */
+struct EditorWindowControls final {
+    std::function<foundation::Result()> minimize{};
+    std::function<foundation::Result()> toggle_maximize{};
+    std::function<foundation::Result()> close{};
+};
+
 /** @brief Coordinates panel registration, semantic layout state, and ImGui docking. */
 class EditorWorkspace final {
 public:
+    /** @brief Chooses whether a panel remains in the editor dockspace or owns a native platform viewport. */
+    enum class PanelPresentation : uint8_t {
+        kDockWindow,
+        kNativeWindow,
+    };
     /** @brief Creates a workspace that borrows one initialized ImGui host. */
     explicit EditorWorkspace(EditorImGuiHost& imgui_host) noexcept;
 
@@ -45,17 +58,30 @@ public:
 
     /** @brief Registers one panel and adds its descriptor to layout persistence. */
     [[nodiscard]] foundation::Result register_panel(EditorPanelDescriptor descriptor,
-                                                    std::unique_ptr<EditorPanel> panel);
+                                                    std::unique_ptr<EditorPanel> panel,
+                                                    std::function<void(bool)> sync_visibility = {});
     /** @brief Removes one panel from the host and semantic layout. */
     [[nodiscard]] foundation::Result unregister_panel(std::string_view panel_key);
     /** @brief Changes visibility while preserving the panel's dock or floating placement. */
     [[nodiscard]] foundation::Result set_panel_visible(std::string_view panel_key, bool visible);
+    /** @brief Changes a user-rearrangeable panel between the default dockspace and a native viewport. */
+    [[nodiscard]] foundation::Result set_panel_presentation(std::string_view panel_key, PanelPresentation presentation);
+    /** @brief Returns the selected presentation; panels start in the dockspace. */
+    [[nodiscard]] PanelPresentation panel_presentation(std::string_view panel_key) const noexcept;
     /** @brief Registers one application command without adding a workspace panel. */
     [[nodiscard]] foundation::Result register_view_action(EditorWorkspaceActionDescriptor descriptor);
+    /** @brief Installs application-owned File/Edit menu content in the workspace navigation row. */
+    void set_main_menu_content(std::function<void()> content) { main_menu_content_ = std::move(content); }
+    /** @brief Installs application-owned callbacks for the custom title-bar controls. */
+    void set_window_controls(EditorWindowControls controls) { window_controls_ = std::move(controls); }
     /** @brief Invokes one registered View-menu command by stable key. */
     [[nodiscard]] foundation::Result invoke_view_action(std::string_view action_key);
     /** @brief Builds the dockspace, workspace menu, and currently visible panels. */
     [[nodiscard]] foundation::Result build_ui();
+    /** @brief Vertical space reserved by the brand, navigation, and command rows. */
+    [[nodiscard]] static constexpr float chrome_height() noexcept { return 104.0f; }
+    /** @brief Space reserved at the right edge for client-drawn window controls. */
+    [[nodiscard]] static constexpr float title_control_width() noexcept { return 126.0f; }
     void set_preferences_open(bool open) noexcept { preferences_open_ = open; }
     [[nodiscard]] bool preferences_open() const noexcept { return preferences_open_; }
     void set_playing(bool playing) noexcept { playing_ = playing; }
@@ -79,6 +105,8 @@ private:
         EditorPanelDescriptor descriptor{};
         /** @brief Generation-checked identity owned by the ImGui host. */
         EditorPanelId panel_id{};
+        /** @brief Mirrors workspace visibility into panels with local visibility state. */
+        std::function<void(bool)> sync_visibility{};
     };
 
     [[nodiscard]] PanelEntry* find_panel(std::string_view panel_key) noexcept;
@@ -87,6 +115,7 @@ private:
     [[nodiscard]] const EditorWorkspaceActionDescriptor* find_view_action(std::string_view action_key) const noexcept;
     [[nodiscard]] foundation::Result initialize_dockspace();
     [[nodiscard]] foundation::Result sync_host_visibility();
+    [[nodiscard]] bool is_native_panel(std::string_view panel_key) const noexcept;
 
     /** @brief Borrowed ImGui host that owns panel instances and the active context. */
     EditorImGuiHost* imgui_host_{nullptr};
@@ -94,13 +123,18 @@ private:
     std::unique_ptr<EditorLayoutModel> layout_{};
     /** @brief Registered panels in deterministic application order. */
     std::vector<PanelEntry> panels_{};
+    /** @brief Panels currently requested as independent native viewports. */
+    std::vector<std::string> native_panel_keys_{};
     /** @brief Application commands shown in the workspace View menu. */
     std::vector<EditorWorkspaceActionDescriptor> view_actions_{};
+    std::function<void()> main_menu_content_{};
+    EditorWindowControls window_controls_{};
     /** @brief True after the current layout has been applied to the ImGui dockspace. */
     bool dockspace_initialized_{false};
     bool building_ui_{false};
     bool preferences_open_{false};
     bool playing_{false};
+    int workspace_mode_{0};
     std::string active_rail_{"Scene"};
     std::string pending_panel_focus_{};
 };

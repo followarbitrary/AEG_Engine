@@ -96,7 +96,8 @@ public:
         const aeg::platform::WindowDesc& desc) override {
         if (fail_create) {
             return {aeg::foundation::Result::failure(aeg::foundation::ResultCode::kBackendError,
-                                                     "Fake viewport creation failed"), {}};
+                                                     "Fake viewport creation failed"),
+                    {}};
         }
         const aeg::platform::WindowId id{next_index++, 1};
         auto window = std::make_shared<FakeWindow>(id, desc);
@@ -148,12 +149,24 @@ public:
 class FloatingPanel final : public aeg::editor::EditorPanel {
 public:
     void build_ui() override {
-        ImGui::SetNextWindowPos(ImVec2(1600.0f, 100.0f), ImGuiCond_Always);
-        ImGui::SetNextWindowSize(ImVec2(320.0f, 200.0f), ImGuiCond_Always);
-        ImGui::Begin("Floating Viewport");
+        ImGui::SetNextWindowPos(ImVec2(1600.0f, 100.0f), ImGuiCond_Once);
+        ImGui::SetNextWindowSize(ImVec2(320.0f, 200.0f), ImGuiCond_Once);
+        ImGuiWindowClass window_class;
+        window_class.ViewportFlagsOverrideSet = ImGuiViewportFlags_NoAutoMerge;
+        ImGui::SetNextWindowClass(&window_class);
+        ImGui::Begin("Floating Viewport", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove);
+        position = ImGui::GetWindowPos();
+        ImGui::SetCursorPos(ImVec2(ImGui::GetWindowWidth() - 36.0f, 3.0f));
+        if (ImGui::Button("x", ImVec2(30.0f, 24.0f)))
+            ++close_clicks;
+        close_hovered = ImGui::IsItemHovered();
+        ImGui::SetCursorPos(ImVec2(12.0f, 40.0f));
         ImGui::TextUnformatted("Viewport bridge");
         ImGui::End();
     }
+    ImVec2 position{};
+    bool close_hovered{false};
+    int close_clicks{0};
 };
 }  // namespace
 
@@ -172,6 +185,7 @@ int main() {
     assert(host.set_font_texture(texture_result.value));
 
     auto panel = std::make_unique<FloatingPanel>();
+    FloatingPanel* floating_panel = panel.get();
     assert(host.register_panel(std::move(panel)));
 
     const aeg::platform::WindowId main_window{0, 1};
@@ -185,11 +199,18 @@ int main() {
     std::vector<aeg::editor::ImGuiDrawPacket> packets;
     assert(host.capture_draw_packets(packets));
     assert(packets.size() >= 2);
-    assert(std::any_of(packets.begin(), packets.end(), [main_window](const auto& packet) {
-        return packet.window == main_window;
-    }));
+    assert(std::any_of(packets.begin(), packets.end(),
+                       [main_window](const auto& packet) { return packet.window == main_window; }));
     assert(window_system.create_count != 0);
     assert(window_system.windows.size() >= 1);
+    // Engine-owned ImGui viewports must be borderless: the editor owns the
+    // chrome inside the client area and the platform frame would otherwise
+    // offset draw data and hide the editor's resize affordances.
+    assert(!window_system.windows.front()->desc().client_decorated);
+    assert(window_system.windows.front()->desc().resizable);
+    // A newly shown native viewport must be active so its first mouse and
+    // keyboard events reach Dear ImGui controls.
+    assert(window_system.windows.front()->state().focused);
 
     const aeg::platform::WindowId floating_window = window_system.windows.front()->id();
     aeg::platform::WindowEvent event{};
@@ -204,9 +225,101 @@ int main() {
     assert(host.end_frame());
     packets.clear();
     assert(host.capture_draw_packets(packets));
-    assert(std::any_of(packets.begin(), packets.end(), [floating_window](const auto& packet) {
-        return packet.window == floating_window;
-    }));
+    assert(std::any_of(packets.begin(), packets.end(),
+                       [floating_window](const auto& packet) { return packet.window == floating_window; }));
+
+    // Moving via the OS caption changes the platform position without an
+    // ImGui drag. Input, UI geometry and draw packets must use the same origin.
+    const auto run_frame = [&] {
+        assert(host.begin_frame(frame_desc));
+        assert(host.build_panels());
+        assert(host.end_frame());
+    };
+    int expected_clicks = 0;
+    for (const aeg::platform::WindowPosition moved :
+         {aeg::platform::WindowPosition{600, 260}, aeg::platform::WindowPosition{100, 80},
+          aeg::platform::WindowPosition{760, 400}}) {
+        assert(window_system.windows.front()->set_position(moved));
+        event.mouse_x = 299.0f;
+        event.mouse_y = 15.0f;
+        assert(host.submit_event(event));
+        run_frame();
+        assert(floating_panel->position.x == moved.x && floating_panel->position.y == moved.y);
+        run_frame();  // Hovered-window discovery uses last frame's bounds.
+        assert(floating_panel->close_hovered);
+        packets.clear();
+        assert(host.capture_draw_packets(packets));
+        const auto packet = std::find_if(packets.begin(), packets.end(), [floating_window](const auto& value) {
+            return value.window == floating_window;
+        });
+        assert(packet != packets.end());
+        assert(packet->display_pos_x == moved.x && packet->display_pos_y == moved.y);
+        aeg::platform::WindowEvent button{};
+        button.window = floating_window;
+        button.type = aeg::platform::WindowEventType::kMouseButton;
+        button.mouse_button = aeg::platform::MouseButton::kLeft;
+        button.mouse_button_down = true;
+        assert(host.submit_event(button));
+        run_frame();
+        button.mouse_button_down = false;
+        assert(host.submit_event(button));
+        run_frame();
+        assert(floating_panel->close_clicks == ++expected_clicks);
+        event.mouse_y = 55.0f;
+        assert(host.submit_event(event));
+        run_frame();
+        assert(!floating_panel->close_hovered);
+        button.mouse_button_down = true;
+        assert(host.submit_event(button));
+        run_frame();
+        button.mouse_button_down = false;
+        assert(host.submit_event(button));
+        run_frame();
+        assert(floating_panel->close_clicks == expected_clicks);
+    }
+
+    // Native client resizes must be forwarded to Dear ImGui so the platform
+    // viewport refreshes its draw-data extent before the next frame.
+    aeg::platform::WindowEvent resize_event{};
+    resize_event.type = aeg::platform::WindowEventType::kWindowResized;
+    resize_event.window = floating_window;
+    resize_event.extent = {960, 540};
+    assert(host.submit_event(resize_event));
+    assert(host.begin_frame(frame_desc));
+    const ImGuiPlatformIO& resized_platform_io = ImGui::GetPlatformIO();
+    const bool resize_was_forwarded = [&] {
+        for (int index = 0; index < resized_platform_io.Viewports.Size; ++index) {
+            const ImGuiViewport* viewport = resized_platform_io.Viewports[index];
+            if (viewport != nullptr && viewport != ImGui::GetMainViewport() && viewport->PlatformRequestResize) {
+                return true;
+            }
+        }
+        return false;
+    }();
+    assert(resize_was_forwarded);
+    assert(host.build_panels());
+    assert(host.end_frame());
+
+    // A close request from a native child must be handed back to Dear ImGui;
+    // dropping the platform event leaves a visible, unresponsive window.
+    aeg::platform::WindowEvent close_event{};
+    close_event.type = aeg::platform::WindowEventType::kWindowCloseRequested;
+    close_event.window = floating_window;
+    assert(host.submit_event(close_event));
+    assert(host.begin_frame(frame_desc));
+    const ImGuiPlatformIO& platform_io = ImGui::GetPlatformIO();
+    const bool close_was_forwarded = [&] {
+        for (int index = 0; index < platform_io.Viewports.Size; ++index) {
+            const ImGuiViewport* viewport = platform_io.Viewports[index];
+            if (viewport != nullptr && viewport != ImGui::GetMainViewport() && viewport->PlatformRequestClose) {
+                return true;
+            }
+        }
+        return false;
+    }();
+    assert(close_was_forwarded);
+    assert(host.build_panels());
+    assert(host.end_frame());
 
     // An interrupted viewport frame still finishes platform bookkeeping, so
     // the next NewFrame does not assert that UpdatePlatformWindows was skipped.

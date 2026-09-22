@@ -18,6 +18,7 @@
 #include "ecs.hpp"
 #include "editor_asset_database.hpp"
 #include "editor_project.hpp"
+#include "editor_project_pipeline_authoring.hpp"
 #include "engine_frame_orchestrator.hpp"
 #include "imgui_texture_registry.hpp"
 #include "pipeline.hpp"
@@ -135,6 +136,12 @@ public:
     /** @brief Exposes the engine renderer plan as this project's editable Renderer Pipeline. */
     [[nodiscard]] foundation::Result create_project_renderer_pipeline();
     [[nodiscard]] std::vector<std::pair<std::string, pipeline::PipelinePlanHandle>> pipeline_snapshots() const;
+    /** Authored project Pipeline documents, available before the game module has been built. */
+    [[nodiscard]] std::span<const EditorProjectPipelineDocument> authored_pipeline_documents() const noexcept;
+    [[nodiscard]] const pipeline::TypeCatalog& authored_pipeline_catalog() const noexcept;
+    /** Persists one authored node's optional connection to the editor-owned Present consumer. */
+    [[nodiscard]] foundation::Result set_authored_present_connection(const std::filesystem::path& document_path,
+                                                                     std::string_view source_node, bool connected);
     /** @brief Stages an Editor-authored ordering override for the selected live game pipeline. */
     [[nodiscard]] foundation::Result add_pipeline_runtime_ordering(PipelineTarget target, uint32_t source_node,
                                                                    uint32_t destination_node);

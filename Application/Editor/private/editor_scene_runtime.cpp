@@ -26,6 +26,7 @@
 #include "editor_font_pipeline.hpp"
 #include "material.hpp"
 #include "opaque_render_feature.hpp"
+#include "pipeline_document_io.hpp"
 #include "resource_uploader.hpp"
 #include "shader_contract.hpp"
 #include "texture_uploader.hpp"
@@ -825,6 +826,7 @@ struct EditorSceneRuntime::Impl final {
     world::WorldScope* active_scope_{nullptr};
     scene::SceneAsset scene_asset_{};
     EditorProjectManager project_manager_{};
+    EditorProjectPipelineAuthoring project_pipeline_authoring_{};
     EditorAssetDatabase asset_database_{};
     asset_pipeline::EditorAssetPipeline asset_pipeline_{};
     bool asset_pipeline_ready_{false};
@@ -929,6 +931,7 @@ struct EditorSceneRuntime::Impl final {
     [[nodiscard]] Result sync_scene_from_edit_world();
     [[nodiscard]] Result commit_edit_commands();
     [[nodiscard]] Result prepare_frame(const engine::EngineFramePreparationContext& context);
+    [[nodiscard]] Result reload_project_pipeline_authoring();
     [[nodiscard]] Result synchronize_asset_pipeline();
     [[nodiscard]] Result consume_asset(const asset_pipeline::CpuAsset& asset,
                                        const engine::EngineFramePreparationContext& context);
@@ -1237,6 +1240,58 @@ std::vector<std::pair<std::string, pipeline::PipelinePlanHandle>> EditorSceneRun
         result.emplace_back("Game / Renderer", impl_->project_renderer_pipeline_);
     }
     return result;
+}
+
+std::span<const EditorProjectPipelineDocument> EditorSceneRuntime::authored_pipeline_documents() const noexcept {
+    return impl_ == nullptr
+               ? std::span<const EditorProjectPipelineDocument>{}
+               : std::span<const EditorProjectPipelineDocument>{impl_->project_pipeline_authoring_.documents};
+}
+
+const pipeline::TypeCatalog& EditorSceneRuntime::authored_pipeline_catalog() const noexcept {
+    static const pipeline::TypeCatalog kEmptyCatalog{};
+    return impl_ == nullptr ? kEmptyCatalog : impl_->project_pipeline_authoring_.catalog;
+}
+
+foundation::Result EditorSceneRuntime::set_authored_present_connection(const std::filesystem::path& document_path,
+                                                                       std::string_view source_node, bool connected) {
+    if (impl_ == nullptr || !impl_->initialized_)
+        return foundation::invalid_state("Editor scene runtime is not initialized");
+    if (document_path.empty() || source_node.empty())
+        return foundation::invalid_argument("Present connection endpoints are invalid");
+    const auto document = std::find_if(impl_->project_pipeline_authoring_.documents.begin(),
+                                       impl_->project_pipeline_authoring_.documents.end(),
+                                       [&document_path](const EditorProjectPipelineDocument& item) {
+                                           return item.path.lexically_normal() == document_path.lexically_normal();
+                                       });
+    if (document == impl_->project_pipeline_authoring_.documents.end())
+        return foundation::not_found("Authored Pipeline document is not loaded");
+    const auto is_authoring_node = [&source_node](const auto& nodes) {
+        return std::any_of(nodes.begin(), nodes.end(),
+                           [&source_node](const auto& node) { return node.node_id == source_node; });
+    };
+    if (!is_authoring_node(document->document.pipeline_nodes) && !is_authoring_node(document->document.feature_nodes) &&
+        !is_authoring_node(document->document.pass_nodes)) {
+        return foundation::not_found("Present connection source is not an authored Pipeline node");
+    }
+    try {
+        std::vector<std::string> previous = document->document.present_connections;
+        auto found = std::find(document->document.present_connections.begin(),
+                               document->document.present_connections.end(), source_node);
+        if (connected && found == document->document.present_connections.end())
+            document->document.present_connections.emplace_back(source_node);
+        else if (!connected && found != document->document.present_connections.end())
+            document->document.present_connections.erase(found);
+        else
+            return Result::success();
+        if (const Result saved = project::save_pipeline_document(document->path, document->document); !saved) {
+            document->document.present_connections = std::move(previous);
+            return saved;
+        }
+        return Result::success();
+    } catch (const std::bad_alloc&) {
+        return foundation::out_of_memory("Present connection update allocation failed");
+    }
 }
 
 foundation::Result EditorSceneRuntime::create_project_renderer_pipeline() {
@@ -2172,6 +2227,20 @@ foundation::Result EditorSceneRuntime::Impl::advance_runtime_demo() {
     }
     const auto snapshot = runtime_scope_->commit(frame_context_->frame_number());
     return snapshot ? Result::success() : snapshot.result;
+}
+
+foundation::Result EditorSceneRuntime::Impl::reload_project_pipeline_authoring() {
+    if (!project_manager_.loaded()) {
+        project_pipeline_authoring_ = {};
+        return Result::success();
+    }
+    const std::filesystem::path root = project_manager_.descriptor().root;
+    const auto loaded =
+        load_editor_project_pipeline_authoring(root, root / "Source", project_manager_.assets_directory());
+    if (!loaded)
+        return loaded.result;
+    project_pipeline_authoring_ = std::move(loaded.value);
+    return Result::success();
 }
 
 foundation::Result EditorSceneRuntime::Impl::synchronize_asset_pipeline() {
@@ -4762,6 +4831,10 @@ foundation::Result EditorSceneRuntime::new_project(const std::filesystem::path& 
         static_cast<void>(impl_->project_manager_.close_project());
         return result;
     }
+    if (const Result result = impl_->reload_project_pipeline_authoring(); !result) {
+        static_cast<void>(impl_->project_manager_.close_project());
+        return result;
+    }
     if (const Result result = impl_->synchronize_asset_pipeline(); !result) {
         static_cast<void>(impl_->project_manager_.close_project());
         return result;
@@ -4786,6 +4859,10 @@ foundation::Result EditorSceneRuntime::import_project(const std::filesystem::pat
     // scene sidecar is restored by the editor application.
     impl_->project_renderer_pipeline_.reset();
     if (const Result result = impl_->asset_database_.initialize(impl_->project_manager_.descriptor().root); !result) {
+        static_cast<void>(impl_->project_manager_.close_project());
+        return result;
+    }
+    if (const Result result = impl_->reload_project_pipeline_authoring(); !result) {
         static_cast<void>(impl_->project_manager_.close_project());
         return result;
     }
@@ -5037,6 +5114,9 @@ foundation::Result EditorSceneRuntime::refresh_assets() {
     const Result result = impl_->asset_database_.refresh();
     if (!result) {
         return result;
+    }
+    if (const Result authoring = impl_->reload_project_pipeline_authoring(); !authoring) {
+        return authoring;
     }
     return impl_->synchronize_asset_pipeline();
 }

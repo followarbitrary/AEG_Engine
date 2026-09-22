@@ -106,6 +106,50 @@ int main() {
     desc.title = "AEG Application Platform Smoke";
     desc.extent = {320, 200};
     desc.visible = false;
+    desc.position = {128, 192};
+    desc.position_specified = true;
+    // Editor windows can own their title bar inside the client area.
+    desc.client_decorated = false;
+    if (desc.client_decorated) {
+        return 99;
+    }
+    const auto borderless_result = system->create_window(desc);
+    if (!borderless_result) {
+        return 100;
+    }
+    const auto borderless_window = borderless_result.value;
+    const HWND borderless_native = static_cast<HWND>(borderless_window->surface_binding().window_handle);
+    POINT borderless_client_origin{0, 0};
+    if (ClientToScreen(borderless_native, &borderless_client_origin) == FALSE ||
+        borderless_client_origin.x != desc.position.x || borderless_client_origin.y != desc.position.y ||
+        borderless_window->state().position != desc.position) {
+        return 105;
+    }
+    const LONG_PTR borderless_style = GetWindowLongPtrW(borderless_native, GWL_STYLE);
+    if ((static_cast<DWORD>(borderless_style) & WS_CAPTION) != 0 ||
+        (static_cast<DWORD>(borderless_style) & WS_THICKFRAME) == 0) {
+        return 101;
+    }
+    RECT borderless_rect{};
+    if (GetWindowRect(borderless_native, &borderless_rect) == FALSE) {
+        return 102;
+    }
+    const LRESULT resize_hit =
+        SendMessageW(borderless_native, WM_NCHITTEST, 0, MAKELPARAM(borderless_rect.left + 2, borderless_rect.top + 2));
+    if (resize_hit != HTTOPLEFT) {
+        return 103;
+    }
+    const LRESULT chrome_close_hit = SendMessageW(borderless_native, WM_NCHITTEST, 0,
+                                                  MAKELPARAM(borderless_rect.right - 20, borderless_rect.top + 4));
+    if (chrome_close_hit != HTCLIENT) {
+        return 106;
+    }
+    if (!system->destroy_window(borderless_window->id())) {
+        return 104;
+    }
+    // Keep the remaining platform smoke on the system-decorated path so its
+    // native-frame extent assertions retain their original contract.
+    desc.client_decorated = true;
     const auto window_result = system->create_window(desc);
     if (!window_result) {
         return 2;
@@ -199,7 +243,8 @@ int main() {
         if (!system->poll_events([&recovery_input_seen](const aeg::platform::WindowEvent& event) {
                 recovery_input_seen |=
                     event.type == aeg::platform::WindowEventType::kTextInput && event.codepoint == U'R';
-            }) || !recovery_input_seen) {
+            }) ||
+            !recovery_input_seen) {
             return 38;
         }
     }

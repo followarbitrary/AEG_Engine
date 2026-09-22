@@ -39,6 +39,8 @@ public:
     [[nodiscard]] foundation::Result apply(const editor::EditorPreferenceState& state) override;
     [[nodiscard]] foundation::Result save(const editor::EditorPreferenceState& state) override;
     [[nodiscard]] foundation::Result cancel(const editor::EditorPreferenceState& state) override;
+    /** @brief Discards the draft without rebuilding the already-applied editor font atlas. */
+    [[nodiscard]] foundation::Result discard_draft();
 
 private:
     [[nodiscard]] foundation::Result rebuild_working_catalog();

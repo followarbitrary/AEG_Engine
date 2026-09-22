@@ -247,6 +247,11 @@ void create_platform_window(ImGuiViewport* viewport) noexcept {
     desc.extent = extent;
     desc.position = to_window_position(viewport->Pos);
     desc.position_specified = true;
+    // Dear ImGui owns the viewport chrome.  A native frame changes the client
+    // origin (and leaves an OS title bar above the editor content), which
+    // makes the captured draw packet and the platform window disagree.
+    desc.client_decorated = false;
+    desc.resizable = true;
     desc.visible = false;
     try {
         const foundation::ResultValue<std::shared_ptr<platform::IWindow>> window_result =
@@ -300,6 +305,12 @@ void show_platform_window(ImGuiViewport* viewport) noexcept {
     }
     try {
         static_cast<void>(data->window_object->set_visible(true));
+        // Borderless ImGui viewports are shown with the platform's
+        // no-activate path so their first frame does not steal focus before
+        // it is ready. Once the viewport is visible, focus it explicitly so
+        // mouse and keyboard events are delivered to the child window and
+        // Dear ImGui can route them to its controls.
+        static_cast<void>(data->window_object->focus());
     } catch (...) {}
 }
 
@@ -341,6 +352,30 @@ void set_platform_window_size(ImGuiViewport* viewport, ImVec2 size) noexcept {
 }
 
 void set_platform_window_title(ImGuiViewport*, const char*) noexcept {}
+
+ImGuiViewport* viewport_for_window(const ImGuiPlatformBridgeContext& context, platform::WindowId window) noexcept {
+    if (!window.is_valid()) {
+        return nullptr;
+    }
+    ImGuiPlatformIO& platform_io = ImGui::GetPlatformIO();
+    for (int index = 0; index < platform_io.Viewports.Size; ++index) {
+        ImGuiViewport* viewport = platform_io.Viewports[index];
+        if (viewport == nullptr) {
+            continue;
+        }
+        if (viewport == ImGui::GetMainViewport()) {
+            if (context.window == window) {
+                return viewport;
+            }
+            continue;
+        }
+        const auto* data = static_cast<const ImGuiPlatformViewportData*>(viewport->PlatformUserData);
+        if (data != nullptr && data->window == window) {
+            return viewport;
+        }
+    }
+    return nullptr;
+}
 
 ImVec2 get_platform_window_size(ImGuiViewport* viewport) noexcept {
     const ImGuiPlatformViewportData* data = viewport_data(viewport);
@@ -586,8 +621,36 @@ void ImGuiPlatformBridge::set_window(ImGuiPlatformBridgeContext& context, platfo
         if (main_viewport != nullptr) {
             main_viewport->PlatformUserData = &context.main_viewport;
             main_viewport->PlatformHandle = &context.main_viewport;
+            // Multi-viewport coordinates are desktop-space. Keep the main
+            // viewport aligned with the native editor client area so windows
+            // positioned from WorkPos remain in the dock host instead of
+            // being promoted to accidental platform viewports.
+            if (context.main_viewport.window_object != nullptr) {
+                const platform::WindowState state = context.main_viewport.window_object->state();
+                main_viewport->Pos = ImVec2(static_cast<float>(state.position.x), static_cast<float>(state.position.y));
+                main_viewport->Size =
+                    ImVec2(static_cast<float>(state.extent.width), static_cast<float>(state.extent.height));
+                main_viewport->WorkPos = main_viewport->Pos;
+                main_viewport->WorkSize = main_viewport->Size;
+            }
         }
         if (context.viewports_enabled) {
+            // OS caption dragging (including top/left edge resizing) updates
+            // IWindow state without an ImGui move. Notify Dear ImGui before
+            // NewFrame so it pulls Platform_GetWindowPos and translates the
+            // viewport's windows to the same desktop origin used by input.
+            const ImGuiPlatformIO& platform_io = ImGui::GetPlatformIO();
+            for (int index = 1; index < platform_io.Viewports.Size; ++index) {
+                ImGuiViewport* viewport = platform_io.Viewports[index];
+                const auto* data = viewport_data(viewport);
+                if (data == nullptr || !data->owns_window || data->window_object == nullptr)
+                    continue;
+                const platform::WindowState state = data->window_object->state();
+                if (!state.minimized && (viewport->Pos.x != static_cast<float>(state.position.x) ||
+                                         viewport->Pos.y != static_cast<float>(state.position.y))) {
+                    viewport->PlatformRequestMove = true;
+                }
+            }
             update_monitors(context);
         }
     }
@@ -610,7 +673,26 @@ void ImGuiPlatformBridge::submit_event(ImGuiIO& io, const platform::WindowEvent&
     using platform::WindowEventType;
     switch (event.type) {
         case WindowEventType::kWindowResized:
+            if (context.viewports_enabled) {
+                if (ImGuiViewport* viewport = viewport_for_window(context, event.window); viewport != nullptr) {
+                    // Dear ImGui uses this request to refresh the platform
+                    // viewport's client extent before rebuilding its draw
+                    // data. Without it a native resize leaves the old
+                    // viewport dimensions active for the next frame.
+                    viewport->PlatformRequestResize = true;
+                }
+            }
+            return;
         case WindowEventType::kWindowCloseRequested:
+            // Platform windows are destroyed by ImGui after this flag is
+            // observed during UpdatePlatformWindows().  Keeping the request
+            // in the backend window alone leaves a visible child that can no
+            // longer receive a useful close action.
+            if (context.viewports_enabled) {
+                if (ImGuiViewport* viewport = viewport_for_window(context, event.window); viewport != nullptr) {
+                    viewport->PlatformRequestClose = true;
+                }
+            }
             return;
         case WindowEventType::kWindowFocusChanged:
             io.AddFocusEvent(event.focused);

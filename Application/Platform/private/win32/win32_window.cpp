@@ -186,9 +186,9 @@ foundation::Result Win32Window::set_extent(platform::WindowExtent extent) noexce
         return foundation::Result::failure(foundation::ResultCode::kBackendError, "Win32 window extent query failed");
     }
     const int64_t frame_width = (static_cast<int64_t>(window_rect.right) - window_rect.left) -
-                               (static_cast<int64_t>(client_rect.right) - client_rect.left);
+                                (static_cast<int64_t>(client_rect.right) - client_rect.left);
     const int64_t frame_height = (static_cast<int64_t>(window_rect.bottom) - window_rect.top) -
-                                (static_cast<int64_t>(client_rect.bottom) - client_rect.top);
+                                 (static_cast<int64_t>(client_rect.bottom) - client_rect.top);
     const int64_t width = static_cast<int64_t>(extent.width) + frame_width;
     const int64_t height = static_cast<int64_t>(extent.height) + frame_height;
     if (width <= 0 || height <= 0 || width > std::numeric_limits<int32_t>::max() ||
@@ -254,6 +254,19 @@ foundation::Result Win32Window::set_maximized(bool maximized) noexcept {
     if (state_.maximized != maximized) {
         return foundation::Result::failure(foundation::ResultCode::kBackendError,
                                            "Win32 window maximization update failed");
+    }
+    return foundation::Result::success();
+}
+
+foundation::Result Win32Window::set_minimized(bool minimized) noexcept {
+    if (hwnd_ == nullptr) {
+        return foundation::Result::failure(foundation::ResultCode::kInvalidState);
+    }
+    ShowWindow(hwnd_, minimized ? SW_MINIMIZE : SW_RESTORE);
+    sync_state_from_native();
+    if (state_.minimized != minimized) {
+        return foundation::Result::failure(foundation::ResultCode::kBackendError,
+                                           "Win32 window minimization update failed");
     }
     return foundation::Result::success();
 }
@@ -382,7 +395,89 @@ LRESULT CALLBACK Win32Window::window_proc(HWND window, UINT message, WPARAM w_pa
 
 LRESULT Win32Window::handle_message(UINT message, WPARAM w_param, LPARAM l_param) noexcept {
     switch (message) {
+        case WM_NCCALCSIZE:
+            if (!desc_.client_decorated) {
+                // Preserve the full client area for editor-owned chrome while
+                // retaining WS_THICKFRAME for native resize handling.
+                return 0;
+            }
+            return DefWindowProcW(hwnd_, message, w_param, l_param);
+        case WM_NCHITTEST:
+            if (!desc_.client_decorated) {
+                POINT point{GET_X_LPARAM(l_param), GET_Y_LPARAM(l_param)};
+                ScreenToClient(hwnd_, &point);
+                RECT client{};
+                GetClientRect(hwnd_, &client);
+                constexpr LONG resize_border = 7;
+                constexpr LONG title_height = 30;
+                // Inline Aeg Chrome owns the close control in the upper-right
+                // client area. Keep that rectangle out of the native resize
+                // hit-test so its ImGui button receives the complete click
+                // region, including the pixels adjacent to the top/right edge.
+                const LONG close_left = client.right - 36;
+                const LONG close_right = client.right - 6;
+                const LONG close_top = 3;
+                const LONG close_bottom = 27;
+                if (point.x >= close_left && point.x < close_right && point.y >= close_top && point.y < close_bottom) {
+                    return HTCLIENT;
+                }
+                // The workspace selector, status, and client controls are real
+                // ImGui controls, not a draggable caption region. Reserve the
+                // right-side control cluster even for compact native panels.
+                const LONG draggable_title_width = std::max<LONG>(0, client.right - 140);
+                if (desc_.resizable && !state_.maximized) {
+                    const bool left = point.x < resize_border;
+                    const bool right = point.x >= client.right - resize_border;
+                    const bool top = point.y < resize_border;
+                    const bool bottom = point.y >= client.bottom - resize_border;
+                    if (top && left)
+                        return HTTOPLEFT;
+                    if (top && right)
+                        return HTTOPRIGHT;
+                    if (bottom && left)
+                        return HTBOTTOMLEFT;
+                    if (bottom && right)
+                        return HTBOTTOMRIGHT;
+                    if (left)
+                        return HTLEFT;
+                    if (right)
+                        return HTRIGHT;
+                    if (top)
+                        return HTTOP;
+                    if (bottom)
+                        return HTBOTTOM;
+                }
+                if (point.y >= 0 && point.y < title_height && point.x < draggable_title_width)
+                    return HTCAPTION;
+                return HTCLIENT;
+            }
+            return DefWindowProcW(hwnd_, message, w_param, l_param);
         case WM_SETCURSOR:
+            if (!desc_.client_decorated) {
+                switch (LOWORD(l_param)) {
+                    case HTTOP:
+                    case HTBOTTOM:
+                        SetCursor(LoadCursorW(nullptr, IDC_SIZENS));
+                        return TRUE;
+                    case HTLEFT:
+                    case HTRIGHT:
+                        SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
+                        return TRUE;
+                    case HTTOPLEFT:
+                    case HTBOTTOMRIGHT:
+                        SetCursor(LoadCursorW(nullptr, IDC_SIZENWSE));
+                        return TRUE;
+                    case HTTOPRIGHT:
+                    case HTBOTTOMLEFT:
+                        SetCursor(LoadCursorW(nullptr, IDC_SIZENESW));
+                        return TRUE;
+                    case HTCAPTION:
+                        SetCursor(cursor_handle(cursor_shape_));
+                        return TRUE;
+                    default:
+                        break;
+                }
+            }
             if (LOWORD(l_param) == HTCLIENT) {
                 SetCursor(cursor_handle(cursor_shape_));
                 return TRUE;

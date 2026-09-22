@@ -4,6 +4,7 @@
  */
 #include "win32_window_system.hpp"
 
+#include <dwmapi.h>
 #include <shobjidl.h>
 #include <windows.h>
 #include <wrl/client.h>
@@ -112,6 +113,16 @@ foundation::ResultValue<std::string> convert_wide_to_utf8(std::wstring_view valu
 }
 
 DWORD window_style(const platform::WindowDesc& desc) noexcept {
+    if (!desc.client_decorated) {
+        // Keep the native sizing contract even though the non-client frame is
+        // removed in WM_NCCALCSIZE.  DefWindowProc uses WS_THICKFRAME when it
+        // turns HT* resize hit-tests into an actual mouse resize operation.
+        DWORD style = WS_POPUP | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX;
+        if (desc.resizable) {
+            style |= WS_MAXIMIZEBOX;
+        }
+        return style;
+    }
     DWORD style = WS_OVERLAPPEDWINDOW;
     if (!desc.resizable) {
         style &= ~(WS_THICKFRAME | WS_MAXIMIZEBOX);
@@ -184,7 +195,11 @@ foundation::ResultValue<std::shared_ptr<platform::IWindow>> Win32WindowSystem::c
         auto window = std::make_shared<Win32Window>(id, this, desc);
 
         RECT client_rect{0, 0, static_cast<LONG>(desc.extent.width), static_cast<LONG>(desc.extent.height)};
-        if (AdjustWindowRectEx(&client_rect, window_style(desc), FALSE, 0) == FALSE) {
+        // A client-decorated window needs its requested client extent expanded
+        // to include the system frame.  Borderless editor viewports fill the
+        // entire native rectangle in WM_NCCALCSIZE, so expanding them here
+        // would make their ImGui display size drift from the swapchain.
+        if (desc.client_decorated && AdjustWindowRectEx(&client_rect, window_style(desc), FALSE, 0) == FALSE) {
             return {backend_error("AdjustWindowRectEx failed"), {}};
         }
         const int64_t native_width = static_cast<int64_t>(client_rect.right) - client_rect.left;
@@ -202,9 +217,26 @@ foundation::ResultValue<std::shared_ptr<platform::IWindow>> Win32WindowSystem::c
             return {backend_error("CreateWindowExW failed"), {}};
         }
         window->attach(handle);
+        if (!desc.client_decorated) {
+            // DWMWA_COLOR_NONE removes the thin system-colored frame that
+            // Windows otherwise draws around WS_THICKFRAME client title bars.
+            constexpr DWORD border_color = 0xFFFFFFFEu;
+            static_cast<void>(DwmSetWindowAttribute(handle, DWMWA_BORDER_COLOR, &border_color, sizeof(border_color)));
+            constexpr DWORD square_corners = 1u;  // DWMWCP_DONOTROUND
+            static_cast<void>(
+                DwmSetWindowAttribute(handle, DWMWA_WINDOW_CORNER_PREFERENCE, &square_corners, sizeof(square_corners)));
+        }
         window->sync_state_from_native();
         if (desc.visible) {
             ShowWindow(handle, desc.start_maximized ? SW_MAXIMIZE : SW_SHOWNORMAL);
+            if (!desc.client_decorated) {
+                constexpr DWORD border_color = 0xFFFFFFFEu;
+                static_cast<void>(
+                    DwmSetWindowAttribute(handle, DWMWA_BORDER_COLOR, &border_color, sizeof(border_color)));
+                constexpr DWORD square_corners = 1u;
+                static_cast<void>(DwmSetWindowAttribute(handle, DWMWA_WINDOW_CORNER_PREFERENCE, &square_corners,
+                                                        sizeof(square_corners)));
+            }
             UpdateWindow(handle);
             window->sync_state_from_native();
         }

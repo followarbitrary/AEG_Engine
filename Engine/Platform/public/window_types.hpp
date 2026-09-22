@@ -86,6 +86,8 @@ struct WindowDesc final {
     bool position_specified{false};
     /** @brief Enables user resizing when supported by the platform. */
     bool resizable{true};
+    /** @brief When false, the client owns the title bar and window controls instead of the platform frame. */
+    bool client_decorated{true};
     /** @brief Shows the window after native creation. */
     bool visible{true};
     /** @brief Requests platform-managed high-DPI behavior when supported. */

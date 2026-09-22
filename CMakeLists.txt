@@ -33,7 +33,7 @@ option(AEG_VULKAN_ENABLE_DEBUG_UTILS "Compile Vulkan debug-utils support" ${AEG_
 option(AEG_VULKAN_ENABLE_DEBUG_NAMES "Compile Vulkan object debug-name support" ${AEG_RHI_ENABLE_DEBUG_NAMES})
 option(AEG_MATH_ENABLE_SIMD "Enable the x86 SSE2 math implementation when available" ON)
 option(AEG_EDITOR_ENABLE_BUILTIN_PIPELINE_DEBUG
-    "Expose the editable Built-in / Editor UI pipeline in an explicit Debug build" OFF)
+    "Expose the editable Built-in / Editor UI pipeline in an explicit Debug build" ON)
 
 set(AEG_LOG_COMPILE_LEVEL "Auto" CACHE STRING
     "Compile-time minimum log level (Auto, Trace, Debug, Info, Notice, Warning, Error, Critical, Off)")
@@ -566,7 +566,7 @@ if (WIN32 AND AEG_BUILD_EDITOR)
             _UNICODE
             WIN32_LEAN_AND_MEAN
     )
-    target_link_libraries(aeg_application_platform PUBLIC aeg_platform aeg_input user32 gdi32 gdiplus imm32 dwrite ole32 shell32 uuid)
+    target_link_libraries(aeg_application_platform PUBLIC aeg_platform aeg_input user32 gdi32 gdiplus imm32 dwrite ole32 shell32 uuid dwmapi)
 
     if (MSVC)
         target_compile_options(aeg_application_platform PRIVATE /W4 /permissive-)
@@ -1778,14 +1778,33 @@ if (AEG_BUILD_TESTS)
         target_compile_definitions(aeg_editor_project_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
     endif()
 
+    add_executable(aeg_editor_project_pipeline_authoring_smoke
+        tests/editor_project_pipeline_authoring_smoke.cpp
+        Application/Editor/private/editor_project_pipeline_authoring.cpp
+    )
+    target_include_directories(aeg_editor_project_pipeline_authoring_smoke PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private
+    )
+    target_link_libraries(aeg_editor_project_pipeline_authoring_smoke PRIVATE
+        aeg_foundation
+        aeg_pipeline
+        aeg_module
+        aeg_application_project
+    )
+    if (WIN32)
+        target_compile_definitions(aeg_editor_project_pipeline_authoring_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+    endif()
+
 endif() # AEG_BUILD_TESTS
 
     add_executable(aeg_editor_application
         Application/Editor/private/editor_application.cpp
         Application/Editor/private/editor_asset_database.cpp
         Application/Editor/private/editor_project.cpp
+        Application/Editor/private/editor_project_pipeline_authoring.cpp
         Application/Platform/private/win32/aether_editor_resources.rc
         Application/Editor/private/editor_scene_runtime.cpp
+        Application/Editor/private/editor_project_pipeline_authoring.cpp
         Application/Editor/private/font/editor_system_font_catalog.cpp
     )
     target_link_libraries(aeg_editor_application PRIVATE
@@ -1797,6 +1816,8 @@ endif() # AEG_BUILD_TESTS
         aeg_renderer
         aeg_resource
         aeg_editor_assets
+        aeg_application_project
+        aeg_module
         aeg_rhi
         aeg_core_shaders
     )
@@ -1868,6 +1889,7 @@ if (AEG_BUILD_TESTS)
         Application/Editor/private/editor_asset_database.cpp
         Application/Editor/private/editor_project.cpp
         Application/Editor/private/editor_scene_runtime.cpp
+        Application/Editor/private/editor_project_pipeline_authoring.cpp
     )
     target_include_directories(aeg_editor_scene_runtime_smoke PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private
@@ -1879,6 +1901,8 @@ if (AEG_BUILD_TESTS)
         aeg_renderer
         aeg_resource
         aeg_editor_assets
+        aeg_application_project
+        aeg_module
         aeg_rhi
         aeg_core_shaders
     )
@@ -1894,6 +1918,7 @@ if (AEG_BUILD_TESTS)
         Application/Editor/private/editor_asset_database.cpp
         Application/Editor/private/editor_project.cpp
         Application/Editor/private/editor_scene_runtime.cpp
+        Application/Editor/private/editor_project_pipeline_authoring.cpp
     )
     target_include_directories(aeg_editor_external_assets_smoke PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private
@@ -1905,6 +1930,8 @@ if (AEG_BUILD_TESTS)
         aeg_renderer
         aeg_resource
         aeg_editor_assets
+        aeg_application_project
+        aeg_module
         aeg_rhi
         aeg_core_shaders
     )
@@ -1920,6 +1947,7 @@ if (AEG_BUILD_TESTS)
         Application/Editor/private/editor_asset_database.cpp
         Application/Editor/private/editor_project.cpp
         Application/Editor/private/editor_scene_runtime.cpp
+        Application/Editor/private/editor_project_pipeline_authoring.cpp
     )
     target_include_directories(aeg_editor_viewport_interaction_smoke PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private
@@ -1931,6 +1959,8 @@ if (AEG_BUILD_TESTS)
         aeg_renderer
         aeg_resource
         aeg_editor_assets
+        aeg_application_project
+        aeg_module
         aeg_rhi
         aeg_core_shaders
     )
@@ -1946,6 +1976,7 @@ if (AEG_BUILD_TESTS)
         Application/Editor/private/editor_asset_database.cpp
         Application/Editor/private/editor_project.cpp
         Application/Editor/private/editor_scene_runtime.cpp
+        Application/Editor/private/editor_project_pipeline_authoring.cpp
     )
     target_include_directories(aeg_editor_history_smoke PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private
@@ -1957,6 +1988,8 @@ if (AEG_BUILD_TESTS)
         aeg_renderer
         aeg_resource
         aeg_editor_assets
+        aeg_application_project
+        aeg_module
         aeg_rhi
         aeg_core_shaders
     )
@@ -1972,6 +2005,7 @@ if (AEG_BUILD_TESTS)
         Application/Editor/private/editor_asset_database.cpp
         Application/Editor/private/editor_project.cpp
         Application/Editor/private/editor_scene_runtime.cpp
+        Application/Editor/private/editor_project_pipeline_authoring.cpp
     )
     target_include_directories(aeg_editor_hierarchy_smoke PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private
@@ -1983,6 +2017,8 @@ if (AEG_BUILD_TESTS)
         aeg_renderer
         aeg_resource
         aeg_editor_assets
+        aeg_application_project
+        aeg_module
         aeg_rhi
         aeg_core_shaders
     )
@@ -1998,6 +2034,7 @@ if (AEG_BUILD_TESTS)
         Application/Editor/private/editor_asset_database.cpp
         Application/Editor/private/editor_project.cpp
         Application/Editor/private/editor_scene_runtime.cpp
+        Application/Editor/private/editor_project_pipeline_authoring.cpp
     )
     target_include_directories(aeg_editor_inspector_smoke PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private
@@ -2009,6 +2046,8 @@ if (AEG_BUILD_TESTS)
         aeg_renderer
         aeg_resource
         aeg_editor_assets
+        aeg_application_project
+        aeg_module
         aeg_rhi
         aeg_core_shaders
     )

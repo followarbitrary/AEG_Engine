@@ -1,9 +1,10 @@
 #pragma once
 
 #include <imgui.h>
-#include <cstdint>
+
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <utility>
@@ -35,9 +36,12 @@ struct PreferenceWindowWorkAreaScale final {
 }
 
 inline const char* asset_edit_block_reason(bool project_asset, bool project_loaded, bool edit_mode) {
-    if (!project_asset) return "Built-in resource (read-only). Import an asset into a game project to edit it.";
-    if (!project_loaded) return "Open a game project to edit its assets.";
-    if (!edit_mode) return "Stop Play mode before editing assets.";
+    if (!project_asset)
+        return "Built-in resource (read-only). Import an asset into a game project to edit it.";
+    if (!project_loaded)
+        return "Open a game project to edit its assets.";
+    if (!edit_mode)
+        return "Stop Play mode before editing assets.";
     return nullptr;
 }
 // Scope every asset row, including its popup, by the resource identity.
@@ -47,26 +51,87 @@ public:
         ImGui::PushID(static_cast<int>(kind));
         ImGui::PushID(std::to_string(id).c_str());
     }
-    ~AssetRowId() { ImGui::PopID(); ImGui::PopID(); }
+    ~AssetRowId() {
+        ImGui::PopID();
+        ImGui::PopID();
+    }
     AssetRowId(const AssetRowId&) = delete;
     AssetRowId& operator=(const AssetRowId&) = delete;
 };
 
 class GraphPanGesture final {
 public:
-    ImVec2 update(bool hovered, bool empty, bool connecting, bool clicked, bool down,
-                  bool dragging, bool cancel, ImVec2 delta) {
-        if (cancel || !down) { active_ = false; return {}; }
-        if (clicked) active_ = hovered && empty && !connecting;
+    ImVec2 update(bool hovered, bool empty, bool connecting, bool clicked, bool down, bool dragging, bool cancel,
+                  ImVec2 delta) {
+        if (cancel || !down) {
+            active_ = false;
+            return {};
+        }
+        if (clicked)
+            active_ = hovered && empty && !connecting;
         return active_ && dragging ? delta : ImVec2{};
     }
+
 private:
     bool active_{false};
 };
 
+/**
+ * @brief Spacing and text sizing for Pipeline graph cards.
+ *
+ * Card rows use their own vertical rhythm so a user-selected editor font
+ * cannot push the final type label into the description row.  Text is kept
+ * at a readable screen size while the canvas is zoomed out.
+ */
+struct PipelineNodeCardLayout final {
+    float title_y{12.0f};
+    float subtitle_y{33.0f};
+    float detail_y{53.0f};
+    float divider_y{75.0f};
+    float footer_y{82.0f};
+    float height{109.0f};
+
+    [[nodiscard]] static PipelineNodeCardLayout for_font_size(float font_size) noexcept {
+        const float line_height = std::max(17.0f, std::ceil(font_size));
+        PipelineNodeCardLayout layout{};
+        layout.title_y = 12.0f;
+        layout.subtitle_y = layout.title_y + line_height + 4.0f;
+        layout.detail_y = layout.subtitle_y + line_height + 3.0f;
+        layout.divider_y = layout.detail_y + line_height + 5.0f;
+        layout.footer_y = layout.divider_y + 7.0f;
+        layout.height = layout.footer_y + line_height + 10.0f;
+        return layout;
+    }
+
+    [[nodiscard]] static float text_size(float font_size, float zoom) noexcept {
+        return std::max(13.0f, font_size * zoom);
+    }
+};
+
+[[nodiscard]] inline std::string pipeline_node_copy_text(std::string_view title, std::string_view subtitle,
+                                                         std::string_view detail) {
+    std::string text;
+    text.reserve(title.size() + subtitle.size() + detail.size() + 2);
+    text.append(title).append("\n").append(subtitle).append("\n").append(detail);
+    return text;
+}
+
+/** Editor-owned terminal card shown for every authored project Pipeline. */
+struct RequiredPipelinePresentConsumer final {
+    std::string_view node_id;
+    std::string_view title;
+    std::string_view subtitle;
+    std::string_view detail;
+};
+
+[[nodiscard]] inline constexpr RequiredPipelinePresentConsumer required_pipeline_present_consumer() noexcept {
+    return {"__aeg_present_consumer", "Present", "Display consumer", "No state link connected"};
+}
+
 inline bool remove_graph_edge(std::vector<std::pair<int, int>>& edges, int from, int to) {
     const auto found = std::find(edges.begin(), edges.end(), std::pair{from, to});
-    if (found == edges.end()) return false;
+    if (found == edges.end())
+        return false;
     edges.erase(found);
     return true;
 }
@@ -100,9 +165,10 @@ public:
 
 private:
     [[nodiscard]] std::vector<PipelineOrderingDraft>::iterator find(const std::string& source, uint32_t source_node,
-                                                                      uint32_t destination_node) {
+                                                                    uint32_t destination_node) {
         return std::find_if(changes_.begin(), changes_.end(), [&](const PipelineOrderingDraft& value) {
-            return value.source == source && value.source_node == source_node && value.destination_node == destination_node;
+            return value.source == source && value.source_node == source_node &&
+                   value.destination_node == destination_node;
         });
     }
 
@@ -175,8 +241,10 @@ public:
         const auto found = std::find_if(layouts_.begin(), layouts_.end(), [&](const PipelineNodeLayout& value) {
             return value.source == layout.source && value.node == layout.node;
         });
-        if (found == layouts_.end()) layouts_.push_back(std::move(layout));
-        else *found = std::move(layout);
+        if (found == layouts_.end())
+            layouts_.push_back(std::move(layout));
+        else
+            *found = std::move(layout);
     }
     [[nodiscard]] std::optional<PipelineNodeLayout> find(std::string_view source, PipelineNodeIdentity node) const {
         const auto found = std::find_if(layouts_.begin(), layouts_.end(), [&](const PipelineNodeLayout& value) {
@@ -186,6 +254,7 @@ public:
     }
     void clear() noexcept { layouts_.clear(); }
     [[nodiscard]] const std::vector<PipelineNodeLayout>& layouts() const noexcept { return layouts_; }
+
 private:
     std::vector<PipelineNodeLayout> layouts_{};
 };
@@ -203,11 +272,14 @@ public:
         const auto found = std::find_if(blends_.begin(), blends_.end(), [&](const PipelineSavedBlend& value) {
             return value.source == blend.source && value.node == blend.node;
         });
-        if (found == blends_.end()) blends_.push_back(std::move(blend));
-        else *found = std::move(blend);
+        if (found == blends_.end())
+            blends_.push_back(std::move(blend));
+        else
+            *found = std::move(blend);
     }
     void clear() noexcept { blends_.clear(); }
     [[nodiscard]] const std::vector<PipelineSavedBlend>& blends() const noexcept { return blends_; }
+
 private:
     std::vector<PipelineSavedBlend> blends_{};
 };
@@ -235,13 +307,16 @@ inline bool graph_link_hit(ImVec2 from, ImVec2 to, ImVec2 mouse, float zoom) {
         const float dx = current.x - previous.x;
         const float dy = current.y - previous.y;
         const float length_squared = dx * dx + dy * dy;
-        const float fraction = length_squared > 0.0f ? std::clamp(
-            ((mouse.x - previous.x) * dx + (mouse.y - previous.y) * dy) / length_squared, 0.0f, 1.0f) : 0.0f;
+        const float fraction =
+            length_squared > 0.0f
+                ? std::clamp(((mouse.x - previous.x) * dx + (mouse.y - previous.y) * dy) / length_squared, 0.0f, 1.0f)
+                : 0.0f;
         const float near_x = previous.x + dx * fraction;
         const float near_y = previous.y + dy * fraction;
         const float distance_x = mouse.x - near_x;
         const float distance_y = mouse.y - near_y;
-        if (distance_x * distance_x + distance_y * distance_y <= hit_radius * hit_radius) return true;
+        if (distance_x * distance_x + distance_y * distance_y <= hit_radius * hit_radius)
+            return true;
         previous = current;
     }
     return false;
@@ -273,8 +348,9 @@ struct PipelineGraphState final {
  * serial stage preserves the existing layer count.  This mirrors the compositing semantics used
  * by the Pipeline canvas without tying the UI helper to a particular PipelinePlan type.
  */
-inline std::vector<PipelineGraphState> pipeline_graph_state_overlay(
-    std::size_t node_count, const std::vector<std::pair<int, int>>& edges, const std::vector<int>& output_nodes) {
+inline std::vector<PipelineGraphState> pipeline_graph_state_overlay(std::size_t node_count,
+                                                                    const std::vector<std::pair<int, int>>& edges,
+                                                                    const std::vector<int>& output_nodes) {
     std::vector<PipelineGraphState> states(node_count);
     std::vector<std::vector<int>> incoming(node_count), outgoing(node_count);
     for (const auto& [source, destination] : edges) {
@@ -344,4 +420,4 @@ inline std::vector<PipelineGraphState> pipeline_graph_state_overlay(
     }
     return states;
 }
-} // namespace aeg::application
+}  // namespace aeg::application

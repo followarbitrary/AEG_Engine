@@ -31,6 +31,8 @@ struct EditorPanelDescriptor final {
     /** @brief Whether the panel may be restored by layout recovery. */
     bool restorable{true};
 
+    bool visible{true};
+
     /** @brief Returns whether the descriptor contains the required stable metadata. */
     [[nodiscard]] bool is_valid() const noexcept { return !key.empty() && !title.empty(); }
 };

@@ -205,7 +205,6 @@ std::vector<DocumentDiagnostic> validate_pipeline_document(const PipelineDocumen
             }
         }
     }
-
     for (const auto& node : document.pass_nodes) {
         if (!claim_node(node.node_id, "pass")) {
             continue;
@@ -389,6 +388,8 @@ std::string document_semantic_digest(const PipelineDocument& document) {
             << edge.source.port_id << ':' << edge.destination.node_id << ':' << edge.destination.port_id << ':'
             << edge.binding_id;
     }
+    for (const auto& source_node : document.present_connections)
+        out << "|Present:" << source_node;
     return out.str();
 }
 

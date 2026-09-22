@@ -64,6 +64,8 @@ struct PipelineDocument final {
     std::vector<PassNodeDocument> pass_nodes{};
     std::vector<ResourceNodeDocument> resources{};
     std::vector<DocumentEdge> edges{};
+    /** Editor display-consumer links targeting the mandatory Present terminal. */
+    std::vector<std::string> present_connections{};
     std::vector<DocumentNodeLayout> layouts{};
     std::vector<OpaqueAuthoringRecord> extensions{};
 };

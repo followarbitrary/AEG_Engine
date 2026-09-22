@@ -124,6 +124,7 @@ struct EditorImGuiHost::Impl final {
         uint32_t generation{1};
         std::unique_ptr<EditorPanel> panel{};
         bool visible{true};
+        bool native{false};
     };
 
     /** @brief Dear ImGui context owned by this host. */
@@ -162,6 +163,7 @@ struct EditorImGuiHost::Impl final {
     /** @brief Rasterized size of the native display face. */
     float display_font_size_pixels{0.0f};
     std::array<ImFont*, 4> preference_fonts{};
+    std::array<float, 4> preference_font_sizes{};
     ImFont* preference_icons{nullptr};
     ImVector<ImWchar> chinese_ranges{};
     /** @brief Monotonic frame identity copied into every captured viewport packet. */
@@ -298,7 +300,10 @@ struct EditorImGuiHost::Impl final {
                     if (settings_key == font_key && sizes[index] == kDisplayFontSizePixels) {
                         next_preference_fonts[index] = next_display_font;
                     } else if (const auto result =
-                                   add_font(*candidate, settings_key, sizes[index], next_preference_fonts[index], true);
+                                   // Settings chrome is English-only; keep the
+                                   // multilingual range on the actual preview
+                                   // font instead of duplicating it four times.
+                               add_font(*candidate, settings_key, sizes[index], next_preference_fonts[index], false);
                                !result) {
                         return result;
                     }
@@ -379,6 +384,7 @@ struct EditorImGuiHost::Impl final {
             display_font = next_display_font;
             display_font_size_pixels = kDisplayFontSizePixels;
             preference_fonts = next_preference_fonts;
+            preference_font_sizes = {size_pixels * 0.875f, size_pixels, size_pixels * 1.25f, size_pixels * 1.5f};
             preference_icons = next_preference_icons;
             font_texture = {};
             io.Fonts->SetTexID(ImTextureRef(static_cast<ImTextureID>(0)));
@@ -442,6 +448,9 @@ foundation::Result EditorImGuiHost::initialize(const EditorImGuiDesc& desc) {
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags = desc.enable_keyboard_navigation ? ImGuiConfigFlags_NavEnableKeyboard : ImGuiConfigFlags_None;
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+    // Use Dear ImGui's built-in focused-window copy path instead of duplicating
+    // Ctrl+C handling in individual editor panels.
+    io.ConfigWindowsCopyContentsWithCtrlC = true;
     if (desc.enable_gamepad_navigation) {
         io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
     }
@@ -646,6 +655,14 @@ foundation::Result EditorImGuiHost::set_preview_font(std::string_view font_key, 
         return foundation::not_found("Editor preview font key is not registered");
     }
 
+    // Slider and combo updates can enqueue the same value more than once in a
+    // frame. Keep the existing atlas in that case; rebuilding and re-uploading
+    // it is a synchronous, expensive operation.
+    if (impl_->preview_font_key == font_key && impl_->preview_font_size_pixels == size_pixels &&
+        impl_->preview_font != nullptr) {
+        return foundation::Result::success();
+    }
+
     ImGui::SetCurrentContext(impl_->context);
     return impl_->rebuild_font_atlas(impl_->active_font_key, impl_->active_font_size_pixels, font_key, size_pixels);
 }
@@ -696,10 +713,9 @@ float EditorImGuiHost::display_font_size_pixels() const noexcept {
 }
 
 const void* EditorImGuiHost::preference_font(float size_pixels) const noexcept {
-    constexpr std::array<float, 4> sizes{16.0f, 20.0f, 24.0f, 32.0f};
     if (impl_ != nullptr) {
-        for (std::size_t index = 0; index < sizes.size(); ++index) {
-            if (size_pixels == sizes[index])
+        for (std::size_t index = 0; index < impl_->preference_font_sizes.size(); ++index) {
+            if (std::abs(size_pixels - impl_->preference_font_sizes[index]) < 0.01f)
                 return impl_->preference_fonts[index];
         }
     }
@@ -783,6 +799,13 @@ foundation::Result EditorImGuiHost::build_panels() {
     } traversal(impl_->building_panels);
     for (const Impl::PanelSlot& slot : impl_->panels) {
         if (slot.panel != nullptr && slot.visible) {
+            ImGuiWindowClass panel_window_class{};
+            panel_window_class.DockNodeFlagsOverrideSet = ImGuiDockNodeFlags_AutoHideTabBar;
+            if (slot.native)
+                panel_window_class.ViewportFlagsOverrideSet = ImGuiViewportFlags_NoAutoMerge;
+            ImGui::SetNextWindowClass(&panel_window_class);
+            if (slot.native)
+                ImGui::SetNextWindowDockID(0, ImGuiCond_Always);
             ImGuiErrorRecoveryState checkpoint{};
             ImGui::ErrorRecoveryStoreState(&checkpoint);
             const auto result = guard_editor_operation([&] {
@@ -962,6 +985,22 @@ foundation::Result EditorImGuiHost::set_panel_visible(EditorPanelId panel, bool 
         return foundation::not_found("Editor panel identity is stale");
     }
     slot.visible = visible;
+    return foundation::Result::success();
+}
+
+foundation::Result EditorImGuiHost::set_panel_native(EditorPanelId panel, bool native) {
+    if (!impl_->initialized) {
+        return foundation::invalid_state("EditorImGuiHost is not initialized");
+    }
+    if (panel.index >= impl_->panels.size()) {
+        return foundation::not_found("Editor panel identity is not registered");
+    }
+
+    Impl::PanelSlot& slot = impl_->panels[panel.index];
+    if (slot.panel == nullptr || slot.generation != panel.generation) {
+        return foundation::not_found("Editor panel identity is stale");
+    }
+    slot.native = native;
     return foundation::Result::success();
 }
 

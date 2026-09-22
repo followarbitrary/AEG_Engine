@@ -86,6 +86,8 @@ public:
     [[nodiscard]] foundation::Result unregister_panel(EditorPanelId panel);
     /** @brief Enables or suppresses one registered panel without releasing its ownership. */
     [[nodiscard]] foundation::Result set_panel_visible(EditorPanelId panel, bool visible);
+    /** @brief Requests an independent Dear ImGui platform viewport for one panel. */
+    [[nodiscard]] foundation::Result set_panel_native(EditorPanelId panel, bool native);
 
     [[nodiscard]] bool is_initialized() const noexcept;
     [[nodiscard]] bool is_frame_active() const noexcept;

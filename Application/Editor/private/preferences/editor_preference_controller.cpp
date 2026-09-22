@@ -103,9 +103,12 @@ foundation::Result EditorPreferenceController::preview(const editor::EditorPrefe
         return foundation::invalid_state("Editor preference controller is not initialized");
     if (working_catalog_.find(state.active_font_key) == nullptr)
         return foundation::not_found("Preview font is not registered");
+    // Install the working catalog before applying the persisted/draft font.
+    // This is required for user fonts and also makes startup use the saved
+    // selection instead of leaving the bundled default active.
     if (const auto result = desc_.imgui_host->replace_font_catalog(working_catalog_, state.active_font_key); !result)
         return result;
-    if (const auto result = desc_.imgui_host->set_preview_font(state.active_font_key, state.font_size_pixels); !result)
+    if (const auto result = desc_.imgui_host->set_font(state.active_font_key, state.font_size_pixels); !result)
         return result;
     return refresh_font_texture(state.active_font_key, state.font_size_pixels);
 }
@@ -153,6 +156,16 @@ foundation::Result EditorPreferenceController::cancel(const editor::EditorPrefer
     user_records_ = applied_user_records_;
     if (const auto result = restore_applied_state(); !result)
         return result;
+    model_->discard();
+    return foundation::Result::success();
+}
+
+foundation::Result EditorPreferenceController::discard_draft() {
+    if (!initialized_ || model_ == nullptr)
+        return foundation::invalid_state("Editor preference controller is not initialized");
+    desc_.repository->rollback();
+    working_catalog_ = applied_catalog_;
+    user_records_ = applied_user_records_;
     model_->discard();
     return foundation::Result::success();
 }

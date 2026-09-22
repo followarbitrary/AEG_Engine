@@ -120,9 +120,9 @@ uint64_t read_u64(const toml::value& value) {
 }
 
 bool known_root_key(std::string_view key) {
-    static constexpr std::string_view keys[] = {"schema_version", "asset_uuid",    "name",       "module_requirements",
-                                                "pipeline_nodes", "feature_nodes", "pass_nodes", "resources",
-                                                "edges",          "layouts",       "extensions"};
+    static constexpr std::string_view keys[] = {
+        "schema_version", "asset_uuid", "name",  "module_requirements", "pipeline_nodes", "feature_nodes",
+        "pass_nodes",     "resources",  "edges", "present_connections", "layouts",        "extensions"};
     for (const auto known : keys)
         if (key == known)
             return true;
@@ -239,6 +239,9 @@ foundation::ResultValue<PipelineDocument> load_pipeline_document(const std::file
                 edge.binding_id = read_u64(item.at("binding_id"));
                 document.edges.push_back(std::move(edge));
             }
+        if (root.contains("present_connections"))
+            for (const auto& value : root.at("present_connections").as_array())
+                document.present_connections.push_back(value.as_string());
         if (root.contains("layouts"))
             for (const auto& value : root.at("layouts").as_array()) {
                 const auto& item = value.as_table();
@@ -337,6 +340,10 @@ foundation::Result save_pipeline_document(const std::filesystem::path& file, con
             edges.emplace_back(std::move(item));
         }
         root["edges"] = std::move(edges);
+        toml::array present_connections;
+        for (const auto& source_node : document.present_connections)
+            present_connections.emplace_back(source_node);
+        root["present_connections"] = std::move(present_connections);
         toml::array layouts;
         for (const auto& layout : document.layouts) {
             toml::table item;

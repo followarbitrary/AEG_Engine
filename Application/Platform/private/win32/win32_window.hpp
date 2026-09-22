@@ -36,6 +36,7 @@ public:
     [[nodiscard]] foundation::Result set_visible(bool visible) noexcept override;
     [[nodiscard]] foundation::Result focus() noexcept override;
     [[nodiscard]] foundation::Result set_maximized(bool maximized) noexcept override;
+    [[nodiscard]] foundation::Result set_minimized(bool minimized) noexcept override;
     [[nodiscard]] foundation::Result set_input_enabled(bool enabled) noexcept override;
     [[nodiscard]] foundation::Result request_close() noexcept override;
     [[nodiscard]] foundation::Result clear_close_request() noexcept override;

@@ -10,12 +10,12 @@
 #include <stdexcept>
 #include <string>
 
-#include "editor_imgui.hpp"
-#include "editor_workspace.hpp"
-#include "editor_toolbar.hpp"
 #include "../Application/Editor/private/editor_ui_interaction.hpp"
 #include "../Application/Editor/private/hierarchy_ui_layout.hpp"
 #include "../Application/Editor/private/pipeline_overview_layout.hpp"
+#include "editor_imgui.hpp"
+#include "editor_toolbar.hpp"
+#include "editor_workspace.hpp"
 
 namespace {
 class TestPanel final : public aeg::editor::EditorPanel {
@@ -41,12 +41,24 @@ int main() {
     assert(host.initialize());
 
     aeg::editor::EditorWorkspace workspace(host);
+    // The global application chrome owns a dedicated brand row, menu row,
+    // and command row.  The dock host must begin beneath all three.
+    assert(aeg::editor::EditorWorkspace::chrome_height() >= 96.0f);
+    assert(aeg::editor::EditorWorkspace::title_control_width() >= 120.0f);
     uint32_t build_count = 0;
     assert(workspace.register_panel(
         aeg::editor::EditorPanelDescriptor{"scene_viewport", "Workspace Test", aeg::editor::EditorDockRegion::kCenter,
                                            true, true, true},
         std::make_unique<TestPanel>(build_count)));
     assert(workspace.panel_count() == 1);
+    assert(workspace.panel_presentation("scene_viewport") ==
+           aeg::editor::EditorWorkspace::PanelPresentation::kDockWindow);
+    assert(workspace.set_panel_presentation("scene_viewport",
+                                            aeg::editor::EditorWorkspace::PanelPresentation::kNativeWindow));
+    assert(workspace.panel_presentation("scene_viewport") ==
+           aeg::editor::EditorWorkspace::PanelPresentation::kNativeWindow);
+    assert(workspace.set_panel_presentation("scene_viewport",
+                                            aeg::editor::EditorWorkspace::PanelPresentation::kDockWindow));
     const auto hierarchy_layout = aeg::application::compact_hierarchy_tree_layout();
     assert(hierarchy_layout.item_spacing.y <= 2.0f);
     assert(hierarchy_layout.frame_padding.y <= 2.0f);
@@ -58,8 +70,8 @@ int main() {
     assert(workspace.layout() != nullptr);
     uint32_t hierarchy_build_count = 0;
     assert(workspace.register_panel(
-        aeg::editor::EditorPanelDescriptor{"hierarchy", "Hierarchy", aeg::editor::EditorDockRegion::kLeft,
-                                           true, true, true},
+        aeg::editor::EditorPanelDescriptor{"hierarchy", "Hierarchy", aeg::editor::EditorDockRegion::kLeft, true, true,
+                                           true},
         std::make_unique<TestPanel>(hierarchy_build_count, "Hierarchy")));
 
     uint32_t preferences_action_count = 0;
@@ -70,34 +82,52 @@ int main() {
     const auto preference_window_scale = aeg::application::preference_window_work_area_scale();
     assert(preference_window_scale.width_percent == 48);
     assert(preference_window_scale.height_percent == 54);
-    assert(workspace.register_view_action(
-        aeg::editor::EditorWorkspaceActionDescriptor{
-            "preferences",
-            "Preferences",
-            [&preferences_action_count, &fail_preferences_action]() {
-                ++preferences_action_count;
-                if (fail_preferences_action) throw std::runtime_error("recoverable Settings action failure");
-                return aeg::foundation::Result::success();
-            },
-            aeg::application::preferences_action_shows_in_view_menu()}));
+    assert(workspace.register_view_action(aeg::editor::EditorWorkspaceActionDescriptor{
+        "preferences", "Preferences",
+        [&preferences_action_count, &fail_preferences_action]() {
+            ++preferences_action_count;
+            if (fail_preferences_action)
+                throw std::runtime_error("recoverable Settings action failure");
+            return aeg::foundation::Result::success();
+        },
+        aeg::application::preferences_action_shows_in_view_menu()}));
     assert(workspace.view_action_count() == 1);
     assert(workspace.invoke_view_action("preferences"));
     assert(preferences_action_count == 1);
 
     uint32_t play_action_count = 0;
     assert(workspace.register_view_action(
-        aeg::editor::EditorWorkspaceActionDescriptor{
-            "play",
-            "Play",
-            [&play_action_count]() {
-                ++play_action_count;
-                return aeg::foundation::Result::success();
-            },
-            false}));
+        aeg::editor::EditorWorkspaceActionDescriptor{"play", "Play",
+                                                     [&play_action_count]() {
+                                                         ++play_action_count;
+                                                         return aeg::foundation::Result::success();
+                                                     },
+                                                     false}));
     assert(workspace.view_action_count() == 2);
     assert(workspace.view_menu_action_count() == 0);
     assert(workspace.invoke_view_action("play"));
     assert(play_action_count == 1);
+
+    uint32_t refresh_action_count = 0;
+    uint32_t rebuild_action_count = 0;
+    assert(workspace.register_view_action(
+        aeg::editor::EditorWorkspaceActionDescriptor{"refresh_assets", "Refresh Project Assets",
+                                                     [&refresh_action_count]() {
+                                                         ++refresh_action_count;
+                                                         return aeg::foundation::Result::success();
+                                                     },
+                                                     false}));
+    assert(workspace.register_view_action(
+        aeg::editor::EditorWorkspaceActionDescriptor{"rebuild_pipeline", "Rebuild Editor Pipeline",
+                                                     [&rebuild_action_count]() {
+                                                         ++rebuild_action_count;
+                                                         return aeg::foundation::Result::success();
+                                                     },
+                                                     false}));
+    assert(workspace.view_action_count() == 4);
+    assert(workspace.invoke_view_action("refresh_assets"));
+    assert(workspace.invoke_view_action("rebuild_pipeline"));
+    assert(refresh_action_count == 1 && rebuild_action_count == 1);
 
     const aeg::platform::WindowId window{0, 1};
     aeg::editor::EditorImGuiFrameDesc frame_desc{};
@@ -109,19 +139,32 @@ int main() {
     assert(build_count == 1);
 
     // Empty dock branches must not collapse the workspace underneath the rail.
-    for (const auto extent : {decltype(frame_desc.display_extent){1280, 720}, decltype(frame_desc.display_extent){640, 480}, decltype(frame_desc.display_extent){1920, 1080}}) {
+    for (const auto extent :
+         {decltype(frame_desc.display_extent){1280, 720}, decltype(frame_desc.display_extent){640, 480},
+          decltype(frame_desc.display_extent){1920, 1080}}) {
         frame_desc.display_extent = extent;
         for (int frame = 0; frame < 4; ++frame) {
             assert(host.begin_frame(frame_desc));
             assert(workspace.build_ui());
             const auto* rail = ImGui::FindWindowByName("##EditorRail");
+            const auto* navigation = ImGui::FindWindowByName("##WorkspaceNavigation");
+            const auto* commands = ImGui::FindWindowByName("##WorkspaceCommands");
             const auto* panel = ImGui::FindWindowByName("Workspace Test");
             const auto* hierarchy = ImGui::FindWindowByName("Hierarchy");
-            assert(rail && panel);
+            assert(rail && navigation && commands && panel);
+            const auto* viewport = ImGui::GetMainViewport();
+            assert(viewport != nullptr);
+            // BeginMainMenuBar reserves the brand row in WorkPos; the
+            // navigation row must start exactly there with no extra blank
+            // viewport band.
+            assert(navigation->Pos.y == viewport->WorkPos.y);
+            assert(commands->Pos.y == navigation->Pos.y + navigation->Size.y);
+            assert(rail->Pos.y == commands->Pos.y + commands->Size.y);
+            assert(rail->Pos.y >= viewport->WorkPos.y + aeg::editor::EditorWorkspace::chrome_height() - 31.0f);
+            assert(panel->Pos.y >= rail->Pos.y);
             assert(panel->Pos.x >= rail->Pos.x + rail->Size.x);
             assert(hierarchy && hierarchy->Pos.x >= rail->Pos.x + rail->Size.x);
-            assert(rail->Size.x >= ImGui::CalcTextSize("Settings").x +
-                16.0f);
+            assert(rail->Size.x >= ImGui::CalcTextSize("Settings").x + 16.0f);
             const auto* status = ImGui::FindWindowByName("##EditorStatusBar");
             assert(status && panel->Pos.y + panel->Size.y <= status->Pos.y + 1.0f);
             assert(ImGui::GetCurrentContext()->ColorStack.Size == 0);
@@ -155,8 +198,8 @@ int main() {
     uint32_t bottom_build_count = 0;
     for (const auto* title : {"Pipeline", "Assets"}) {
         assert(workspace.register_panel(
-            aeg::editor::EditorPanelDescriptor{std::string(title) == "Pipeline" ? "pipeline" : "assets",
-                title, aeg::editor::EditorDockRegion::kBottom, true, true, true},
+            aeg::editor::EditorPanelDescriptor{std::string(title) == "Pipeline" ? "pipeline" : "assets", title,
+                                               aeg::editor::EditorDockRegion::kBottom, true, true, true},
             std::make_unique<TestPanel>(bottom_build_count, title)));
     }
     for (int frame = 0; frame < 4; ++frame) {
@@ -194,7 +237,8 @@ int main() {
         assert(ImGui::GetItemRectSize().y == aeg::editor::toolbar_height());
     }
     ImGui::PushFont(ImGui::GetFont(), 28.0f);
-    for (const auto icon : {aeg::editor::ToolbarIcon::Play, aeg::editor::ToolbarIcon::Pause, aeg::editor::ToolbarIcon::Stop}) {
+    for (const auto icon :
+         {aeg::editor::ToolbarIcon::Play, aeg::editor::ToolbarIcon::Pause, aeg::editor::ToolbarIcon::Stop}) {
         ImGui::PushID(static_cast<int>(icon));
         aeg::editor::toolbar_button("Large text", "Tooltip", icon);
         assert(ImGui::GetItemRectSize().y == 44.0f);
@@ -204,9 +248,18 @@ int main() {
     ImGui::PopFont();
     assert(ImGui::GetCurrentContext()->ColorStack.Size == 0);
     ImGuiID mesh_popup = 0, material_popup = 0, large_id_popup = 0;
-    { aeg::application::AssetRowId row(1, 2); mesh_popup = ImGui::GetID("AssetContext"); }
-    { aeg::application::AssetRowId row(2, 2); material_popup = ImGui::GetID("AssetContext"); }
-    { aeg::application::AssetRowId row(1, 0x100000002ULL); large_id_popup = ImGui::GetID("AssetContext"); }
+    {
+        aeg::application::AssetRowId row(1, 2);
+        mesh_popup = ImGui::GetID("AssetContext");
+    }
+    {
+        aeg::application::AssetRowId row(2, 2);
+        material_popup = ImGui::GetID("AssetContext");
+    }
+    {
+        aeg::application::AssetRowId row(1, 0x100000002ULL);
+        large_id_popup = ImGui::GetID("AssetContext");
+    }
     assert(mesh_popup != material_popup && mesh_popup != large_id_popup);
     ImGui::End();
     assert(host.end_frame());
@@ -248,6 +301,20 @@ int main() {
     assert(aeg::application::can_start_render_state_link(false, true));
     assert(aeg::application::can_start_render_state_link(true, false));
     assert(!aeg::application::can_start_render_state_link(false, false));
+    const auto card_layout = aeg::application::PipelineNodeCardLayout::for_font_size(17.0f);
+    assert(card_layout.title_y < card_layout.subtitle_y);
+    assert(card_layout.subtitle_y < card_layout.detail_y);
+    assert(card_layout.detail_y < card_layout.divider_y);
+    assert(card_layout.divider_y < card_layout.footer_y);
+    assert(card_layout.footer_y + 17.0f <= card_layout.height);
+    assert(aeg::application::PipelineNodeCardLayout::text_size(17.0f, 0.65f) >= 13.0f);
+    assert(aeg::application::pipeline_node_copy_text("Custom Outline Feature", "Feature", "Authored Pipeline node") ==
+           "Custom Outline Feature\nFeature\nAuthored Pipeline node");
+    const auto present_consumer = aeg::application::required_pipeline_present_consumer();
+    assert(present_consumer.node_id == "__aeg_present_consumer");
+    assert(present_consumer.title == "Present");
+    assert(present_consumer.subtitle == "Display consumer");
+    assert(present_consumer.detail == "No state link connected");
     assert(!aeg::application::builtin_pipeline_debug_enabled());
     const auto state_overlay = aeg::application::pipeline_graph_state_overlay(
         5, std::vector<std::pair<int, int>>{{0, 1}, {1, 3}, {2, 3}, {3, 4}}, std::vector<int>{4});
@@ -261,23 +328,23 @@ int main() {
     assert(aeg::application::asset_edit_block_reason(true, false, true) != nullptr);
     assert(aeg::application::asset_edit_block_reason(true, true, false) != nullptr);
     assert(aeg::application::asset_edit_block_reason(true, true, true) == nullptr);
-    auto delta = pan.update(true, true, false, true, true, false, false, {0,0});
+    auto delta = pan.update(true, true, false, true, true, false, false, {0, 0});
     assert(delta.x == 0 && delta.y == 0);
-    delta = pan.update(true, true, false, false, true, true, false, {12,-5});
+    delta = pan.update(true, true, false, false, true, true, false, {12, -5});
     assert(delta.x == 12 && delta.y == -5);
-    delta = pan.update(true, true, false, false, false, false, false, {9,9});
+    delta = pan.update(true, true, false, false, false, false, false, {9, 9});
     assert(delta.x == 0 && delta.y == 0);
-    delta = pan.update(true, true, false, false, true, true, false, {9,9});
-    assert(delta.x == 0 && delta.y == 0); // No press originating on this canvas.
+    delta = pan.update(true, true, false, false, true, true, false, {9, 9});
+    assert(delta.x == 0 && delta.y == 0);  // No press originating on this canvas.
     pan.update(true, false, false, true, true, false, false, {});
-    delta = pan.update(true, true, false, false, true, true, false, {9,9});
-    assert(delta.x == 0 && delta.y == 0); // Node drag must not pan.
+    delta = pan.update(true, true, false, false, true, true, false, {9, 9});
+    assert(delta.x == 0 && delta.y == 0);  // Node drag must not pan.
     pan.update(true, true, true, true, true, false, false, {});
-    delta = pan.update(true, true, true, false, true, true, false, {9,9});
-    assert(delta.x == 0 && delta.y == 0); // Connecting must not pan.
+    delta = pan.update(true, true, true, false, true, true, false, {9, 9});
+    assert(delta.x == 0 && delta.y == 0);  // Connecting must not pan.
     pan.update(true, true, false, true, true, false, false, {});
-    delta = pan.update(false, true, false, false, true, true, true, {9,9});
-    assert(delta.x == 0 && delta.y == 0); // Escape / focus loss cancels.
+    delta = pan.update(false, true, false, false, true, true, true, {9, 9});
+    assert(delta.x == 0 && delta.y == 0);  // Escape / focus loss cancels.
 
     assert(workspace.set_panel_visible("scene_viewport", false));
     assert(host.begin_frame(frame_desc));

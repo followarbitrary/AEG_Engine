@@ -79,7 +79,7 @@ int main() {
 
     assert(model->select_font("bundled"));
     assert(controller.request_remove_font(imported->descriptor.key));
-    assert(controller.cancel(model->state()));
+    assert(controller.discard_draft());
     assert(controller.catalog().find(imported->descriptor.key) != nullptr);
 
     assert(model->select_font("bundled"));

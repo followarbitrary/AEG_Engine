@@ -35,6 +35,11 @@ public:
         static_cast<void>(maximized);
         return foundation::unsupported("Window maximization is not supported by this platform adapter");
     }
+    /** @brief Requests minimized presentation state. */
+    [[nodiscard]] virtual foundation::Result set_minimized(bool minimized) noexcept {
+        static_cast<void>(minimized);
+        return foundation::unsupported("Window minimization is not supported by this platform adapter");
+    }
     /** @brief Enables or disables user input delivery for the window. */
     [[nodiscard]] virtual foundation::Result set_input_enabled(bool enabled) noexcept {
         static_cast<void>(enabled);

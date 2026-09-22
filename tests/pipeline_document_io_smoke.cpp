@@ -26,6 +26,7 @@ int main() {
                                   .size_rule = "swapchain",
                                   .sample_count = 1}});
     fixture.document.extensions.push_back({"feature", pipeline::OpaqueAuthoringEncoding::kJson, "{\"custom\":true}"});
+    fixture.document.present_connections.push_back("pass");
 
     const auto root = std::filesystem::temp_directory_path() / "aeg_pipeline_document_io_smoke";
     std::error_code error;
@@ -38,7 +39,8 @@ int main() {
     if (!loaded ||
         pipeline::document_semantic_digest(loaded.value) != pipeline::document_semantic_digest(fixture.document))
         return 2;
-    if (loaded.value.resources.size() != 1 || loaded.value.extensions.size() != 1)
+    if (loaded.value.resources.size() != 1 || loaded.value.extensions.size() != 1 ||
+        loaded.value.present_connections != std::vector<std::string>{"pass"})
         return 3;
     if (!std::holds_alternative<uint64_t>(loaded.value.resources.front().parameters.at(9001)) ||
         std::get<uint64_t>(loaded.value.resources.front().parameters.at(9001)) != 0xffffffffffffffffull)
