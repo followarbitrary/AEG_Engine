@@ -158,7 +158,17 @@ int main(int argc, char** argv) {
 
     const auto loaded = application::load_editor_project_pipeline_authoring(root, root / "Source", root / "Assets");
     if (!require(static_cast<bool>(loaded), "project authoring data did not load") ||
-        !require(loaded.value.catalog.entries().size() == 3, "Pipeline catalog is missing project types") ||
+        !require(loaded.value.catalog.entries().size() == 14, "Pipeline catalog is missing engine or project types") ||
+        !require(
+            loaded.value.catalog.find({pipeline::AuthoringTypeKind::kPipeline,
+                                       pipeline::PipelineId("Renderer.DeferredRenderPipeline").value()}) != nullptr,
+            "engine deferred Pipeline type is missing") ||
+        !require(loaded.value.catalog.find({pipeline::AuthoringTypeKind::kPipeline,
+                                            pipeline::PipelineId("Renderer.ForwardRenderPipeline").value()}) != nullptr,
+                 "engine forward Pipeline type is missing") ||
+        !require(loaded.value.catalog.find({pipeline::AuthoringTypeKind::kRenderPass,
+                                            pipeline::RenderPassTypeId("Renderer.GBufferPass").value()}) != nullptr,
+                 "engine GBuffer Pass type is missing") ||
         !require(loaded.value.documents.size() == 1, "Pipeline document was not loaded") ||
         !require(loaded.value.documents.front().document.pipeline_nodes.size() == 1, "Pipeline node was not loaded") ||
         !require(loaded.value.documents.front().document.feature_nodes.size() == 1, "Feature node was not loaded") ||

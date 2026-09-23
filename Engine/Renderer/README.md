@@ -25,6 +25,65 @@ RenderFeature 通过 RenderGraph 声明和执行；当前还提供 Experimental 
 `OpaqueRenderFeature`，用于把已提取的 MeshRenderer 实例发出为最小的 indexed
 opaque draw。
 
+## Deferred 与 Forward 管线
+
+Renderer 同时注册两个可由项目 `.aegpipe` 选择的内置管线：
+
+- `Renderer.DeferredRenderPipeline`：`RenderExtract`、`Shadow`、`GBuffer`、
+  `DeferredLighting`、`SkyboxPostProcess`、`BeforePresent`；
+- `Renderer.ForwardRenderPipeline`：`RenderExtract`、`Shadow`、`ZPrepass`、
+  `LightCulling`、`ForwardOpaque`、`SkyboxPostProcess`、`BeforePresent`。
+
+七个 RenderPass 类型通过 `register_builtin_render_passes()` 注册，
+`register_builtin_rendering()` 负责装配运行时；`register_renderer_authoring_types()`
+把同一组管线、Feature、Pass、端口和资源约束加入 Editor 的 `TypeCatalog`。
+
+当前 Pass 先形成可执行的 RenderGraph 拓扑：Deferred 创建 ShadowMap 和三张 GBuffer，
+其中 GBuffer 在提供 `RenderMaterialResource::gbuffer_pipeline` 时会解析网格、材质、
+对象资源并发出 indexed draw；Deferred Lighting 采样 Albedo、编码 Normal 和 Depth，
+执行共享方向光与环境光契约的全屏绘制。Forward 的 `ForwardOpaque` 复用同一套资源解析和绘制路径，
+并声明对 Z-prepass 深度、ShadowMap 与 LightClusters 的依赖。外部 SceneColor/SceneDepth
+由 FrameContext 绑定，临时资源由 RenderGraph 管理。
+
+Z-prepass 通过 `RenderMaterialResource::depth_pipeline` 执行几何体深度绘制，ForwardOpaque
+加载其深度结果。宿主通过 `DeferredLightingResources` 创建全屏光照 pipeline，并在
+`resolve_deferred_lighting()` 中返回当前帧的绑定服务；GBuffer 的临时采样视图由执行上下文
+解析，descriptor 每次执行单独分配并交给 FrameContext 延迟销毁。有几何体却缺失这些
+资源时构图返回错误；空场景允许只清屏。光照参数复用 `RenderLightingResource` 的 uniform
+范围，和 GBuffer 视图一起绑定到全屏 shader 的 group 0；Opaque 的 group 2 契约不变。
+
+Shadow 已执行方向光视图的深度绘制，前向与延迟 shader 均可采样 ShadowMap。
+Forward 的 LightCulling 在计算队列按 16×16 像素分块，使用 Z-prepass 深度和视空间
+光源范围生成点光源/聚光灯列表；ForwardOpaque 通过 `clustered_pipeline` 消费列表，
+叠加距离衰减与光锥衰减，并保留方向光阴影。宿主通过 `LightCullingResources` 准备当前帧
+资源，借用同一 ShaderManager 的 group 3 布局；帧结束后旧绑定不可重用。
+最多支持 1024 个有效局部光源，超出时显式报错。空场景不派发计算。
+Editor 的 Add Component 菜单可添加 Point Light 和 Spot Light。组件支持颜色、强度、世界单位
+范围、可见性掩码和启用状态；Spot Light 另有局部方向及内外光锥余弦，方向随 Transform
+旋转。组件可随场景保存、重开，并通过快照提取进入前向光源列表。
+Editor 对象法线使用模型—视图矩阵的逆转置，方向光也转换到视空间，保持两条管线的光照一致。
+Skybox/PostProcess 现在执行全屏绘制：光照先写入 `Renderer.SceneLighting`（RGBA16F），
+末尾 pass 读取 HDR 颜色和深度，在背景处按世界空间视线绘制程序化天空，再应用曝光、
+可选 Reinhard 色调映射与 Gamma，输出到 `Renderer.SceneColor`。前向 `clustered_pipeline`
+与延迟光照 pipeline 必须使用 `kSceneLightingFormat`；最终输出格式由 `PostProcessResources`
+初始化时指定。有无几何体都需要宿主提供 `resolve_post_process()`，缺失时明确报错。
+Editor 可添加 Scene Environment 组件，设置天顶、地平线、地面颜色及后处理参数，并随
+场景保存。每个视图最多消费一个启用的环境；没有环境组件时采用关闭天空、曝光/Gamma
+为 1 的兼容设置。此实现提供程序化天空，不包含环境贴图资产导入。
+七个内置 Pass 均通过宿主 `RenderPassRegistry` 的 `setup/execute` 执行。Feature 负责解析和导入
+帧资源，然后将不可变的帧命令交给注册的 Pass；Pass 通过受限 RenderGraph 上下文声明资源并录制命令。
+宿主须提供 `RenderFeatureContext::render_passes`（使用帧编排器时设置 `EngineFrameDesc::render_passes`），
+与编译项目文档使用同一注册表。图保留解析出的 Pass 和帧配置，注册表后续变动不影响已构建的帧。
+缺少注册表、Pass 类型或已准备的帧命令会明确失败；帧命令不会序列化到 `.aegpipe` 文档。
+
+Editor 的 Pipeline 面板选中项目内置管线文档后，可用 `Apply to Viewport` 应用到场景视口。
+候选文档先验证并编译，成功后在 Edit 模式的帧边界替换 Frame Host；编译或项目保存失败
+会保留原来的管线。选择写入项目的 `startup_pipelines`，保留其他项目管线，重新打开项目
+时自动恢复。`Use Default Renderer` 恢复兼容管线并移除内置管线选择。
+两种新 Feature 均输出 Render State，经现有 Present 合成流程输出到视口。
+内置 Feature 要求 authored Feature 保留完整默认 Pass 拓扑；禁用、缺失、改变队列或使用不支持的
+资源重绑定都会在编译时返回结构化错误，不会忽略配置后继续绘制。
+
 ## 边界
 
 Renderer 可以消费 World 的渲染快照、Shader Contract、Resource 和 RenderGraph，
@@ -157,8 +216,19 @@ group 2 Lighting。顶点 Position 为 `float4`、UV 为 `float2`、Normal 为 `
 Shader 输出插值 UV 和 View-space Normal。材质参数块继续提供稳定的 `float4` Tint，片元
 Shader 按插值 UV 采样纹理，并计算
 `albedo * tint * (ambient + color * intensity * max(dot(normal, -direction), 0))`。
-当前实现只支持一个 Directional Light，不包含阴影、镜面反射、PBR 或多光源循环；没有
+兼容 Opaque 实现只支持一个 Directional Light，不包含阴影、镜面反射、PBR 或多光源循环；没有
 Directional Light 时由 `make_render_lighting_constants()` 生成环境光回退。
+
+Deferred/Forward 变体支持该方向光的真实阴影：`casts_shadow` 控制是否从光源视角绘制
+深度，并在光照中进行 3×3 PCF 深度比较，只衰减直接光。`RenderSceneSnapshot::shadow_casters`
+保留通过可见性掩码但被相机视锥裁掉的物体，避免画面外投影物体丢失。阴影视图按世界包围体
+拟合，采用独立 View ID；宿主必须按 `(View ID, Object ID)` 提供不会互相覆盖的对象常量。
+当前为单张方向光阴影图，尚无级联阴影或点光源阴影。
+
+`ShadowResources` 在宿主侧创建每帧常量及描述符，通过 `FrameContext` 延迟回收。
+前向材质提供 `shadow_pipeline`，其 group 3 的 BindingLayout 传给该资源服务；该 Layout
+必须保持到所有使用它的 GPU 帧完成。延迟宿主向 `DeferredLightingResources::initialize`
+提供可选阴影 Shader 包。无阴影的已有宿主不需要这些可选资源。
 
 Lighting Uniform 必须作为当前帧/View 的新版本上传，并通过 `FrameContext` 的延迟销毁
 路径管理旧 Buffer 和 BindingSet；禁止在 GPU 仍可能使用时原地修改持久 Descriptor。

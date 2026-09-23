@@ -1200,8 +1200,17 @@ endif()
 endif() # AEG_BUILD_TESTS
 
 add_library(aeg_renderer STATIC
+    Engine/Renderer/private/post_process.cpp
+    Engine/Renderer/private/light_culling.cpp
+    Engine/Renderer/private/shadow_rendering.cpp
+    Engine/Renderer/private/shadow_resources.cpp
+    Engine/Renderer/private/deferred_lighting_resources.cpp
+    Engine/Renderer/private/builtin_render_passes.cpp
+    Engine/Renderer/private/render_pipeline_graph.cpp
+    Engine/Renderer/private/renderer_authoring.cpp
     Engine/Renderer/private/opaque_render_feature.cpp
     Engine/Renderer/private/renderer.cpp
+    Engine/Renderer/private/render_pipeline_variants.cpp
 )
 target_compile_features(aeg_renderer PUBLIC cxx_std_20)
 target_include_directories(aeg_renderer
@@ -1215,6 +1224,8 @@ target_link_libraries(aeg_renderer
         aeg_pipeline
     PRIVATE
         aeg_world
+        aeg_shader
+        aeg_render_graph
 )
 
 if (MSVC)
@@ -1449,6 +1460,27 @@ target_link_libraries(aeg_renderer_smoke PRIVATE aeg_engine aeg_renderer aeg_rhi
 if (WIN32)
     target_compile_definitions(aeg_renderer_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
+add_executable(aeg_renderer_pipeline_variants_smoke
+    tests/renderer_pipeline_variants_smoke.cpp
+)
+target_link_libraries(aeg_renderer_pipeline_variants_smoke PRIVATE aeg_engine aeg_renderer aeg_rhi)
+if (WIN32)
+    target_compile_definitions(aeg_renderer_pipeline_variants_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+add_executable(aeg_renderer_builtin_pass_smoke tests/renderer_builtin_pass_smoke.cpp)
+add_executable(aeg_renderer_shadow_view_smoke tests/renderer_shadow_view_smoke.cpp)
+target_link_libraries(aeg_renderer_shadow_view_smoke PRIVATE aeg_renderer)
+target_link_libraries(aeg_renderer_builtin_pass_smoke PRIVATE aeg_engine aeg_renderer aeg_rhi)
+if (WIN32)
+    target_compile_definitions(aeg_renderer_builtin_pass_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+add_executable(aeg_renderer_authoring_smoke tests/renderer_authoring_smoke.cpp)
+add_executable(aeg_renderer_pipeline_graph_smoke tests/renderer_pipeline_graph_smoke.cpp)
+target_link_libraries(aeg_renderer_pipeline_graph_smoke PRIVATE aeg_engine aeg_renderer aeg_rhi)
+target_link_libraries(aeg_renderer_authoring_smoke PRIVATE aeg_engine aeg_renderer aeg_rhi)
+if (WIN32)
+    target_compile_definitions(aeg_renderer_authoring_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
 add_executable(aeg_render_feature_runtime_smoke tests/render_feature_runtime_smoke.cpp)
 add_executable(aeg_frame_retention_smoke tests/frame_retention_smoke.cpp)
 target_link_libraries(aeg_frame_retention_smoke PRIVATE aeg_render_graph aeg_rhi)
@@ -1670,6 +1702,78 @@ if (AEG_BUILD_EDITOR)
             "fragment|ps_6_0|${CMAKE_CURRENT_SOURCE_DIR}/shaders/core/opaque/unlit_mesh.frag.hlsl"
         PACKAGE_OUTPUT_VARIABLE AEG_OPAQUE_UNLIT_SHADER_PACKAGE
     )
+    set(AEG_GBUFFER_MESH_SHADER_PACKAGE
+        "${AEG_SHADER_OUTPUT_DIR}/core_contract/gbuffer_mesh.aegshader")
+    aeg_add_hlsl_gameplay_shader_program(
+        TARGET aeg_core_shaders
+        NAME gbuffer_mesh
+        OUTPUT_DIRECTORY "${AEG_SHADER_OUTPUT_DIR}/core_contract"
+        CONTRACT_TOOL aeg_shader_contract_tool
+        STAGES
+            "vertex|vs_6_0|${CMAKE_CURRENT_SOURCE_DIR}/shaders/core/gbuffer/mesh.vert.hlsl"
+            "fragment|ps_6_0|${CMAKE_CURRENT_SOURCE_DIR}/shaders/core/gbuffer/mesh.frag.hlsl"
+        PACKAGE_OUTPUT_VARIABLE AEG_GBUFFER_MESH_SHADER_PACKAGE
+    )
+    aeg_add_hlsl_gameplay_shader_program(
+        TARGET aeg_core_shaders
+        NAME depth_mesh
+        OUTPUT_DIRECTORY "${AEG_SHADER_OUTPUT_DIR}/core_contract"
+        CONTRACT_TOOL aeg_shader_contract_tool
+        STAGES
+            "vertex|vs_6_0|${CMAKE_CURRENT_SOURCE_DIR}/shaders/core/depth/mesh.vert.hlsl"
+        PACKAGE_OUTPUT_VARIABLE AEG_DEPTH_MESH_SHADER_PACKAGE
+    )
+    aeg_add_hlsl_gameplay_shader_program(
+        TARGET aeg_core_shaders
+        NAME deferred_lighting
+        OUTPUT_DIRECTORY "${AEG_SHADER_OUTPUT_DIR}/core_contract"
+        CONTRACT_TOOL aeg_shader_contract_tool
+        STAGES
+            "vertex|vs_6_0|${CMAKE_CURRENT_SOURCE_DIR}/shaders/core/deferred/lighting.vert.hlsl"
+            "fragment|ps_6_0|${CMAKE_CURRENT_SOURCE_DIR}/shaders/core/deferred/lighting.frag.hlsl"
+        PACKAGE_OUTPUT_VARIABLE AEG_DEFERRED_LIGHTING_SHADER_PACKAGE
+    )
+    aeg_add_hlsl_gameplay_shader_program(
+        TARGET aeg_core_shaders NAME forward_shadow
+        DEPENDENCIES "${CMAKE_CURRENT_SOURCE_DIR}/shaders/core/shadow/visibility.hlsli"
+        OUTPUT_DIRECTORY "${AEG_SHADER_OUTPUT_DIR}/core_contract" CONTRACT_TOOL aeg_shader_contract_tool
+        STAGES
+            "vertex|vs_6_0|${CMAKE_CURRENT_SOURCE_DIR}/shaders/core/opaque/unlit_mesh.vert.hlsl"
+            "fragment|ps_6_0|${CMAKE_CURRENT_SOURCE_DIR}/shaders/core/shadow/forward.frag.hlsl"
+        PACKAGE_OUTPUT_VARIABLE AEG_FORWARD_SHADOW_SHADER_PACKAGE)
+    aeg_add_hlsl_gameplay_shader_program(
+        TARGET aeg_core_shaders NAME light_culling
+        OUTPUT_DIRECTORY "${AEG_SHADER_OUTPUT_DIR}/core_contract" CONTRACT_TOOL aeg_shader_contract_tool
+        STAGES "compute|cs_6_0|${CMAKE_CURRENT_SOURCE_DIR}/shaders/core/lighting/light_culling.comp.hlsl"
+        PACKAGE_OUTPUT_VARIABLE AEG_LIGHT_CULLING_SHADER_PACKAGE)
+    aeg_add_hlsl_gameplay_shader_program(
+        TARGET aeg_core_shaders NAME forward_clustered
+        OUTPUT_DIRECTORY "${AEG_SHADER_OUTPUT_DIR}/core_contract" CONTRACT_TOOL aeg_shader_contract_tool
+        DEPENDENCIES "${CMAKE_CURRENT_SOURCE_DIR}/shaders/core/shadow/visibility.hlsli"
+        STAGES
+            "vertex|vs_6_0|${CMAKE_CURRENT_SOURCE_DIR}/shaders/core/opaque/unlit_mesh.vert.hlsl"
+            "fragment|ps_6_0|${CMAKE_CURRENT_SOURCE_DIR}/shaders/core/lighting/forward_clustered.frag.hlsl"
+        PACKAGE_OUTPUT_VARIABLE AEG_FORWARD_CLUSTERED_SHADER_PACKAGE)
+    aeg_add_hlsl_gameplay_shader_program(
+        TARGET aeg_core_shaders NAME deferred_shadow
+        DEPENDENCIES "${CMAKE_CURRENT_SOURCE_DIR}/shaders/core/shadow/visibility.hlsli"
+        OUTPUT_DIRECTORY "${AEG_SHADER_OUTPUT_DIR}/core_contract" CONTRACT_TOOL aeg_shader_contract_tool
+        STAGES
+            "vertex|vs_6_0|${CMAKE_CURRENT_SOURCE_DIR}/shaders/core/deferred/lighting.vert.hlsl"
+            "fragment|ps_6_0|${CMAKE_CURRENT_SOURCE_DIR}/shaders/core/shadow/deferred.frag.hlsl"
+        PACKAGE_OUTPUT_VARIABLE AEG_DEFERRED_SHADOW_SHADER_PACKAGE)
+    aeg_add_hlsl_gameplay_shader_program(
+        TARGET aeg_core_shaders NAME skybox_post_process
+        OUTPUT_DIRECTORY "${AEG_SHADER_OUTPUT_DIR}/core_contract" CONTRACT_TOOL aeg_shader_contract_tool
+        STAGES
+            "vertex|vs_6_0|${CMAKE_CURRENT_SOURCE_DIR}/shaders/core/deferred/lighting.vert.hlsl"
+            "fragment|ps_6_0|${CMAKE_CURRENT_SOURCE_DIR}/shaders/core/post_process/skybox_post.frag.hlsl"
+        PACKAGE_OUTPUT_VARIABLE AEG_POST_PROCESS_SHADER_PACKAGE)
+    if (TARGET aeg_renderer_pipeline_graph_smoke)
+        target_compile_definitions(aeg_renderer_pipeline_graph_smoke PRIVATE
+            AEG_POST_PROCESS_SHADER_PACKAGE_PATH="${AEG_POST_PROCESS_SHADER_PACKAGE}")
+        add_dependencies(aeg_renderer_pipeline_graph_smoke aeg_core_shaders)
+    endif()
     set(AEG_STATE_COMPOSITE_SHADER_PACKAGE
         "${AEG_SHADER_OUTPUT_DIR}/core_contract/presentation_fullscreen_texture_blit.aegshader")
     aeg_add_hlsl_gameplay_shader_program(
@@ -1684,6 +1788,14 @@ if (AEG_BUILD_EDITOR)
     )
     target_compile_definitions(aeg_editor_framework PRIVATE
         AEG_EDITOR_IMGUI_SHADER_PACKAGE_PATH="${AEG_EDITOR_IMGUI_SHADER_PACKAGE}"
+        AEG_GBUFFER_MESH_SHADER_PACKAGE_PATH="${AEG_GBUFFER_MESH_SHADER_PACKAGE}"
+        AEG_DEFERRED_LIGHTING_SHADER_PACKAGE_PATH="${AEG_DEFERRED_LIGHTING_SHADER_PACKAGE}"
+        AEG_FORWARD_SHADOW_SHADER_PACKAGE_PATH="${AEG_FORWARD_SHADOW_SHADER_PACKAGE}"
+        AEG_LIGHT_CULLING_SHADER_PACKAGE_PATH="${AEG_LIGHT_CULLING_SHADER_PACKAGE}"
+        AEG_FORWARD_CLUSTERED_SHADER_PACKAGE_PATH="${AEG_FORWARD_CLUSTERED_SHADER_PACKAGE}"
+        AEG_POST_PROCESS_SHADER_PACKAGE_PATH="${AEG_POST_PROCESS_SHADER_PACKAGE}"
+        AEG_DEFERRED_SHADOW_SHADER_PACKAGE_PATH="${AEG_DEFERRED_SHADOW_SHADER_PACKAGE}"
+        AEG_DEPTH_MESH_SHADER_PACKAGE_PATH="${AEG_DEPTH_MESH_SHADER_PACKAGE}"
     )
     add_dependencies(aeg_editor_framework aeg_core_shaders)
 
@@ -1703,6 +1815,29 @@ if (AEG_BUILD_TESTS)
     add_executable(aeg_opaque_render_feature_smoke
         tests/opaque_render_feature_smoke.cpp
     )
+    add_executable(aeg_renderer_depth_pass_smoke tests/renderer_depth_pass_smoke.cpp)
+    add_executable(aeg_renderer_shadow_gpu_smoke tests/renderer_shadow_gpu_smoke.cpp)
+    add_executable(aeg_renderer_light_culling_smoke tests/renderer_light_culling_smoke.cpp)
+    target_link_libraries(aeg_renderer_light_culling_smoke PRIVATE aeg_renderer aeg_render_graph aeg_shader aeg_rhi aeg_core_shaders)
+    target_compile_definitions(aeg_renderer_light_culling_smoke PRIVATE
+        AEG_LIGHT_CULLING_SHADER_PACKAGE_PATH="${AEG_LIGHT_CULLING_SHADER_PACKAGE}")
+    add_dependencies(aeg_renderer_light_culling_smoke aeg_core_shaders)
+    target_link_libraries(aeg_renderer_shadow_gpu_smoke PRIVATE aeg_renderer aeg_render_graph aeg_shader aeg_rhi aeg_core_shaders)
+    target_compile_definitions(aeg_renderer_shadow_gpu_smoke PRIVATE
+        AEG_OPAQUE_UNLIT_SHADER_PACKAGE_PATH="${AEG_OPAQUE_UNLIT_SHADER_PACKAGE}"
+        AEG_GBUFFER_MESH_SHADER_PACKAGE_PATH="${AEG_GBUFFER_MESH_SHADER_PACKAGE}"
+        AEG_DEPTH_MESH_SHADER_PACKAGE_PATH="${AEG_DEPTH_MESH_SHADER_PACKAGE}"
+        AEG_DEFERRED_LIGHTING_SHADER_PACKAGE_PATH="${AEG_DEFERRED_LIGHTING_SHADER_PACKAGE}"
+        AEG_FORWARD_SHADOW_SHADER_PACKAGE_PATH="${AEG_FORWARD_SHADOW_SHADER_PACKAGE}"
+        AEG_LIGHT_CULLING_SHADER_PACKAGE_PATH="${AEG_LIGHT_CULLING_SHADER_PACKAGE}"
+        AEG_FORWARD_CLUSTERED_SHADER_PACKAGE_PATH="${AEG_FORWARD_CLUSTERED_SHADER_PACKAGE}"
+        AEG_POST_PROCESS_SHADER_PACKAGE_PATH="${AEG_POST_PROCESS_SHADER_PACKAGE}"
+        AEG_DEFERRED_SHADOW_SHADER_PACKAGE_PATH="${AEG_DEFERRED_SHADOW_SHADER_PACKAGE}")
+    add_dependencies(aeg_renderer_shadow_gpu_smoke aeg_core_shaders)
+    target_link_libraries(aeg_renderer_depth_pass_smoke PRIVATE aeg_renderer aeg_render_graph aeg_shader aeg_rhi aeg_core_shaders)
+    target_compile_definitions(aeg_renderer_depth_pass_smoke PRIVATE
+        AEG_DEPTH_MESH_SHADER_PACKAGE_PATH="${AEG_DEPTH_MESH_SHADER_PACKAGE}")
+    add_dependencies(aeg_renderer_depth_pass_smoke aeg_core_shaders)
     target_link_libraries(aeg_opaque_render_feature_smoke PRIVATE
         aeg_engine
         aeg_renderer
@@ -1715,6 +1850,14 @@ if (AEG_BUILD_TESTS)
     target_compile_definitions(aeg_opaque_render_feature_smoke PRIVATE
         _CRT_SECURE_NO_WARNINGS
         AEG_OPAQUE_UNLIT_SHADER_PACKAGE_PATH="${AEG_OPAQUE_UNLIT_SHADER_PACKAGE}"
+        AEG_DEPTH_MESH_SHADER_PACKAGE_PATH="${AEG_DEPTH_MESH_SHADER_PACKAGE}"
+        AEG_GBUFFER_MESH_SHADER_PACKAGE_PATH="${AEG_GBUFFER_MESH_SHADER_PACKAGE}"
+        AEG_DEFERRED_LIGHTING_SHADER_PACKAGE_PATH="${AEG_DEFERRED_LIGHTING_SHADER_PACKAGE}"
+        AEG_FORWARD_SHADOW_SHADER_PACKAGE_PATH="${AEG_FORWARD_SHADOW_SHADER_PACKAGE}"
+        AEG_LIGHT_CULLING_SHADER_PACKAGE_PATH="${AEG_LIGHT_CULLING_SHADER_PACKAGE}"
+        AEG_FORWARD_CLUSTERED_SHADER_PACKAGE_PATH="${AEG_FORWARD_CLUSTERED_SHADER_PACKAGE}"
+        AEG_POST_PROCESS_SHADER_PACKAGE_PATH="${AEG_POST_PROCESS_SHADER_PACKAGE}"
+        AEG_DEFERRED_SHADOW_SHADER_PACKAGE_PATH="${AEG_DEFERRED_SHADOW_SHADER_PACKAGE}"
     )
     add_dependencies(aeg_opaque_render_feature_smoke aeg_core_shaders)
 
@@ -1790,6 +1933,7 @@ if (AEG_BUILD_TESTS)
         aeg_pipeline
         aeg_module
         aeg_application_project
+        aeg_renderer
     )
     if (WIN32)
         target_compile_definitions(aeg_editor_project_pipeline_authoring_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
@@ -1830,6 +1974,14 @@ target_compile_definitions(aeg_editor_application PRIVATE
         AEG_EDITOR_ENABLE_BUILTIN_PIPELINE_DEBUG=$<AND:$<BOOL:${AEG_EDITOR_ENABLE_BUILTIN_PIPELINE_DEBUG}>,$<CONFIG:Debug>>
         AEG_EDITOR_IMGUI_SHADER_PACKAGE_PATH="${AEG_EDITOR_IMGUI_SHADER_PACKAGE}"
         AEG_OPAQUE_UNLIT_SHADER_PACKAGE_PATH="${AEG_OPAQUE_UNLIT_SHADER_PACKAGE}"
+        AEG_GBUFFER_MESH_SHADER_PACKAGE_PATH="${AEG_GBUFFER_MESH_SHADER_PACKAGE}"
+        AEG_DEFERRED_LIGHTING_SHADER_PACKAGE_PATH="${AEG_DEFERRED_LIGHTING_SHADER_PACKAGE}"
+        AEG_FORWARD_SHADOW_SHADER_PACKAGE_PATH="${AEG_FORWARD_SHADOW_SHADER_PACKAGE}"
+        AEG_LIGHT_CULLING_SHADER_PACKAGE_PATH="${AEG_LIGHT_CULLING_SHADER_PACKAGE}"
+        AEG_FORWARD_CLUSTERED_SHADER_PACKAGE_PATH="${AEG_FORWARD_CLUSTERED_SHADER_PACKAGE}"
+        AEG_POST_PROCESS_SHADER_PACKAGE_PATH="${AEG_POST_PROCESS_SHADER_PACKAGE}"
+        AEG_DEFERRED_SHADOW_SHADER_PACKAGE_PATH="${AEG_DEFERRED_SHADOW_SHADER_PACKAGE}"
+        AEG_DEPTH_MESH_SHADER_PACKAGE_PATH="${AEG_DEPTH_MESH_SHADER_PACKAGE}"
         AEG_STATE_COMPOSITE_SHADER_PACKAGE_PATH="${AEG_STATE_COMPOSITE_SHADER_PACKAGE}"
     )
     add_dependencies(aeg_editor_application aeg_core_shaders)
@@ -1870,6 +2022,20 @@ endif() # AEG_BUILD_TESTS
         DESTINATION shaders/core
         RENAME opaque_unlit_mesh.aegshader
     )
+    install(FILES "${AEG_GBUFFER_MESH_SHADER_PACKAGE}"
+        DESTINATION shaders/core
+        RENAME gbuffer_mesh.aegshader
+    )
+    install(FILES "${AEG_DEPTH_MESH_SHADER_PACKAGE}"
+        DESTINATION shaders/core
+        RENAME depth_mesh.aegshader
+    )
+    install(FILES "${AEG_DEFERRED_LIGHTING_SHADER_PACKAGE}"
+        DESTINATION shaders/core
+        RENAME deferred_lighting.aegshader
+    )
+    install(FILES "${AEG_FORWARD_SHADOW_SHADER_PACKAGE}" "${AEG_DEFERRED_SHADOW_SHADER_PACKAGE}"
+        DESTINATION shaders/core)
     install(FILES "${AEG_STATE_COMPOSITE_SHADER_PACKAGE}"
         DESTINATION shaders/core
         RENAME presentation_fullscreen_texture_blit.aegshader
@@ -1909,9 +2075,27 @@ if (AEG_BUILD_TESTS)
     target_compile_definitions(aeg_editor_scene_runtime_smoke PRIVATE
         _CRT_SECURE_NO_WARNINGS
         AEG_OPAQUE_UNLIT_SHADER_PACKAGE_PATH="${AEG_OPAQUE_UNLIT_SHADER_PACKAGE}"
+        AEG_GBUFFER_MESH_SHADER_PACKAGE_PATH="${AEG_GBUFFER_MESH_SHADER_PACKAGE}"
+        AEG_DEFERRED_LIGHTING_SHADER_PACKAGE_PATH="${AEG_DEFERRED_LIGHTING_SHADER_PACKAGE}"
+        AEG_FORWARD_SHADOW_SHADER_PACKAGE_PATH="${AEG_FORWARD_SHADOW_SHADER_PACKAGE}"
+        AEG_LIGHT_CULLING_SHADER_PACKAGE_PATH="${AEG_LIGHT_CULLING_SHADER_PACKAGE}"
+        AEG_FORWARD_CLUSTERED_SHADER_PACKAGE_PATH="${AEG_FORWARD_CLUSTERED_SHADER_PACKAGE}"
+        AEG_POST_PROCESS_SHADER_PACKAGE_PATH="${AEG_POST_PROCESS_SHADER_PACKAGE}"
+        AEG_DEFERRED_SHADOW_SHADER_PACKAGE_PATH="${AEG_DEFERRED_SHADOW_SHADER_PACKAGE}"
+        AEG_DEPTH_MESH_SHADER_PACKAGE_PATH="${AEG_DEPTH_MESH_SHADER_PACKAGE}"
         AEG_STATE_COMPOSITE_SHADER_PACKAGE_PATH="${AEG_STATE_COMPOSITE_SHADER_PACKAGE}"
     )
     add_dependencies(aeg_editor_scene_runtime_smoke aeg_core_shaders)
+
+    get_target_property(AEG_SCENE_TEST_SOURCES aeg_editor_scene_runtime_smoke SOURCES)
+    list(REMOVE_ITEM AEG_SCENE_TEST_SOURCES tests/editor_scene_runtime_smoke.cpp)
+    get_target_property(AEG_SCENE_TEST_LIBRARIES aeg_editor_scene_runtime_smoke LINK_LIBRARIES)
+    get_target_property(AEG_SCENE_TEST_DEFINITIONS aeg_editor_scene_runtime_smoke COMPILE_DEFINITIONS)
+    add_executable(aeg_editor_renderer_pipeline_smoke tests/editor_renderer_pipeline_smoke.cpp ${AEG_SCENE_TEST_SOURCES})
+    target_include_directories(aeg_editor_renderer_pipeline_smoke PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private)
+    target_link_libraries(aeg_editor_renderer_pipeline_smoke PRIVATE ${AEG_SCENE_TEST_LIBRARIES})
+    target_compile_definitions(aeg_editor_renderer_pipeline_smoke PRIVATE ${AEG_SCENE_TEST_DEFINITIONS})
+    add_dependencies(aeg_editor_renderer_pipeline_smoke aeg_core_shaders)
 
     add_executable(aeg_editor_external_assets_smoke
         tests/editor_external_assets_smoke.cpp
@@ -2096,12 +2280,16 @@ if (BUILD_TESTING AND AEG_BUILD_TESTS)
             "-DENGINE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
             "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/extensibility-embed"
             -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/extensibility_embed.cmake")
+    # These integration tests configure and compile independent cold build trees.
+    # A smoke-test timeout is insufficient for their build/cook/launch coverage.
+    set_tests_properties(aeg_extensibility_embed PROPERTIES TIMEOUT 600)
     if (AEG_BUILD_TOOLS)
         add_test(NAME aeg_extensibility_external_project
             COMMAND "${CMAKE_COMMAND}"
                 "-DENGINE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
                 "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/extensibility-external-示例"
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/extensibility_external_project.cmake")
+        set_tests_properties(aeg_extensibility_external_project PROPERTIES TIMEOUT 600)
     endif()
     add_test(NAME aeg_math_smoke COMMAND aeg_math_smoke)
     add_test(NAME aeg_result_smoke COMMAND aeg_result_smoke)
@@ -2186,6 +2374,12 @@ if (BUILD_TESTING AND AEG_BUILD_TESTS)
     add_test(NAME aeg_runtime_components_scene_smoke COMMAND aeg_runtime_components_scene_smoke)
     add_test(NAME aeg_runtime_component_orchestrator_smoke COMMAND aeg_runtime_component_orchestrator_smoke)
     add_test(NAME aeg_renderer_smoke COMMAND aeg_renderer_smoke)
+    add_test(NAME aeg_renderer_pipeline_variants_smoke COMMAND aeg_renderer_pipeline_variants_smoke)
+    add_test(NAME aeg_renderer_builtin_pass_smoke COMMAND aeg_renderer_builtin_pass_smoke)
+    add_test(NAME aeg_renderer_shadow_view_smoke COMMAND aeg_renderer_shadow_view_smoke)
+    add_test(NAME aeg_renderer_authoring_smoke COMMAND aeg_renderer_authoring_smoke)
+    add_test(NAME aeg_renderer_pipeline_graph_smoke COMMAND aeg_renderer_pipeline_graph_smoke)
+    set_tests_properties(aeg_renderer_pipeline_graph_smoke PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME aeg_render_feature_runtime_smoke COMMAND aeg_render_feature_runtime_smoke)
     add_test(NAME aeg_frame_retention_smoke COMMAND aeg_frame_retention_smoke)
     add_test(NAME aeg_render_graph_context_contract_smoke COMMAND aeg_render_graph_context_contract_smoke)
@@ -2198,9 +2392,37 @@ if (BUILD_TESTING AND AEG_BUILD_TESTS)
     if (WIN32 AND AEG_BUILD_EDITOR)
         add_test(NAME aeg_editor_imgui_renderer_smoke COMMAND aeg_editor_imgui_renderer_smoke)
         add_test(NAME aeg_opaque_render_feature_smoke COMMAND aeg_opaque_render_feature_smoke)
+        add_test(NAME aeg_forward_render_feature_smoke COMMAND aeg_opaque_render_feature_smoke --forward)
+        add_test(NAME aeg_deferred_render_feature_smoke COMMAND aeg_opaque_render_feature_smoke --deferred)
+        add_test(NAME aeg_deferred_backlit_smoke COMMAND aeg_opaque_render_feature_smoke --deferred-backlit)
+        set_tests_properties(aeg_deferred_render_feature_smoke aeg_deferred_backlit_smoke PROPERTIES
+            FAIL_REGULAR_EXPRESSION "Vulkan validation \\[ERROR\\]")
+        set_tests_properties(aeg_forward_render_feature_smoke PROPERTIES
+            FAIL_REGULAR_EXPRESSION "Vulkan validation \\[ERROR\\]")
+        add_test(NAME aeg_renderer_depth_pass_smoke COMMAND aeg_renderer_depth_pass_smoke)
+        add_test(NAME aeg_forward_shadow_smoke COMMAND aeg_renderer_shadow_gpu_smoke)
+        add_test(NAME aeg_renderer_light_culling_smoke COMMAND aeg_renderer_light_culling_smoke)
+        set_tests_properties(aeg_renderer_light_culling_smoke PROPERTIES
+            FAIL_REGULAR_EXPRESSION "Vulkan validation \\[ERROR\\]")
+        add_test(NAME aeg_deferred_shadow_smoke COMMAND aeg_renderer_shadow_gpu_smoke --deferred)
+        add_test(NAME aeg_forward_local_lights_smoke COMMAND aeg_renderer_shadow_gpu_smoke --local-lights)
+        add_test(NAME aeg_forward_post_process_smoke COMMAND aeg_renderer_shadow_gpu_smoke --post-process)
+        add_test(NAME aeg_deferred_post_process_smoke COMMAND aeg_renderer_shadow_gpu_smoke --deferred-post-process)
+        set_tests_properties(aeg_forward_post_process_smoke aeg_deferred_post_process_smoke PROPERTIES
+            FAIL_REGULAR_EXPRESSION "Vulkan validation \\[ERROR\\]")
+        set_tests_properties(aeg_forward_local_lights_smoke PROPERTIES
+            FAIL_REGULAR_EXPRESSION "Vulkan validation \\[ERROR\\]")
+        set_tests_properties(aeg_forward_shadow_smoke aeg_deferred_shadow_smoke PROPERTIES
+            FAIL_REGULAR_EXPRESSION "Vulkan validation \\[ERROR\\]")
+        set_tests_properties(aeg_renderer_depth_pass_smoke PROPERTIES
+            FAIL_REGULAR_EXPRESSION "Vulkan validation \\[ERROR\\]")
         add_test(NAME aeg_opaque_render_feature_multiframe_smoke COMMAND aeg_opaque_render_feature_multiframe_smoke)
         add_test(NAME aeg_opaque_render_feature_uv_depth_smoke COMMAND aeg_opaque_render_feature_uv_depth_smoke)
         add_test(NAME aeg_editor_scene_runtime_smoke COMMAND aeg_editor_scene_runtime_smoke)
+        add_test(NAME aeg_editor_renderer_pipeline_smoke COMMAND aeg_editor_renderer_pipeline_smoke)
+        set_tests_properties(aeg_editor_renderer_pipeline_smoke PROPERTIES
+            FAIL_REGULAR_EXPRESSION "Vulkan validation \\[ERROR\\]")
+        add_test(NAME aeg_editor_project_pipeline_authoring_smoke COMMAND aeg_editor_project_pipeline_authoring_smoke)
         add_test(NAME aeg_editor_external_assets_smoke COMMAND aeg_editor_external_assets_smoke)
         add_test(NAME aeg_editor_viewport_interaction_smoke COMMAND aeg_editor_viewport_interaction_smoke)
         add_test(NAME aeg_editor_history_smoke COMMAND aeg_editor_history_smoke)
@@ -2212,6 +2434,16 @@ if (BUILD_TESTING AND AEG_BUILD_TESTS)
         add_test(NAME aeg_editor_application COMMAND aeg_editor_application --frames 60 --stress-resize)
         add_test(NAME aeg_editor_application_preferences
                  COMMAND aeg_editor_application --frames 60 --stress-resize --open-preferences)
+        add_test(NAME aeg_editor_application_native_viewports
+                 COMMAND aeg_editor_application --frames 60 --stress-native-viewports)
+        set_tests_properties(aeg_editor_application_native_viewports PROPERTIES TIMEOUT 30)
+        add_test(NAME aeg_editor_application_pipeline_recovery
+            COMMAND "${CMAKE_COMMAND}"
+                "-DEDITOR=$<TARGET_FILE:aeg_editor_application>"
+                "-DFIXTURE_WRITER=$<TARGET_FILE:aeg_editor_renderer_pipeline_smoke>"
+                "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/editor-pipeline-recovery"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/editor_pipeline_recovery.cmake")
+        set_tests_properties(aeg_editor_application_pipeline_recovery PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
         add_test(NAME aeg_editor_application_missing_project
                  COMMAND aeg_editor_application --frames 2 --project "${CMAKE_CURRENT_BINARY_DIR}/missing-recovery-project/project.aegproject")
         set_tests_properties(aeg_editor_imgui_renderer_smoke aeg_opaque_render_feature_smoke
@@ -2220,6 +2452,7 @@ if (BUILD_TESTING AND AEG_BUILD_TESTS)
                 aeg_editor_history_smoke aeg_editor_hierarchy_smoke aeg_editor_inspector_smoke
                 aeg_editor_asset_database_smoke aeg_editor_project_smoke aeg_editor_application
                 aeg_editor_application_preferences
+                aeg_editor_application_native_viewports
             PROPERTIES
             FAIL_REGULAR_EXPRESSION "Vulkan validation \\[ERROR\\]"
         )
@@ -2250,6 +2483,7 @@ if (BUILD_TESTING AND AEG_BUILD_TESTS)
                 aeg_editor_asset_database_smoke aeg_editor_project_smoke aeg_render_feature_runtime_smoke
                 aeg_frame_retention_smoke aeg_rhi_smoke aeg_logging_smoke aeg_triangle
                 aeg_editor_application_identity_smoke aeg_editor_application aeg_editor_application_preferences
+                aeg_editor_application_native_viewports
                 aeg_editor_application_missing_project aeg_editor_error_smoke aeg_editor_asset_pipeline_recovery_smoke
                 aeg_render_graph_imported_texture_state_smoke)
     endif()

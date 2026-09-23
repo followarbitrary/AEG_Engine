@@ -99,5 +99,40 @@ struct DirectionalLight final {
     float intensity{1.0f};
     /** @brief Controls whether this light contributes during extraction. */
     bool enabled{true};
+    /** @brief Enables directional shadow casting in supported renderer variants. */
+    bool casts_shadow{false};
+};
+
+/** @brief Local light at the entity Transform position; range is measured in world units. */
+struct PointLight final {
+    math::Vec3 color{1.0f, 1.0f, 1.0f};
+    float intensity{1.0f};
+    float range{5.0f};
+    uint32_t visibility_mask{0xffffffffu};
+    bool enabled{true};
+};
+
+/** @brief Local cone light; Transform rotation maps its local direction into world space. */
+struct SpotLight final {
+    math::Vec3 color{1.0f, 1.0f, 1.0f};
+    float intensity{1.0f};
+    float range{5.0f};
+    uint32_t visibility_mask{0xffffffffu};
+    bool enabled{true};
+    math::Vec3 direction{0.0f, 0.0f, -1.0f};
+    float inner_cone_cosine{0.95f};
+    float outer_cone_cosine{0.85f};
+};
+
+/** @brief One enabled environment supplies the view's procedural sky and postprocessing. */
+struct SceneEnvironment final {
+    math::Vec3 sky_zenith{0.08f, 0.2f, 0.5f};
+    math::Vec3 sky_horizon{0.5f, 0.65f, 0.9f};
+    math::Vec3 sky_ground{0.025f, 0.025f, 0.025f};
+    float exposure{1.0f};
+    float gamma{2.2f};
+    bool sky_enabled{true};
+    bool tone_mapping{true};
+    bool enabled{true};
 };
 }  // namespace aeg::engine::components

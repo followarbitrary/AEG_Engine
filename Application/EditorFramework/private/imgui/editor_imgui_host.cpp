@@ -163,7 +163,8 @@ struct EditorImGuiHost::Impl final {
     /** @brief Rasterized size of the native display face. */
     float display_font_size_pixels{0.0f};
     std::array<ImFont*, 4> preference_fonts{};
-    std::array<float, 4> preference_font_sizes{};
+    // Public role identifiers stay fixed while their raster sizes follow the applied font.
+    static constexpr std::array<float, 4> kPreferenceFontRoles{16, 20, 24, 32};
     ImFont* preference_icons{nullptr};
     ImVector<ImWchar> chinese_ranges{};
     /** @brief Monotonic frame identity copied into every captured viewport packet. */
@@ -317,13 +318,13 @@ struct EditorImGuiHost::Impl final {
                         return result;
                     }
                     // Microsoft Segoe MDL2 Assets: Settings, KeyboardClassic, Font.
-                    static constexpr ImWchar icon_ranges[]{0xE713, 0xE713, 0xE765, 0xE765, 0xE8D2, 0xE8D2, 0};
+                    static constexpr ImWchar kIconRanges[]{0xE713, 0xE713, 0xE765, 0xE765, 0xE8D2, 0xE8D2, 0};
                     ImFontConfig config{};
                     config.FontDataOwnedByAtlas = false;
                     config.FontNo = static_cast<int>(icon_asset->face_index);
                     next_preference_icons = candidate->AddFontFromMemoryTTF(
                         const_cast<std::byte*>(icon_asset->font_data.data()),
-                        static_cast<int>(icon_asset->font_data.size()), 20.0f, &config, icon_ranges);
+                        static_cast<int>(icon_asset->font_data.size()), 20.0f, &config, kIconRanges);
                     if (next_preference_icons == nullptr) {
                         return foundation::invalid_argument("Editor preference icon font could not be loaded");
                     }
@@ -384,7 +385,6 @@ struct EditorImGuiHost::Impl final {
             display_font = next_display_font;
             display_font_size_pixels = kDisplayFontSizePixels;
             preference_fonts = next_preference_fonts;
-            preference_font_sizes = {size_pixels * 0.875f, size_pixels, size_pixels * 1.25f, size_pixels * 1.5f};
             preference_icons = next_preference_icons;
             font_texture = {};
             io.Fonts->SetTexID(ImTextureRef(static_cast<ImTextureID>(0)));
@@ -714,8 +714,8 @@ float EditorImGuiHost::display_font_size_pixels() const noexcept {
 
 const void* EditorImGuiHost::preference_font(float size_pixels) const noexcept {
     if (impl_ != nullptr) {
-        for (std::size_t index = 0; index < impl_->preference_font_sizes.size(); ++index) {
-            if (std::abs(size_pixels - impl_->preference_font_sizes[index]) < 0.01f)
+        for (std::size_t index = 0; index < Impl::kPreferenceFontRoles.size(); ++index) {
+            if (std::abs(size_pixels - Impl::kPreferenceFontRoles[index]) < 0.01f)
                 return impl_->preference_fonts[index];
         }
     }

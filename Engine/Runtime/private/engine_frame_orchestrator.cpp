@@ -1000,8 +1000,9 @@ foundation::Result EngineFrameOrchestrator::build_render_features() {
                     if (snapshot == nullptr) {
                         return not_found("Frame pipeline has no extracted RenderSceneSnapshot");
                     }
-                    auto context = std::make_unique<renderer::RenderFeatureContext>(renderer::RenderFeatureContext{
-                        snapshot, frame_desc_.render_resource_resolver, frame_desc_.user_data});
+                    auto context = std::make_unique<renderer::RenderFeatureContext>(
+                        renderer::RenderFeatureContext{snapshot, frame_desc_.render_resource_resolver,
+                                                       frame_desc_.user_data, frame_desc_.render_passes});
                     feature_context = context.get();
                     render_feature_contexts_.push_back(
                         RenderFeatureContextBinding{pinned_pipeline.host, std::move(context)});

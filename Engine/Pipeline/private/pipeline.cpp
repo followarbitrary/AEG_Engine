@@ -2446,6 +2446,10 @@ foundation::Result PipelineRegistry::bind_feature(const FeatureBindingDescriptor
     if (definition.descriptor.domains != 0 && (binding_domains & ~definition.descriptor.domains) != 0) {
         return unsupported("feature domain is not enabled by the pipeline");
     }
+    if (feature_iterator->second.descriptor.pipeline_affinity.is_valid() &&
+        feature_iterator->second.descriptor.pipeline_affinity != binding.pipeline) {
+        return unsupported("feature is bound to a different pipeline");
+    }
 
     FeatureBindingDescriptor normalized = binding;
     if (!normalized.instance.is_valid()) {
@@ -2581,6 +2585,38 @@ foundation::ResultValue<PipelinePlan> PipelineCompiler::compile(const PipelineCo
         return {registered_bindings.result, {}};
     }
     feature_bindings.insert(feature_bindings.end(), registered_bindings.value.begin(), registered_bindings.value.end());
+    if (input.configuration != nullptr) {
+        if (input.configuration->pipeline != input.pipeline || input.configuration->scope != input.scope ||
+            (input.configuration->instance.is_valid() && input.configuration->instance != input.instance)) {
+            return {invalid_argument("pipeline instance configuration does not match compile input"), {}};
+        }
+        // An authored instance replaces the default binding for the same feature/point.
+        // Keep unrelated host contributions, and retain default ordering priorities.
+        const auto default_bindings = feature_bindings;
+        std::erase_if(feature_bindings, [&](const FeatureBindingDescriptor& binding) {
+            return std::any_of(input.configuration->features.begin(), input.configuration->features.end(),
+                               [&](const FeatureInstanceConfiguration& feature) {
+                                   return feature.feature == binding.feature && feature.point == binding.point;
+                               });
+        });
+        for (const FeatureInstanceConfiguration& feature : input.configuration->features) {
+            if (!feature.instance.is_valid() || !feature.feature.is_valid() || !feature.point.is_valid()) {
+                return {invalid_argument("authored feature binding identity is invalid"), {}};
+            }
+            const auto default_binding = std::find_if(
+                default_bindings.begin(), default_bindings.end(), [&](const FeatureBindingDescriptor& binding) {
+                    return feature.feature == binding.feature && feature.point == binding.point;
+                });
+            feature_bindings.push_back(
+                {.feature = feature.feature,
+                 .pipeline = input.pipeline,
+                 .scope = input.scope,
+                 .point = feature.point,
+                 .priority = default_binding == default_bindings.end() ? 0 : default_binding->priority,
+                 .enabled = true,
+                 .instance = feature.instance});
+        }
+    }
     std::sort(feature_bindings.begin(), feature_bindings.end(),
               [](const FeatureBindingDescriptor& left, const FeatureBindingDescriptor& right) {
                   if (left.point != right.point) {
@@ -2620,6 +2656,9 @@ foundation::ResultValue<PipelinePlan> PipelineCompiler::compile(const PipelineCo
             return {feature_registration.result, {}};
         }
         const FeatureDescriptor& feature_descriptor = feature_registration.value.descriptor;
+        if (feature_descriptor.pipeline_affinity.is_valid() && feature_descriptor.pipeline_affinity != input.pipeline) {
+            return {unsupported("feature is bound to a different pipeline"), {}};
+        }
         const PipelineFeaturePointRecord* point = nullptr;
         for (const PipelineFeaturePointRecord& candidate : base_definition.feature_points) {
             if (candidate.descriptor.id == binding.point) {
@@ -2649,7 +2688,7 @@ foundation::ResultValue<PipelinePlan> PipelineCompiler::compile(const PipelineCo
         const size_t first_contribution_index = feature_contributions.size();
         FeatureBuildContext context(
             contribution_builder, input.scope, input.pipeline, binding.feature, binding.instance, {}, point->descriptor,
-            feature_registration.value.implementation->feature_domain(), &feature_contributions);
+            feature_registration.value.implementation->feature_domain(), &feature_contributions, input.configuration);
         foundation::Result contribution_result;
         try {
             contribution_result = feature_registration.value.implementation->collect_contributions(context);
@@ -3347,9 +3386,11 @@ foundation::Result PipelineScopeHost::bind_pipeline(PipelineId pipeline) {
 
 foundation::Result PipelineScopeHost::rebuild(const PipelineRegistry& registry, CapabilityMask available_capabilities) {
     PipelineId pipeline;
+    std::shared_ptr<const PipelineInstanceConfiguration> configuration;
     {
         std::shared_lock plan_lock(plan_mutex_);
         pipeline = pipeline_;
+        configuration = configuration_;
     }
     if (!pipeline.is_valid()) {
         return invalid_state("scope host has no bound pipeline");
@@ -3360,6 +3401,7 @@ foundation::Result PipelineScopeHost::rebuild(const PipelineRegistry& registry, 
         .available_capabilities = available_capabilities,
         .registry = &registry,
         .instance = instance_,
+        .configuration = configuration,
     });
     if (!compiled) {
         return compiled.result;
@@ -3373,7 +3415,7 @@ foundation::Result PipelineScopeHost::rebuild(const PipelineRegistry& registry, 
     }
 
     std::unique_lock plan_lock(plan_mutex_);
-    if (pipeline_ != pipeline) {
+    if (pipeline_ != pipeline || configuration_ != configuration) {
         return invalid_state("bound pipeline changed during pipeline rebuild");
     }
     if (active_) {

@@ -117,6 +117,8 @@ struct EngineFrameDesc final {
     bool require_resolved_render_resources{false};
     /** @brief Optional controlled hook run before RenderFeature graph construction. */
     EngineFramePreparationFunction render_feature_preparation{};
+    /** Built-in variants use the same pass registry that compiles their documents. */
+    const pipeline::RenderPassRegistry* render_passes{nullptr};
 };
 
 /** @brief Non-owning registration of one World view and its Frame pipeline host. */

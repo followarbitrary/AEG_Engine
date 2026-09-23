@@ -22,6 +22,10 @@ namespace aeg::world {
 class WorldFrameScope;
 }
 
+namespace aeg::pipeline {
+class RenderPassRegistry;
+}
+
 namespace aeg::renderer {
 struct RenderViewIdTag;
 struct RenderObjectIdTag;
@@ -81,6 +85,17 @@ struct RenderExtent final {
     friend constexpr bool operator==(RenderExtent, RenderExtent) = default;
 };
 
+/** @brief View-local procedural sky and HDR-to-output settings. Neutral defaults preserve linear output. */
+struct RenderPostProcessSettings final {
+    math::Vec3 sky_zenith{0.08f, 0.2f, 0.5f};
+    math::Vec3 sky_horizon{0.5f, 0.65f, 0.9f};
+    math::Vec3 sky_ground{0.025f, 0.025f, 0.025f};
+    float exposure{1.0f};
+    float gamma{1.0f};
+    bool sky_enabled{false};
+    bool tone_mapping{false};
+};
+
 /** @brief Camera matrices and clip-space parameters consumed by rendering. */
 struct RenderCamera final {
     math::Mat4 view{math::identity()};
@@ -106,6 +121,7 @@ struct RenderView final {
     bool frustum_culling{false};
     /** @brief Resource usage required after the opaque color pass completes. */
     rhi::ResourceUsage color_target_final_usage{rhi::ResourceUsage::kColorAttachmentWrite};
+    RenderPostProcessSettings post_process{};
 
     [[nodiscard]] bool is_valid() const noexcept;
 };
@@ -245,6 +261,14 @@ struct RenderMaterialResource final {
     uint64_t material_parameter_offset{0};
     /** @brief Byte size of the material parameter range. */
     uint64_t material_parameter_size{0};
+    /** @brief Optional graphics pipeline writing Albedo/Normal/Material GBuffer MRTs. */
+    rhi::PipelineHandle gbuffer_pipeline{};
+    /** @brief Optional depth-only graphics pipeline used by shadow/Z-prepass. */
+    rhi::PipelineHandle depth_pipeline{};
+    /** @brief Optional forward pipeline consuming the group-three shadow binding. */
+    rhi::PipelineHandle shadow_pipeline{};
+    /** @brief Forward pipeline consuming the tile light list and optional directional shadow. */
+    rhi::PipelineHandle clustered_pipeline{};
 
     /** @brief Reports whether this material can issue a graphics draw. */
     [[nodiscard]] bool is_valid() const noexcept;
@@ -313,6 +337,62 @@ struct RenderObjectResource final {
     [[nodiscard]] bool is_valid() const noexcept;
 };
 
+/** @brief GBuffer views and lighting range resolved after graph resource allocation. */
+struct RenderDeferredLightingInputs final {
+    rhi::TextureViewHandle albedo{};
+    rhi::TextureViewHandle normal{};
+    rhi::TextureViewHandle depth{};
+    rhi::BufferRange lighting{};
+    rhi::TextureViewHandle shadow_map{};
+    rhi::BufferRange shadow_constants{};
+};
+
+/**
+ * @brief Host-owned fullscreen lighting resources for the current frame.
+ * The callback prepares a fresh
+ * group-zero descriptor set and retains it until
+ * GPU frame completion. It must not modify a set referenced by an
+ * earlier pass.
+ */
+struct RenderDeferredLightingResource final {
+    rhi::PipelineHandle pipeline{};
+    std::function<foundation::ResultValue<rhi::BindingSetHandle>(const RenderDeferredLightingInputs&)> prepare_inputs{};
+    rhi::PipelineHandle shadow_pipeline{};
+
+    [[nodiscard]] bool is_valid() const noexcept { return pipeline.is_valid() && bool(prepare_inputs); }
+};
+
+struct RenderShadowView;
+/** @brief Frame-owned shadow constants and a lazy group-three input descriptor. */
+struct RenderShadowResource final {
+    rhi::BufferHandle buffer{};
+    rhi::BufferDesc buffer_desc{};
+    pipeline::RenderGraphBuffer graph_buffer{};
+    std::function<foundation::ResultValue<rhi::BindingSetHandle>(rhi::TextureViewHandle)> prepare_inputs{};
+};
+
+/** @brief Host-owned light culling resources, imported into the current graph by the feature. */
+struct RenderLightCullingResource final {
+    rhi::PipelineHandle pipeline{};
+    rhi::BufferHandle constants{}, lights{};
+    rhi::BufferDesc constants_desc{}, lights_desc{};
+    pipeline::RenderGraphBuffer constants_graph{}, lights_graph{};
+    uint32_t tile_count_x{0}, tile_count_y{0};
+    uint64_t cluster_bytes{0};
+    /** @brief Compute: scene depth/list buffer. Forward: shadow depth/list buffer. */
+    std::function<foundation::ResultValue<rhi::BindingSetHandle>(rhi::TextureViewHandle, rhi::BufferHandle)>
+        prepare_compute{}, prepare_forward{};
+};
+
+/** @brief Current-frame sky/postprocess shader, constants and fresh descriptor preparation. */
+struct RenderPostProcessResource final {
+    rhi::PipelineHandle pipeline{};
+    rhi::BufferHandle constants{};
+    rhi::BufferDesc constants_desc{};
+    std::function<foundation::ResultValue<rhi::BindingSetHandle>(rhi::TextureViewHandle, rhi::TextureViewHandle)>
+        prepare_inputs{};
+};
+
 /** @brief Resolves renderer asset identities to backend-neutral RHI resources. */
 class RenderResourceResolver {
 public:
@@ -327,6 +407,20 @@ public:
     /** @brief Resolves the frame/view-local lighting binding required by Opaque. */
     [[nodiscard]] virtual foundation::ResultValue<RenderLightingResource> resolve_lighting(
         const RenderSceneSnapshot& snapshot, const RenderView& view) const;
+    /** @brief Resolves fullscreen deferred shading; not needed for an empty scene. */
+    [[nodiscard]] virtual foundation::ResultValue<RenderDeferredLightingResource> resolve_deferred_lighting(
+        const RenderView& view) const;
+    [[nodiscard]] virtual foundation::ResultValue<RenderShadowResource> resolve_shadow(const RenderShadowView&) const {
+        return {foundation::not_found("shadow resources are unavailable"), {}};
+    }
+    [[nodiscard]] virtual foundation::ResultValue<RenderLightCullingResource> resolve_light_culling(
+        const RenderSceneSnapshot&, const RenderShadowView&) const {
+        return {foundation::not_found("light culling resources are unavailable"), {}};
+    }
+    [[nodiscard]] virtual foundation::ResultValue<RenderPostProcessResource> resolve_post_process(
+        const RenderView&) const {
+        return {foundation::not_found("skybox/postprocess resources are unavailable"), {}};
+    }
 };
 
 /** @brief Immutable frame-local rendering input produced by RenderExtract. */
@@ -338,6 +432,8 @@ struct RenderSceneSnapshot final {
     RenderVisibilityStats visibility{};
     std::vector<RenderInstance> instances{};
     std::vector<RenderLight> lights{};
+    /** @brief Mask-visible casters retained before camera frustum culling. */
+    std::vector<RenderInstance> shadow_casters{};
 
     [[nodiscard]] bool is_valid() const noexcept {
         return world_revision != 0 && world.is_valid() && view.is_valid() && view.world == world;
@@ -408,6 +504,8 @@ struct RenderFeatureContext final {
     const RenderSceneSnapshot* scene_snapshot{nullptr};
     const RenderResourceResolver* resource_resolver{nullptr};
     void* user_data{nullptr};
+    /** Host registry borrowed during graph construction; graph retains each resolved pass. */
+    const pipeline::RenderPassRegistry* render_passes{nullptr};
 
     [[nodiscard]] bool is_valid() const noexcept { return scene_snapshot != nullptr && scene_snapshot->is_valid(); }
 };

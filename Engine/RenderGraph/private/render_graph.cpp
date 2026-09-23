@@ -86,12 +86,36 @@ struct TextureViewCacheEntry {
     bool owns_handle{false};
 };
 
+/** Keeps graph-owned images/views alive when the graph is rebuilt before GPU completion. */
+struct TextureAllocationOwner {
+    explicit TextureAllocationOwner(rhi::Device& device) : device(device) {}
+    ~TextureAllocationOwner() { release_unreferenced(); }
+    void release_unreferenced() {
+        // A descriptor may outlive the graph that created its views. Keep only
+        // handles the backend still considers referenced; the frame lease retries
+        // after retiring descriptors. Unreferenced imports can be released now.
+        std::erase_if(views, [this](rhi::TextureViewHandle view) {
+            const auto result = device.destroy_texture_view(view);
+            return result || result.code == foundation::ResultCode::kNotFound;
+        });
+        if (views.empty() && texture.is_valid()) {
+            const auto result = device.destroy_texture(texture);
+            if (result || result.code == foundation::ResultCode::kNotFound)
+                texture = {};
+        }
+    }
+    rhi::Device& device;
+    rhi::TextureHandle texture{};
+    std::vector<rhi::TextureViewHandle> views{};
+};
+
 struct PhysicalTexture {
     rhi::TextureHandle handle{};
     OwnedTextureDesc desc{};
     std::vector<rhi::ResourceState> states{};
     std::vector<TextureViewCacheEntry> views{};
     bool owns_handle{false};
+    std::shared_ptr<TextureAllocationOwner> owner{};
 };
 
 struct ResourceUse {
@@ -1102,6 +1126,9 @@ foundation::Result RenderGraph::update_imported_texture(RenderGraphTexture resou
         }
     }
     record->physical.views.clear();
+    if (record->physical.owner)
+        record->physical.owner->release_unreferenced();
+    record->physical.owner.reset();
     record->imported = texture;
     record->imported_default_view = default_view;
     record->physical.handle = texture;
@@ -2678,6 +2705,8 @@ foundation::Result RenderGraph::Impl::release_physical_buffer(PhysicalBuffer& ph
 }
 
 foundation::Result RenderGraph::Impl::release_physical_texture(PhysicalTexture& physical) {
+    if (physical.owner)
+        physical.owner->release_unreferenced();
     foundation::Result first_error = foundation::Result::success();
     for (const TextureViewCacheEntry& view : physical.views) {
         if (!view.owns_handle || !view.handle.is_valid()) {
@@ -3188,6 +3217,18 @@ foundation::Result RenderGraph::Impl::prepare_execution_views(const RenderGraphP
             if (!view) {
                 return view.result;
             }
+        }
+        // Sampled graph resources need views just like attachments do. Prepare
+        // them before command recording so pass callbacks remain lookup-only.
+        for (const ResourceUse& use : pass->uses) {
+            if (use.kind != ResourceKind::kTexture || use.before_state.usage != rhi::ResourceUsage::kSampledRead) {
+                continue;
+            }
+            const auto view = ensure_texture_view({use.resource_index, use.resource_generation, graph_id}, frame_slot,
+                                                  rhi::TextureViewKind::kSampled, use.subresources,
+                                                  rhi::Format::kUnknown, rhi::TextureViewDimension::kAuto);
+            if (!view)
+                return view.result;
         }
     }
     return foundation::Result::success();
@@ -3874,6 +3915,31 @@ foundation::ResultValue<RenderGraphExecutionResult> RenderGraph::execute(FrameCo
         if (!view_result) {
             return fail_execution(view_result);
         }
+        // Descriptor sets are retired before retained owners by FrameContext.
+        // Transfer ownership, but keep the cache handles so repeated executions
+        // can reuse the same persistent allocations without losing their contents.
+        for (TextureRecord& record : impl_->textures) {
+            if (!record.has_use)
+                continue;
+            PhysicalTexture* physical = impl_->physical_texture(record, frame_slot);
+            if (physical == nullptr)
+                continue;
+            if (!physical->owner)
+                physical->owner = std::make_shared<TextureAllocationOwner>(device_);
+            if (physical->owns_handle) {
+                physical->owner->texture = physical->handle;
+                physical->owns_handle = false;
+            }
+            for (TextureViewCacheEntry& view : physical->views) {
+                if (!view.owns_handle)
+                    continue;
+                physical->owner->views.push_back(view.handle);
+                view.owns_handle = false;
+            }
+            if (const auto retained = frame_context.retain_until_complete(physical->owner); !retained) {
+                return fail_execution(retained);
+            }
+        }
 
         const rhi::FrameAcquireResult* acquired = frame_context.acquired_frame();
         uint32_t acquire_batch = kInvalidHandleIndex;
@@ -4210,6 +4276,25 @@ foundation::ResultValue<RenderGraphExecutionResult> RenderGraph::execute(FrameCo
             }
             execution_result.presented = true;
             execution_result.suboptimal = present_result.value.suboptimal;
+        }
+        // A sampled-read declaration can also use a host-provided descriptor.
+        // Drop auto-prepared views that no command/descriptor actually used;
+        // otherwise they prevent the host from replacing an imported texture.
+        for (TextureRecord& record : impl_->textures) {
+            if (!record.has_use)
+                continue;
+            PhysicalTexture* physical = impl_->physical_texture(record, frame_slot);
+            if (physical == nullptr || !physical->owner)
+                continue;
+            std::erase_if(physical->views, [&](const TextureViewCacheEntry& view) {
+                if (view.desc.kind != rhi::TextureViewKind::kSampled)
+                    return false;
+                const auto released = device_.destroy_texture_view(view.handle);
+                if (!released && released.code != foundation::ResultCode::kNotFound)
+                    return false;
+                std::erase(physical->owner->views, view.handle);
+                return true;
+            });
         }
         return {foundation::Result::success(), execution_result};
     } catch (const std::bad_alloc&) {

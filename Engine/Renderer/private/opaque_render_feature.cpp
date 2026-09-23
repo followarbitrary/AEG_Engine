@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "../public/renderer.hpp"
+#include "builtin_render_passes.hpp"
 
 namespace aeg::renderer {
 namespace {
@@ -89,6 +90,10 @@ struct OpaquePassData final {
     uint64_t lighting_size{0};
     bool has_depth_target{false};
     bool preserve_color{false};
+    pipeline::RenderGraphTexture shadow_map{};
+    RenderShadowResource shadow_resource{};
+    RenderLightCullingResource light_culling{};
+    pipeline::RenderGraphBuffer light_clusters{};
     RenderExtent output_extent{};
     std::vector<OpaqueDrawItem> draws{};
 };
@@ -113,10 +118,25 @@ public:
     }
 
     [[nodiscard]] foundation::Result build_render_graph(pipeline::RenderGraphBuilder& builder) const override {
+        return build_render_graph_with_options(builder, false);
+    }
+
+    [[nodiscard]] foundation::Result build_render_graph_with_options(
+        pipeline::RenderGraphBuilder& builder, bool preserve_depth, pipeline::RenderGraphTexture shadow_map = {},
+        pipeline::RenderGraphBuffer light_clusters = {}, const RenderShadowResource* shadow_resource = nullptr,
+        const RenderLightCullingResource* light_culling = nullptr,
+        pipeline::RenderGraphTexture color_override = {}) const {
         const RenderFeatureContext* context = render_feature_context(builder);
         if (context == nullptr || !context->is_valid()) {
             return invalid_state("opaque render feature requires a valid renderer context");
         }
+        const auto add_opaque_pass = [&](std::string_view name, pipeline::RenderPassSetupFunction setup,
+                                         pipeline::RenderPassExecuteFunction execute) {
+            if (color_override.is_valid())
+                return detail::add_builtin_render_pass(builder, *context, kForwardOpaquePassTypeId, std::move(setup),
+                                                       std::move(execute));
+            return builder.add_graphics_pass(name, std::move(setup), std::move(execute));
+        };
         if (!context->scene_snapshot->instances.empty() && context->resource_resolver == nullptr) {
             return invalid_state("opaque render feature requires a render resource resolver");
         }
@@ -127,17 +147,22 @@ public:
         const pipeline::RenderGraphTexture state_output = builder.state_output();
         const pipeline::RenderGraphTexture state_input = builder.state_input();
         const std::span<const pipeline::RenderGraphTexture> state_inputs = builder.state_inputs();
-        const bool preserve_state = state_output.is_valid() && !state_inputs.empty();
+        const bool preserve_state = !color_override.is_valid() && state_output.is_valid() && !state_inputs.empty();
         // RenderFeatureRuntime pre-composes multi-input state into state_output.
         // A serial input still needs the inexpensive copy seed below.
         const bool needs_state_seed = preserve_state && state_inputs.size() == 1 && state_input.is_valid();
-        const foundation::ResultValue<pipeline::RenderGraphTexture> color_target = state_output.is_valid()
-            ? foundation::ResultValue<pipeline::RenderGraphTexture>{foundation::Result::success(), state_output}
-            : builder.find_texture(context->scene_snapshot->view.color_target);
-        if (!color_target) return color_target.result;
-        const rhi::ResourceUsage color_final_usage = state_output.is_valid()
-            ? rhi::ResourceUsage::kCopySource
-            : context->scene_snapshot->view.color_target_final_usage;
+        const foundation::ResultValue<pipeline::RenderGraphTexture> color_target =
+            color_override.is_valid()
+                ? foundation::ResultValue<pipeline::RenderGraphTexture>{foundation::Result::success(), color_override}
+            : state_output.is_valid()
+                ? foundation::ResultValue<pipeline::RenderGraphTexture>{foundation::Result::success(), state_output}
+                : builder.find_texture(context->scene_snapshot->view.color_target);
+        if (!color_target)
+            return color_target.result;
+        const rhi::ResourceUsage color_final_usage = color_override.is_valid() ? rhi::ResourceUsage::kSampledRead
+                                                     : state_output.is_valid()
+                                                         ? rhi::ResourceUsage::kCopySource
+                                                         : context->scene_snapshot->view.color_target_final_usage;
 
         if (needs_state_seed) {
             const rhi::Extent3D extent{context->scene_snapshot->view.output_extent.width,
@@ -145,9 +170,8 @@ public:
             const auto seed = builder.add_copy_pass(
                 "Opaque.StateSeed",
                 [state_input, state_output](pipeline::RenderPassBuilder& pass) {
-                    if (const foundation::Result result = pass.read(
-                            state_input, rhi::ResourceUsage::kCopySource, rhi::PipelineStage::kCopy,
-                            rhi::ShaderStage::kAll);
+                    if (const foundation::Result result = pass.read(state_input, rhi::ResourceUsage::kCopySource,
+                                                                    rhi::PipelineStage::kCopy, rhi::ShaderStage::kAll);
                         !result) {
                         return result;
                     }
@@ -155,10 +179,10 @@ public:
                                       rhi::ShaderStage::kAll, {}, true);
                 },
                 [state_input, state_output, extent](pipeline::RenderPassExecutionContext& execution) {
-                    return execution.copy_texture(state_input, rhi::TextureSubresourceLayers{rhi::Aspect::kColor, 0, 0, 1},
-                                                  rhi::Offset3D{}, state_output,
-                                                  rhi::TextureSubresourceLayers{rhi::Aspect::kColor, 0, 0, 1},
-                                                  rhi::Offset3D{}, extent);
+                    return execution.copy_texture(
+                        state_input, rhi::TextureSubresourceLayers{rhi::Aspect::kColor, 0, 0, 1}, rhi::Offset3D{},
+                        state_output, rhi::TextureSubresourceLayers{rhi::Aspect::kColor, 0, 0, 1}, rhi::Offset3D{},
+                        extent);
                 });
             if (!seed) {
                 return seed.result;
@@ -179,17 +203,40 @@ public:
         // Empty frames still own and clear their targets; otherwise imported textures retain old geometry.
         if (context->scene_snapshot->instances.empty()) {
             const auto final_usage = color_final_usage;
-            const auto clear = builder.add_graphics_pass("Opaque.ClearEmpty",
-                [color = color_target.value, depth_target, final_usage, preserve_state](pipeline::RenderPassBuilder& pass) {
-                    if (const auto result = pass.use_color_attachment(color,
-                            preserve_state ? rhi::LoadOp::kLoad : rhi::LoadOp::kClear,
-                            rhi::StoreOp::kStore, rhi::ClearColorValue{0, 0, 0, 1}, final_usage); !result) return result;
-                    if (depth_target.is_valid()) return pass.use_depth_stencil_attachment(
-                        depth_target, rhi::LoadOp::kClear, rhi::StoreOp::kStore, 1.0f, 0);
+            const auto clear = add_opaque_pass(
+                "Opaque.ClearEmpty",
+                [color = color_target.value, depth_target, final_usage, preserve_state, preserve_depth, shadow_map,
+                 light_clusters](pipeline::RenderPassBuilder& pass) {
+                    if (shadow_map.is_valid()) {
+                        if (const auto result =
+                                pass.read(shadow_map, rhi::ResourceUsage::kSampledRead,
+                                          rhi::PipelineStage::kFragmentShader, rhi::ShaderStage::kFragment);
+                            !result) {
+                            return result;
+                        }
+                    }
+                    if (light_clusters.is_valid()) {
+                        if (const auto result =
+                                pass.read(light_clusters, rhi::ResourceUsage::kStorageRead,
+                                          rhi::PipelineStage::kFragmentShader, rhi::ShaderStage::kFragment);
+                            !result) {
+                            return result;
+                        }
+                    }
+                    if (const auto result = pass.use_color_attachment(
+                            color, preserve_state ? rhi::LoadOp::kLoad : rhi::LoadOp::kClear, rhi::StoreOp::kStore,
+                            rhi::ClearColorValue{0, 0, 0, 1}, final_usage);
+                        !result)
+                        return result;
+                    if (depth_target.is_valid())
+                        return pass.use_depth_stencil_attachment(
+                            depth_target, preserve_depth ? rhi::LoadOp::kLoad : rhi::LoadOp::kClear,
+                            rhi::StoreOp::kStore, 1.0f, 0);
                     return foundation::Result::success();
                 },
                 [](pipeline::RenderPassExecutionContext& pass) {
-                    if (const auto result = pass.begin_rendering(); !result) return result;
+                    if (const auto result = pass.begin_rendering(); !result)
+                        return result;
                     return pass.end_rendering();
                 });
             return clear ? foundation::Result::success() : clear.result;
@@ -202,6 +249,19 @@ public:
         pass_data->color_target_final_usage = color_final_usage;
         pass_data->has_depth_target = depth_target.is_valid();
         pass_data->preserve_color = preserve_state;
+        pass_data->shadow_map = shadow_map;
+        if (shadow_resource) {
+            if (!shadow_resource->graph_buffer.is_valid() || !shadow_resource->prepare_inputs || !shadow_map.is_valid())
+                return invalid_state("forward shadow inputs are incomplete");
+            pass_data->shadow_resource = *shadow_resource;
+        }
+        pass_data->light_clusters = light_clusters;
+        if (light_culling) {
+            if (!light_culling->constants_graph.is_valid() || !light_culling->lights_graph.is_valid() ||
+                !light_culling->prepare_forward || !light_clusters.is_valid() || !shadow_map.is_valid())
+                return invalid_state("forward light culling inputs are incomplete");
+            pass_data->light_culling = *light_culling;
+        }
         pass_data->output_extent = context->scene_snapshot->view.output_extent;
         pass_data->draws.reserve(context->scene_snapshot->instances.size());
 
@@ -291,11 +351,17 @@ public:
                 return transform_buffer.result;
             }
 
+            if (shadow_resource && !material.value.shadow_pipeline.is_valid())
+                return invalid_state("forward shadow pipeline is unavailable");
+            if (light_culling && !material.value.clustered_pipeline.is_valid())
+                return invalid_state("forward clustered pipeline is unavailable");
             pass_data->draws.push_back({
                 .vertex_buffer = vertex_buffer.value,
                 .index_buffer = index_buffer.value,
                 .transform_buffer = transform_buffer.value,
-                .pipeline = material.value.pipeline,
+                .pipeline = light_culling     ? material.value.clustered_pipeline
+                            : shadow_resource ? material.value.shadow_pipeline
+                                              : material.value.pipeline,
                 .material_binding_set = material.value.binding_set,
                 .material_binding_group = material.value.binding_group,
                 .material_texture = material.value.material_texture,
@@ -326,9 +392,9 @@ public:
         pass_data->lighting_size = lighting.value.lighting_size;
 
         const std::shared_ptr<const OpaquePassData> captured_data = std::move(pass_data);
-        const foundation::ResultValue<pipeline::RenderGraphPass> pass = builder.add_graphics_pass(
+        const foundation::ResultValue<pipeline::RenderGraphPass> pass = add_opaque_pass(
             "DrawOpaque",
-            [captured_data](pipeline::RenderPassBuilder& pass_builder) {
+            [captured_data, preserve_depth](pipeline::RenderPassBuilder& pass_builder) {
                 for (const OpaqueDrawItem& draw : captured_data->draws) {
                     if (const foundation::Result result =
                             pass_builder.read(draw.vertex_buffer, rhi::ResourceUsage::kVertexInput,
@@ -366,6 +432,41 @@ public:
                         return result;
                     }
                 }
+                if (captured_data->light_clusters.is_valid()) {
+                    if (const foundation::Result result =
+                            pass_builder.read(captured_data->light_clusters, rhi::ResourceUsage::kStorageRead,
+                                              rhi::PipelineStage::kFragmentShader, rhi::ShaderStage::kFragment);
+                        !result) {
+                        return result;
+                    }
+                }
+                if (captured_data->light_culling.constants_graph.is_valid()) {
+                    if (const auto result = pass_builder.read(
+                            captured_data->light_culling.constants_graph, rhi::ResourceUsage::kUniformRead,
+                            rhi::PipelineStage::kFragmentShader, rhi::ShaderStage::kFragment);
+                        !result)
+                        return result;
+                    if (const auto result = pass_builder.read(
+                            captured_data->light_culling.lights_graph, rhi::ResourceUsage::kStorageRead,
+                            rhi::PipelineStage::kFragmentShader, rhi::ShaderStage::kFragment);
+                        !result)
+                        return result;
+                }
+                if (captured_data->shadow_map.is_valid()) {
+                    if (const foundation::Result result =
+                            pass_builder.read(captured_data->shadow_map, rhi::ResourceUsage::kSampledRead,
+                                              rhi::PipelineStage::kFragmentShader, rhi::ShaderStage::kFragment);
+                        !result) {
+                        return result;
+                    }
+                }
+                if (captured_data->shadow_resource.graph_buffer.is_valid()) {
+                    if (const auto result = pass_builder.read(
+                            captured_data->shadow_resource.graph_buffer, rhi::ResourceUsage::kUniformRead,
+                            rhi::PipelineStage::kFragmentShader, rhi::ShaderStage::kFragment);
+                        !result)
+                        return result;
+                }
                 if (const foundation::Result result = pass_builder.read(
                         captured_data->lighting_resource, rhi::ResourceUsage::kUniformRead,
                         rhi::PipelineStage::kFragmentShader, rhi::ShaderStage::kFragment,
@@ -375,15 +476,15 @@ public:
                 }
                 if (const foundation::Result result = pass_builder.use_color_attachment(
                         captured_data->color_target,
-                        captured_data->preserve_color ? rhi::LoadOp::kLoad : rhi::LoadOp::kClear,
-                        rhi::StoreOp::kStore,
+                        captured_data->preserve_color ? rhi::LoadOp::kLoad : rhi::LoadOp::kClear, rhi::StoreOp::kStore,
                         rhi::ClearColorValue{0.0f, 0.0f, 0.0f, 1.0f}, captured_data->color_target_final_usage);
                     !result) {
                     return result;
                 }
                 if (captured_data->has_depth_target) {
-                    return pass_builder.use_depth_stencil_attachment(captured_data->depth_target, rhi::LoadOp::kClear,
-                                                                     rhi::StoreOp::kStore, 1.0f, 0);
+                    return pass_builder.use_depth_stencil_attachment(
+                        captured_data->depth_target, preserve_depth ? rhi::LoadOp::kLoad : rhi::LoadOp::kClear,
+                        rhi::StoreOp::kStore, 1.0f, 0);
                 }
                 return foundation::Result::success();
             },
@@ -412,9 +513,40 @@ public:
                     return end_rendering_after_failure(execution, result);
                 }
 
+                rhi::BindingSetHandle shadow_set{};
+                if (captured_data->light_culling.constants_graph.is_valid()) {
+                    const auto view = execution.texture_view(captured_data->shadow_map, rhi::TextureViewKind::kSampled,
+                                                             {rhi::Aspect::kDepth, 0, 1, 0, 1});
+                    const auto clusters = execution.buffer(captured_data->light_clusters);
+                    if (!view || !clusters)
+                        return end_rendering_after_failure(execution, !view ? view.result : clusters.result);
+                    const auto prepared = captured_data->light_culling.prepare_forward(view.value, clusters.value);
+                    if (!prepared)
+                        return end_rendering_after_failure(execution, prepared.result);
+                    if (!prepared.value.is_valid())
+                        return end_rendering_after_failure(execution,
+                                                           invalid_state("forward light culling binding is invalid"));
+                    shadow_set = prepared.value;
+                } else if (captured_data->shadow_resource.graph_buffer.is_valid()) {
+                    const auto view = execution.texture_view(captured_data->shadow_map, rhi::TextureViewKind::kSampled,
+                                                             {rhi::Aspect::kDepth, 0, 1, 0, 1});
+                    if (!view)
+                        return end_rendering_after_failure(execution, view.result);
+                    const auto prepared = captured_data->shadow_resource.prepare_inputs(view.value);
+                    if (!prepared)
+                        return end_rendering_after_failure(execution, prepared.result);
+                    if (!prepared.value.is_valid())
+                        return end_rendering_after_failure(execution,
+                                                           invalid_state("forward shadow input binding is invalid"));
+                    shadow_set = prepared.value;
+                }
                 for (const OpaqueDrawItem& draw : captured_data->draws) {
                     if (const foundation::Result result = execution.bind_pipeline(draw.pipeline); !result) {
                         return end_rendering_after_failure(execution, result);
+                    }
+                    if (shadow_set.is_valid()) {
+                        if (const auto result = execution.bind_binding_set(3, shadow_set); !result)
+                            return end_rendering_after_failure(execution, result);
                     }
                     if (const foundation::Result result = execution.bind_binding_set(
                             captured_data->lighting_binding_group, captured_data->lighting_binding_set);
@@ -472,6 +604,211 @@ protected:
         return stage ? foundation::Result::success() : invalid_state("opaque render feature stage declaration failed");
     }
 };
+
+struct GBufferDrawItem final {
+    pipeline::RenderGraphBuffer vertex_buffer{};
+    pipeline::RenderGraphBuffer index_buffer{};
+    pipeline::RenderGraphBuffer transform_buffer{};
+    rhi::PipelineHandle pipeline{};
+    rhi::BindingSetHandle material_binding_set{};
+    uint32_t material_binding_group{1};
+    rhi::BindingSetHandle object_binding_set{};
+    uint32_t object_binding_group{0};
+    uint64_t transform_offset{0};
+    uint64_t transform_size{0};
+    pipeline::RenderGraphTexture material_texture{};
+    pipeline::RenderGraphBuffer material_parameter_resource{};
+    uint64_t material_parameter_offset{0};
+    uint64_t material_parameter_size{0};
+    uint32_t index_count{0};
+    rhi::IndexFormat index_format{rhi::IndexFormat::kUint16};
+};
+
+struct GBufferPassData final {
+    pipeline::RenderGraphTexture albedo{};
+    pipeline::RenderGraphTexture normal{};
+    pipeline::RenderGraphTexture material{};
+    pipeline::RenderGraphTexture depth{};
+    RenderExtent extent{};
+    std::vector<GBufferDrawItem> draws{};
+};
+
+[[nodiscard]] foundation::Result build_gbuffer_impl(
+    pipeline::RenderGraphBuilder& builder, const RenderFeatureContext& context, pipeline::RenderGraphTexture albedo,
+    pipeline::RenderGraphTexture normal, pipeline::RenderGraphTexture material, pipeline::RenderGraphTexture depth) {
+    if (!builder.is_runtime() || builder.scope() != pipeline::PipelineScope::kFrame) {
+        return invalid_state("GBuffer render graph requires a frame runtime builder");
+    }
+    if (!context.is_valid() || render_feature_context(builder) != &context) {
+        return invalid_state("GBuffer render graph context does not match the runtime builder");
+    }
+    if (!albedo.is_valid() || !normal.is_valid() || !material.is_valid() || !depth.is_valid()) {
+        return invalid_argument("GBuffer render graph requires valid MRT and depth targets");
+    }
+    if (!context.scene_snapshot->instances.empty() && context.resource_resolver == nullptr) {
+        return invalid_state("GBuffer render graph requires a render resource resolver");
+    }
+
+    auto pass_data = std::make_shared<GBufferPassData>();
+    pass_data->albedo = albedo;
+    pass_data->normal = normal;
+    pass_data->material = material;
+    pass_data->depth = depth;
+    pass_data->extent = context.scene_snapshot->view.output_extent;
+    pass_data->draws.reserve(context.scene_snapshot->instances.size());
+
+    for (const RenderInstance& instance : context.scene_snapshot->instances) {
+        const auto mesh = context.resource_resolver->resolve_mesh(instance.mesh);
+        if (!mesh)
+            return mesh.result;
+        if (!mesh.value.is_valid())
+            return invalid_state("GBuffer received an invalid mesh resource");
+        const auto& layout = mesh.value.vertex_layout;
+        if (layout.position_format != rhi::Format::kRgba32Float || layout.position_offset > mesh.value.vertex_stride ||
+            kPositionAttributeSize > mesh.value.vertex_stride - layout.position_offset ||
+            layout.uv_format != rhi::Format::kRg32Float || layout.uv_offset > mesh.value.vertex_stride ||
+            kUvAttributeSize > mesh.value.vertex_stride - layout.uv_offset ||
+            layout.normal_format != rhi::Format::kRgb32Float || layout.normal_offset > mesh.value.vertex_stride ||
+            kNormalAttributeSize > mesh.value.vertex_stride - layout.normal_offset) {
+            return invalid_state("GBuffer received an incompatible vertex layout");
+        }
+
+        const auto material_resource = context.resource_resolver->resolve_material(instance.material);
+        if (!material_resource)
+            return material_resource.result;
+        if (!material_resource.value.is_valid() || !material_resource.value.gbuffer_pipeline.is_valid()) {
+            return invalid_state("GBuffer material is missing a GBuffer graphics pipeline");
+        }
+        if (!material_resource.value.material_texture.is_valid() ||
+            !material_resource.value.material_parameter_resource.is_valid() ||
+            material_resource.value.material_parameter_size < sizeof(float) * 4u ||
+            material_resource.value.material_parameter_offset >
+                material_resource.value.material_parameter_buffer_desc.size ||
+            material_resource.value.material_parameter_size >
+                material_resource.value.material_parameter_buffer_desc.size -
+                    material_resource.value.material_parameter_offset) {
+            return invalid_state("GBuffer material parameters are invalid");
+        }
+
+        const auto object = context.resource_resolver->resolve_object(instance, context.scene_snapshot->view);
+        if (!object)
+            return object.result;
+        if (!object.value.is_valid())
+            return invalid_state("GBuffer received an invalid object resource");
+
+        const auto vertex_buffer =
+            mesh.value.vertex_resource.is_valid()
+                ? foundation::ResultValue<pipeline::RenderGraphBuffer>{foundation::Result::success(),
+                                                                       mesh.value.vertex_resource}
+                : find_or_import_buffer(builder, make_resource_id(kVertexResourceNamespace, instance.mesh.value()),
+                                        mesh.value.vertex_buffer, mesh.value.vertex_buffer_desc);
+        if (!vertex_buffer)
+            return vertex_buffer.result;
+        const auto index_buffer =
+            mesh.value.index_resource.is_valid()
+                ? foundation::ResultValue<pipeline::RenderGraphBuffer>{foundation::Result::success(),
+                                                                       mesh.value.index_resource}
+                : find_or_import_buffer(builder, make_resource_id(kIndexResourceNamespace, instance.mesh.value()),
+                                        mesh.value.index_buffer, mesh.value.index_buffer_desc);
+        if (!index_buffer)
+            return index_buffer.result;
+        const auto transform_buffer =
+            find_or_import_buffer(builder, make_object_resource_id(instance.object, context.scene_snapshot->view.id),
+                                  object.value.transform_buffer, object.value.transform_buffer_desc);
+        if (!transform_buffer)
+            return transform_buffer.result;
+
+        pass_data->draws.push_back(
+            {vertex_buffer.value, index_buffer.value, transform_buffer.value, material_resource.value.gbuffer_pipeline,
+             material_resource.value.binding_set, material_resource.value.binding_group, object.value.binding_set,
+             object.value.binding_group, object.value.transform_offset, object.value.transform_size,
+             material_resource.value.material_texture, material_resource.value.material_parameter_resource,
+             material_resource.value.material_parameter_offset, material_resource.value.material_parameter_size,
+             mesh.value.index_count, mesh.value.index_format});
+    }
+
+    const auto pass = detail::add_builtin_render_pass(
+        builder, context, kGBufferPassTypeId,
+        [pass_data](pipeline::RenderPassBuilder& pass_builder) {
+            for (const auto& draw : pass_data->draws) {
+                if (const auto result = pass_builder.read(draw.vertex_buffer, rhi::ResourceUsage::kVertexInput,
+                                                          rhi::PipelineStage::kVertexInput, rhi::ShaderStage::kVertex);
+                    !result)
+                    return result;
+                if (const auto result = pass_builder.read(draw.index_buffer, rhi::ResourceUsage::kIndexInput,
+                                                          rhi::PipelineStage::kVertexInput, rhi::ShaderStage::kVertex);
+                    !result)
+                    return result;
+                if (const auto result = pass_builder.read(draw.transform_buffer, rhi::ResourceUsage::kUniformRead,
+                                                          rhi::PipelineStage::kVertexShader, rhi::ShaderStage::kVertex,
+                                                          {draw.transform_offset, draw.transform_size});
+                    !result)
+                    return result;
+                if (const auto result =
+                        pass_builder.read(draw.material_texture, rhi::ResourceUsage::kSampledRead,
+                                          rhi::PipelineStage::kFragmentShader, rhi::ShaderStage::kFragment);
+                    !result)
+                    return result;
+                if (const auto result =
+                        pass_builder.read(draw.material_parameter_resource, rhi::ResourceUsage::kUniformRead,
+                                          rhi::PipelineStage::kFragmentShader, rhi::ShaderStage::kFragment,
+                                          {draw.material_parameter_offset, draw.material_parameter_size});
+                    !result)
+                    return result;
+            }
+            if (const auto result = pass_builder.use_color_attachment(
+                    pass_data->albedo, rhi::LoadOp::kClear, rhi::StoreOp::kStore, {}, rhi::ResourceUsage::kSampledRead);
+                !result)
+                return result;
+            if (const auto result = pass_builder.use_color_attachment(
+                    pass_data->normal, rhi::LoadOp::kClear, rhi::StoreOp::kStore, {}, rhi::ResourceUsage::kSampledRead);
+                !result)
+                return result;
+            if (const auto result =
+                    pass_builder.use_color_attachment(pass_data->material, rhi::LoadOp::kClear, rhi::StoreOp::kStore,
+                                                      {}, rhi::ResourceUsage::kSampledRead);
+                !result)
+                return result;
+            return pass_builder.use_depth_stencil_attachment(
+                pass_data->depth, rhi::LoadOp::kClear, rhi::StoreOp::kStore, 1.0f, 0, rhi::ResourceUsage::kSampledRead);
+        },
+        [pass_data](pipeline::RenderPassExecutionContext& execution) {
+            if (const auto result = execution.begin_rendering(); !result)
+                return result;
+            if (const auto result = execution.set_viewport({0.0f, 0.0f, static_cast<float>(pass_data->extent.width),
+                                                            static_cast<float>(pass_data->extent.height), 0.0f, 1.0f});
+                !result)
+                return end_rendering_after_failure(execution, result);
+            if (const auto result = execution.set_scissor({0, 0, pass_data->extent.width, pass_data->extent.height});
+                !result)
+                return end_rendering_after_failure(execution, result);
+            for (const auto& draw : pass_data->draws) {
+                if (const auto result = execution.bind_pipeline(draw.pipeline); !result)
+                    return end_rendering_after_failure(execution, result);
+                if (const auto result =
+                        execution.bind_binding_set(draw.material_binding_group, draw.material_binding_set);
+                    !result)
+                    return end_rendering_after_failure(execution, result);
+                if (const auto result = execution.bind_binding_set(draw.object_binding_group, draw.object_binding_set);
+                    !result)
+                    return end_rendering_after_failure(execution, result);
+                const auto vertex_buffer = execution.buffer(draw.vertex_buffer);
+                if (!vertex_buffer)
+                    return end_rendering_after_failure(execution, vertex_buffer.result);
+                const auto index_buffer = execution.buffer(draw.index_buffer);
+                if (!index_buffer)
+                    return end_rendering_after_failure(execution, index_buffer.result);
+                if (const auto result = execution.bind_vertex_buffer(0, vertex_buffer.value); !result)
+                    return end_rendering_after_failure(execution, result);
+                if (const auto result = execution.bind_index_buffer(index_buffer.value, 0, draw.index_format); !result)
+                    return end_rendering_after_failure(execution, result);
+                if (const auto result = execution.draw_indexed({draw.index_count, 1, 0, 0, 0}); !result)
+                    return end_rendering_after_failure(execution, result);
+            }
+            return execution.end_rendering();
+        });
+    return pass ? foundation::Result::success() : pass.result;
+}
 }  // namespace
 
 foundation::Result register_opaque_render_feature(pipeline::PipelineRegistry& registry) {
@@ -487,5 +824,160 @@ foundation::Result bind_opaque_render_feature(pipeline::PipelineRegistry& regist
         .priority = priority,
         .enabled = true,
     });
+}
+
+foundation::Result build_opaque_render_graph(pipeline::RenderGraphBuilder& builder, const RenderFeatureContext& context,
+                                             bool preserve_depth, pipeline::RenderGraphTexture shadow_map,
+                                             pipeline::RenderGraphBuffer light_clusters,
+                                             const RenderShadowResource* shadow_resource,
+                                             const RenderLightCullingResource* light_culling,
+                                             pipeline::RenderGraphTexture color_override) {
+    if (!context.is_valid()) {
+        return invalid_state("opaque render graph helper requires a valid renderer context");
+    }
+    if (render_feature_context(builder) != &context) {
+        return invalid_state("opaque render graph helper context does not match the runtime builder");
+    }
+    // The feature implementation reads the same typed context from the
+    // runtime builder. The explicit argument is part of the public contract
+    // and is validated above so callers cannot accidentally pass a stale
+    // snapshot while reusing the draw path for a variant pipeline.
+    OpaqueRenderFeature feature;
+    return feature.build_render_graph_with_options(builder, preserve_depth, shadow_map, light_clusters, shadow_resource,
+                                                   light_culling, color_override);
+}
+
+foundation::Result build_gbuffer_render_graph(pipeline::RenderGraphBuilder& builder,
+                                              const RenderFeatureContext& context,
+                                              pipeline::RenderGraphTexture albedo_target,
+                                              pipeline::RenderGraphTexture normal_target,
+                                              pipeline::RenderGraphTexture material_target,
+                                              pipeline::RenderGraphTexture depth_target) {
+    return build_gbuffer_impl(builder, context, albedo_target, normal_target, material_target, depth_target);
+}
+
+foundation::Result build_depth_render_graph(pipeline::RenderGraphBuilder& builder, const RenderFeatureContext& context,
+                                            const RenderView& view, pipeline::RenderGraphTexture depth_target,
+                                            std::string_view pass_name, std::span<const RenderInstance> instances) {
+    if (!builder.is_runtime() || builder.scope() != pipeline::PipelineScope::kFrame || !context.is_valid() ||
+        render_feature_context(builder) != &context || !view.is_valid() ||
+        view.world != context.scene_snapshot->world || !depth_target.is_valid() || pass_name.empty()) {
+        return invalid_state("depth render graph context or target is invalid");
+    }
+    if (instances.empty())
+        instances = context.scene_snapshot->instances;
+    if (!instances.empty() && context.resource_resolver == nullptr) {
+        return invalid_state("depth render graph requires a render resource resolver");
+    }
+    struct DepthDraw final {
+        pipeline::RenderGraphBuffer vertex{}, index{}, transform{};
+        rhi::PipelineHandle pipeline{};
+        rhi::BindingSetHandle object_set{};
+        uint32_t object_group{0};
+        uint64_t transform_offset{0}, transform_size{0};
+        uint32_t index_count{0};
+        rhi::IndexFormat index_format{rhi::IndexFormat::kUint16};
+    };
+    struct DepthData final {
+        pipeline::RenderGraphTexture depth{};
+        RenderExtent extent{};
+        std::vector<DepthDraw> draws{};
+    };
+    auto data = std::make_shared<DepthData>();
+    data->depth = depth_target;
+    data->extent = view.output_extent;
+    data->draws.reserve(instances.size());
+    for (const RenderInstance& instance : instances) {
+        const auto mesh = context.resource_resolver->resolve_mesh(instance.mesh);
+        const auto material = context.resource_resolver->resolve_material(instance.material);
+        const auto object = context.resource_resolver->resolve_object(instance, view);
+        if (!mesh || !material || !object)
+            return !mesh ? mesh.result : !material ? material.result : object.result;
+        if (!mesh.value.is_valid() || !material.value.depth_pipeline.is_valid() || !object.value.is_valid()) {
+            return invalid_state("depth render graph received incomplete draw resources");
+        }
+        if (mesh.value.vertex_layout.position_format != rhi::Format::kRgba32Float ||
+            mesh.value.vertex_layout.position_offset > mesh.value.vertex_stride ||
+            kPositionAttributeSize > mesh.value.vertex_stride - mesh.value.vertex_layout.position_offset) {
+            return invalid_state("depth render graph requires a float4 position attribute");
+        }
+        const auto vertex =
+            mesh.value.vertex_resource.is_valid()
+                ? foundation::ResultValue<pipeline::RenderGraphBuffer>{foundation::Result::success(),
+                                                                       mesh.value.vertex_resource}
+                : find_or_import_buffer(builder, make_resource_id(kVertexResourceNamespace, instance.mesh.value()),
+                                        mesh.value.vertex_buffer, mesh.value.vertex_buffer_desc);
+        const auto index =
+            mesh.value.index_resource.is_valid()
+                ? foundation::ResultValue<pipeline::RenderGraphBuffer>{foundation::Result::success(),
+                                                                       mesh.value.index_resource}
+                : find_or_import_buffer(builder, make_resource_id(kIndexResourceNamespace, instance.mesh.value()),
+                                        mesh.value.index_buffer, mesh.value.index_buffer_desc);
+        const auto transform = find_or_import_buffer(builder, make_object_resource_id(instance.object, view.id),
+                                                     object.value.transform_buffer, object.value.transform_buffer_desc);
+        if (!vertex || !index || !transform)
+            return !vertex ? vertex.result : !index ? index.result : transform.result;
+        data->draws.push_back({vertex.value, index.value, transform.value, material.value.depth_pipeline,
+                               object.value.binding_set, object.value.binding_group, object.value.transform_offset,
+                               object.value.transform_size, mesh.value.index_count, mesh.value.index_format});
+    }
+    const auto add_depth_pass = [&](pipeline::RenderPassSetupFunction setup,
+                                    pipeline::RenderPassExecuteFunction execute) {
+        const pipeline::RenderPassTypeId type(pass_name);
+        if (type == kZPrepassPassTypeId || type == kShadowPassTypeId)
+            return detail::add_builtin_render_pass(builder, context, type, std::move(setup), std::move(execute));
+        return builder.add_graphics_pass(pass_name, std::move(setup), std::move(execute));
+    };
+    const auto pass = add_depth_pass(
+        [data](pipeline::RenderPassBuilder& pass) {
+            for (const auto& draw : data->draws) {
+                if (const auto r = pass.read(draw.vertex, rhi::ResourceUsage::kVertexInput,
+                                             rhi::PipelineStage::kVertexInput, rhi::ShaderStage::kVertex);
+                    !r)
+                    return r;
+                if (const auto r = pass.read(draw.index, rhi::ResourceUsage::kIndexInput,
+                                             rhi::PipelineStage::kVertexInput, rhi::ShaderStage::kVertex);
+                    !r)
+                    return r;
+                if (const auto r =
+                        pass.read(draw.transform, rhi::ResourceUsage::kUniformRead, rhi::PipelineStage::kVertexShader,
+                                  rhi::ShaderStage::kVertex, {draw.transform_offset, draw.transform_size});
+                    !r)
+                    return r;
+            }
+            return pass.use_depth_stencil_attachment(data->depth, rhi::LoadOp::kClear, rhi::StoreOp::kStore, 1.0f, 0,
+                                                     rhi::ResourceUsage::kDepthStencilWrite);
+        },
+        [data](pipeline::RenderPassExecutionContext& execution) {
+            if (const auto r = execution.begin_rendering(); !r)
+                return r;
+            const auto fail = [&execution](foundation::Result result) {
+                return end_rendering_after_failure(execution, std::move(result));
+            };
+            if (const auto r = execution.set_viewport(
+                    {0, 0, static_cast<float>(data->extent.width), static_cast<float>(data->extent.height), 0, 1});
+                !r)
+                return fail(r);
+            if (const auto r = execution.set_scissor({0, 0, data->extent.width, data->extent.height}); !r)
+                return fail(r);
+            for (const auto& draw : data->draws) {
+                if (const auto r = execution.bind_pipeline(draw.pipeline); !r)
+                    return fail(r);
+                if (const auto r = execution.bind_binding_set(draw.object_group, draw.object_set); !r)
+                    return fail(r);
+                const auto vertex = execution.buffer(draw.vertex);
+                const auto index = execution.buffer(draw.index);
+                if (!vertex || !index)
+                    return fail(!vertex ? vertex.result : index.result);
+                if (const auto r = execution.bind_vertex_buffer(0, vertex.value); !r)
+                    return fail(r);
+                if (const auto r = execution.bind_index_buffer(index.value, 0, draw.index_format); !r)
+                    return fail(r);
+                if (const auto r = execution.draw_indexed({draw.index_count, 1, 0, 0, 0}); !r)
+                    return fail(r);
+            }
+            return execution.end_rendering();
+        });
+    return pass ? foundation::Result::success() : pass.result;
 }
 }  // namespace aeg::renderer

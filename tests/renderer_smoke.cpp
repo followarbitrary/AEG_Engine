@@ -5,6 +5,7 @@
 #include <array>
 #include <cstdint>
 #include <engine_frame_orchestrator.hpp>
+#include <iostream>
 #include <memory>
 #include <renderer.hpp>
 #include <rhi.hpp>
@@ -54,14 +55,15 @@ public:
                                                         .vertex_count = 4,
                                                         .index_count = 6,
                                                         .index_format = aeg::rhi::IndexFormat::kUint16,
-                                                        .vertex_layout = {
-                                                            .position_offset = 0,
-                                                            .position_format = aeg::rhi::Format::kRgba32Float,
-                                                            .uv_offset = sizeof(float) * 4u,
-                                                            .uv_format = aeg::rhi::Format::kRg32Float,
-                                                            .normal_offset = sizeof(float) * 6u,
-                                                            .normal_format = aeg::rhi::Format::kRgb32Float,
-                                                        },
+                                                        .vertex_layout =
+                                                            {
+                                                                .position_offset = 0,
+                                                                .position_format = aeg::rhi::Format::kRgba32Float,
+                                                                .uv_offset = sizeof(float) * 4u,
+                                                                .uv_format = aeg::rhi::Format::kRg32Float,
+                                                                .normal_offset = sizeof(float) * 6u,
+                                                                .normal_format = aeg::rhi::Format::kRgb32Float,
+                                                            },
                                                     }};
     }
 
@@ -278,6 +280,20 @@ int main() {
     }
 
     ResolverState resolver_state{};
+    auto outside_view = view;
+    outside_view.frustum_culling = true;
+    outside_view.camera.view = aeg::math::translation({-100, 0, 0});
+    const auto outside =
+        renderer.extract(snapshot_result.value, outside_view, aeg::renderer::RenderExtractionDesc{7, &extractor_state});
+    if (!outside || !outside.value->instances.empty() || outside.value->shadow_casters.size() != 2) {
+        std::cerr << "Camera culling discarded potential shadow casters\n";
+        return 39;
+    }
+    outside_view.visibility_mask = 0;
+    const auto masked =
+        renderer.extract(snapshot_result.value, outside_view, aeg::renderer::RenderExtractionDesc{7, &extractor_state});
+    if (!masked || !masked.value->shadow_casters.empty())
+        return 40;
     SmokeRenderResourceResolver resolver(resolver_state);
     const auto resolved_extracted = renderer.extract(
         snapshot_result.value, view, aeg::renderer::RenderExtractionDesc{7, &extractor_state, &resolver, true});

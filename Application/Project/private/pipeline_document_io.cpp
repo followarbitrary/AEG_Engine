@@ -120,10 +120,10 @@ uint64_t read_u64(const toml::value& value) {
 }
 
 bool known_root_key(std::string_view key) {
-    static constexpr std::string_view keys[] = {
+    static constexpr std::string_view kEys[] = {
         "schema_version", "asset_uuid", "name",  "module_requirements", "pipeline_nodes", "feature_nodes",
         "pass_nodes",     "resources",  "edges", "present_connections", "layouts",        "extensions"};
-    for (const auto known : keys)
+    for (const auto known : kEys)
         if (key == known)
             return true;
     return false;
@@ -333,10 +333,10 @@ foundation::Result save_pipeline_document(const std::filesystem::path& file, con
             item["edge_id"] = edge.edge_id;
             item["kind"] = static_cast<int64_t>(edge.kind);
             item["source_node"] = edge.source.node_id;
-            item["source_port"] = static_cast<int64_t>(edge.source.port_id);
+            item["source_port"] = encode_u64(edge.source.port_id);
             item["destination_node"] = edge.destination.node_id;
-            item["destination_port"] = static_cast<int64_t>(edge.destination.port_id);
-            item["binding_id"] = static_cast<int64_t>(edge.binding_id);
+            item["destination_port"] = encode_u64(edge.destination.port_id);
+            item["binding_id"] = encode_u64(edge.binding_id);
             edges.emplace_back(std::move(item));
         }
         root["edges"] = std::move(edges);

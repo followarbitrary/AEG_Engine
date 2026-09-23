@@ -27,6 +27,12 @@ int main() {
                                   .sample_count = 1}});
     fixture.document.extensions.push_back({"feature", pipeline::OpaqueAuthoringEncoding::kJson, "{\"custom\":true}"});
     fixture.document.present_connections.push_back("pass");
+    // Stable renderer port/binding IDs use all 64 bits, including values above INT64_MAX.
+    fixture.document.edges.push_back({.edge_id = "high-bit-resource-binding",
+                                      .kind = pipeline::DocumentEdgeKind::kRenderResource,
+                                      .source = {"scene_color", 0xffffffffffffffffull},
+                                      .destination = {"pass", 0x8000000000000001ull},
+                                      .binding_id = 0x8000000000000000ull});
 
     const auto root = std::filesystem::temp_directory_path() / "aeg_pipeline_document_io_smoke";
     std::error_code error;

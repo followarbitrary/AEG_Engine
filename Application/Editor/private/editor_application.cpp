@@ -30,6 +30,10 @@
 #include <utility>
 #include <vector>
 
+#if defined(_MSC_VER) && defined(_DEBUG)
+#include <crtdbg.h>
+#endif
+
 #include "Components/component_ids.hpp"
 #include "application_platform.hpp"
 #include "editor_error.hpp"
@@ -55,6 +59,7 @@
 #include "render_graph.hpp"
 #include "render_state_flow.hpp"
 #include "renderer.hpp"
+#include "renderer_variants.hpp"
 #include "resource_uploader.hpp"
 #include "rhi.hpp"
 #include "texture_uploader.hpp"
@@ -361,6 +366,12 @@ public:
             gizmo_mode_ = ViewportGizmoMode::kScale;
         }
         const float toolbar_bottom = ImGui::GetItemRectMax().y + 10.0f;
+        if (!runtime_.renderer_pipeline_diagnostic().empty()) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4{1.0f, 0.75f, 0.25f, 1.0f}, "Default preview");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", std::string(runtime_.renderer_pipeline_diagnostic()).c_str());
+        }
         viewport_draw->ChannelsSetCurrent(0);
         ImGui::SetCursorScreenPos(viewport_origin);
         const ImVec2 extent = ImGui::GetContentRegionAvail();
@@ -1058,6 +1069,52 @@ public:
             expand_ = true;
         const PipelineSource& selected_source = sources[source_];
         const bool authored_source = selected_source.authored_document != nullptr;
+        if (authored_source && !selected_source.authored_document->load_result) {
+            ImGui::BeginChild("PipelineLoadError", ImVec2{0, 0}, true);
+            ImGui::TextWrapped("Could not load %s: %s", selected_source.authored_document->path.string().c_str(),
+                               selected_source.authored_document->load_result.message.c_str());
+            ImGui::TextWrapped("Repair the file, then reload the project pipelines.");
+            if (ImGui::Button("Reload Pipelines")) {
+                const auto result = runtime_.refresh_assets();
+                feedback_ = result ? "Project pipelines reloaded." : result.message;
+                signature_.clear();
+            }
+            if (!feedback_.empty())
+                ImGui::TextWrapped("%s", feedback_.c_str());
+            ImGui::EndChild();
+            ImGui::End();
+            return;
+        }
+        const bool selectable_renderer =
+            authored_source &&
+            std::any_of(selected_source.authored_document->document.pipeline_nodes.begin(),
+                        selected_source.authored_document->document.pipeline_nodes.end(), [](const auto& node) {
+                            return node.type == aeg::renderer::kDeferredRenderPipelineId ||
+                                   node.type == aeg::renderer::kForwardRenderPipelineId;
+                        });
+        if (selectable_renderer) {
+            ImGui::BeginDisabled(runtime_.mode() != EditorSceneRuntime::Mode::kEdit);
+            if (ImGui::SmallButton("Apply to Viewport")) {
+                const auto result =
+                    runtime_.activate_renderer_pipeline_document(selected_source.authored_document->path);
+                feedback_ = result ? "Renderer applied to viewport and saved for this project." : result.message;
+            }
+            ImGui::EndDisabled();
+            if (runtime_.active_renderer_pipeline_document() == selected_source.authored_document->path) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("Active in viewport");
+            }
+        }
+        if (!runtime_.active_renderer_pipeline_document().empty()) {
+            if (selectable_renderer)
+                ImGui::SameLine();
+            ImGui::BeginDisabled(runtime_.mode() != EditorSceneRuntime::Mode::kEdit);
+            if (ImGui::SmallButton("Use Default Renderer")) {
+                const auto result = runtime_.restore_default_renderer_pipeline();
+                feedback_ = result ? "Default renderer restored." : result.message;
+            }
+            ImGui::EndDisabled();
+        }
         const auto* plan = selected_source.plan.get();
         active_source_ = selected_source.name;
         authoring_source_ = authored_source;
@@ -1115,11 +1172,11 @@ public:
         const float validation_height =
             std::clamp(content_height * 0.22f, minimum_validation_height, maximum_validation_height);
         const float body_height = std::max(1.0f, content_height - validation_height - vertical_spacing);
-        const bool authoring_ui_ = ImGui::GetContentRegionAvail().x >= 850.0f;
+        const bool authoring_ui = ImGui::GetContentRegionAvail().x >= 850.0f;
         const bool table_open =
-            authoring_ui_ && ImGui::BeginTable("PipelineAuthoringLayout", 3,
-                                               ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingStretchProp,
-                                               ImVec2{0, body_height});
+            authoring_ui && ImGui::BeginTable("PipelineAuthoringLayout", 3,
+                                              ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingStretchProp,
+                                              ImVec2{0, body_height});
         if (table_open) {
             ImGui::TableSetupColumn("Catalog", ImGuiTableColumnFlags_WidthFixed, 270.0f);
             ImGui::TableSetupColumn("Graph", ImGuiTableColumnFlags_WidthStretch);
@@ -1439,9 +1496,9 @@ public:
             if (blend_popup_node_ >= 0 && blend_popup_node_ < static_cast<int>(nodes_.size())) {
                 Node& node = nodes_[blend_popup_node_];
                 ImGui::TextUnformatted("State blend");
-                constexpr std::array<const char*, 3> names{"Replace", "Over", "Add"};
-                for (uint32_t index = 0; index < names.size(); ++index) {
-                    if (ImGui::MenuItem(names[index], nullptr, node.blend_mode == index)) {
+                constexpr std::array<const char*, 3> kNames{"Replace", "Over", "Add"};
+                for (uint32_t index = 0; index < kNames.size(); ++index) {
+                    if (ImGui::MenuItem(kNames[index], nullptr, node.blend_mode == index)) {
                         stage_blend(node, index);
                     }
                 }
@@ -1760,7 +1817,8 @@ public:
             ImGui::EndTable();
             ImGui::BeginChild("PipelineValidation", ImVec2{0, validation_height}, true);
             const bool has_links = !edges_.empty();
-            const int issue_count = has_links ? 0 : 1;
+            const auto renderer_diagnostic = runtime_.renderer_pipeline_diagnostic();
+            const int issue_count = (has_links ? 0 : 1) + (renderer_diagnostic.empty() ? 0 : 1);
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4{0.10f, 0.26f, 0.27f, 1.0f});
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4{0.14f, 0.34f, 0.34f, 1.0f});
             ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4{0.18f, 0.40f, 0.38f, 1.0f});
@@ -1775,6 +1833,8 @@ public:
             ImGui::SameLine();
             ImGui::TextColored(ImVec4{1.0f, 0.72f, 0.30f, 1.0f}, "!  %d Warnings", issue_count);
             ImGui::Separator();
+            if (!renderer_diagnostic.empty())
+                ImGui::TextWrapped("%s", std::string(renderer_diagnostic).c_str());
             if (ImGui::BeginTable(
                     "PipelineValidationTable", 4,
                     ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
@@ -1873,15 +1933,15 @@ private:
         return text;
     }
     static const char* phase_name(aeg::pipeline::EnginePhase phase) {
-        constexpr const char* names[]{"Startup", "Frame Begin",  "Input",          "Pre Update",   "Fixed Update",
-                                      "Update",  "World Commit", "Render Extract", "Render Build", "Render Execute",
-                                      "Present", "Frame End",    "Shutdown"};
+        constexpr const char* kNames[]{"Startup", "Frame Begin",  "Input",          "Pre Update",   "Fixed Update",
+                                       "Update",  "World Commit", "Render Extract", "Render Build", "Render Execute",
+                                       "Present", "Frame End",    "Shutdown"};
         const auto i = static_cast<unsigned>(phase);
-        return i < 13 ? names[i] : "Custom Phase";
+        return i < 13 ? kNames[i] : "Custom Phase";
     }
     static const char* blend_name(uint8_t blend_mode) {
-        constexpr std::array<const char*, 3> names{"Replace", "Over", "Add"};
-        return blend_mode < names.size() ? names[blend_mode] : "Replace";
+        constexpr std::array<const char*, 3> kNames{"Replace", "Over", "Add"};
+        return blend_mode < kNames.size() ? kNames[blend_mode] : "Replace";
     }
     void rebuild(const aeg::pipeline::PipelinePlan& plan,
                  std::span<const aeg::render_graph::RenderStateLinkOverride> state_overrides = {},
@@ -2529,6 +2589,9 @@ public:
                 const ComponentTypeId camera_type(aeg::engine::components::kCameraName);
                 const ComponentTypeId mesh_type(aeg::engine::components::kMeshRendererName);
                 const ComponentTypeId light_type(aeg::engine::components::kDirectionalLightName);
+                const ComponentTypeId point_type(aeg::engine::components::kPointLightName);
+                const ComponentTypeId spot_type(aeg::engine::components::kSpotLightName);
+                const ComponentTypeId environment_type(aeg::engine::components::kSceneEnvironmentName);
                 if (ImGui::MenuItem("Transform", nullptr, false, single_selection && !has_common(transform_type))) {
                     last_operation_ = runtime_.add_component(selected_entities, transform_type);
                 }
@@ -2540,6 +2603,16 @@ public:
                 }
                 if (ImGui::MenuItem("Directional Light", nullptr, false, single_selection && !has_common(light_type))) {
                     last_operation_ = runtime_.add_component(selected_entities, light_type);
+                }
+                if (ImGui::MenuItem("Point Light", nullptr, false, single_selection && !has_common(point_type))) {
+                    last_operation_ = runtime_.add_component(selected_entities, point_type);
+                }
+                if (ImGui::MenuItem("Spot Light", nullptr, false, single_selection && !has_common(spot_type))) {
+                    last_operation_ = runtime_.add_component(selected_entities, spot_type);
+                }
+                if (ImGui::MenuItem("Scene Environment", nullptr, false,
+                                    single_selection && !has_common(environment_type))) {
+                    last_operation_ = runtime_.add_component(selected_entities, environment_type);
                 }
                 ImGui::EndPopup();
             }
@@ -2733,17 +2806,27 @@ private:
                     const bool normalized_color =
                         (component == ComponentTypeId(aeg::engine::components::kMeshRendererName) &&
                          (field.name == "tint" || field.name == "tint_alpha")) ||
-                        (component == ComponentTypeId(aeg::engine::components::kDirectionalLightName) &&
+                        ((component == ComponentTypeId(aeg::engine::components::kDirectionalLightName) ||
+                          component == ComponentTypeId(aeg::engine::components::kPointLightName) ||
+                          component == ComponentTypeId(aeg::engine::components::kSpotLightName)) &&
                          field.name == "color");
                     switch (field.value_kind) {
                         case aeg::reflection::FieldValueKind::kFloat: {
                             float minimum = -std::numeric_limits<float>::max();
                             float maximum = std::numeric_limits<float>::max();
                             ImGuiSliderFlags flags = ImGuiSliderFlags_None;
-                            if (normalized_color || field.name == "intensity") {
+                            if (normalized_color || field.name == "intensity" || field.name == "range" ||
+                                field.name == "exposure") {
                                 minimum = 0.0f;
                                 maximum = normalized_color ? 1.0f : std::numeric_limits<float>::max();
                                 flags = normalized_color ? ImGuiSliderFlags_AlwaysClamp : ImGuiSliderFlags_None;
+                            } else if (field.name == "gamma") {
+                                minimum = 0.001f;
+                                maximum = std::numeric_limits<float>::max();
+                            } else if (field.name == "inner_cone_cosine" || field.name == "outer_cone_cosine") {
+                                minimum = -1.0f;
+                                maximum = 1.0f;
+                                flags = ImGuiSliderFlags_AlwaysClamp;
                             } else if (field.name == "vertical_fov_radians") {
                                 minimum = 0.001f;
                                 maximum = aeg::math::kPi - 0.001f;
@@ -2768,7 +2851,10 @@ private:
                             break;
                         case aeg::reflection::FieldValueKind::kVec3: {
                             auto* vector = static_cast<aeg::math::Vec3*>(field_value);
-                            if (normalized_color) {
+                            if (component == ComponentTypeId(aeg::engine::components::kSceneEnvironmentName)) {
+                                changed = ImGui::ColorEdit3("##value", &vector->x,
+                                                            ImGuiColorEditFlags_HDR | ImGuiColorEditFlags_Float);
+                            } else if (normalized_color) {
                                 changed = ImGui::ColorEdit3("##value", &vector->x);
                                 if (component == ComponentTypeId(aeg::engine::components::kMeshRendererName) &&
                                     field.name == "tint") {
@@ -3557,6 +3643,10 @@ public:
                 if (fatal_runtime_error_)
                     return false;
             } else {
+                if (!scene_runtime_->renderer_pipeline_diagnostic().empty()) {
+                    AEG_LOG_WARNING(aeg::logging::Category::kApplication, "{}",
+                                    scene_runtime_->renderer_pipeline_diagnostic());
+                }
                 const auto pipeline_result =
                     aeg::editor::guard_editor_operation([&] { return restore_pipeline_document(); });
                 if (!pipeline_result) {
@@ -3759,8 +3849,9 @@ public:
     }
 
     [[nodiscard]] int run(uint32_t frame_limit, bool resize_regression, bool open_preferences_regression,
+                          bool native_viewport_regression,
                           const aeg::application::IConsoleInterruptController& console_interrupt) {
-        regression_mode_ = resize_regression || open_preferences_regression;
+        regression_mode_ = resize_regression || open_preferences_regression || native_viewport_regression;
         resize_regression_ = resize_regression;
         preferences_regression_mode_ = open_preferences_regression;
         preferences_regression_opened_ = false;
@@ -3778,6 +3869,19 @@ public:
                     break;
                 }
                 ++attempted_frames;
+
+                // Exercise the same presentation command as the workspace menu,
+                // including re-docking and exiting with a native viewport alive.
+                if (native_viewport_regression &&
+                    (attempted_frames == 2 || attempted_frames == 16 || attempted_frames == 28 ||
+                     attempted_frames == 40 || attempted_frames == 52)) {
+                    const bool native = attempted_frames != 16 && attempted_frames != 40;
+                    const auto presentation = native ? aeg::editor::EditorWorkspace::PanelPresentation::kNativeWindow
+                                                     : aeg::editor::EditorWorkspace::PanelPresentation::kDockWindow;
+                    if (!report_result(workspace_.set_panel_presentation("pipeline", presentation),
+                                       "switch_pipeline_presentation"))
+                        return 1;
+                }
 
                 Result event_result = Result::success();
                 const Result poll_result = window_system_->poll_events([this, &event_result](const WindowEvent& event) {
@@ -4102,6 +4206,19 @@ public:
                     continue;
                 }
                 ++frame_count_;
+                if (native_viewport_regression &&
+                    (attempted_frames == 12 || attempted_frames == 24 || attempted_frames == 36 ||
+                     attempted_frames == 48 || attempted_frames == 60)) {
+                    const bool expected_native = attempted_frames != 24 && attempted_frames != 48;
+                    if (!report_result(native_viewports_.empty() == !expected_native
+                                           ? Result::success()
+                                           : aeg::foundation::invalid_state(
+                                                 "Pipeline viewport presentation did not change at frame " +
+                                                 std::to_string(attempted_frames) +
+                                                 "; native windows: " + std::to_string(native_viewports_.size())),
+                                       "verify_pipeline_presentation"))
+                        return 1;
+                }
                 if (preferences_regression_mode_ && !preferences_regression_preview_requested_ && frame_count_ == 1 &&
                     preference_model_ != nullptr) {
                     std::string preview_font_key;
@@ -4344,6 +4461,9 @@ private:
         pipeline_saved_orderings_.clear();
         pipeline_layouts_.clear();
         pipeline_saved_blends_.clear();
+        // Saved project graph overrides must not modify the Editor fallback preview.
+        if (scene_runtime_ != nullptr && !scene_runtime_->renderer_pipeline_diagnostic().empty())
+            return Result::success();
         const std::filesystem::path path = pipeline_document_path();
         if (path.empty() || !std::filesystem::exists(path))
             return Result::success();
@@ -6048,8 +6168,12 @@ private:
         if (iterator == native_viewports_.end())
             return;
         NativeViewportRenderState& state = *iterator->second;
-        if (state.orchestrator != nullptr)
+        if (state.orchestrator != nullptr) {
             static_cast<void>(state.orchestrator->shutdown());
+            // The destructor still borrows the frame context and render graph.
+            // Release it before those services, just as for the main viewport.
+            state.orchestrator.reset();
+        }
         static_cast<void>(aeg::editor::unregister_imgui_render_feature(state.registry));
         if (state.imgui_renderer != nullptr) {
             static_cast<void>(state.imgui_renderer->release_prepared_frame());
@@ -6473,6 +6597,12 @@ bool has_argument(int argc, char** argv, std::string_view argument) {
 int main(int argc, char** argv) {
     try {
         error_dialogs_enabled = parse_frame_limit(argc, argv) == 0;
+#if defined(_MSC_VER) && defined(_DEBUG)
+        if (!error_dialogs_enabled) {
+            _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
+            _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
+        }
+#endif
         const auto console_interrupt_result = aeg::application::install_console_interrupt_controller();
         if (!console_interrupt_result || console_interrupt_result.value == nullptr) {
             return 1;
@@ -6484,7 +6614,8 @@ int main(int argc, char** argv) {
             return 1;
         }
         return application.run(parse_frame_limit(argc, argv), has_argument(argc, argv, "--stress-resize"),
-                               has_argument(argc, argv, "--open-preferences"), *console_interrupt_result.value);
+                               has_argument(argc, argv, "--open-preferences"),
+                               has_argument(argc, argv, "--stress-native-viewports"), *console_interrupt_result.value);
     } catch (...) {
         // Startup is also an application boundary: a malformed argument,
         // filesystem failure, or backend exception must have a controlled exit.

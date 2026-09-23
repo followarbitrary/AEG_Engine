@@ -1,11 +1,14 @@
 #include <iostream>
 #include <memory>
+#include <vector>
 
 #include "editor_composition_preview.hpp"
 #include "editor_composition_test_support.hpp"
+#include "pipeline_configuration.hpp"
 
 namespace {
 uint32_t g_preview_task_runs = 0;
+std::vector<aeg::pipeline::FeatureInstanceId> g_preview_feature_builds;
 
 aeg::foundation::Result preview_task(aeg::pipeline::PipelineTaskContext&) {
     ++g_preview_task_runs;
@@ -25,7 +28,8 @@ public:
 
     const aeg::pipeline::FeatureDescriptor& descriptor() const noexcept override { return descriptor_; }
 
-    aeg::foundation::Result collect_contributions(aeg::pipeline::FeatureBuildContext&) const override {
+    aeg::foundation::Result collect_contributions(aeg::pipeline::FeatureBuildContext& context) const override {
+        g_preview_feature_builds.push_back(context.feature_instance_id());
         return aeg::foundation::Result::success();
     }
 
@@ -82,6 +86,28 @@ public:
 private:
     aeg::pipeline::PipelineDescriptor descriptor_{};
 };
+
+class PreviewPass final : public aeg::pipeline::RenderPass {
+public:
+    const aeg::pipeline::RenderPassDescriptor& descriptor() const noexcept override { return descriptor_; }
+    aeg::foundation::Result setup(aeg::pipeline::RenderPassBuilder&,
+                                  const aeg::pipeline::RenderPassConfiguration&) const override {
+        return aeg::foundation::Result::success();
+    }
+    aeg::foundation::Result execute(aeg::pipeline::RenderPassExecutionContext&,
+                                    const aeg::pipeline::RenderPassConfiguration&) const override {
+        return aeg::foundation::Result::success();
+    }
+
+private:
+    aeg::pipeline::RenderPassDescriptor descriptor_{
+        .type = aeg::pipeline::RenderPassTypeId("Game.EditorPass"),
+        .owner_module = aeg::pipeline::ModuleId("Game.Editor"),
+        .name = "Game.EditorPass",
+        .version = {1, 0, 0},
+        .graph_type = aeg::pipeline::RenderGraphPassType::kGraphics,
+        .allowed_queue_mask = uint64_t{1} << static_cast<uint8_t>(aeg::rhi::QueueClass::kGraphics)};
+};
 }  // namespace
 
 int main() {
@@ -98,8 +124,16 @@ int main() {
     pipeline::PipelineScopeHost host(pipeline::PipelineScope::kFrame, pipeline::PipelineInstanceId("pipeline"));
     const engine::PipelineHostBinding binding{"pipeline", &host};
     auto document = std::make_shared<const pipeline::PipelineDocument>(fixture.document);
+    const auto missing_pass =
+        preview.request(document, fixture.catalog, 6, std::span<const engine::PipelineHostBinding>(&binding, 1));
+    if (missing_pass.code != foundation::ResultCode::kNotFound || runtime.has_pending() || !preview.state().stale)
+        return 8;
+    if (!render_passes.register_pass([] { return std::make_unique<PreviewPass>(); }))
+        return 9;
     const auto request =
         preview.request(document, fixture.catalog, 7, std::span<const engine::PipelineHostBinding>(&binding, 1));
+    if (!request)
+        std::cerr << "preview request failed: " << request.message << '\n';
     if (!request || !preview.state().rebuilding || preview.state().stale || preview.state().active_revision != 0 ||
         preview.state().draft_revision != 7 || !runtime.has_pending())
         return 2;
@@ -117,6 +151,8 @@ int main() {
         std::cerr << "rebuild failed: " << result.message << "\n";
         return 4;
     }
+    if (g_preview_feature_builds != std::vector{pipeline::FeatureInstanceId("feature")})
+        return 10;
     if (const auto result = host.activate({}); !result) {
         std::cerr << "activate failed: " << result.message << "\n";
         return 5;
@@ -128,6 +164,11 @@ int main() {
     if (!preview.stop() || !preview.state().stopped || preview.state().rebuilding || host.is_active() ||
         runtime.active_host_count() != 0 || runtime.active_configuration_count() != 0)
         return 7;
+    auto duplicate = std::make_shared<pipeline::PipelineInstanceConfiguration>(*host.configuration());
+    duplicate->features.push_back(duplicate->features.front());
+    duplicate->features.back().instance = pipeline::FeatureInstanceId("duplicate");
+    if (!host.set_configuration(duplicate) || host.rebuild(registry).code != foundation::ResultCode::kInvalidArgument)
+        return 11;
     std::cout << "Editor composition preview smoke passed\n";
     return 0;
 }

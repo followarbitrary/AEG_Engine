@@ -9,6 +9,7 @@
 
 #include "module_bundle.hpp"
 #include "pipeline_document_io.hpp"
+#include "renderer_variants.hpp"
 
 namespace aeg::application {
 namespace {
@@ -49,6 +50,9 @@ foundation::ResultValue<EditorProjectPipelineAuthoring> load_editor_project_pipe
         return {foundation::invalid_argument("Project authoring paths are invalid"), {}};
 
     EditorProjectPipelineAuthoring result{};
+    if (const foundation::Result builtins = renderer::register_renderer_authoring_types(result.catalog); !builtins) {
+        return {builtins, {}};
+    }
     const auto metadata_files = files_with_extension(source_directory, ".json");
     if (!metadata_files)
         return {metadata_files.result, {}};
@@ -73,8 +77,13 @@ foundation::ResultValue<EditorProjectPipelineAuthoring> load_editor_project_pipe
         result.documents.reserve(pipeline_files.value.size());
         for (const std::filesystem::path& path : pipeline_files.value) {
             const auto document = project::load_pipeline_document(path);
-            if (!document)
-                return {document.result, {}};
+            if (!document) {
+                if (document.result.code == foundation::ResultCode::kOutOfMemory ||
+                    document.result.code == foundation::ResultCode::kDeviceLost)
+                    return {document.result, {}};
+                result.documents.push_back({path, {}, document.result});
+                continue;
+            }
             result.documents.push_back({path, std::move(document.value)});
         }
     } catch (const std::bad_alloc&) {

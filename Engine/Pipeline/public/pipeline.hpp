@@ -263,6 +263,8 @@ public:
     [[nodiscard]] uint32_t state_layer_count() const noexcept;
     [[nodiscard]] bool allows(FeaturePointFlags flag) const noexcept;
     [[nodiscard]] bool is_runtime() const noexcept;
+    /** @brief Immutable authored configuration during feature declaration. */
+    [[nodiscard]] std::shared_ptr<const PipelineInstanceConfiguration> configuration() const noexcept;
 
     [[nodiscard]] foundation::ResultValue<RenderGraphBuffer> create_buffer(
         const rhi::BufferDesc& desc, RenderGraphResourceLifetime lifetime = RenderGraphResourceLifetime::kTransient);
@@ -902,7 +904,8 @@ private:
     FeatureBuildContext(PipelineBuilder& builder, PipelineScope scope, PipelineId pipeline_id, FeatureId feature_id,
                         FeatureInstanceId feature_instance_id, FeaturePartId part_id,
                         const FeaturePointDescriptor& feature_point, FeatureDomain active_domain,
-                        std::vector<PipelineFeatureContributionRecord>* contribution_records) noexcept
+                        std::vector<PipelineFeatureContributionRecord>* contribution_records,
+                        std::shared_ptr<const PipelineInstanceConfiguration> configuration = {}) noexcept
         : builder_(&builder),
           scope_(scope),
           pipeline_id_(pipeline_id),
@@ -911,6 +914,7 @@ private:
           part_id_(part_id),
           feature_point_(feature_point),
           active_domain_(active_domain),
+          configuration_(std::move(configuration)),
           contribution_records_(contribution_records) {}
 
     explicit FeatureBuildContext(FeatureDeclarationBackend& backend) noexcept : feature_backend_(&backend) {}
@@ -1253,6 +1257,7 @@ struct PipelineCompileInput {
     const PipelineRegistry* registry{nullptr};
     PipelineInstanceId instance{};
     const PhaseRegistry* phase_registry{nullptr};
+    std::shared_ptr<const PipelineInstanceConfiguration> configuration{};
 };
 
 /** @brief Converts one registered definition into an immutable execution plan. */
@@ -1391,6 +1396,10 @@ inline foundation::Result render_graph_builder_permission_denied(FeaturePointFla
 }
 
 inline RenderGraphBuilder::RenderGraphBuilder(FeatureBuildContext& context) noexcept : declaration_context_(&context) {}
+
+inline std::shared_ptr<const PipelineInstanceConfiguration> RenderGraphBuilder::configuration() const noexcept {
+    return declaration_context_ == nullptr ? nullptr : declaration_context_->configuration();
+}
 
 inline RenderGraphBuilder::RenderGraphBuilder(RenderGraphBuilderBackend& backend,
                                               const RenderGraphFeatureContext& context) noexcept

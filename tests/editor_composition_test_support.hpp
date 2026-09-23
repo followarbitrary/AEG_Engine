@@ -76,7 +76,8 @@ struct EditorCompositionFixture final {
                              .schema_id = 1,
                              .binding_id = 77,
                              .resource_constraints = {.resource_class = ResourceClass::kTexture}}};
-        pass_entry.declaration = PassAuthoringDeclaration{.type = pass_id, .allowed_queue_mask = 1};
+        pass_entry.declaration = PassAuthoringDeclaration{
+            .type = pass_id, .allowed_queue_mask = uint64_t{1} << static_cast<uint8_t>(rhi::QueueClass::kGraphics)};
 
         if (!catalog.add(pipeline_entry) || !catalog.add(feature_entry) || !catalog.add(pass_entry))
             throw std::runtime_error("editor composition fixture catalog is invalid");

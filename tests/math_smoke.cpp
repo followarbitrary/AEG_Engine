@@ -90,6 +90,15 @@ int main() {
     }
 
     const Mat4 view = aeg::math::look_at(Vec3{0.0f, 0.0f, 3.0f}, Vec3{0.0f, 0.0f, 0.0f}, Vec3{0.0f, 1.0f, 0.0f});
+    const Mat4 sideways_view = aeg::math::look_at(Vec3{3, 2, 4}, Vec3{4, 2, 4}, Vec3{0, 1, 0});
+    Vec3 eye_in_view{}, target_in_view{};
+    if (!check(aeg::math::try_transform_point(sideways_view, {3, 2, 4}, eye_in_view) &&
+                   aeg::math::nearly_equal(eye_in_view, Vec3{0, 0, 0}, kTolerance),
+               "look_at must map eye to origin") ||
+        !check(aeg::math::try_transform_point(sideways_view, {4, 2, 4}, target_in_view) &&
+                   aeg::math::nearly_equal(target_in_view, Vec3{0, 0, -1}, kTolerance),
+               "look_at must map target onto negative Z"))
+        return 5;
     const Mat4 projection =
         aeg::math::perspective(aeg::math::kPi / 3.0f, 16.0f / 9.0f, 0.1f, 100.0f, ClipSpaceConvention{false, false});
     Vec3 projected_point{};

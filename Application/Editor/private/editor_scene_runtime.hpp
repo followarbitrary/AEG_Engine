@@ -135,6 +135,13 @@ public:
     [[nodiscard]] foundation::Result render_frame(uint64_t frame_number);
     /** @brief Exposes the engine renderer plan as this project's editable Renderer Pipeline. */
     [[nodiscard]] foundation::Result create_project_renderer_pipeline();
+    /** Validates, activates and persists a project renderer document at a frame boundary. */
+    [[nodiscard]] foundation::Result activate_renderer_pipeline_document(const std::filesystem::path& path);
+    [[nodiscard]] const std::filesystem::path& active_renderer_pipeline_document() const noexcept;
+    /** Non-blocking project pipeline failure while the Editor default preview remains usable. */
+    [[nodiscard]] std::string_view renderer_pipeline_diagnostic() const noexcept;
+    /** Restores the compatible built-in renderer and removes the project renderer selection. */
+    [[nodiscard]] foundation::Result restore_default_renderer_pipeline();
     [[nodiscard]] std::vector<std::pair<std::string, pipeline::PipelinePlanHandle>> pipeline_snapshots() const;
     /** Authored project Pipeline documents, available before the game module has been built. */
     [[nodiscard]] std::span<const EditorProjectPipelineDocument> authored_pipeline_documents() const noexcept;

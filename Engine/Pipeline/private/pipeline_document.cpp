@@ -296,10 +296,29 @@ std::vector<DocumentDiagnostic> validate_pipeline_document(const PipelineDocumen
         }
         const TypeCatalogEntry* source_entry = entry_for_endpoint(node_entries, edge.source);
         const TypeCatalogEntry* destination_entry = entry_for_endpoint(node_entries, edge.destination);
+        PortDescriptor source_resource_port{}, destination_resource_port{};
+        const auto resource_port = [&](const DocumentEndpoint& endpoint, PortDirection direction,
+                                       PortDescriptor& port) -> const PortDescriptor* {
+            const auto resource = resources.find(endpoint.node_id);
+            if (resource == resources.end() || edge.kind != DocumentEdgeKind::kRenderResource ||
+                endpoint.port_id != resource->second->resource_id.value())
+                return nullptr;
+            port = {.id = endpoint.port_id,
+                    .name = endpoint.node_id,
+                    .direction = direction,
+                    .value_kind = PortValueKind::kRenderResource,
+                    .schema_id = resource->second->type.value(),
+                    .binding_id = resource->second->resource_id.value(),
+                    .resource_constraints = resource->second->resource_constraints};
+            return &port;
+        };
         const PortDescriptor* source_port =
-            source_entry == nullptr ? nullptr : port_schema(*source_entry, edge.source.port_id);
+            source_entry == nullptr ? resource_port(edge.source, PortDirection::kOutput, source_resource_port)
+                                    : port_schema(*source_entry, edge.source.port_id);
         const PortDescriptor* destination_port =
-            destination_entry == nullptr ? nullptr : port_schema(*destination_entry, edge.destination.port_id);
+            destination_entry == nullptr
+                ? resource_port(edge.destination, PortDirection::kInput, destination_resource_port)
+                : port_schema(*destination_entry, edge.destination.port_id);
         if (source_port == nullptr || destination_port == nullptr) {
             diagnostic(result, "port.missing", "edge references an undeclared port", {}, edge.edge_id,
                        source_port == nullptr ? edge.source.port_id : edge.destination.port_id);
@@ -319,10 +338,36 @@ std::vector<DocumentDiagnostic> validate_pipeline_document(const PipelineDocumen
             diagnostic(result, "port.multiplicity", "input port has too many connections", {}, edge.edge_id,
                        edge.destination.port_id);
         }
-        const auto producer_key = std::make_pair(edge.kind, edge.binding_id);
-        const auto [producer, inserted] = producers.emplace(producer_key, edge.source.node_id);
-        if (!inserted && producer->second != edge.source.node_id) {
-            diagnostic(result, "binding.producers", "binding has multiple producers", {}, edge.edge_id);
+        if (!resources.contains(edge.source.node_id)) {
+            const auto producer_key = std::make_pair(edge.kind, edge.binding_id);
+            const auto [producer, inserted] = producers.emplace(producer_key, edge.source.node_id);
+            if (!inserted && producer->second != edge.source.node_id) {
+                diagnostic(result, "binding.producers", "binding has multiple producers", {}, edge.edge_id);
+            }
+        }
+        if (edge.kind == DocumentEdgeKind::kRenderResource) {
+            const auto& source = source_port->resource_constraints;
+            const auto& destination = destination_port->resource_constraints;
+            bool format_matches = source.formats.empty() || destination.formats.empty();
+            for (const auto& format : source.formats)
+                format_matches |= std::find(destination.formats.begin(), destination.formats.end(), format) !=
+                                  destination.formats.end();
+            if (source.resource_class != destination.resource_class || !format_matches ||
+                (source.sample_count && destination.sample_count && source.sample_count != destination.sample_count))
+                diagnostic(result, "resource.incompatible", "connected resource schemas are incompatible", {},
+                           edge.edge_id);
+        }
+    }
+
+    for (const auto& [node, entry] : node_entries) {
+        if (const auto pass = passes.find(node); pass != passes.end() && !pass->second->enabled)
+            continue;
+        if (const auto feature = features.find(node); feature != features.end() && !feature->second->enabled)
+            continue;
+        for (const auto& port : entry->ports) {
+            if (port.direction == PortDirection::kInput && port.required &&
+                incoming_connections[node + ":" + std::to_string(port.id)] < port.min_connections)
+                diagnostic(result, "port.required", "required input port is disconnected", node, {}, port.id);
         }
     }
 
@@ -363,6 +408,74 @@ std::vector<DocumentDiagnostic> validate_pipeline_document(const PipelineDocumen
             break;
         }
     }
+
+    bool requires_present = false;
+    for (const auto& [node_id, entry] : node_entries) {
+        static_cast<void>(node_id);
+        if (entry == nullptr) {
+            continue;
+        }
+        const auto* declaration = std::get_if<PipelineAuthoringDeclaration>(&entry->declaration);
+        if (declaration == nullptr) {
+            continue;
+        }
+        requires_present = std::any_of(declaration->feature_points.begin(), declaration->feature_points.end(),
+                                       [](const AuthoringFeaturePoint& point) {
+                                           return has_flag(point.flags, FeaturePointFlags::kMayWriteFinalOutput);
+                                       });
+        if (requires_present) {
+            break;
+        }
+    }
+    if (requires_present) {
+        if (document.present_connections.empty()) {
+            diagnostic(result, "present.missing", "rendering Pipeline requires a Present connection");
+        }
+        std::unordered_set<std::string> present_sources;
+        for (const std::string& source_node : document.present_connections) {
+            if (!present_sources.insert(source_node).second) {
+                diagnostic(result, "present.duplicate", "Present connection is duplicated", source_node);
+            }
+            const auto pass = passes.find(source_node);
+            const auto feature = features.find(source_node);
+            if (pass == passes.end() && feature == features.end()) {
+                diagnostic(result, "present.source", "Present connection references an unknown pass", source_node);
+            } else if ((pass != passes.end() &&
+                        [&] {
+                            const auto parent = features.find(pass->second->feature_node);
+                            return !pass->second->enabled || parent == features.end() || !parent->second->enabled;
+                        }()) ||
+                       (feature != features.end() && !feature->second->enabled)) {
+                diagnostic(result, "present.disabled", "Present connection references a disabled source", source_node);
+            }
+        }
+        for (const auto& [disabled_id, disabled] : passes) {
+            if (disabled == nullptr || disabled->enabled) {
+                continue;
+            }
+            std::vector<std::string> pending{disabled_id};
+            std::unordered_set<std::string> visited;
+            bool reaches_present = false;
+            for (size_t index = 0; index < pending.size(); ++index) {
+                const std::string& current = pending[index];
+                if (!visited.insert(current).second) {
+                    continue;
+                }
+                if (present_sources.contains(current)) {
+                    reaches_present = true;
+                    break;
+                }
+                const auto next = graph.find(current);
+                if (next != graph.end()) {
+                    pending.insert(pending.end(), next->second.begin(), next->second.end());
+                }
+            }
+            if (reaches_present) {
+                diagnostic(result, "pass.required_disabled", "a disabled pass lies on the authored Present route",
+                           disabled_id);
+            }
+        }
+    }
     return result;
 }
 
@@ -396,7 +509,7 @@ std::string document_semantic_digest(const PipelineDocument& document) {
 foundation::ResultValue<PreparedPipelineDocument> prepare_pipeline_document(const PipelineDocument& document,
                                                                             const TypeCatalog& catalog,
                                                                             const PipelineRegistry&,
-                                                                            const RenderPassRegistry&) {
+                                                                            const RenderPassRegistry& pass_registry) {
     const auto diagnostics = validate_pipeline_document(document, catalog);
     if (!diagnostics.empty()) {
         return {foundation::invalid_argument(diagnostics.front().message), {}};
@@ -410,7 +523,7 @@ foundation::ResultValue<PreparedPipelineDocument> prepare_pipeline_document(cons
         configuration->scope = node.scope;
         configuration->source = node.node_id;
         for (const auto& feature : document.feature_nodes) {
-            if (feature.pipeline_node != node.node_id) {
+            if (feature.pipeline_node != node.node_id || !feature.enabled) {
                 continue;
             }
             FeatureInstanceConfiguration feature_configuration;
@@ -425,6 +538,16 @@ foundation::ResultValue<PreparedPipelineDocument> prepare_pipeline_document(cons
                 }
                 RenderPassInstanceConfiguration pass_configuration;
                 pass_configuration.type = pass.type;
+                const auto registered = pass_registry.find_pass(pass.type);
+                if (!registered)
+                    return {registered.result, {}};
+                const auto queue_mask = registered.value->descriptor().allowed_queue_mask;
+                if (!(queue_mask & (uint64_t{1} << static_cast<uint8_t>(pass_configuration.queue)))) {
+                    if (queue_mask & (uint64_t{1} << static_cast<uint8_t>(rhi::QueueClass::kCompute)))
+                        pass_configuration.queue = rhi::QueueClass::kCompute;
+                    else
+                        return {foundation::unsupported("render pass has no supported default queue"), {}};
+                }
                 pass_configuration.instance = RenderPassInstanceId(pass.node_id);
                 pass_configuration.parameters = pass.parameters;
                 pass_configuration.enabled = pass.enabled;

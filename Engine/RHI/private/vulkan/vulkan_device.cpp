@@ -1080,6 +1080,9 @@ struct VulkanResourceState {
     }
     result.access2 = to_vk_access2(state.usage);
     result.stages2 = to_vk_pipeline_stages2(state.pipeline_stages);
+    // Ownership-release submissions use the legacy wait mask even with synchronization2.
+    // Keep it aligned with the explicitly requested stages (e.g. compute-only consumers).
+    result.stages = to_vk_pipeline_stages(state.pipeline_stages);
     if (state.pipeline_stages == PipelineStage::kAllCommands && state.shader_stages != ShaderStage::kAll &&
         (state.usage == ResourceUsage::kUniformRead || state.usage == ResourceUsage::kSampledRead ||
          state.usage == ResourceUsage::kTypedRead || state.usage == ResourceUsage::kStorageRead ||
@@ -5375,8 +5378,8 @@ Result VulkanDevice::transition_texture(CommandListResource& command, TextureHan
                         return Result::failure(
                             ResultCode::kInvalidState,
                             "Explicit command list texture state does not match the declared usage (current=" +
-                                std::to_string(static_cast<uint32_t>(current.usage)) + ", requested=" +
-                                std::to_string(static_cast<uint32_t>(normalized_after.usage)) + ")");
+                                std::to_string(static_cast<uint32_t>(current.usage)) +
+                                ", requested=" + std::to_string(static_cast<uint32_t>(normalized_after.usage)) + ")");
                     }
                 }
             }
@@ -7283,13 +7286,13 @@ Result VulkanDevice::update_binding_set(BindingSetHandle set, std::span<const Bi
             case BindingType::kSampledTexture:
             case BindingType::kStorageTexture: {
                 const TextureViewResource* view = texture_views_.get(write.resource.texture_view);
-                const TextureResource* texture = textures_.get(view->desc.texture);
-                const bool depth_texture = texture != nullptr && is_depth_format(texture->desc.format);
-                const VkImageLayout image_layout =
-                    entry->type == BindingType::kStorageTexture
-                        ? VK_IMAGE_LAYOUT_GENERAL
-                        : (depth_texture ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
-                                         : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                // Descriptors must use the same layout as the tracked usage
+                // and barriers, including sampled depth textures.
+                const VkImageLayout image_layout = to_vk_image_usage_state(entry->type == BindingType::kStorageTexture
+                                                                               ? ResourceUsage::kStorageReadWrite
+                                                                               : ResourceUsage::kSampledRead)
+                                                       .value()
+                                                       .layout;
                 image_infos.push_back(VkDescriptorImageInfo{VK_NULL_HANDLE, view->view, image_layout});
                 vk_write.pImageInfo = &image_infos.back();
                 break;
@@ -7836,10 +7839,11 @@ Result VulkanDevice::bind_binding_set(CommandListHandle command_list, uint32_t g
                     transition_texture(*command, view->desc.texture, view->desc.subresources, state);
                 if (!transition_result) {
                     const TextureResource* texture = textures_.get(view->desc.texture);
-                    const std::string_view debug_name = texture == nullptr ? std::string_view{} : texture->desc.name.value;
+                    const std::string_view debug_name =
+                        texture == nullptr ? std::string_view{} : texture->desc.name.value;
                     return Result::failure(transition_result.code,
-                                           "Binding-set sampled texture '" + std::string(debug_name) + "' transition failed: " +
-                                               transition_result.message);
+                                           "Binding-set sampled texture '" + std::string(debug_name) +
+                                               "' transition failed: " + transition_result.message);
                 }
                 add_unique(command->referenced_texture_views, write.resource.texture_view);
                 add_unique(command->referenced_textures, view->desc.texture);

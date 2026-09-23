@@ -291,6 +291,11 @@ foundation::Result RenderSceneSnapshotBuilder::add_instance(const RenderInstance
         increment(snapshot_.visibility.visibility_masked_instance_count);
         return foundation::Result::success();
     }
+    try {
+        snapshot_.shadow_casters.push_back(instance);
+    } catch (const std::bad_alloc&) {
+        return out_of_memory("shadow caster snapshot allocation failed");
+    }
     if (snapshot_.view.frustum_culling) {
         if (!frustum_valid_) {
             return invalid_argument("render view frustum is invalid");
@@ -356,6 +361,11 @@ foundation::Result RenderSceneSnapshotBuilder::add_light(const RenderLight& ligh
 foundation::ResultValue<RenderLightingResource> RenderResourceResolver::resolve_lighting(const RenderSceneSnapshot&,
                                                                                          const RenderView&) const {
     return {not_found("render resource resolver does not provide a frame lighting resource"), {}};
+}
+
+foundation::ResultValue<RenderDeferredLightingResource> RenderResourceResolver::resolve_deferred_lighting(
+    const RenderView&) const {
+    return {not_found("render resource resolver does not provide deferred lighting resources"), {}};
 }
 
 foundation::ResultValue<RenderLightingConstants> make_render_lighting_constants(std::span<const RenderLight> lights,

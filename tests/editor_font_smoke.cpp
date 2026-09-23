@@ -150,6 +150,10 @@ int main() {
             assert(sample->GetFontBaked(sample->LegacySize)->FindGlyphNoFallback(codepoint) != nullptr);
         }
         auto* chrome = static_cast<const ImFont*>(collection_host.preference_font(20));
+        assert(chrome != nullptr);  // 20 identifies the body role, even when its raster size is 18.
+        assert(chrome->LegacySize == 18);
+        for (const float role : {16.0f, 20.0f, 24.0f, 32.0f})
+            assert(collection_host.preference_font(role) != nullptr);
         const float chrome_size = chrome->LegacySize;
         assert(collection_host.set_preview_font("collection_primary", 48));
         assert(collection_host.active_font_size_pixels() == 18);

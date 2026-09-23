@@ -854,13 +854,13 @@ bool try_look_at(Vec3 eye, Vec3 target, Vec3 up, Mat4& result) noexcept {
 
     Mat4 view = identity();
     view.at(0, 0) = right.x;
-    view.at(1, 0) = right.y;
-    view.at(2, 0) = right.z;
-    view.at(0, 1) = corrected_up.x;
+    view.at(0, 1) = right.y;
+    view.at(0, 2) = right.z;
+    view.at(1, 0) = corrected_up.x;
     view.at(1, 1) = corrected_up.y;
-    view.at(2, 1) = corrected_up.z;
-    view.at(0, 2) = -forward.x;
-    view.at(1, 2) = -forward.y;
+    view.at(1, 2) = corrected_up.z;
+    view.at(2, 0) = -forward.x;
+    view.at(2, 1) = -forward.y;
     view.at(2, 2) = -forward.z;
     view.at(0, 3) = -dot(right, eye);
     view.at(1, 3) = -dot(corrected_up, eye);

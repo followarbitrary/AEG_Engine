@@ -7,11 +7,13 @@
 #include <cmath>
 #include <cstddef>
 #include <string>
+#include <type_traits>
 #include <utility>
 
 #include "Components/component_bundle.hpp"
 #include "Components/component_ids.hpp"
 #include "Components/component_render_extraction.hpp"
+#include "post_process.hpp"
 
 namespace aeg::engine::components {
 const std::string_view kTransformName{"Game.Transform"};
@@ -19,6 +21,9 @@ const std::string_view kCameraName{"Game.Camera"};
 const std::string_view kMeshRendererName{"Game.MeshRenderer"};
 const std::string_view kTextRendererName{"Game.TextRenderer"};
 const std::string_view kDirectionalLightName{"Game.DirectionalLight"};
+const std::string_view kPointLightName{"Game.PointLight"};
+const std::string_view kSpotLightName{"Game.SpotLight"};
+const std::string_view kSceneEnvironmentName{"Game.SceneEnvironment"};
 const std::string_view kVec3TypeName{"Math.Vec3"};
 const std::string_view kQuatTypeName{"Math.Quat"};
 const uint32_t kRenderComponentSchemaVersion = 1;
@@ -342,6 +347,84 @@ foundation::ResultValue<reflection::TypeDescriptor> directional_light_reflection
         !result) {
         return {result, {}};
     }
+    if (const auto result = builder.add_field("casts_shadow", reflection::type_id<bool>(),
+                                              reflection::make_member_accessor(&DirectionalLight::casts_shadow));
+        !result)
+        return {result, {}};
+    return std::move(builder).finish();
+}
+
+namespace {
+template <typename Light>
+foundation::ResultValue<reflection::TypeDescriptor> local_light_descriptor(std::string_view name) {
+    reflection::TypeBuilder builder({reflection::TypeId(name), std::string(name), kRenderComponentSchemaVersion,
+                                     reflection::TypeKind::kComponent, sizeof(Light), alignof(Light)});
+    if (const auto r = builder.add_field("color", reflection::TypeId(kVec3TypeName), make_vec3_accessor(&Light::color));
+        !r)
+        return {r, {}};
+    if (const auto r = builder.add_field("intensity", reflection::type_id<float>(),
+                                         reflection::make_member_accessor(&Light::intensity));
+        !r)
+        return {r, {}};
+    if (const auto r =
+            builder.add_field("range", reflection::type_id<float>(), reflection::make_member_accessor(&Light::range));
+        !r)
+        return {r, {}};
+    if (const auto r = builder.add_field("visibility_mask", reflection::type_id<uint32_t>(),
+                                         reflection::make_member_accessor(&Light::visibility_mask));
+        !r)
+        return {r, {}};
+    if (const auto r = builder.add_field("enabled", reflection::type_id<bool>(),
+                                         reflection::make_member_accessor(&Light::enabled));
+        !r)
+        return {r, {}};
+    if constexpr (std::is_same_v<Light, SpotLight>) {
+        if (const auto r = builder.add_field("direction", reflection::TypeId(kVec3TypeName),
+                                             make_vec3_accessor(&Light::direction));
+            !r)
+            return {r, {}};
+        if (const auto r = builder.add_field("inner_cone_cosine", reflection::type_id<float>(),
+                                             reflection::make_member_accessor(&Light::inner_cone_cosine));
+            !r)
+            return {r, {}};
+        if (const auto r = builder.add_field("outer_cone_cosine", reflection::type_id<float>(),
+                                             reflection::make_member_accessor(&Light::outer_cone_cosine));
+            !r)
+            return {r, {}};
+    }
+    return std::move(builder).finish();
+}
+}  // namespace
+
+foundation::ResultValue<reflection::TypeDescriptor> point_light_reflection_descriptor() {
+    return local_light_descriptor<PointLight>(kPointLightName);
+}
+foundation::ResultValue<reflection::TypeDescriptor> spot_light_reflection_descriptor() {
+    return local_light_descriptor<SpotLight>(kSpotLightName);
+}
+
+foundation::ResultValue<reflection::TypeDescriptor> scene_environment_reflection_descriptor() {
+    reflection::TypeBuilder builder({reflection::TypeId(kSceneEnvironmentName), std::string(kSceneEnvironmentName),
+                                     kRenderComponentSchemaVersion, reflection::TypeKind::kComponent,
+                                     sizeof(SceneEnvironment), alignof(SceneEnvironment)});
+    for (auto [name, member] : std::array{std::pair{"sky_zenith", &SceneEnvironment::sky_zenith},
+                                          std::pair{"sky_horizon", &SceneEnvironment::sky_horizon},
+                                          std::pair{"sky_ground", &SceneEnvironment::sky_ground}})
+        if (const auto r = builder.add_field(name, reflection::TypeId(kVec3TypeName), make_vec3_accessor(member)); !r)
+            return {r, {}};
+    for (auto [name, member] :
+         std::array{std::pair{"exposure", &SceneEnvironment::exposure}, std::pair{"gamma", &SceneEnvironment::gamma}})
+        if (const auto r =
+                builder.add_field(name, reflection::type_id<float>(), reflection::make_member_accessor(member));
+            !r)
+            return {r, {}};
+    for (auto [name, member] : std::array{std::pair{"sky_enabled", &SceneEnvironment::sky_enabled},
+                                          std::pair{"tone_mapping", &SceneEnvironment::tone_mapping},
+                                          std::pair{"enabled", &SceneEnvironment::enabled}})
+        if (const auto r =
+                builder.add_field(name, reflection::type_id<bool>(), reflection::make_member_accessor(member));
+            !r)
+            return {r, {}};
     return std::move(builder).finish();
 }
 
@@ -367,10 +450,18 @@ foundation::Result register_render_component_reflection(reflection::TypeRegistry
         return directional_light.result;
     }
 
-    const std::array<reflection::TypeDescriptor, 5> descriptors{
+    auto point_light = point_light_reflection_descriptor();
+    auto spot_light = spot_light_reflection_descriptor();
+    auto environment = scene_environment_reflection_descriptor();
+    if (!environment)
+        return environment.result;
+    if (!point_light || !spot_light)
+        return !point_light ? point_light.result : spot_light.result;
+    const std::array<reflection::TypeDescriptor, 8> descriptors{
         std::move(transform.value),         std::move(camera.value),
         std::move(mesh_renderer.value),     std::move(text_renderer.value),
-        std::move(directional_light.value),
+        std::move(directional_light.value), std::move(point_light.value),
+        std::move(spot_light.value),        std::move(environment.value),
     };
     std::array<reflection::TypeId, descriptors.size()> inserted{};
     std::size_t inserted_count = 0;
@@ -411,8 +502,20 @@ foundation::Result register_render_components(ecs::World& world) {
         !result) {
         return result;
     }
-    return ensure_raw_component_storage<DirectionalLight>(world, component_type_id(kDirectionalLightName),
-                                                          kDirectionalLightName);
+    if (const auto r = ensure_raw_component_storage<DirectionalLight>(world, component_type_id(kDirectionalLightName),
+                                                                      kDirectionalLightName);
+        !r)
+        return r;
+    if (const auto r =
+            ensure_raw_component_storage<PointLight>(world, component_type_id(kPointLightName), kPointLightName);
+        !r)
+        return r;
+    if (const auto r =
+            ensure_raw_component_storage<SpotLight>(world, component_type_id(kSpotLightName), kSpotLightName);
+        !r)
+        return r;
+    return ensure_raw_component_storage<SceneEnvironment>(world, component_type_id(kSceneEnvironmentName),
+                                                          kSceneEnvironmentName);
 }
 
 foundation::Result register_reflected_render_components(ecs::World& world, const reflection::TypeRegistry& registry) {
@@ -438,9 +541,22 @@ foundation::Result register_reflected_render_components(ecs::World& world, const
         !result) {
         return result;
     }
-    return register_component_from_schema<DirectionalLight>(world, registry, directional_light_reflection_descriptor(),
-                                                            component_type_id(kDirectionalLightName),
-                                                            kDirectionalLightName);
+    if (const auto r = register_component_from_schema<DirectionalLight>(
+            world, registry, directional_light_reflection_descriptor(), component_type_id(kDirectionalLightName),
+            kDirectionalLightName);
+        !r)
+        return r;
+    if (const auto r = register_component_from_schema<PointLight>(world, registry, point_light_reflection_descriptor(),
+                                                                  component_type_id(kPointLightName), kPointLightName);
+        !r)
+        return r;
+    if (const auto r = register_component_from_schema<SpotLight>(world, registry, spot_light_reflection_descriptor(),
+                                                                 component_type_id(kSpotLightName), kSpotLightName);
+        !r)
+        return r;
+    return register_component_from_schema<SceneEnvironment>(world, registry, scene_environment_reflection_descriptor(),
+                                                            component_type_id(kSceneEnvironmentName),
+                                                            kSceneEnvironmentName);
 }
 
 foundation::Result register_render_component_bundle(ecs::World& world, reflection::TypeRegistry& registry) {
@@ -512,6 +628,25 @@ foundation::ResultValue<renderer::RenderView> make_render_view(const ecs::WorldS
     view.color_target = desc.color_target;
     view.depth_target = desc.depth_target;
     view.frustum_culling = desc.frustum_culling;
+    foundation::Result environment_result = foundation::Result::success();
+    uint32_t environment_count = 0;
+    world_snapshot.for_each<SceneEnvironment>([&](ecs::EntityId, const SceneEnvironment& environment) {
+        if (!environment_result || !environment.enabled)
+            return;
+        if (++environment_count > 1) {
+            environment_result =
+                foundation::invalid_state("A render view requires at most one enabled SceneEnvironment");
+            return;
+        }
+        const auto settings = make_post_process_settings(environment);
+        if (!settings) {
+            environment_result = settings.result;
+            return;
+        }
+        view.post_process = settings.value;
+    });
+    if (!environment_result)
+        return {environment_result, {}};
     if (!view.is_valid()) {
         return {foundation::invalid_state("Runtime RenderView violates the renderer view contract"), {}};
     }
@@ -616,7 +751,7 @@ foundation::Result extract_directional_lights(const renderer::RenderExtractConte
                                                 1.0f,
                                                 0.0f,
                                                 0xffffffffu,
-                                                false});
+                                                light.casts_shadow});
         });
     return result;
 }
@@ -624,5 +759,83 @@ foundation::Result extract_directional_lights(const renderer::RenderExtractConte
 foundation::ResultValue<renderer::RenderExtractorId> register_directional_light_extractor(
     renderer::Renderer& renderer) {
     return renderer.register_extractor(&extract_directional_lights);
+}
+
+foundation::ResultValue<renderer::RenderPostProcessSettings> make_post_process_settings(
+    const SceneEnvironment& environment) {
+    renderer::RenderPostProcessSettings settings{
+        environment.sky_zenith, environment.sky_horizon, environment.sky_ground,  environment.exposure,
+        environment.gamma,      environment.sky_enabled, environment.tone_mapping};
+    const auto result = renderer::validate_post_process_settings(settings);
+    return {result, settings};
+}
+
+foundation::Result validate_point_light(const PointLight& light) {
+    const auto unit = [](float value) { return math::is_finite(value) && value >= 0 && value <= 1; };
+    if (!unit(light.color.x) || !unit(light.color.y) || !unit(light.color.z) || !math::is_finite(light.intensity) ||
+        light.intensity < 0 || !math::is_finite(light.range) || light.range < 0)
+        return foundation::invalid_argument(
+            "Local light requires finite color [0,1], non-negative intensity and range");
+    return foundation::Result::success();
+}
+
+foundation::Result validate_spot_light(const SpotLight& light) {
+    if (const auto r =
+            validate_point_light({light.color, light.intensity, light.range, light.visibility_mask, light.enabled});
+        !r)
+        return r;
+    math::Vec3 normalized{};
+    if (!math::try_normalize(light.direction, normalized) || !math::is_finite(light.inner_cone_cosine) ||
+        !math::is_finite(light.outer_cone_cosine) || light.outer_cone_cosine < -1 || light.inner_cone_cosine > 1 ||
+        light.outer_cone_cosine > light.inner_cone_cosine)
+        return foundation::invalid_argument(
+            "Spot light requires a direction and -1 <= outer <= inner <= 1 cone cosines");
+    return foundation::Result::success();
+}
+
+foundation::Result extract_local_lights(const renderer::RenderExtractContext& context) {
+    auto result = foundation::Result::success();
+    const auto extract = [&]<typename Light>() {
+        context.world_snapshot.for_each<Light>([&](ecs::EntityId entity, const Light& light) {
+            if (!result || !light.enabled)
+                return;
+            constexpr bool kSpot = std::is_same_v<Light, SpotLight>;
+            if constexpr (kSpot)
+                result = validate_spot_light(light);
+            else
+                result = validate_point_light(light);
+            if (!result)
+                return;
+            const auto* transform = context.world_snapshot.get<Transform>(entity);
+            if (!transform)
+                return;
+            // Include the component identity so multiple light types on one entity remain distinct.
+            const auto type = ecs::ComponentTypeId(kSpot ? kSpotLightName : kPointLightName);
+            renderer::RenderLight output{};
+            output.light = renderer::RenderLightId(renderer::make_render_light_id(entity).value() ^ type.value());
+            output.type = kSpot ? renderer::RenderLightType::kSpot : renderer::RenderLightType::kPoint;
+            output.position = transform->translation;
+            output.color = light.color;
+            output.intensity = light.intensity;
+            output.range = light.range;
+            output.visibility_mask = light.visibility_mask;
+            if constexpr (kSpot) {
+                if (!math::try_normalize(math::rotate(transform->rotation, light.direction), output.direction)) {
+                    result = foundation::invalid_argument("Spot light world direction is invalid");
+                    return;
+                }
+                output.inner_cone_cosine = light.inner_cone_cosine;
+                output.outer_cone_cosine = light.outer_cone_cosine;
+            }
+            result = context.builder.add_light(output);
+        });
+    };
+    extract.operator()<PointLight>();
+    extract.operator()<SpotLight>();
+    return result;
+}
+
+foundation::ResultValue<renderer::RenderExtractorId> register_local_light_extractor(renderer::Renderer& renderer) {
+    return renderer.register_extractor(&extract_local_lights);
 }
 }  // namespace aeg::engine::components

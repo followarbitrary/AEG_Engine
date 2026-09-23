@@ -18,6 +18,9 @@ extern const std::string_view kMeshRendererName;
 extern const std::string_view kTextRendererName;
 /** @brief Stable ECS and Reflection identity for the minimal directional light. */
 extern const std::string_view kDirectionalLightName;
+extern const std::string_view kPointLightName;
+extern const std::string_view kSpotLightName;
+extern const std::string_view kSceneEnvironmentName;
 
 /** @brief Stable field type identity for the engine's aligned three-float vector encoding. */
 extern const std::string_view kVec3TypeName;

@@ -13,6 +13,11 @@ namespace aeg::pipeline {
 struct RenderPassInstanceIdTag;
 using RenderPassInstanceId = StableId<RenderPassInstanceIdTag>;
 
+/** Frame-local, pass-owned execution data. Never persisted in authoring documents. */
+struct RenderPassRuntimeData {
+    virtual ~RenderPassRuntimeData() = default;
+};
+
 struct RenderPassConfiguration final {
     RenderPassTypeId type{};
     RenderPassInstanceId instance{};
@@ -21,6 +26,7 @@ struct RenderPassConfiguration final {
     ParameterBlock parameters{};
     std::unordered_map<uint64_t, uint64_t> bindings{};
     std::string source{};
+    std::shared_ptr<const RenderPassRuntimeData> runtime_data{};
 };
 
 struct RenderPassDescriptor final {

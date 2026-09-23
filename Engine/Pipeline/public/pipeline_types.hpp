@@ -390,6 +390,8 @@ struct FeatureDescriptor {
     PipelineScopeMask supported_scopes{kAllPipelineScopes};
     Version version{1, 0, 0};
     ModuleId owner_module{};
+    /** Optional host pipeline identity for engine-owned features with fixed topology. */
+    PipelineId pipeline_affinity{};
 };
 
 /** @brief Public extension anchor exposed by a pipeline definition. */

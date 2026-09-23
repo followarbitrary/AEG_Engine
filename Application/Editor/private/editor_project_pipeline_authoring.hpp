@@ -16,6 +16,8 @@ namespace aeg::application {
 struct EditorProjectPipelineDocument final {
     std::filesystem::path path{};
     pipeline::PipelineDocument document{};
+    /** Keeps unreadable project files visible without failing the entire authoring catalog. */
+    foundation::Result load_result{};
 };
 
 struct EditorProjectPipelineAuthoring final {

@@ -57,4 +57,14 @@ struct RuntimeRenderViewDesc final {
 /** @brief Registers the Runtime Directional Light extraction callback. */
 [[nodiscard]] foundation::ResultValue<renderer::RenderExtractorId> register_directional_light_extractor(
     renderer::Renderer& renderer);
+
+/** @brief Shared data validation for extraction and transactional Editor updates. */
+[[nodiscard]] foundation::Result validate_point_light(const PointLight& light);
+[[nodiscard]] foundation::Result validate_spot_light(const SpotLight& light);
+[[nodiscard]] foundation::ResultValue<renderer::RenderPostProcessSettings> make_post_process_settings(
+    const SceneEnvironment& environment);
+/** @brief Extracts enabled point/spot components with Transform positions and rotations. */
+[[nodiscard]] foundation::Result extract_local_lights(const renderer::RenderExtractContext& context);
+[[nodiscard]] foundation::ResultValue<renderer::RenderExtractorId> register_local_light_extractor(
+    renderer::Renderer& renderer);
 }  // namespace aeg::engine::components

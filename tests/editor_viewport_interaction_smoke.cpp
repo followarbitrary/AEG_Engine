@@ -2,6 +2,7 @@
  * @file editor_viewport_interaction_smoke.cpp
  * @brief Verifies CPU viewport picking and editor-owned Transform transactions.
  */
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <filesystem>
@@ -41,6 +42,92 @@ bool same_transform(const aeg::engine::components::Transform& left, const aeg::e
     return aeg::math::nearly_equal(left.translation, right.translation, 1.0e-4f) &&
            aeg::math::nearly_equal(left.rotation, right.rotation, 1.0e-4f) &&
            aeg::math::nearly_equal(left.scale, right.scale, 1.0e-4f);
+}
+
+bool scale_drag_follows_visible_axis(aeg::application::EditorSceneRuntime& runtime) {
+    using aeg::application::ViewportGizmoAxis;
+    using aeg::application::ViewportGizmoMode;
+    using aeg::application::ViewportPoint;
+    using aeg::engine::components::Transform;
+    const auto transform_type = aeg::ecs::ComponentTypeId(aeg::engine::components::kTransformName);
+    const auto* camera = find_entity(runtime, "Camera");
+    const auto* mesh = find_entity(runtime, "Right Mesh");
+    if (!require(camera && mesh, "scale direction regression entities are missing"))
+        return false;
+    const auto camera_id = camera->id;
+    const auto mesh_id = mesh->id;
+    const Transform original_camera =
+        *static_cast<const Transform*>(runtime.component_value(camera_id, transform_type));
+    const Transform initial = *static_cast<const Transform*>(runtime.component_value(mesh_id, transform_type));
+    if (!require(runtime.select(mesh_id), "scale direction selection failed") ||
+        !require(runtime.request_viewport_extent(320, 240), "scale direction extent failed"))
+        return false;
+    uint64_t frame = 21;
+    // View the same object from opposite sides: +Z projects left/down, then right/down.
+    for (float yaw : {0.65f, -0.65f}) {
+        Transform camera_pose = original_camera;
+        camera_pose.rotation = aeg::math::quat_from_axis_angle({0.0f, 1.0f, 0.0f}, yaw) *
+                               aeg::math::quat_from_axis_angle({1.0f, 0.0f, 0.0f}, -0.35f);
+        camera_pose.translation = initial.translation + aeg::math::rotate(camera_pose.rotation, {0.0f, 0.0f, 6.0f});
+        if (!require(
+                runtime.queue_component_update(camera_id, transform_type, std::as_bytes(std::span{&camera_pose, 1})),
+                "scale direction camera update failed") ||
+            !require(runtime.render_frame(frame++), "scale direction camera frame failed"))
+            return false;
+        for (const auto axis : {ViewportGizmoAxis::kZ, ViewportGizmoAxis::kX, ViewportGizmoAxis::kY}) {
+            const auto projection = runtime.selected_gizmo_projection(320, 240);
+            if (!require(projection && projection.value.valid, "scale direction projection failed"))
+                return false;
+            const std::array<ViewportPoint, 3> tips{projection.value.x_axis, projection.value.y_axis,
+                                                    projection.value.z_axis};
+            const auto index = static_cast<std::size_t>(axis);
+            const ViewportPoint tip = tips[index];
+            const float dx = tip.x - projection.value.center.x;
+            const float dy = tip.y - projection.value.center.y;
+            const float length = std::sqrt(dx * dx + dy * dy);
+            if (!require(length > 1.0f, "scale direction fixture has a collapsed handle"))
+                return false;
+            // Outward must grow, inward must shrink, perpendicular motion must not scale.
+            for (const int direction : {1, -1, 0}) {
+                const ViewportPoint end = direction == 0
+                                              ? ViewportPoint{tip.x - dy / length * 12.0f, tip.y + dx / length * 12.0f}
+                                              : ViewportPoint{tip.x + dx / length * 12.0f * direction,
+                                                              tip.y + dy / length * 12.0f * direction};
+                if (!require(runtime.begin_transform_edit(ViewportGizmoMode::kScale, axis, tip, 320, 240),
+                             "scale direction begin failed") ||
+                    !require(runtime.update_transform_edit(end, 320, 240), "scale direction update failed") ||
+                    !require(runtime.render_frame(frame++), "scale direction preview frame failed"))
+                    return false;
+                const auto* edited = static_cast<const Transform*>(runtime.component_value(mesh_id, transform_type));
+                if (!require(edited != nullptr, "scale direction edited Transform is missing"))
+                    return false;
+                const float before = initial.scale[index];
+                const float after = edited->scale[index];
+                const bool correct = direction > 0   ? after > before
+                                     : direction < 0 ? after > 0.0f && after < before
+                                                     : aeg::math::nearly_equal(after, before, 1.0e-4f);
+                if (!correct) {
+                    std::cerr << "Scale drag disagrees with visible axis: axis=" << index << ", yaw=" << yaw
+                              << ", direction=" << direction << ", before=" << before << ", after=" << after << '\n';
+                    return false;
+                }
+                Transform unchanged = *edited;
+                unchanged.scale[index] = initial.scale[index];
+                if (!require(same_transform(unchanged, initial), "axis scale changed another Transform component") ||
+                    !require(runtime.cancel_transform_edit(), "scale direction cancel failed") ||
+                    !require(runtime.render_frame(frame++), "scale direction cancel frame failed"))
+                    return false;
+                const auto* cancelled = static_cast<const Transform*>(runtime.component_value(mesh_id, transform_type));
+                if (!require(cancelled && same_transform(*cancelled, initial),
+                             "scale direction cancel did not restore Transform"))
+                    return false;
+            }
+        }
+    }
+    return require(
+               runtime.queue_component_update(camera_id, transform_type, std::as_bytes(std::span{&original_camera, 1})),
+               "scale direction camera restore failed") &&
+           require(runtime.render_frame(frame), "scale direction restore frame failed");
 }
 }  // namespace
 
@@ -224,52 +311,66 @@ int main() {
     const auto mesh_type = aeg::ecs::ComponentTypeId(aeg::engine::components::kMeshRendererName);
     for (const char* name : {"Left Mesh", "Right Mesh"}) {
         const auto* entity = find_entity(runtime, name);
-        if (!require(entity, "visibility regression entity missing")) return 19;
-        auto mesh = *static_cast<const aeg::engine::components::MeshRenderer*>(runtime.component_value(entity->id, mesh_type));
+        if (!require(entity, "visibility regression entity missing"))
+            return 19;
+        auto mesh =
+            *static_cast<const aeg::engine::components::MeshRenderer*>(runtime.component_value(entity->id, mesh_type));
         mesh.visible = false;
         if (!require(runtime.select(entity->id), "visibility selection failed") ||
-            !require(runtime.queue_component_update(entity->id, mesh_type, std::as_bytes(std::span{&mesh, 1})), "visibility update failed") ||
-            !require(runtime.render_frame(10), "visibility frame failed")) return 20;
+            !require(runtime.queue_component_update(entity->id, mesh_type, std::as_bytes(std::span{&mesh, 1})),
+                     "visibility update failed") ||
+            !require(runtime.render_frame(10), "visibility frame failed"))
+            return 20;
         const auto hidden_gizmo = runtime.selected_gizmo_projection(96, 64);
-        if (!require(hidden_gizmo && !hidden_gizmo.value.valid, "hidden entity still exposes a gizmo")) return 21;
+        if (!require(hidden_gizmo && !hidden_gizmo.value.valid, "hidden entity still exposes a gizmo"))
+            return 21;
     }
     if (!require(runtime.request_viewport_readback(), "empty viewport readback request failed") ||
-        !require(runtime.render_frame(11), "empty viewport frame failed")) return 22;
+        !require(runtime.render_frame(11), "empty viewport frame failed"))
+        return 22;
     const auto pixels = runtime.read_viewport_pixels();
-    if (!require(pixels, "empty viewport readback failed")) return 23;
+    if (!require(pixels, "empty viewport readback failed"))
+        return 23;
     for (std::size_t i = 0; i + 3 < pixels.value.size(); i += 4) {
-        if (!require(std::to_integer<int>(pixels.value[i]) < 10 &&
-                     std::to_integer<int>(pixels.value[i+1]) < 10 &&
-                     std::to_integer<int>(pixels.value[i+2]) < 10,
-                     "all hidden viewport retained previous colored geometry")) return 24;
+        if (!require(std::to_integer<int>(pixels.value[i]) < 10 && std::to_integer<int>(pixels.value[i + 1]) < 10 &&
+                         std::to_integer<int>(pixels.value[i + 2]) < 10,
+                     "all hidden viewport retained previous colored geometry"))
+            return 24;
     }
     const auto* restore_entity = find_entity(runtime, "Right Mesh");
-    auto restored_mesh = *static_cast<const aeg::engine::components::MeshRenderer*>(runtime.component_value(restore_entity->id, mesh_type));
+    auto restored_mesh = *static_cast<const aeg::engine::components::MeshRenderer*>(
+        runtime.component_value(restore_entity->id, mesh_type));
     restored_mesh.visible = true;
-    if (!require(runtime.queue_component_update(restore_entity->id, mesh_type,
-            std::as_bytes(std::span{&restored_mesh, 1})), "restore visibility failed") ||
+    if (!require(
+            runtime.queue_component_update(restore_entity->id, mesh_type, std::as_bytes(std::span{&restored_mesh, 1})),
+            "restore visibility failed") ||
         !require(runtime.request_viewport_readback(), "restore readback request failed") ||
-        !require(runtime.render_frame(12), "restore frame failed")) return 25;
+        !require(runtime.render_frame(12), "restore frame failed"))
+        return 25;
     const auto restored_gizmo = runtime.selected_gizmo_projection(96, 64);
     const auto restored_pixels = runtime.read_viewport_pixels();
     bool has_geometry = false;
     if (!require(restored_pixels && restored_gizmo && restored_gizmo.value.valid,
-                 "restoring visibility did not restore gizmo/readback")) return 26;
+                 "restoring visibility did not restore gizmo/readback"))
+        return 26;
     for (std::size_t i = 0; i + 3 < restored_pixels.value.size(); i += 4)
-        has_geometry |= std::to_integer<int>(restored_pixels.value[i+1]) > 40;
-    if (!require(has_geometry, "restoring visibility did not restore rendered geometry")) return 27;
+        has_geometry |= std::to_integer<int>(restored_pixels.value[i + 1]) > 40;
+    if (!require(has_geometry, "restoring visibility did not restore rendered geometry"))
+        return 27;
 
     const auto snapshots = runtime.pipeline_snapshots();
-    const auto renderer_plan = std::find_if(snapshots.begin(), snapshots.end(), [](const auto& snapshot) {
-        return snapshot.first == "Game / Renderer";
-    });
+    const auto renderer_plan = std::find_if(snapshots.begin(), snapshots.end(),
+                                            [](const auto& snapshot) { return snapshot.first == "Game / Renderer"; });
     if (!require(renderer_plan != snapshots.end() && renderer_plan->second != nullptr,
-                 "renderer pipeline snapshot is unavailable for state-link test")) return 28;
+                 "renderer pipeline snapshot is unavailable for state-link test"))
+        return 28;
     const auto& plan = *renderer_plan->second;
     std::vector<uint8_t> state_writers(plan.feature_contributions.size(), 0);
-    for (std::size_t contribution_index = 0; contribution_index < plan.feature_contributions.size(); ++contribution_index) {
+    for (std::size_t contribution_index = 0; contribution_index < plan.feature_contributions.size();
+         ++contribution_index) {
         const auto& contribution = plan.feature_contributions[contribution_index];
-        if (contribution.domain != aeg::pipeline::FeatureDomain::kRender) continue;
+        if (contribution.domain != aeg::pipeline::FeatureDomain::kRender)
+            continue;
         for (const auto& implementation : plan.feature_implementations) {
             if (implementation.feature_instance == contribution.feature_instance && implementation.implementation &&
                 implementation.implementation->uses_render_state_output()) {
@@ -287,27 +388,32 @@ int main() {
             present_node = node_index;
         }
         bool is_render_feature = false;
-        for (std::size_t contribution_index = 0; contribution_index < plan.feature_contributions.size(); ++contribution_index) {
+        for (std::size_t contribution_index = 0; contribution_index < plan.feature_contributions.size();
+             ++contribution_index) {
             const auto& contribution = plan.feature_contributions[contribution_index];
             if (contribution.domain != aeg::pipeline::FeatureDomain::kRender ||
                 plan.nodes[node_index].definition_stage_index < contribution.first_stage_index ||
-                plan.nodes[node_index].definition_stage_index >= contribution.first_stage_index + contribution.stage_count) {
+                plan.nodes[node_index].definition_stage_index >=
+                    contribution.first_stage_index + contribution.stage_count) {
                 continue;
             }
             is_render_feature = true;
             break;
         }
-        if (!is_render_feature && plan.nodes[node_index].phase != aeg::pipeline::EnginePhase::kPresent) non_render_node = node_index;
+        if (!is_render_feature && plan.nodes[node_index].phase != aeg::pipeline::EnginePhase::kPresent)
+            non_render_node = node_index;
     }
     if (!require(non_render_node && present_node,
-                 "renderer pipeline has no non-Render/Present pair for State Link validation")) return 29;
+                 "renderer pipeline has no non-Render/Present pair for State Link validation"))
+        return 29;
     const auto invalid_state_link = runtime.add_render_state_link(*non_render_node, *present_node);
     if (!require(!invalid_state_link && invalid_state_link.code == aeg::foundation::ResultCode::kInvalidArgument,
-                 "non-Render stage was allowed to create a State Link")) return 30;
+                 "non-Render stage was allowed to create a State Link"))
+        return 30;
     std::optional<aeg::render_graph::RenderStateLinkOverride> removed_link;
     for (const auto& edge : plan.dependencies) {
-        const std::array<aeg::render_graph::RenderStateLinkOverride, 1> override{{
-            {edge.source_node, edge.destination_node, false}}};
+        const std::array<aeg::render_graph::RenderStateLinkOverride, 1> override{
+            {{edge.source_node, edge.destination_node, false}}};
         const auto detached = aeg::render_graph::build_render_state_flow(plan, override);
         bool writer_reaches_present = false;
         for (std::size_t index = 0; index < state_writers.size(); ++index) {
@@ -318,41 +424,49 @@ int main() {
             break;
         }
     }
-    if (!require(removed_link.has_value(), "renderer pipeline has no detachable State Link")) return 31;
+    if (!require(removed_link.has_value(), "renderer pipeline has no detachable State Link"))
+        return 31;
     if (!require(runtime.remove_render_state_link(removed_link->source_node, removed_link->destination_node),
                  "removing compiled State Link failed") ||
         !require(runtime.request_viewport_readback(), "detached State Link readback request failed") ||
-        !require(runtime.render_frame(13), "detached State Link frame failed")) return 32;
+        !require(runtime.render_frame(13), "detached State Link frame failed"))
+        return 32;
     const auto detached_pixels = runtime.read_viewport_pixels();
-    if (!require(detached_pixels, "detached State Link readback failed")) return 33;
+    if (!require(detached_pixels, "detached State Link readback failed"))
+        return 33;
     for (std::size_t i = 0; i + 3 < detached_pixels.value.size(); i += 4) {
         if (!require(std::to_integer<int>(detached_pixels.value[i]) < 10 &&
-                     std::to_integer<int>(detached_pixels.value[i + 1]) < 10 &&
-                     std::to_integer<int>(detached_pixels.value[i + 2]) < 10,
-                     "detached State Link retained rendered geometry")) return 34;
+                         std::to_integer<int>(detached_pixels.value[i + 1]) < 10 &&
+                         std::to_integer<int>(detached_pixels.value[i + 2]) < 10,
+                     "detached State Link retained rendered geometry"))
+            return 34;
     }
     if (!require(runtime.add_render_state_link(removed_link->source_node, removed_link->destination_node),
                  "reconnecting compiled State Link failed") ||
         !require(runtime.request_viewport_readback(), "reconnected State Link readback request failed") ||
-        !require(runtime.render_frame(14), "reconnected State Link frame failed")) return 35;
+        !require(runtime.render_frame(14), "reconnected State Link frame failed"))
+        return 35;
     const auto reconnected_pixels = runtime.read_viewport_pixels();
     bool reconnected_geometry = false;
-    if (!require(reconnected_pixels, "reconnected State Link readback failed")) return 36;
+    if (!require(reconnected_pixels, "reconnected State Link readback failed"))
+        return 36;
     for (std::size_t i = 0; i + 3 < reconnected_pixels.value.size(); i += 4) {
         reconnected_geometry |= std::to_integer<int>(reconnected_pixels.value[i + 1]) > 40;
     }
-    if (!require(reconnected_geometry, "reconnected State Link did not restore rendered geometry")) return 37;
+    if (!require(reconnected_geometry, "reconnected State Link did not restore rendered geometry"))
+        return 37;
     // State-composite descriptors sample RenderGraph-owned transient textures.
     // Keep rendering beyond the frames-in-flight rotation to prove that no
     // persistent descriptor retains an expired state texture.
     for (uint64_t frame = 15; frame < 21; ++frame) {
         const auto continued_frame = runtime.render_frame(frame);
-        if (!require(continued_frame, continued_frame.message.empty()
-                                          ? "state-link continuation frame failed"
-                                          : continued_frame.message.c_str())) {
+        if (!require(continued_frame, continued_frame.message.empty() ? "state-link continuation frame failed"
+                                                                      : continued_frame.message.c_str())) {
             return 38;
         }
     }
+    if (!scale_drag_follows_visible_axis(runtime))
+        return 39;
     if (!require(preserved, "viewport interaction smoke Play/Stop polluted the edit Transform") ||
         !require(runtime.shutdown(), "viewport interaction smoke shutdown failed")) {
         return 15;

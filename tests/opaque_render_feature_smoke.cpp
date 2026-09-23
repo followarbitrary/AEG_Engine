@@ -8,15 +8,20 @@
 #include <iostream>
 #include <memory>
 #include <span>
+#include <string_view>
 
 #include "Components/component_registration.hpp"
 #include "Components/component_render_extraction.hpp"
+#include "deferred_lighting_resources.hpp"
 #include "engine_frame_orchestrator.hpp"
+#include "light_culling.hpp"
 #include "material.hpp"
 #include "opaque_render_feature.hpp"
 #include "pipeline.hpp"
+#include "post_process.hpp"
 #include "render_graph.hpp"
 #include "renderer.hpp"
+#include "renderer_variants.hpp"
 #include "resource_uploader.hpp"
 #include "rhi.hpp"
 #include "shader_contract.hpp"
@@ -264,11 +269,10 @@ public:
                     {}};
         }
 
-        const aeg::renderer::RenderObjectConstants constants{
-            view.camera.view_projection() * instance.world_transform, aeg::math::identity()};
-        const Result upload_result =
-            device_.write_buffer(object_.transform_buffer, object_.transform_offset,
-                                 std::as_bytes(std::span{&constants, 1}));
+        const aeg::renderer::RenderObjectConstants constants{view.camera.view_projection() * instance.world_transform,
+                                                             aeg::math::identity()};
+        const Result upload_result = device_.write_buffer(object_.transform_buffer, object_.transform_offset,
+                                                          std::as_bytes(std::span{&constants, 1}));
         if (!upload_result) {
             return {upload_result, {}};
         }
@@ -282,7 +286,33 @@ public:
     }
 
     mutable uint32_t mesh_resolve_count{0};
+    aeg::renderer::DeferredLightingResources* deferred_resources{};
+    aeg::renderer::LightCullingResources* culling_resources{};
+    aeg::renderer::PostProcessResources* post_resources{};
+    aeg::render_graph::FrameContext* deferred_frame{};
+    mutable aeg::renderer::RenderDeferredLightingResource last_deferred_binding{};
+    [[nodiscard]] aeg::foundation::ResultValue<aeg::renderer::RenderDeferredLightingResource> resolve_deferred_lighting(
+        const aeg::renderer::RenderView&) const override {
+        if (!deferred_resources || !deferred_frame)
+            return {aeg::foundation::not_found("Deferred test resources not configured"), {}};
+        const auto resource = deferred_resources->for_frame(*deferred_frame);
+        if (resource)
+            last_deferred_binding = resource.value;
+        return resource;
+    }
     mutable uint32_t material_resolve_count{0};
+    [[nodiscard]] aeg::foundation::ResultValue<aeg::renderer::RenderPostProcessResource> resolve_post_process(
+        const aeg::renderer::RenderView& view) const override {
+        if (!post_resources || !deferred_frame)
+            return {aeg::foundation::not_found("Postprocess test resources not configured"), {}};
+        return post_resources->for_frame(*deferred_frame, view);
+    }
+    [[nodiscard]] aeg::foundation::ResultValue<aeg::renderer::RenderLightCullingResource> resolve_light_culling(
+        const aeg::renderer::RenderSceneSnapshot& scene, const aeg::renderer::RenderShadowView& shadow) const override {
+        if (!culling_resources || !deferred_frame)
+            return {aeg::foundation::not_found("Forward test resources not configured"), {}};
+        return culling_resources->for_frame(*deferred_frame, scene, shadow);
+    }
     mutable uint32_t object_resolve_count{0};
 
 private:
@@ -296,24 +326,45 @@ private:
 };
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     static_assert(sizeof(Vertex) == sizeof(float) * 9u);
+    const bool forward = argc == 2 && std::string_view(argv[1]) == "--forward";
+    const bool backlit = argc == 2 && std::string_view(argv[1]) == "--deferred-backlit";
+    const bool deferred = backlit || (argc == 2 && std::string_view(argv[1]) == "--deferred");
+    const PipelineId pipeline_id = deferred  ? aeg::renderer::kDeferredRenderPipelineId
+                                   : forward ? aeg::renderer::kForwardRenderPipelineId
+                                             : PipelineId("RenderPipeline");
+    const aeg::pipeline::FeaturePointId draw_point(deferred  ? "Renderer.DeferredRenderPipeline.BeforePresent"
+                                                   : forward ? "Renderer.ForwardRenderPipeline.BeforePresent"
+                                                             : "RenderPipeline.Opaque");
 
     constexpr uint32_t kViewId = 3;
     const aeg::renderer::MeshAssetId mesh_id{0x1111ull};
     const aeg::renderer::MaterialInstanceId material_id{0x2222ull};
 
     PipelineRegistry registry;
-    if (!require(aeg::renderer::register_render_pipeline(registry), "RenderPipeline registration failed") ||
-        !require(aeg::renderer::register_opaque_render_feature(registry), "opaque RenderFeature registration failed") ||
-        !require(aeg::renderer::bind_opaque_render_feature(registry), "opaque RenderFeature binding failed") ||
+    aeg::pipeline::RenderPassRegistry passes;
+    if (!aeg::renderer::register_builtin_render_passes(passes))
+        return 2;
+    if (!require(deferred  ? aeg::renderer::register_deferred_render_pipeline(registry)
+                 : forward ? aeg::renderer::register_forward_render_pipeline(registry)
+                           : aeg::renderer::register_render_pipeline(registry),
+                 "RenderPipeline registration failed") ||
+        !require(deferred  ? aeg::renderer::register_deferred_render_feature(registry)
+                 : forward ? aeg::renderer::register_forward_render_feature(registry)
+                           : aeg::renderer::register_opaque_render_feature(registry),
+                 "RenderFeature registration failed") ||
+        !require(deferred  ? aeg::renderer::bind_deferred_render_feature(registry)
+                 : forward ? aeg::renderer::bind_forward_render_feature(registry)
+                           : aeg::renderer::bind_opaque_render_feature(registry),
+                 "RenderFeature binding failed") ||
         !require(registry.register_feature([] { return std::make_unique<OpaqueReadbackFeature>(); }),
                  "opaque readback RenderFeature registration failed") ||
         !require(registry.bind_feature({
                      .feature = kOpaqueReadbackFeatureId,
-                     .pipeline = PipelineId("RenderPipeline"),
+                     .pipeline = pipeline_id,
                      .scope = PipelineScope::kFrame,
-                     .point = aeg::pipeline::FeaturePointId("RenderPipeline.Opaque"),
+                     .point = draw_point,
                      .priority = 1,
                      .enabled = true,
                  }),
@@ -353,7 +404,7 @@ int main() {
     }
     aeg::pipeline::PipelineScopeHost frame_host(PipelineScope::kFrame,
                                                 PipelineInstanceId("OpaqueRenderFeatureSmokeFrame"));
-    if (!require(frame_host.bind_pipeline(PipelineId("RenderPipeline")), "opaque smoke pipeline binding failed") ||
+    if (!require(frame_host.bind_pipeline(pipeline_id), "opaque smoke pipeline binding failed") ||
         !require(frame_host.rebuild(registry), "opaque smoke frame pipeline rebuild failed")) {
         return 6;
     }
@@ -433,7 +484,7 @@ int main() {
 
     TextureDesc depth_desc = target_desc;
     depth_desc.format = Format::kD32Float;
-    depth_desc.capabilities = TextureCapability::kDepthStencil;
+    depth_desc.capabilities = TextureCapability::kDepthStencil | TextureCapability::kSampled;
     depth_desc.name = DebugName{"Renderer.OpaqueSmoke.Depth"};
     const auto depth_texture_result = device->create_texture(depth_desc);
     if (!require(depth_texture_result, "opaque smoke depth texture creation failed")) {
@@ -466,7 +517,11 @@ int main() {
         return 14;
     }
     BufferHandle vertex_buffer = vertex_buffer_result.value;
-    if (!require(device->write_buffer(vertex_buffer, 0, std::as_bytes(std::span{kTriangleVertices})),
+    auto vertices = kTriangleVertices;
+    if (backlit)
+        for (auto& vertex : vertices)
+            vertex.nz = -1.0f;
+    if (!require(device->write_buffer(vertex_buffer, 0, std::as_bytes(std::span{vertices})),
                  "opaque smoke vertex upload failed")) {
         return 15;
     }
@@ -546,6 +601,63 @@ int main() {
         return 21;
     }
     PipelineHandle graphics_pipeline = graphics_pipeline_result.value;
+    PipelineHandle gbuffer_pipeline{};
+    if (deferred) {
+        const auto program = aeg::shader::load_shader_program(AEG_GBUFFER_MESH_SHADER_PACKAGE_PATH);
+        if (!require(program, "deferred geometry shader load failed"))
+            return 34;
+        const auto layout = shader_manager.build_pipeline_layout(program.value);
+        if (!require(layout, "deferred geometry layout failed"))
+            return 35;
+        auto graphics = graphics_state;
+        const std::array<Format, 3> formats{Format::kRgba16Float, Format::kRgba16Float, Format::kRgba8Unorm};
+        graphics.color_formats = formats;
+        const auto pipeline = shader_manager.create_pipeline(
+            program.value, layout.value, {PipelineType::kGraphics, graphics, DebugName{"DeferredSmoke.GBuffer"}});
+        if (!require(pipeline, "deferred geometry pipeline failed"))
+            return 36;
+        gbuffer_pipeline = pipeline.value;
+    }
+    PipelineHandle depth_pipeline{};
+    PipelineHandle clustered_pipeline{};
+    aeg::renderer::LightCullingResources culling_resources;
+    if (forward) {
+        const auto program = aeg::shader::load_shader_program(AEG_FORWARD_CLUSTERED_SHADER_PACKAGE_PATH);
+        if (!require(program, "forward clustered shader load failed"))
+            return 43;
+        const auto layout = shader_manager.build_pipeline_layout(program.value);
+        if (!require(layout, "forward clustered layout failed"))
+            return 44;
+        const std::array hdr_colors{aeg::renderer::kSceneLightingFormat};
+        auto clustered_graphics = graphics_state;
+        clustered_graphics.color_formats = hdr_colors;
+        const auto pipeline = shader_manager.create_pipeline(
+            program.value, layout.value,
+            {PipelineType::kGraphics, clustered_graphics, DebugName{"ForwardSmoke.Clustered"}});
+        if (!require(pipeline, "forward clustered pipeline failed"))
+            return 45;
+        clustered_pipeline = pipeline.value;
+        const auto inputs = shader_manager.binding_layout(layout.value, 3);
+        if (!require(inputs, "forward clustered bindings failed") ||
+            !require(culling_resources.initialize(*device, AEG_LIGHT_CULLING_SHADER_PACKAGE_PATH, inputs.value),
+                     "forward culling initialization failed"))
+            return 46;
+        const auto depth_program = aeg::shader::load_shader_program(AEG_DEPTH_MESH_SHADER_PACKAGE_PATH);
+        if (!require(depth_program, "forward depth shader load failed"))
+            return 30;
+        const auto depth_layout = shader_manager.build_pipeline_layout(depth_program.value);
+        if (!require(depth_layout, "forward depth layout failed"))
+            return 31;
+        auto depth_graphics = graphics_state;
+        depth_graphics.color_formats = {};
+        depth_graphics.vertex_attributes = std::span<const VertexAttributeDesc>{vertex_attributes.data(), 1};
+        const auto depth_pipeline_result =
+            shader_manager.create_pipeline(depth_program.value, depth_layout.value,
+                                           {PipelineType::kGraphics, depth_graphics, DebugName{"ForwardSmoke.Depth"}});
+        if (!require(depth_pipeline_result, "forward depth pipeline failed"))
+            return 32;
+        depth_pipeline = depth_pipeline_result.value;
+    }
 
     OpaqueSmokeResolver resolver(*device, mesh_id, material_id,
                                  aeg::renderer::RenderMeshResource{
@@ -557,14 +669,15 @@ int main() {
                                      .vertex_count = static_cast<uint32_t>(kTriangleVertices.size()),
                                      .index_count = static_cast<uint32_t>(kTriangleIndices.size()),
                                      .index_format = aeg::rhi::IndexFormat::kUint16,
-                                     .vertex_layout = {
-                                         .position_offset = 0,
-                                         .position_format = Format::kRgba32Float,
-                                         .uv_offset = sizeof(float) * 4u,
-                                         .uv_format = Format::kRg32Float,
-                                         .normal_offset = sizeof(float) * 6u,
-                                         .normal_format = Format::kRgb32Float,
-                                     },
+                                     .vertex_layout =
+                                         {
+                                             .position_offset = 0,
+                                             .position_format = Format::kRgba32Float,
+                                             .uv_offset = sizeof(float) * 4u,
+                                             .uv_format = Format::kRg32Float,
+                                             .normal_offset = sizeof(float) * 6u,
+                                             .normal_format = Format::kRgb32Float,
+                                         },
                                  },
                                  aeg::renderer::RenderMaterialResource{.pipeline = graphics_pipeline},
                                  aeg::renderer::RenderObjectResource{
@@ -579,6 +692,30 @@ int main() {
 
     aeg::pipeline::PipelineScheduler scheduler({1, 1, 1, 1});
     aeg::render_graph::FrameContext frame_context(*device);
+    resolver.deferred_frame = &frame_context;
+    resolver.culling_resources = &culling_resources;
+    aeg::renderer::PostProcessResources post_resources;
+    if (forward || deferred) {
+        if (!require(post_resources.initialize(*device, AEG_POST_PROCESS_SHADER_PACKAGE_PATH, target_desc.format),
+                     "postprocess initialization failed"))
+            return 48;
+        resolver.post_resources = &post_resources;
+    }
+    aeg::renderer::DeferredLightingResources deferred_resources;
+    if (deferred) {
+        const auto initialized = deferred_resources.initialize(*device, AEG_DEFERRED_LIGHTING_SHADER_PACKAGE_PATH,
+                                                               aeg::renderer::kSceneLightingFormat);
+        if (!initialized) {
+            std::cerr << "deferred lighting initialization failed: " << initialized.message << '\n';
+            return 38;
+        }
+        resolver.deferred_resources = &deferred_resources;
+        resolver.deferred_frame = &frame_context;
+        const auto inactive = deferred_resources.for_frame(frame_context);
+        if (!require(!inactive && inactive.result.code == ResultCode::kInvalidState,
+                     "deferred resources accepted an inactive frame"))
+            return 39;
+    }
     aeg::render_graph::RenderGraph render_graph(*device);
     aeg::engine::EngineFrameOrchestrator orchestrator(registry, scheduler, frame_context, render_graph);
     if (!require(orchestrator.register_world_frame(world_scope, frame_host, kViewId),
@@ -593,6 +730,7 @@ int main() {
     frame_desc.render_output_extent = {kTargetWidth, kTargetHeight};
     frame_desc.renderer = &renderer;
     frame_desc.render_resource_resolver = &resolver;
+    frame_desc.render_passes = &passes;
     frame_desc.require_resolved_render_resources = true;
     frame_desc.user_data = &smoke_state;
     frame_desc.render_view_resolver = [&smoke_state](const aeg::engine::EngineFrameRenderViewContext& context)
@@ -611,7 +749,8 @@ int main() {
     frame_desc.render_feature_preparation = [&smoke_state, &resolver, device_ptr = device.get(),
                                              material_binding_layout, lighting_binding_layout, graphics_pipeline,
                                              target_texture, target_view, target_desc, depth_texture, depth_view,
-                                             depth_desc](const aeg::engine::EngineFramePreparationContext& context) {
+                                             depth_desc, depth_pipeline, gbuffer_pipeline, clustered_pipeline,
+                                             deferred](const aeg::engine::EngineFramePreparationContext& context) {
         const Result invalid_binding = context.bind_feature_texture(kOpaqueSceneColor, {});
         if (invalid_binding || invalid_binding.code != ResultCode::kInvalidArgument) {
             return aeg::foundation::invalid_state("opaque smoke accepted an invalid feature texture binding");
@@ -743,6 +882,9 @@ int main() {
         }
         aeg::renderer::RenderMaterialResource material_resource{};
         material_resource.pipeline = graphics_pipeline;
+        material_resource.depth_pipeline = depth_pipeline;
+        material_resource.gbuffer_pipeline = gbuffer_pipeline;
+        material_resource.clustered_pipeline = clustered_pipeline;
         material_resource.binding_set = smoke_state.material.binding_set;
         material_resource.binding_group = smoke_state.material.binding_group;
         material_resource.material_texture = {replacement_upload.value.target.index,
@@ -755,9 +897,10 @@ int main() {
         resolver.set_material(material_resource);
 
         const aeg::renderer::RenderLightingConstants lighting_constants{
-            .directional_direction_intensity = {0.0f, 0.0f, -1.0f, 0.0f},
-            .directional_color = {0.0f, 0.0f, 0.0f, 1.0f},
-            .ambient_color = {1.0f, 1.0f, 1.0f, 1.0f},
+            .directional_direction_intensity = {0.0f, 0.0f, -1.0f, deferred ? 0.5f : 0.0f},
+            .directional_color = {1.0f, 0.5f, 0.0f, 1.0f},
+            .ambient_color =
+                deferred ? aeg::math::Vec4{0.1f, 0.1f, 0.1f, 1.0f} : aeg::math::Vec4{1.0f, 1.0f, 1.0f, 1.0f},
         };
         BufferDesc lighting_desc{};
         lighting_desc.size = sizeof(lighting_constants);
@@ -773,19 +916,17 @@ int main() {
         if (!lighting_upload) {
             return lighting_upload.result;
         }
-        const auto lighting_set_result = device_ptr->create_binding_set(
-            BindingSetDesc{lighting_binding_layout, BindingSetLifetime::kPersistent,
-                           DebugName{"Renderer.OpaqueSmoke.LightingSet"}});
+        const auto lighting_set_result = device_ptr->create_binding_set(BindingSetDesc{
+            lighting_binding_layout, BindingSetLifetime::kPersistent, DebugName{"Renderer.OpaqueSmoke.LightingSet"}});
         if (!lighting_set_result) {
             return lighting_set_result.result;
         }
         BindingResource lighting_resource{};
         lighting_resource.type = BindingType::kUniformBuffer;
-        lighting_resource.buffer_range =
-            BufferRange{lighting_upload.value.destination, 0, sizeof(lighting_constants)};
+        lighting_resource.buffer_range = BufferRange{lighting_upload.value.destination, 0, sizeof(lighting_constants)};
         const BindingWrite lighting_write{{2, 0}, 0, lighting_resource};
-        if (const Result result = device_ptr->update_binding_set(
-                lighting_set_result.value, std::span{&lighting_write, 1});
+        if (const Result result =
+                device_ptr->update_binding_set(lighting_set_result.value, std::span{&lighting_write, 1});
             !result) {
             (void)device_ptr->destroy_binding_set(lighting_set_result.value);
             return result;
@@ -798,7 +939,7 @@ int main() {
             .lighting_buffer = lighting_upload.value.destination,
             .lighting_buffer_desc = lighting_desc,
             .lighting_resource = {lighting_upload.value.target.index, lighting_upload.value.target.generation,
-                                   lighting_upload.value.target.graph_id},
+                                  lighting_upload.value.target.graph_id},
             .lighting_offset = 0,
             .lighting_size = sizeof(lighting_constants),
         });
@@ -832,7 +973,7 @@ int main() {
                      smoke_state.readback_feature_build_count == 1,
                  "opaque smoke frame preparation or readback feature contract failed") ||
         !require(resolver.mesh_resolve_count >= 2 && resolver.material_resolve_count >= 2 &&
-                     resolver.object_resolve_count == 1,
+                     resolver.object_resolve_count == (forward ? 2u : 1u),
                  "opaque smoke resource resolver did not serve extraction and graphics build")) {
         return 24;
     }
@@ -849,16 +990,31 @@ int main() {
     const unsigned center_red = std::to_integer<unsigned char>(pixels[center_pixel + 0]);
     const unsigned center_green = std::to_integer<unsigned char>(pixels[center_pixel + 1]);
     const unsigned center_blue = std::to_integer<unsigned char>(pixels[center_pixel + 2]);
-    if (!require(center_red >= 80u && center_red <= 115u && center_green >= 25u && center_green <= 50u &&
-                     center_blue >= 10u && center_blue <= 35u,
+    if (!require(backlit    ? (center_red >= 8u && center_red <= 12u && center_green >= 2u && center_green <= 5u &&
+                               center_blue >= 1u && center_blue <= 4u)
+                 : deferred ? (center_red >= 48u && center_red <= 69u && center_green >= 9u && center_green <= 18u &&
+                               center_blue >= 1u && center_blue <= 4u)
+                            : (center_red >= 80u && center_red <= 115u && center_green >= 25u && center_green <= 50u &&
+                               center_blue >= 10u && center_blue <= 35u),
                  "opaque smoke center pixel does not contain the updated material output")) {
         return 27;
+    }
+    if (deferred) {
+        if (!require(pixels[0] == std::byte{0} && pixels[1] == std::byte{0} && pixels[2] == std::byte{0} &&
+                         pixels[3] == std::byte{0},
+                     "deferred lighting must leave background transparent"))
+            return 40;
+        const auto stale = resolver.last_deferred_binding.prepare_inputs({});
+        if (!require(!stale && stale.result.code == ResultCode::kInvalidState,
+                     "deferred bindings accepted execution outside their frame"))
+            return 41;
     }
 
     aeg::engine::EngineFrameDesc missing_resolver_desc = frame_desc;
     missing_resolver_desc.require_resolved_render_resources = false;
     missing_resolver_desc.render_resource_resolver = nullptr;
-    missing_resolver_desc.render_feature_preparation = [target_texture, target_view, target_desc](
+    missing_resolver_desc.render_feature_preparation = [target_texture, target_view, target_desc, depth_texture,
+                                                        depth_view, depth_desc](
                                                            const aeg::engine::EngineFramePreparationContext& context) {
         const auto target_resource =
             context.render_graph.import_texture(target_texture, target_view, target_desc,
@@ -867,7 +1023,12 @@ int main() {
         if (!target_resource) {
             return target_resource.result;
         }
-        return context.bind_feature_texture(kOpaqueSceneColor, target_resource.value);
+        if (const auto r = context.bind_feature_texture(kOpaqueSceneColor, target_resource.value); !r)
+            return r;
+        const auto depth_resource = context.render_graph.import_texture(depth_texture, depth_view, depth_desc);
+        if (!depth_resource)
+            return depth_resource.result;
+        return context.bind_feature_texture(RenderResourceId{"OpaqueSceneDepth"}, depth_resource.value);
     };
     const Result missing_resolver_result = orchestrator.run_frame(missing_resolver_desc);
     if (!require(!missing_resolver_result && missing_resolver_result.code == ResultCode::kInvalidState,
@@ -875,6 +1036,17 @@ int main() {
         return 28;
     }
 
+    // Retire descriptors from both compute and graphics before releasing resources.
+    if (!require(frame_context.drain(), "frame retirement failed"))
+        return 42;
+    if (clustered_pipeline.is_valid() &&
+        !require(device->destroy_pipeline(clustered_pipeline), "forward clustered cleanup failed"))
+        return 47;
+    if (depth_pipeline.is_valid() && !require(device->destroy_pipeline(depth_pipeline), "forward depth cleanup failed"))
+        return 33;
+    if (gbuffer_pipeline.is_valid() &&
+        !require(device->destroy_pipeline(gbuffer_pipeline), "deferred geometry cleanup failed"))
+        return 37;
     if (!require(orchestrator.shutdown(), "opaque smoke orchestrator shutdown failed") ||
         !require(orchestrator.unregister_world_frame(world_scope.handle(), kViewId),
                  "opaque smoke World frame unregistration failed") ||

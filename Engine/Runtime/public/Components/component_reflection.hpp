@@ -21,6 +21,9 @@ namespace aeg::engine::components {
 
 /** @brief Returns the stable reflection descriptor for the Directional Light component. */
 [[nodiscard]] foundation::ResultValue<reflection::TypeDescriptor> directional_light_reflection_descriptor();
+[[nodiscard]] foundation::ResultValue<reflection::TypeDescriptor> point_light_reflection_descriptor();
+[[nodiscard]] foundation::ResultValue<reflection::TypeDescriptor> spot_light_reflection_descriptor();
+[[nodiscard]] foundation::ResultValue<reflection::TypeDescriptor> scene_environment_reflection_descriptor();
 
 /** @brief Registers compatible Runtime component schemas in the supplied registry. */
 [[nodiscard]] foundation::Result register_render_component_reflection(reflection::TypeRegistry& registry);

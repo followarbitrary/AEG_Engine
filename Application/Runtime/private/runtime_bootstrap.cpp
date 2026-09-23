@@ -13,6 +13,7 @@
 #include "pipeline_asset.hpp"
 #include "pipeline_authoring.hpp"
 #include "render_pass.hpp"
+#include "renderer_variants.hpp"
 #include "scene_payload.hpp"
 
 namespace aeg::application::runtime {
@@ -117,7 +118,6 @@ foundation::Result RuntimeBootstrap::initialize(const RuntimeBootRequest& reques
     // Keep a host-owned copy for package validation and preparation.  The
     // definition itself is moved into ModuleRegistry below, so runtime
     // startup never needs to retain a pointer into the caller's object.
-    const pipeline::TypeCatalog catalog = definition.catalog;
     std::filesystem::path manifest = effective.manifest_path;
     if (manifest.empty())
         manifest = std::filesystem::current_path() / "game.manifest";
@@ -202,6 +202,31 @@ foundation::Result RuntimeBootstrap::initialize(const RuntimeBootRequest& reques
     impl_->passes = std::make_unique<pipeline::RenderPassRegistry>();
     impl_->modules =
         std::make_unique<module::ModuleRegistry>(*impl_->pipelines, impl_->reflection.get(), impl_->passes.get());
+    if (const foundation::Result builtins = renderer::register_builtin_rendering(*impl_->pipelines, *impl_->passes);
+        !builtins) {
+        impl_->modules.reset();
+        impl_->passes.reset();
+        impl_->reflection.reset();
+        impl_->pipelines.reset();
+        return builtins;
+    }
+    if (const foundation::Result builtins_catalog = renderer::register_renderer_authoring_types(impl_->catalog);
+        !builtins_catalog) {
+        impl_->modules.reset();
+        impl_->passes.reset();
+        impl_->reflection.reset();
+        impl_->pipelines.reset();
+        return builtins_catalog;
+    }
+    for (const pipeline::TypeCatalogEntry& entry : definition.catalog.entries()) {
+        if (const foundation::Result added = impl_->catalog.add(entry); !added) {
+            impl_->modules.reset();
+            impl_->passes.reset();
+            impl_->reflection.reset();
+            impl_->pipelines.reset();
+            return added;
+        }
+    }
     if (const auto result = module::register_static_module(*impl_->modules, std::move(definition)); !result) {
         impl_->modules.reset();
         impl_->passes.reset();
@@ -209,7 +234,6 @@ foundation::Result RuntimeBootstrap::initialize(const RuntimeBootRequest& reques
         impl_->pipelines.reset();
         return result;
     }
-    impl_->catalog = catalog;
     if (std::filesystem::exists(binary_path)) {
         const auto binary = read_binary_manifest(binary_path);
         if (!binary)
