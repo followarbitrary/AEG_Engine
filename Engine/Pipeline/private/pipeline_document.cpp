@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cmath>
 #include <map>
+#include <set>
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
@@ -241,8 +242,31 @@ std::vector<DocumentDiagnostic> validate_pipeline_document(const PipelineDocumen
             if (!allowed_pass(*feature_declaration, node.type)) {
                 diagnostic(result, "pass.unauthorized", "RenderPass type is not allowed by the Feature", node.node_id);
             }
-            if (!node.part_id.empty() && !has_part(*feature_declaration, node.part_id)) {
+            if (!feature_declaration->allow_add_passes) {
+                const bool is_declared_default = std::any_of(
+                    feature_declaration->default_passes.begin(), feature_declaration->default_passes.end(),
+                    [&](const DefaultPassNode& pass) {
+                        return node.node_id == pass.node_id || node.node_id == node.feature_node + "/" + pass.node_id;
+                    });
+                if (!is_declared_default) {
+                    diagnostic(result, "pass.additional", "Feature does not allow additional RenderPass nodes",
+                               node.node_id);
+                }
+            }
+            if (feature_declaration->parts.empty()) {
+                if (!node.part_id.empty()) {
+                    diagnostic(result, "part.missing", "RenderPass part is not declared by the Feature", node.node_id);
+                }
+            } else if (node.part_id.empty()) {
+                diagnostic(result, "part.missing", "RenderPass requires a declared render part", node.node_id);
+            } else if (!has_part(*feature_declaration, node.part_id)) {
                 diagnostic(result, "part.missing", "RenderPass part is not declared by the Feature", node.node_id);
+            } else {
+                const auto part = std::find_if(feature_declaration->parts.begin(), feature_declaration->parts.end(),
+                                               [&](const AuthoringPart& value) { return value.name == node.part_id; });
+                if (part->domain != FeatureDomain::kRender) {
+                    diagnostic(result, "part.domain", "RenderPass part must belong to the render domain", node.node_id);
+                }
             }
         }
     }
@@ -287,6 +311,20 @@ std::vector<DocumentDiagnostic> validate_pipeline_document(const PipelineDocumen
             if (edge.binding_id != 0 || edge.source.port_id != 0 || edge.destination.port_id != 0 ||
                 edge.source.node_id == edge.destination.node_id) {
                 diagnostic(result, "edge.ordering", "ordering edges cannot carry ports or bindings", {}, edge.edge_id);
+            }
+            const auto source_pass = passes.find(edge.source.node_id);
+            const auto destination_pass = passes.find(edge.destination.node_id);
+            if (source_pass == passes.end() || destination_pass == passes.end()) {
+                diagnostic(result, "edge.ordering.type", "ordering edges must connect two RenderPass nodes", {},
+                           edge.edge_id);
+            } else {
+                if (source_pass->second->feature_node != destination_pass->second->feature_node) {
+                    diagnostic(result, "edge.ordering.feature", "Pass ordering edges must stay within one Feature", {},
+                               edge.edge_id);
+                } else if (source_pass->second->part_id != destination_pass->second->part_id) {
+                    diagnostic(result, "edge.ordering.part", "Pass ordering edges must stay within one Render Part", {},
+                               edge.edge_id);
+                }
             }
             continue;
         }
@@ -516,44 +554,248 @@ foundation::ResultValue<PreparedPipelineDocument> prepare_pipeline_document(cons
     }
     PreparedPipelineDocument prepared;
     prepared.semantic_digest = document_semantic_digest(document);
+    std::unordered_map<std::string, const ResourceNodeDocument*> resource_nodes;
+    resource_nodes.reserve(document.resources.size());
+    for (const ResourceNodeDocument& resource : document.resources) {
+        resource_nodes.emplace(resource.node_id, &resource);
+    }
+    const auto choose_queue = [&](const RenderPassDescriptor& descriptor,
+                                  rhi::QueueClass& queue) -> foundation::Result {
+        const auto supports = [&](rhi::QueueClass candidate) {
+            return (descriptor.allowed_queue_mask & (uint64_t{1} << static_cast<uint8_t>(candidate))) != 0;
+        };
+        if (supports(queue)) {
+            return foundation::Result::success();
+        }
+        for (const rhi::QueueClass candidate :
+             {rhi::QueueClass::kGraphics, rhi::QueueClass::kCompute, rhi::QueueClass::kCopy}) {
+            if (supports(candidate)) {
+                queue = candidate;
+                return foundation::Result::success();
+            }
+        }
+        return foundation::unsupported("render pass has no supported default queue");
+    };
+
+    const auto resolve_part = [](const FeatureAuthoringDeclaration& declaration, FeatureInstanceId instance,
+                                 std::string_view name, FeaturePartId& resolved) -> foundation::Result {
+        if (name.empty()) {
+            resolved = {};
+            return foundation::Result::success();
+        }
+        for (const AuthoringPart& part : declaration.parts) {
+            if (part.name == name) {
+                resolved = make_feature_part_id(instance, part.part_index);
+                return foundation::Result::success();
+            }
+        }
+        return foundation::invalid_argument("render pass references an unknown feature part");
+    };
+
+    const auto sort_passes = [](std::vector<RenderPassInstanceConfiguration>& passes,
+                                std::span<const DocumentEdge> edges) -> foundation::Result {
+        if (passes.size() < 2) {
+            return foundation::Result::success();
+        }
+        std::unordered_map<std::string, uint32_t> indices;
+        indices.reserve(passes.size());
+        for (uint32_t index = 0; index < passes.size(); ++index) {
+            indices.emplace(passes[index].source, index);
+        }
+        std::vector<std::vector<uint32_t>> outgoing(passes.size());
+        std::vector<uint32_t> incoming(passes.size(), 0);
+        for (const DocumentEdge& edge : edges) {
+            if (edge.kind != DocumentEdgeKind::kOrdering) {
+                continue;
+            }
+            const auto source = indices.find(edge.source.node_id);
+            const auto destination = indices.find(edge.destination.node_id);
+            if (source == indices.end() || destination == indices.end()) {
+                continue;
+            }
+            outgoing[source->second].push_back(destination->second);
+            ++incoming[destination->second];
+            passes[destination->second].ordered_after.push_back(passes[source->second].instance);
+        }
+        std::vector<uint32_t> ready;
+        for (uint32_t index = 0; index < incoming.size(); ++index) {
+            if (incoming[index] == 0) {
+                ready.push_back(index);
+            }
+        }
+        std::vector<RenderPassInstanceConfiguration> ordered;
+        ordered.reserve(passes.size());
+        while (!ready.empty()) {
+            const auto minimum = std::min_element(ready.begin(), ready.end());
+            const uint32_t current = *minimum;
+            ready.erase(minimum);
+            ordered.push_back(std::move(passes[current]));
+            for (const uint32_t next : outgoing[current]) {
+                if (--incoming[next] == 0) {
+                    ready.push_back(next);
+                }
+            }
+        }
+        if (ordered.size() != passes.size()) {
+            return foundation::invalid_argument("authored render pass ordering contains a cycle");
+        }
+        passes = std::move(ordered);
+        return foundation::Result::success();
+    };
+
     for (const auto& node : document.pipeline_nodes) {
         auto configuration = std::make_shared<PipelineInstanceConfiguration>();
         configuration->instance = PipelineInstanceId(node.node_id);
         configuration->pipeline = node.type;
         configuration->scope = node.scope;
         configuration->source = node.node_id;
+
+        const auto* pipeline_entry = catalog.find({AuthoringTypeKind::kPipeline, node.type.value()});
+        const auto* pipeline_declaration =
+            pipeline_entry == nullptr ? nullptr
+                                      : std::get_if<PipelineAuthoringDeclaration>(&pipeline_entry->declaration);
+        if (pipeline_declaration == nullptr) {
+            return {foundation::invalid_argument("pipeline declaration is unavailable"), {}};
+        }
+
+        struct FeatureSource final {
+            std::string node_id{};
+            FeatureId type{};
+            FeaturePointId point{};
+            ParameterBlock parameters{};
+            bool explicit_node{false};
+        };
+        std::vector<FeatureSource> feature_sources;
+        std::set<std::pair<FeatureId, FeaturePointId>> explicit_default_keys;
         for (const auto& feature : document.feature_nodes) {
-            if (feature.pipeline_node != node.node_id || !feature.enabled) {
+            if (feature.pipeline_node != node.node_id) {
                 continue;
             }
+            explicit_default_keys.emplace(feature.type, feature.point);
+            if (!feature.enabled) {
+                continue;
+            }
+            feature_sources.push_back({feature.node_id, feature.type, feature.point, feature.parameters, true});
+        }
+        for (const DefaultFeatureNode& feature : pipeline_declaration->default_features) {
+            if (explicit_default_keys.contains({feature.type, feature.point})) {
+                continue;
+            }
+            feature_sources.push_back({feature.node_id, feature.type, feature.point, feature.parameters, false});
+        }
+
+        for (const FeatureSource& feature : feature_sources) {
+            const auto* feature_entry = catalog.find({AuthoringTypeKind::kFeature, feature.type.value()});
+            const auto* feature_declaration =
+                feature_entry == nullptr ? nullptr
+                                         : std::get_if<FeatureAuthoringDeclaration>(&feature_entry->declaration);
+            if (feature_declaration == nullptr) {
+                return {foundation::invalid_argument("feature declaration is unavailable"), {}};
+            }
             FeatureInstanceConfiguration feature_configuration;
-            feature_configuration.instance = FeatureInstanceId(feature.node_id);
+            feature_configuration.instance =
+                feature.explicit_node ? FeatureInstanceId(feature.node_id)
+                                      : make_feature_instance_id(feature.type, node.type, node.scope, feature.point);
             feature_configuration.feature = feature.type;
             feature_configuration.point = feature.point;
             feature_configuration.parameters = feature.parameters;
+            feature_configuration.expand_authored_passes = feature_declaration->allow_add_passes;
             feature_configuration.source = feature.node_id;
+
+            std::vector<DocumentEdge> ordering_edges;
+            const auto append_pass = [&](std::string node_id, RenderPassTypeId type, ParameterBlock parameters,
+                                         bool enabled, std::string part, std::span<const DocumentEdge> edges,
+                                         const std::unordered_map<std::string, uint64_t>& default_resources) {
+                RenderPassInstanceConfiguration pass_configuration;
+                pass_configuration.type = type;
+                const auto registered = pass_registry.find_pass(type);
+                if (!registered) {
+                    return foundation::ResultValue<bool>{registered.result, false};
+                }
+                if (const foundation::Result queue_result =
+                        choose_queue(registered.value->descriptor(), pass_configuration.queue);
+                    !queue_result) {
+                    return foundation::ResultValue<bool>{queue_result, false};
+                }
+                pass_configuration.instance = RenderPassInstanceId(node_id);
+                pass_configuration.parameters = std::move(parameters);
+                pass_configuration.enabled = enabled;
+                pass_configuration.part = std::move(part);
+                pass_configuration.source = pass_configuration.instance.is_valid() ? node_id : std::string{};
+                if (const foundation::Result part_result =
+                        resolve_part(*feature_declaration, feature_configuration.instance, pass_configuration.part,
+                                     pass_configuration.resolved_part);
+                    !part_result) {
+                    return foundation::ResultValue<bool>{part_result, false};
+                }
+                for (const DocumentEdge& edge : edges) {
+                    if (edge.kind != DocumentEdgeKind::kRenderResource) {
+                        continue;
+                    }
+                    const DocumentEndpoint* other_endpoint = nullptr;
+                    if (edge.source.node_id == node_id) {
+                        other_endpoint = &edge.destination;
+                    } else if (edge.destination.node_id == node_id) {
+                        other_endpoint = &edge.source;
+                    }
+                    if (other_endpoint == nullptr) {
+                        continue;
+                    }
+                    uint64_t resource_id = 0;
+                    if (const auto resource = resource_nodes.find(other_endpoint->node_id);
+                        resource != resource_nodes.end()) {
+                        resource_id = resource->second->resource_id.value();
+                    } else if (const auto resource = default_resources.find(other_endpoint->node_id);
+                               resource != default_resources.end()) {
+                        resource_id = resource->second;
+                    }
+                    if (resource_id == 0) {
+                        continue;
+                    }
+                    const auto [binding, inserted] =
+                        pass_configuration.resource_bindings.emplace(edge.binding_id, resource_id);
+                    if (!inserted && binding->second != resource_id) {
+                        return foundation::ResultValue<bool>{
+                            foundation::invalid_argument("render pass resource binding is ambiguous: " + node_id),
+                            false};
+                    }
+                }
+                feature_configuration.passes.push_back(std::move(pass_configuration));
+                return foundation::ResultValue<bool>{foundation::Result::success(), true};
+            };
+
+            std::unordered_map<std::string, uint64_t> default_resources;
+            for (const DefaultResourceNode& resource : feature_declaration->default_resources) {
+                default_resources.emplace(resource.node_id, resource.resource_id.value());
+            }
+            bool has_explicit_passes = false;
             for (const auto& pass : document.pass_nodes) {
                 if (pass.feature_node != feature.node_id) {
                     continue;
                 }
-                RenderPassInstanceConfiguration pass_configuration;
-                pass_configuration.type = pass.type;
-                const auto registered = pass_registry.find_pass(pass.type);
-                if (!registered)
-                    return {registered.result, {}};
-                const auto queue_mask = registered.value->descriptor().allowed_queue_mask;
-                if (!(queue_mask & (uint64_t{1} << static_cast<uint8_t>(pass_configuration.queue)))) {
-                    if (queue_mask & (uint64_t{1} << static_cast<uint8_t>(rhi::QueueClass::kCompute)))
-                        pass_configuration.queue = rhi::QueueClass::kCompute;
-                    else
-                        return {foundation::unsupported("render pass has no supported default queue"), {}};
+                has_explicit_passes = true;
+                if (const auto result = append_pass(pass.node_id, pass.type, pass.parameters, pass.enabled,
+                                                    pass.part_id, document.edges, default_resources);
+                    !result) {
+                    return {result.result, {}};
                 }
-                pass_configuration.instance = RenderPassInstanceId(pass.node_id);
-                pass_configuration.parameters = pass.parameters;
-                pass_configuration.enabled = pass.enabled;
-                pass_configuration.part = pass.part_id;
-                pass_configuration.source = pass.node_id;
-                feature_configuration.passes.push_back(std::move(pass_configuration));
+            }
+            if (has_explicit_passes) {
+                ordering_edges.assign(document.edges.begin(), document.edges.end());
+            } else {
+                ordering_edges = feature_declaration->default_edges;
+                for (const DefaultPassNode& pass : feature_declaration->default_passes) {
+                    if (const auto result =
+                            append_pass(pass.node_id, pass.type, pass.parameters, pass.enabled, pass.part_id,
+                                        feature_declaration->default_edges, default_resources);
+                        !result) {
+                        return {result.result, {}};
+                    }
+                }
+            }
+            if (const foundation::Result order_result = sort_passes(feature_configuration.passes, ordering_edges);
+                !order_result) {
+                return {order_result, {}};
             }
             configuration->features.push_back(std::move(feature_configuration));
         }

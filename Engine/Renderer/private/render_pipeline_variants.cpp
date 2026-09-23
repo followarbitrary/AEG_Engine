@@ -1,4 +1,6 @@
 /** @file render_pipeline_variants.cpp @brief Built-in frame renderer definitions. */
+#include <algorithm>
+
 #include "opaque_render_feature.hpp"
 #include "pipeline_configuration.hpp"
 #include "render_pipeline_contract.hpp"
@@ -124,8 +126,11 @@ protected:
                 const auto index = pass_indices(variant_)[i];
                 const auto& pass = authored->passes[i];
                 const auto queue = index == 5 ? rhi::QueueClass::kCompute : rhi::QueueClass::kGraphics;
+                const bool rebound_resource =
+                    std::any_of(pass.resource_bindings.begin(), pass.resource_bindings.end(),
+                                [](const auto& binding) { return binding.first != binding.second; });
                 if (pass.type != pipeline::RenderPassTypeId(kPassNames[index]) || !pass.enabled ||
-                    pass.queue != queue || !pass.parameters.empty() || !pass.resource_bindings.empty())
+                    pass.queue != queue || !pass.parameters.empty() || rebound_resource)
                     return foundation::unsupported(
                         "built-in renderer pass topology, parameters or resource rebinding is unsupported");
             }

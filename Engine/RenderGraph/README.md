@@ -28,3 +28,11 @@ RenderGraph 只管理 Render Domain 的图，不承担通用业务 Pipeline 的�
 `RenderPassTypeId` 创建。Pass 的 setup/execute 回调只能使用 `RenderPassBuilder`、
 `RenderPassExecutionContext` 和当前 `RenderPassConfiguration`；资源状态、依赖和同步由
 RenderGraph 统一管理。Pass 不得保存 Device、原生命令缓冲或跨帧 Graph Handle。
+
+# RenderGraph 与 RenderFeature
+
+RenderGraph runtime 在 Feature transaction 内调用 RenderFeature 的图构建入口。`FeatureInstanceConfiguration::expand_authored_passes`
+由 Feature authoring declaration 的 `allow_add_passes` 生成；启用后，runtime 从当前配置读取 Pass 类型、实例、队列、参数和稳定资源绑定，使用当前 PassRegistry 展开 setup/execute。旧的
+`uses_authored_render_passes*()` 虚函数继续支持没有文档配置的代码路径。任何注册、队列或图类型错误都会回滚当前 Feature 的构图。
+
+RenderPass 不能独立进入 Pipeline FeaturePoint。Feature 或 Render Part 持有 Pass，Pass 只通过 `RenderPassBuilder` 和 `RenderPassExecutionContext` 访问当前 Graph。

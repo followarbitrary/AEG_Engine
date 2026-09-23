@@ -128,19 +128,21 @@ constexpr pipeline::Version kVersion{1, 0, 0};
     const std::string present_stage = detail::stage_name(variant, "BeforePresent");
     append_stage(pipeline::StageId(present_stage), present_stage.c_str(), pipeline::PhaseId("Present"),
                  pipeline::ExecutionDomain::kRenderThread);
-    declaration.feature_points.push_back(
-        {.id = pipeline::FeaturePointId(present_stage),
-         .name = present_stage,
-         .anchor_stage = pipeline::StageId(present_stage),
-         .position = pipeline::FeaturePointPosition::kBefore,
-         .domains = pipeline::to_mask(pipeline::FeatureDomain::kRender),
-         .scopes = pipeline::to_mask(pipeline::PipelineScope::kFrame),
-         .flags = pipeline::FeaturePointFlags::kMayCreateArtifacts |
-                  pipeline::FeaturePointFlags::kMayCreateGraphicsPass |
-                  pipeline::FeaturePointFlags::kMayWriteFinalOutput |
-                  (deferred ? pipeline::FeaturePointFlags::kNone
-                            : pipeline::FeaturePointFlags::kMayCreateComputePass |
-                                  pipeline::FeaturePointFlags::kMayUseDedicatedQueue)});
+    const auto add_point = [&](const char* suffix) {
+        const std::string name = detail::stage_name(variant, suffix);
+        declaration.feature_points.push_back({.id = pipeline::FeaturePointId(name),
+                                              .name = name,
+                                              .anchor_stage = pipeline::StageId(name),
+                                              .position = pipeline::FeaturePointPosition::kBefore,
+                                              .domains = detail::kDomain,
+                                              .scopes = detail::kScope,
+                                              .flags = detail::point_flags(variant, suffix)});
+    };
+    add_point("RenderExtract");
+    for (const size_t index : detail::pass_indices(variant)) {
+        add_point(detail::kPassNodes[index]);
+    }
+    add_point("BeforePresent");
     declaration.default_features.push_back({
         .node_id = deferred ? "DeferredFeature" : "ForwardFeature",
         .type = deferred ? kDeferredRenderFeatureId : kForwardRenderFeatureId,

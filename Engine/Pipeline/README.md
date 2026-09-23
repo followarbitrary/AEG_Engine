@@ -38,8 +38,9 @@ Vulkan/D3D12 类型。`PipelineScheduler` 通过 Concurrency 的 `ExecutorRegist
 稳定 ID、参数、连接和布局，不保存函数地址、编译索引或 GPU Handle。
 
 `RenderPassRegistry` 负责把自定义 Pass 适配到现有 `RenderGraphBuilder`；Pass 回调只能通过
-`RenderPassBuilder` 与 `RenderPassExecutionContext` 访问图资源。CompositeFeature 的组合规则
-当前仅作为文档和注册审查约定，不由额外的代码 trait 强制执行。
+`RenderPassBuilder` 与 `RenderPassExecutionContext` 访问图资源，并按稳定 `RenderResourceId`
+解析当前图中的句柄。CompositeFeature 会按 render Part 过滤和展开 authored Pass；ordering edge
+通过显式 Graph 依赖保留。
 
 Render Pass 需要 Shader 或其他 GPU 程序时，声明阶段使用
 `RenderPassBuilder::declare_render_program()`，执行阶段使用
@@ -55,3 +56,20 @@ Render Pass 需要 Shader 或其他 GPU 程序时，声明阶段使用
 在 Pass 的 `.cpp` 中使用 `REGISTER_RENDER_PASS(MyPass)` 完成静态注册。宏参数应为当前
 命名空间中的类型名；注册发生在 `main()` 前，运行时通过 `global_render_pass_registry()`
 按稳定 `RenderPassTypeId` 查找。
+
+# Pipeline、Feature 与 RenderPass
+
+Pipeline 定义执行骨架：Stage、Artifact、FeaturePoint 和固定依赖交给 Compiler/Scheduler 形成 Plan。Feature 是绑定到 FeaturePoint 的领域能力；RenderFeature 可以拥有多个 RenderPass，Pass 只负责当前 Graph 中的一步资源声明和受限命令录制。
+
+作者文档保存 Pipeline、Feature、Pass、资源节点和稳定连接。准备阶段把 Pass 收入
+`FeatureInstanceConfiguration::passes`，资源边只保存稳定 `RenderResourceId`，ordering edge 会转为
+Pass 间的显式 Graph 依赖。声明中的默认 Feature/Pass 也会在准备阶段物化；Graph handle 和 RHI
+handle 不会写回文档。
+
+`FeatureAuthoringDeclaration::allow_add_passes` 是作者 Pass 的唯一声明开关。准备阶段会把它复制到
+`FeatureInstanceConfiguration::expand_authored_passes`，RenderGraph 据此展开配置中的 Pass；旧的
+`uses_authored_render_passes*()` 虚函数仍用于兼容没有文档配置的代码路径。Feature Part 的
+`part_index` 必须等于声明数组中的位置，保证作者 Pass、CompositeFeature 和运行时 Part 使用同一身份。
+文档中的 ordering edge 只能连接两个 RenderPass 节点，并且必须属于同一个 Feature 和 Render Part。
+
+一个 Feature 可以拥有零个、一个或多个 Pass。Pass 不单独绑定 FeaturePoint，也不创建自己的调度器；跨领域能力使用 `CompositeFeature` 组合领域 Part。

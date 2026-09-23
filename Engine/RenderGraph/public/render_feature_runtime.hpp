@@ -22,13 +22,15 @@ struct RenderStateCompositeInput final {
 /**
  * @brief Invoked to combine multiple terminal state textures into the Present target.
  *
- * The callback owns the visual blend semantics and must declare every resource
- * access through the supplied builder. It is called only while the feature-build
+ * The callback owns the
+ * visual blend semantics and must declare every resource
+ * access through the supplied builder. It is called only
+ * while the feature-build
  * transaction is active.
  */
-using RenderStateCompositeFunction = std::function<foundation::Result(
-    pipeline::RenderGraphBuilder& builder, std::span<const RenderStateCompositeInput> inputs,
-    pipeline::RenderGraphTexture destination)>;
+using RenderStateCompositeFunction = std::function<foundation::Result(pipeline::RenderGraphBuilder& builder,
+                                                                      std::span<const RenderStateCompositeInput> inputs,
+                                                                      pipeline::RenderGraphTexture destination)>;
 
 /** @brief Associates a public resource id with an existing graph buffer. */
 struct RenderGraphFeatureBufferBinding {
@@ -72,6 +74,10 @@ struct RenderGraphFeatureRuntimeDesc {
     void* user_data{nullptr};
     const void* feature_data{nullptr};
     RenderGraphFeatureStateDesc state{};
+    /** Borrowed pipeline configuration retained by the active frame host. */
+    std::shared_ptr<const pipeline::PipelineInstanceConfiguration> configuration{};
+    /** Borrowed pass registry used by authored RenderFeatures. */
+    const pipeline::RenderPassRegistry* render_passes{nullptr};
 };
 
 /**

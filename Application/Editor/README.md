@@ -56,7 +56,8 @@ GPU 句柄或裸指针。
 不会扫描或编译游戏源码来猜测节点类型。图编辑器始终使用稳定 TypeId、版本、FeaturePoint、
 Part、端口和 binding ID，因此显示标题相同也不会产生二义性。Pipeline 图、Feature/Part 图
 和 Pass/Resource 图分别投影同一份 authoring snapshot，固定 Stage/FeaturePoint 与模块声明
-的默认结构带有只读标记，CompositeFeature 仍是架构层约定，不添加额外的代码层限制。
+的默认结构带有只读标记。CompositeFeature 的 Part 会在运行时映射为独立的
+FeaturePartId；声明了 Part 的 Feature，其 authored Pass 只能挂到 Render Part；跨 Part 的 Pass ordering 会被拒绝。
 
 所有编辑命令写入 `PipelineDocument` 快照并进入统一 Undo/Redo；参数使用元数据描述的类型、
 范围和枚举，连接使用共享端口 schema 校验。保存通过独立的原子源文档 codec 完成，只有替换

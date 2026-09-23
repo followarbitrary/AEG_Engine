@@ -524,6 +524,7 @@ struct RenderGraph::Impl {
     std::vector<uint8_t> live_passes{};
     std::vector<uint32_t> topological_order{};
     std::vector<Edge> edges{};
+    std::vector<Edge> explicit_edges{};
     std::vector<Batch> batches{};
     std::vector<TransientBufferSlotPlan> transient_buffer_slots{};
     std::vector<TransientTextureSlotPlan> transient_texture_slots{};
@@ -536,6 +537,7 @@ struct RenderGraph::Impl {
         size_t buffer_count{0};
         size_t texture_count{0};
         size_t pass_count{0};
+        size_t explicit_edge_count{0};
         size_t execution_owner_count{0};
         uint32_t next_generation{1};
         uint64_t revision{0};
@@ -688,6 +690,7 @@ foundation::Result RenderGraph::Impl::begin_feature_build_transaction(const Rend
     checkpoint.buffer_count = buffers.size();
     checkpoint.texture_count = textures.size();
     checkpoint.pass_count = passes.size();
+    checkpoint.explicit_edge_count = explicit_edges.size();
     checkpoint.execution_owner_count = execution_owners.size();
     checkpoint.next_generation = next_generation;
     checkpoint.revision = revision;
@@ -738,6 +741,7 @@ void RenderGraph::Impl::rollback_feature_build_transaction(RenderGraphCompileInf
     buffers.resize(feature_build_transaction.buffer_count);
     textures.resize(feature_build_transaction.texture_count);
     passes.resize(feature_build_transaction.pass_count);
+    explicit_edges.resize(feature_build_transaction.explicit_edge_count);
     execution_owners.resize(feature_build_transaction.execution_owner_count);
     for (size_t index = 0; index < feature_build_transaction.buffer_exports.size() && index < buffers.size(); ++index) {
         buffers[index].exported = feature_build_transaction.buffer_exports[index] != 0;
@@ -817,6 +821,7 @@ void RenderGraph::clear_passes() noexcept {
     }
     impl_->transient_pools.clear();
     impl_->passes.clear();
+    impl_->explicit_edges.clear();
     impl_->execution_owners.clear();
     impl_->live_passes.clear();
     impl_->topological_order.clear();
@@ -850,6 +855,7 @@ void RenderGraph::reset() noexcept {
     impl_->buffers.clear();
     impl_->textures.clear();
     impl_->passes.clear();
+    impl_->explicit_edges.clear();
     impl_->execution_owners.clear();
     impl_->transient_pools.clear();
     impl_->live_passes.clear();
@@ -1241,6 +1247,22 @@ foundation::ResultValue<RenderGraphPass> RenderGraph::add_pass(std::string_view 
         return {foundation::Result::failure(foundation::ResultCode::kBackendError,
                                             "Render graph pass setup threw an exception"),
                 {}};
+    }
+}
+
+foundation::Result RenderGraph::add_dependency(RenderGraphPass source, RenderGraphPass destination) {
+    if (impl_ == nullptr || impl_->get_pass(source) == nullptr || impl_->get_pass(destination) == nullptr ||
+        source == destination) {
+        return foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
+                                           "Render graph dependency has invalid pass handles");
+    }
+    try {
+        impl_->explicit_edges.push_back(Edge{source.index, destination.index});
+        impl_->mark_dirty();
+        return foundation::Result::success();
+    } catch (const std::bad_alloc&) {
+        return foundation::Result::failure(foundation::ResultCode::kOutOfMemory,
+                                           "Render graph dependency allocation failed");
     }
 }
 
@@ -1928,6 +1950,7 @@ foundation::Result RenderGraph::Impl::compile_graph(RenderGraphCompileInfo& info
             }
         }
 
+        edges.insert(edges.end(), explicit_edges.begin(), explicit_edges.end());
         std::sort(edges.begin(), edges.end());
         edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
 

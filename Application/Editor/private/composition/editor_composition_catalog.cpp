@@ -73,6 +73,8 @@ foundation::ResultValue<std::vector<EditorPaletteEntry>> build_composition_palet
         const auto* declaration = std::get_if<pipeline::FeatureAuthoringDeclaration>(&feature_entry->declaration);
         if (!declaration)
             return {foundation::invalid_argument("Feature catalog declaration is invalid"), {}};
+        if (!declaration->allow_add_passes)
+            return {foundation::Result::success(), std::move(result)};
         for (const auto type : declaration->allowed_pass_types) {
             const auto* pass = catalog.find({pipeline::AuthoringTypeKind::kRenderPass, type.value()});
             if (pass)

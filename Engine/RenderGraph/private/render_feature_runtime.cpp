@@ -3,7 +3,6 @@
  * @brief Adapts Pipeline render features to the concrete RenderGraph API.
  */
 #include "../public/render_feature_runtime.hpp"
-#include "../public/render_state_flow.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -12,7 +11,12 @@
 #include <new>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
+
+#include "../../Pipeline/public/pipeline_configuration.hpp"
+#include "../../Pipeline/public/render_pass.hpp"
+#include "../public/render_state_flow.hpp"
 
 namespace aeg::render_graph {
 namespace {
@@ -69,12 +73,21 @@ inline constexpr uint32_t kKnownFeaturePointFlags =
     return pipeline::RenderGraphPass{handle.index, handle.generation, handle.graph_id};
 }
 
+[[nodiscard]] RenderGraphPass to_render_graph_pass(pipeline::RenderGraphPass handle) noexcept {
+    return RenderGraphPass{handle.index, handle.generation, handle.graph_id};
+}
+
 class RenderGraphBuilderBackendImpl;
 
 class RenderPassBuilderBackendImpl final : public pipeline::RenderPassBuilderBackend {
 public:
     RenderPassBuilderBackendImpl(std::shared_ptr<RenderGraphBuilderBackendImpl> owner, PassBuilder& builder) noexcept
         : owner_(std::move(owner)), builder_(builder) {}
+
+    [[nodiscard]] foundation::ResultValue<pipeline::RenderGraphBuffer> find_buffer(
+        pipeline::RenderResourceId id) const override;
+    [[nodiscard]] foundation::ResultValue<pipeline::RenderGraphTexture> find_texture(
+        pipeline::RenderResourceId id) const override;
 
     [[nodiscard]] foundation::Result read_buffer(pipeline::RenderGraphBuffer buffer, rhi::ResourceUsage usage,
                                                  rhi::PipelineStageMask pipeline_stages,
@@ -122,6 +135,10 @@ public:
         : owner_(std::move(owner)), context_(context) {}
 
     [[nodiscard]] pipeline::RenderGraphPass pass() const noexcept override;
+    [[nodiscard]] foundation::ResultValue<pipeline::RenderGraphBuffer> find_buffer(
+        pipeline::RenderResourceId id) const override;
+    [[nodiscard]] foundation::ResultValue<pipeline::RenderGraphTexture> find_texture(
+        pipeline::RenderResourceId id) const override;
     [[nodiscard]] foundation::ResultValue<rhi::BufferHandle> buffer(pipeline::RenderGraphBuffer buffer) const override;
     [[nodiscard]] foundation::ResultValue<rhi::TextureHandle> texture(
         pipeline::RenderGraphTexture texture) const override;
@@ -217,6 +234,10 @@ public:
     [[nodiscard]] foundation::ResultValue<pipeline::RenderGraphPass> add_pass(
         std::string_view name, pipeline::RenderGraphPassType type, rhi::QueueClass queue,
         pipeline::RenderPassSetupFunction setup, pipeline::RenderPassExecuteFunction execute) override;
+    [[nodiscard]] foundation::Result add_dependency(pipeline::RenderGraphPass source,
+                                                    pipeline::RenderGraphPass destination) override {
+        return graph_.add_dependency(to_render_graph_pass(source), to_render_graph_pass(destination));
+    }
 
     [[nodiscard]] foundation::ResultValue<RenderGraphBuffer> resolve_buffer(pipeline::RenderGraphBuffer buffer) const;
     [[nodiscard]] foundation::ResultValue<RenderGraphTexture> resolve_texture(
@@ -603,6 +624,16 @@ foundation::Result RenderGraphBuilderBackendImpl::register_initial_resources(
     return foundation::Result::success();
 }
 
+foundation::ResultValue<pipeline::RenderGraphBuffer> RenderPassBuilderBackendImpl::find_buffer(
+    pipeline::RenderResourceId id) const {
+    return owner_->find_buffer(id);
+}
+
+foundation::ResultValue<pipeline::RenderGraphTexture> RenderPassBuilderBackendImpl::find_texture(
+    pipeline::RenderResourceId id) const {
+    return owner_->find_texture(id);
+}
+
 foundation::Result RenderPassBuilderBackendImpl::read_buffer(pipeline::RenderGraphBuffer buffer,
                                                              rhi::ResourceUsage usage,
                                                              rhi::PipelineStageMask pipeline_stages,
@@ -705,6 +736,16 @@ pipeline::RenderGraphPass RenderPassExecutionContextBackendImpl::pass() const no
     return to_pipeline_pass(context_.pass());
 }
 
+foundation::ResultValue<pipeline::RenderGraphBuffer> RenderPassExecutionContextBackendImpl::find_buffer(
+    pipeline::RenderResourceId id) const {
+    return owner_->find_buffer(id);
+}
+
+foundation::ResultValue<pipeline::RenderGraphTexture> RenderPassExecutionContextBackendImpl::find_texture(
+    pipeline::RenderResourceId id) const {
+    return owner_->find_texture(id);
+}
+
 foundation::ResultValue<rhi::BufferHandle> RenderPassExecutionContextBackendImpl::buffer(
     pipeline::RenderGraphBuffer buffer) const {
     const auto resolved = owner_->resolve_buffer(buffer);
@@ -761,6 +802,90 @@ bool RenderPassExecutionContextBackendImpl::rendering_started() const noexcept {
 
 foundation::Result RenderPassExecutionContextBackendImpl::set_viewport(const rhi::Viewport& viewport) {
     return context_.set_viewport(viewport);
+}
+
+[[nodiscard]] foundation::Result expand_authored_render_passes(pipeline::RenderGraphBuilder& builder,
+                                                               const pipeline::RenderGraphFeatureContext& context) {
+    if (context.configuration == nullptr) {
+        return invalid_state("authored render passes require a Feature configuration");
+    }
+    if (context.render_passes == nullptr) {
+        return invalid_state("authored render passes require a RenderPassRegistry");
+    }
+
+    std::unordered_set<uint64_t> instances;
+    std::unordered_map<pipeline::RenderPassInstanceId, pipeline::RenderGraphPass,
+                       pipeline::StableIdHash<pipeline::RenderPassInstanceIdTag>>
+        handles;
+    for (const pipeline::RenderPassInstanceConfiguration& authored : context.configuration->passes) {
+        if (!authored.enabled) {
+            continue;
+        }
+        if (context.part.is_valid()) {
+            if (!authored.resolved_part.is_valid()) {
+                return invalid_argument("authored render pass has no resolved CompositeFeature part");
+            }
+            if (authored.resolved_part != context.part) {
+                continue;
+            }
+        }
+        if (!authored.instance.is_valid() || !instances.insert(authored.instance.value()).second) {
+            return invalid_argument("authored render pass instance is missing or duplicated");
+        }
+        if (static_cast<uint8_t>(authored.queue) > static_cast<uint8_t>(rhi::QueueClass::kCopy)) {
+            return invalid_argument("authored render pass queue is invalid");
+        }
+
+        const auto registered = context.render_passes->find_pass(authored.type);
+        if (!registered) {
+            return registered.result;
+        }
+        const auto& descriptor = registered.value->descriptor();
+        const auto queue_bit = uint64_t{1} << static_cast<uint8_t>(authored.queue);
+        if ((descriptor.allowed_queue_mask & queue_bit) == 0) {
+            return invalid_argument("authored render pass queue is not allowed");
+        }
+        if ((descriptor.graph_type == pipeline::RenderGraphPassType::kGraphics &&
+             authored.queue != rhi::QueueClass::kGraphics) ||
+            (descriptor.graph_type == pipeline::RenderGraphPassType::kCompute &&
+             authored.queue != rhi::QueueClass::kCompute) ||
+            (descriptor.graph_type == pipeline::RenderGraphPassType::kCopy &&
+             authored.queue != rhi::QueueClass::kCopy)) {
+            return invalid_argument("authored render pass graph type and queue do not match");
+        }
+
+        auto configuration = std::make_shared<pipeline::RenderPassConfiguration>();
+        configuration->type = authored.type;
+        configuration->instance = authored.instance;
+        configuration->queue = authored.queue;
+        configuration->enabled = authored.enabled;
+        configuration->parameters = authored.parameters;
+        configuration->bindings = authored.resource_bindings;
+        configuration->source = authored.source;
+        const auto added =
+            pipeline::add_registered_render_pass(builder, *context.render_passes, std::move(configuration));
+        if (!added) {
+            return added.result;
+        }
+        handles.emplace(authored.instance, added.value);
+    }
+    for (const pipeline::RenderPassInstanceConfiguration& authored : context.configuration->passes) {
+        const auto destination = handles.find(authored.instance);
+        if (destination == handles.end()) {
+            continue;
+        }
+        for (const pipeline::RenderPassInstanceId source_instance : authored.ordered_after) {
+            const auto source = handles.find(source_instance);
+            if (source == handles.end()) {
+                return invalid_argument("authored render pass ordering references an inactive pass");
+            }
+            if (const foundation::Result dependency = builder.add_dependency(source->second, destination->second);
+                !dependency) {
+                return dependency;
+            }
+        }
+    }
+    return foundation::Result::success();
 }
 
 [[nodiscard]] pipeline::RenderResourceId render_state_output_id(uint32_t contribution_index) noexcept {
@@ -978,8 +1103,8 @@ foundation::Result RenderGraphFeatureRuntime::build() {
     // state through such pass-through Features.
     std::vector<std::vector<uint32_t>> state_input_writers(impl_->plan->feature_contributions.size());
     std::vector<uint8_t> state_writer_contributions(impl_->plan->feature_contributions.size(), 0);
-    std::vector<pipeline::RenderStateBlendMode> state_writer_blend_modes(
-        impl_->plan->feature_contributions.size(), pipeline::RenderStateBlendMode::kReplace);
+    std::vector<pipeline::RenderStateBlendMode> state_writer_blend_modes(impl_->plan->feature_contributions.size(),
+                                                                         pipeline::RenderStateBlendMode::kReplace);
     std::vector<uint8_t> state_writer_capabilities(impl_->plan->feature_contributions.size(), 0);
     if (impl_->desc.state.enabled) {
         for (uint32_t contribution_index = 0; contribution_index < impl_->plan->feature_contributions.size();
@@ -998,7 +1123,8 @@ foundation::Result RenderGraphFeatureRuntime::build() {
                 }
                 feature_implementation = feature_result.value;
             }
-            state_writer_capabilities[contribution_index] = feature_implementation->uses_render_state_output() ? 1u : 0u;
+            state_writer_capabilities[contribution_index] =
+                feature_implementation->uses_render_state_output() ? 1u : 0u;
             state_writer_blend_modes[contribution_index] = feature_implementation->render_state_blend_mode();
             for (const RenderStateBlendOverride& override : impl_->desc.state.blend_overrides) {
                 if (override.node >= impl_->plan->nodes.size()) {
@@ -1018,8 +1144,8 @@ foundation::Result RenderGraphFeatureRuntime::build() {
             state_desc.extent.height == 0 || state_desc.extent.depth == 0 || state_desc.mip_levels == 0 ||
             state_desc.array_layers == 0 || state_desc.capabilities == rhi::TextureCapability::kNone) {
             return rollback(invalid_argument("render-state texture template is incomplete (format=" +
-                                             std::to_string(static_cast<uint32_t>(state_desc.format)) + ", extent=" +
-                                             std::to_string(state_desc.extent.width) + "x" +
+                                             std::to_string(static_cast<uint32_t>(state_desc.format)) +
+                                             ", extent=" + std::to_string(state_desc.extent.width) + "x" +
                                              std::to_string(state_desc.extent.height) + "x" +
                                              std::to_string(state_desc.extent.depth) + ")"));
         }
@@ -1031,9 +1157,9 @@ foundation::Result RenderGraphFeatureRuntime::build() {
                 state_writer_capabilities[contribution_index] == 0) {
                 continue;
             }
-            const auto texture = backend->create_texture(
-                render_state_output_id(contribution_index), impl_->desc.state.texture_desc,
-                pipeline::RenderGraphResourceLifetime::kTransient);
+            const auto texture =
+                backend->create_texture(render_state_output_id(contribution_index), impl_->desc.state.texture_desc,
+                                        pipeline::RenderGraphResourceLifetime::kTransient);
             if (!texture) {
                 return rollback(append_feature_message("render state output allocation failed", texture.result));
             }
@@ -1043,14 +1169,16 @@ foundation::Result RenderGraphFeatureRuntime::build() {
              ++contribution_index) {
             std::vector<uint8_t> visiting(impl_->plan->feature_contributions.size(), 0);
             const auto collect_input_writers = [&](auto&& self, uint32_t destination) -> void {
-                if (destination >= state_flow.contributions.size() || visiting[destination] != 0) return;
+                if (destination >= state_flow.contributions.size() || visiting[destination] != 0)
+                    return;
                 visiting[destination] = 1;
                 for (const uint32_t predecessor : state_flow.contributions[destination].input_contributions) {
-                    if (predecessor >= state_outputs.size()) continue;
+                    if (predecessor >= state_outputs.size())
+                        continue;
                     if (state_writer_capabilities[predecessor] != 0 && state_outputs[predecessor].is_valid()) {
                         if (std::find(state_input_writers[contribution_index].begin(),
-                                      state_input_writers[contribution_index].end(), predecessor) ==
-                            state_input_writers[contribution_index].end()) {
+                                      state_input_writers[contribution_index].end(),
+                                      predecessor) == state_input_writers[contribution_index].end()) {
                             state_input_writers[contribution_index].push_back(predecessor);
                             state_inputs[contribution_index].push_back(state_outputs[predecessor]);
                         }
@@ -1090,15 +1218,15 @@ foundation::Result RenderGraphFeatureRuntime::build() {
             (!impl_->desc.state.enabled || feature_implementation->uses_render_state_output())) {
             continue;
         }
-        const bool writes_render_state = impl_->desc.state.enabled && feature_implementation->uses_render_state_output();
+        const bool writes_render_state =
+            impl_->desc.state.enabled && feature_implementation->uses_render_state_output();
         if (writes_render_state) {
             if (!state_outputs[contribution_index].is_valid()) {
                 return rollback(invalid_state("render-state feature has no allocated state output"));
             }
             if (state_inputs[contribution_index].size() > 1) {
                 if (!impl_->desc.state.compose_terminal_states) {
-                    return rollback(invalid_state(
-                        "multiple render-state inputs require a state compositor callback"));
+                    return rollback(invalid_state("multiple render-state inputs require a state compositor callback"));
                 }
                 std::vector<RenderStateCompositeInput> merge_inputs{};
                 merge_inputs.reserve(state_input_writers[contribution_index].size());
@@ -1122,20 +1250,23 @@ foundation::Result RenderGraphFeatureRuntime::build() {
                     pipeline::RenderGraphBuilder composite_builder(*backend, composite_context);
                     foundation::Result composite_result;
                     try {
-                        composite_result = impl_->desc.state.compose_terminal_states(
-                            composite_builder, merge_inputs, state_outputs[contribution_index]);
+                        composite_result = impl_->desc.state.compose_terminal_states(composite_builder, merge_inputs,
+                                                                                     state_outputs[contribution_index]);
                     } catch (const std::bad_alloc&) {
                         composite_result = foundation::Result::failure(
                             foundation::ResultCode::kOutOfMemory, "render-state merge compositor allocation failed");
                     } catch (const std::exception& exception) {
-                        composite_result = foundation::Result::failure(foundation::ResultCode::kUnknown, exception.what());
+                        composite_result =
+                            foundation::Result::failure(foundation::ResultCode::kUnknown, exception.what());
                     } catch (...) {
-                        composite_result = foundation::Result::failure(
-                            foundation::ResultCode::kUnknown, "render-state merge compositor threw an unknown exception");
+                        composite_result =
+                            foundation::Result::failure(foundation::ResultCode::kUnknown,
+                                                        "render-state merge compositor threw an unknown exception");
                     }
                     backend->set_feature_point_flags(pipeline::FeaturePointFlags::kNone);
                     if (!composite_result) {
-                        return rollback(append_feature_message("render-state input composition failed", composite_result));
+                        return rollback(
+                            append_feature_message("render-state input composition failed", composite_result));
                     }
                 }
             }
@@ -1143,14 +1274,33 @@ foundation::Result RenderGraphFeatureRuntime::build() {
 
         backend->set_feature_owner(feature_implementation);
         backend->set_feature_point_flags(contribution.point_flags);
+        const pipeline::FeatureInstanceConfiguration* feature_configuration = nullptr;
+        if (impl_->desc.configuration != nullptr) {
+            for (const pipeline::FeatureInstanceConfiguration& candidate : impl_->desc.configuration->features) {
+                if (candidate.instance == contribution.feature_instance) {
+                    feature_configuration = &candidate;
+                    break;
+                }
+            }
+        }
         const pipeline::RenderGraphFeatureContext feature_context{
-            impl_->plan->scope,    impl_->plan->pipeline,    contribution.feature,        contribution.feature_instance,
-            contribution.part,     contribution.point,       contribution.point_position, contribution.point_flags,
+            impl_->plan->scope,
+            impl_->plan->pipeline,
+            contribution.feature,
+            contribution.feature_instance,
+            contribution.part,
+            contribution.point,
+            contribution.point_position,
+            contribution.point_flags,
             state_outputs[contribution_index],
             state_inputs[contribution_index].empty() ? pipeline::RenderGraphTexture{}
                                                      : state_inputs[contribution_index].front(),
-            state_inputs[contribution_index], state_flow.contributions[contribution_index].layer_count,
-            impl_->desc.user_data, impl_->desc.feature_data,
+            state_inputs[contribution_index],
+            state_flow.contributions[contribution_index].layer_count,
+            impl_->desc.user_data,
+            impl_->desc.feature_data,
+            feature_configuration,
+            impl_->desc.render_passes,
         };
         pipeline::RenderGraphBuilder builder(*backend, feature_context);
 
@@ -1166,11 +1316,36 @@ foundation::Result RenderGraphFeatureRuntime::build() {
             build_result = foundation::Result::failure(foundation::ResultCode::kUnknown,
                                                        "render feature graph build threw an unknown exception");
         }
-        backend->set_feature_owner({});
-        backend->set_feature_point_flags(pipeline::FeaturePointFlags::kNone);
         if (!build_result) {
+            backend->set_feature_owner({});
+            backend->set_feature_point_flags(pipeline::FeaturePointFlags::kNone);
             return rollback(append_feature_message("render feature graph build failed", build_result));
         }
+        const bool expands_authored_passes =
+            feature_configuration != nullptr && feature_configuration->expand_authored_passes;
+        const bool legacy_expands_authored_passes = feature_implementation->uses_authored_render_passes_for_part(
+            contribution.feature_instance, contribution.part);
+        if (expands_authored_passes || legacy_expands_authored_passes) {
+            foundation::Result authored_pass_result;
+            try {
+                authored_pass_result = expand_authored_render_passes(builder, feature_context);
+            } catch (const std::bad_alloc&) {
+                authored_pass_result = foundation::Result::failure(foundation::ResultCode::kOutOfMemory,
+                                                                   "authored render pass expansion allocation failed");
+            } catch (const std::exception& exception) {
+                authored_pass_result = foundation::Result::failure(foundation::ResultCode::kUnknown, exception.what());
+            } catch (...) {
+                authored_pass_result = foundation::Result::failure(
+                    foundation::ResultCode::kUnknown, "authored render pass expansion threw an unknown exception");
+            }
+            if (!authored_pass_result) {
+                backend->set_feature_owner({});
+                backend->set_feature_point_flags(pipeline::FeaturePointFlags::kNone);
+                return rollback(append_feature_message("authored render pass expansion failed", authored_pass_result));
+            }
+        }
+        backend->set_feature_owner({});
+        backend->set_feature_point_flags(pipeline::FeaturePointFlags::kNone);
         if (writes_render_state) {
             state_writer_contributions[contribution_index] = 1;
         }
@@ -1205,7 +1380,8 @@ foundation::Result RenderGraphFeatureRuntime::build() {
             terminal_state_writers.push_back(source);
         }
     }
-    if (impl_->desc.state.enabled && impl_->desc.state.present_target_id.is_valid() && !terminal_state_writers.empty()) {
+    if (impl_->desc.state.enabled && impl_->desc.state.present_target_id.is_valid() &&
+        !terminal_state_writers.empty()) {
         if (impl_->desc.state.present_extent.width == 0 || impl_->desc.state.present_extent.height == 0 ||
             impl_->desc.state.present_extent.depth == 0) {
             return rollback(invalid_argument("render-state Present extent is invalid"));
@@ -1222,8 +1398,8 @@ foundation::Result RenderGraphFeatureRuntime::build() {
         }
         if (terminal_states.size() > 1) {
             if (!impl_->desc.state.compose_terminal_states) {
-                return rollback(invalid_state(
-                    "multiple terminal render-state outputs require a terminal compositor callback"));
+                return rollback(
+                    invalid_state("multiple terminal render-state outputs require a terminal compositor callback"));
             }
             const pipeline::RenderGraphFeatureContext composite_context{
                 .scope = impl_->plan->scope,
@@ -1241,16 +1417,16 @@ foundation::Result RenderGraphFeatureRuntime::build() {
             pipeline::RenderGraphBuilder composite_builder(*backend, composite_context);
             foundation::Result composite_result;
             try {
-                composite_result = impl_->desc.state.compose_terminal_states(
-                    composite_builder, terminal_states, destination);
+                composite_result =
+                    impl_->desc.state.compose_terminal_states(composite_builder, terminal_states, destination);
             } catch (const std::bad_alloc&) {
                 composite_result = foundation::Result::failure(foundation::ResultCode::kOutOfMemory,
                                                                "render-state terminal compositor allocation failed");
             } catch (const std::exception& exception) {
                 composite_result = foundation::Result::failure(foundation::ResultCode::kUnknown, exception.what());
             } catch (...) {
-                composite_result = foundation::Result::failure(foundation::ResultCode::kUnknown,
-                                                               "render-state terminal compositor threw an unknown exception");
+                composite_result = foundation::Result::failure(
+                    foundation::ResultCode::kUnknown, "render-state terminal compositor threw an unknown exception");
             }
             backend->set_feature_point_flags(pipeline::FeaturePointFlags::kNone);
             if (!composite_result) {
@@ -1263,14 +1439,13 @@ foundation::Result RenderGraphFeatureRuntime::build() {
                 "RenderState.Present", pipeline::RenderGraphPassType::kCopy, rhi::QueueClass::kCopy,
                 [source, destination](pipeline::RenderPassBuilder& pass_builder) {
                     if (const foundation::Result result = pass_builder.read(
-                            source, rhi::ResourceUsage::kCopySource, rhi::PipelineStage::kCopy,
-                            rhi::ShaderStage::kAll);
+                            source, rhi::ResourceUsage::kCopySource, rhi::PipelineStage::kCopy, rhi::ShaderStage::kAll);
                         !result) {
                         return result;
                     }
-                    if (const foundation::Result result = pass_builder.write(
-                            destination, rhi::ResourceUsage::kCopyDestination, rhi::PipelineStage::kCopy,
-                            rhi::ShaderStage::kAll, {}, true);
+                    if (const foundation::Result result =
+                            pass_builder.write(destination, rhi::ResourceUsage::kCopyDestination,
+                                               rhi::PipelineStage::kCopy, rhi::ShaderStage::kAll, {}, true);
                         !result) {
                         return result;
                     }
@@ -1278,8 +1453,7 @@ foundation::Result RenderGraphFeatureRuntime::build() {
                     return foundation::Result::success();
                 },
                 [source, destination, extent](pipeline::RenderPassExecutionContext& execution) {
-                    return execution.copy_texture(source,
-                                                  rhi::TextureSubresourceLayers{rhi::Aspect::kColor, 0, 0, 1},
+                    return execution.copy_texture(source, rhi::TextureSubresourceLayers{rhi::Aspect::kColor, 0, 0, 1},
                                                   rhi::Offset3D{0, 0, 0}, destination,
                                                   rhi::TextureSubresourceLayers{rhi::Aspect::kColor, 0, 0, 1},
                                                   rhi::Offset3D{0, 0, 0}, extent);

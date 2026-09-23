@@ -44,6 +44,8 @@ struct EditorCompositionFixture final {
         feature_declaration.parts = {{.part_index = 0, .domain = FeatureDomain::kRender, .name = "render"}};
         feature_declaration.allowed_pass_types = {pass_id};
         feature_declaration.allow_add_passes = true;
+        feature_declaration.default_passes = {
+            {.node_id = "DefaultPass", .type = pass_id, .version = {1, 0, 0}, .part_id = "render"}};
         TypeCatalogEntry feature_entry;
         feature_entry.key = {AuthoringTypeKind::kFeature, feature_id.value()};
         feature_entry.version = {1, 0, 0};

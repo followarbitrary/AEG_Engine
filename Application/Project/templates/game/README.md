@@ -13,4 +13,6 @@ CMake 会先把 DLL 复制到 `Binaries/Editor/...` staging 目录，再生成�
 源文件与 cooked product 的 UUID。脚手架会同时生成 Main scene，Asset Cooker 可据此建立
 场景与启动 Pipeline 的依赖闭包。
 
-CompositeFeature 当前只作为设计与注册审查约定，不在代码层增加额外约束。
+CompositeFeature 的 Part 由运行时映射为 FeaturePartId；声明了 Part 的 Feature，其 Pass 必须归属于
+Render Part；没有声明 Part 的直接 Feature 使用空 `part_id`。只有声明 `allow_add_passes` 的
+Feature 才能在 Editor 中添加额外 Pass。

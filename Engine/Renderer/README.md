@@ -258,3 +258,9 @@ BeforePresent 的 Stage/FeaturePoint 拓扑；实际 Pass、资源和 Shader 由
 RenderPipeline 的实现可以依赖 `RenderSceneSnapshot`，但不能反向修改 World，也不能将
 后端对象写入 Renderer 公共接口。资源状态转换、队列同步和物理执行仍由 RenderGraph
 与 RHI 负责。
+
+# Renderer pipeline、feature 与 pass
+
+Deferred/Forward Pipeline 负责定义 RenderExtract、RenderBuild、BeforePresent 等阶段和 FeaturePoint。渲染能力由 RenderFeature 贡献；Feature 内的 Shadow、GBuffer、Lighting、PostProcess 等步骤才是 RenderPass。内置 VariantFeature 保留专用图构建，因此不会再次走作者 Pass 适配器；游戏模块的 RenderFeature 可以显式启用作者 Pass 展开。
+
+Renderer 的运行时拓扑和 Editor TypeCatalog 使用相同的稳定 Pipeline、FeaturePoint、Feature、Pass identity。作者 Pass 的参数、启停和稳定资源绑定属于 Feature 实例配置，当前帧的 Graph 资源仍由 RenderGraph 解析。

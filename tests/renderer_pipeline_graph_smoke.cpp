@@ -137,7 +137,7 @@ struct EmptySceneResolver final : aeg::renderer::RenderResourceResolver {
             invalid[1].enabled = false;
             invalid[2].queue = config.queue == aeg::rhi::QueueClass::kCompute ? aeg::rhi::QueueClass::kGraphics
                                                                               : aeg::rhi::QueueClass::kCompute;
-            invalid[3].bindings.emplace(1, 2);
+            invalid[3].bindings[1] = 2;
             return invalid;
         }
         Result setup(aeg::pipeline::RenderPassBuilder& builder,

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <exception>
 #include <new>
+#include <unordered_map>
 
 namespace aeg::application {
 namespace {
@@ -42,6 +43,62 @@ const PipelineNodeDocument* find_pipeline(const PipelineDocument& document, std:
     return found == document.pipeline_nodes.end() ? nullptr : &*found;
 }
 
+foundation::Result materialize_feature_defaults(PipelineDocument& next, const TypeCatalog& catalog,
+                                                const FeatureNodeDocument& feature, PipelineScope scope) {
+    const auto* entry = catalog.find({AuthoringTypeKind::kFeature, feature.type.value()});
+    const auto* declaration =
+        entry == nullptr ? nullptr : std::get_if<FeatureAuthoringDeclaration>(&entry->declaration);
+    if (declaration == nullptr) {
+        return foundation::invalid_argument("Feature declaration is unavailable");
+    }
+    std::unordered_map<std::string, std::string> local_ids;
+    for (const auto& pass : declaration->default_passes) {
+        const std::string id = feature.node_id + "/" + pass.node_id;
+        if (has_node(next, id)) {
+            return foundation::invalid_state("default Pass node ID is already in use");
+        }
+        local_ids.emplace(pass.node_id, id);
+        next.pass_nodes.push_back(
+            {id, pass.type, pass.version, feature.node_id, pass.part_id, pass.parameters, pass.enabled});
+    }
+    for (const auto& resource : declaration->default_resources) {
+        const std::string id = feature.node_id + "/" + resource.node_id;
+        if (has_node(next, id)) {
+            return foundation::invalid_state("default resource node ID is already in use");
+        }
+        local_ids.emplace(resource.node_id, id);
+        const bool produced = std::any_of(
+            declaration->default_edges.begin(), declaration->default_edges.end(), [&](const DocumentEdge& edge) {
+                return edge.kind == DocumentEdgeKind::kRenderResource && edge.destination.node_id == resource.node_id;
+            });
+        next.resources.push_back({.node_id = id,
+                                  .resource_id = resource.resource_id,
+                                  .type = ArtifactTypeId(resource.constraints.resource_class == ResourceClass::kBuffer
+                                                             ? "Pipeline.DefaultBuffer"
+                                                             : "Pipeline.DefaultTexture"),
+                                  .owner_scope = scope,
+                                  .visible_to = to_mask(scope),
+                                  .external_input = !produced,
+                                  .storage = ArtifactStorage::kGpuLogicalResource,
+                                  .lifetime = ArtifactLifetime::kFrame,
+                                  .ownership = OwnershipPolicy::kGraphOwned,
+                                  .resource_constraints = resource.constraints});
+    }
+    for (const auto& edge : declaration->default_edges) {
+        const auto source = local_ids.find(edge.source.node_id);
+        const auto destination = local_ids.find(edge.destination.node_id);
+        if (source == local_ids.end() || destination == local_ids.end()) {
+            return foundation::invalid_argument("default edge references an unknown node");
+        }
+        DocumentEdge materialized = edge;
+        materialized.edge_id = feature.node_id + "/" + edge.edge_id;
+        materialized.source.node_id = source->second;
+        materialized.destination.node_id = destination->second;
+        next.edges.push_back(std::move(materialized));
+    }
+    return foundation::Result::success();
+}
+
 }  // namespace
 
 foundation::Result EditorCompositionCommands::add_type(const EditorGraphAddress& address, AuthoringTypeKey key,
@@ -64,6 +121,25 @@ foundation::Result EditorCompositionCommands::add_type(const EditorGraphAddress&
             node.scope = first_scope(entry->scopes);
             node.parameters = {};
             next.pipeline_nodes.push_back(std::move(node));
+            if (const auto* pipeline_declaration = std::get_if<PipelineAuthoringDeclaration>(&entry->declaration);
+                pipeline_declaration != nullptr) {
+                for (const auto& default_feature : pipeline_declaration->default_features) {
+                    const std::string feature_node_id = node_id + "/" + default_feature.node_id;
+                    if (has_node(next, feature_node_id)) {
+                        return foundation::invalid_state("default Feature node ID is already in use");
+                    }
+                    FeatureNodeDocument feature{feature_node_id,           default_feature.type,
+                                                default_feature.version,   node_id,
+                                                default_feature.point,     true,
+                                                default_feature.parameters};
+                    next.feature_nodes.push_back(feature);
+                    if (const foundation::Result result = materialize_feature_defaults(
+                            next, document_.catalog(), feature, next.pipeline_nodes.back().scope);
+                        !result) {
+                        return result;
+                    }
+                }
+            }
         } else if (address.kind == EditorGraphKind::kFeature) {
             if (key.kind != AuthoringTypeKind::kFeature || !find_pipeline(next, address.pipeline_node))
                 return foundation::invalid_argument("Feature insertion address or type is invalid");
@@ -88,25 +164,34 @@ foundation::Result EditorCompositionCommands::add_type(const EditorGraphAddress&
             node.version = entry->version;
             node.pipeline_node = address.pipeline_node;
             node.point = FeaturePointId(attachment_id);
-            if (const auto* feature_decl = std::get_if<FeatureAuthoringDeclaration>(&entry->declaration))
-                if (!feature_decl->default_passes.empty()) {
-                    // Defaults are materialized by the shared document preparer.
-                }
             next.feature_nodes.push_back(std::move(node));
+            if (const foundation::Result result = materialize_feature_defaults(
+                    next, document_.catalog(), next.feature_nodes.back(), pipeline_node->scope);
+                !result) {
+                return result;
+            }
         } else {
             if (key.kind != AuthoringTypeKind::kRenderPass || address.feature_node.empty())
                 return foundation::invalid_argument("Pass insertion address or type is invalid");
             const auto* owner = find_feature(next, address.feature_node);
-            if (!owner || address.part_id.empty())
+            if (!owner)
                 return foundation::invalid_argument("Pass owner or part is invalid");
             const auto* owner_entry =
                 find_type(document_.catalog(), {AuthoringTypeKind::kFeature, owner->type.value()});
             const auto* declaration =
                 owner_entry ? std::get_if<FeatureAuthoringDeclaration>(&owner_entry->declaration) : nullptr;
-            if (!declaration ||
+            if (!declaration || !declaration->allow_add_passes ||
                 std::find(declaration->allowed_pass_types.begin(), declaration->allowed_pass_types.end(),
                           RenderPassTypeId(key.id)) == declaration->allowed_pass_types.end())
                 return foundation::invalid_argument("Pass type is not allowed by the Feature");
+            if (!address.part_id.empty()) {
+                const auto part = std::find_if(declaration->parts.begin(), declaration->parts.end(),
+                                               [&](const auto& value) { return value.name == address.part_id; });
+                if (part == declaration->parts.end() || part->domain != FeatureDomain::kRender)
+                    return foundation::invalid_argument("Pass part is not a declared render part");
+            } else if (!declaration->parts.empty()) {
+                return foundation::invalid_argument("Pass insertion requires a declared render part");
+            }
             PassNodeDocument node;
             node.node_id = node_id;
             node.type = RenderPassTypeId(entry->key.id);

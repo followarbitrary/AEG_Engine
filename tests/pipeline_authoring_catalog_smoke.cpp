@@ -209,6 +209,7 @@ int declaration_validation_cases() {
     }));
     CHECK(reject_feature([](auto& d) { d.parts[0].name.clear(); }));
     CHECK(reject_feature([](auto& d) { d.parts[0].domain = FeatureDomain::kComposite; }));
+    CHECK(reject_feature([](auto& d) { d.parts[0].part_index = 1; }));
     CHECK(reject_feature([](auto& d) {
         auto p = d.parts[0];
         p.name = "Other";

@@ -1873,7 +1873,7 @@ foundation::Result EditorSceneRuntime::initialize(rhi::Device& device,
 }
 
 foundation::Result EditorSceneRuntime::Impl::initialize_device(Device& device) {
-    device = &device;
+    this->device = &device;
     // Reconstruct the device-borrowing members only after the actual Device exists.
     frame_context =
         std::make_unique<render_graph::FrameContext>(device, render_graph::FrameContextDesc{kFramesInFlight});
@@ -1976,9 +1976,9 @@ foundation::Result EditorSceneRuntime::Impl::initialize_graphics_resources() {
     if (!object_layout || !material_layout || !lighting_layout) {
         return foundation::invalid_state("Editor opaque binding layouts are incomplete");
     }
-    object_layout = object_layout.value;
-    material_layout = material_layout.value;
-    lighting_layout = lighting_layout.value;
+    this->object_layout = object_layout.value;
+    this->material_layout = material_layout.value;
+    this->lighting_layout = lighting_layout.value;
     const std::array<VertexBindingDesc, 1> bindings{{{0, sizeof(Vertex), VertexInputRate::kVertex}}};
     const std::array<VertexAttributeDesc, 3> attributes{{
         {0, 0, Format::kRgba32Float, 0},
@@ -2006,7 +2006,7 @@ foundation::Result EditorSceneRuntime::Impl::initialize_graphics_resources() {
     if (!pipeline) {
         return pipeline.result;
     }
-    pipeline = pipeline.value;
+    this->pipeline = pipeline.value;
 
 #ifdef AEG_FORWARD_SHADOW_SHADER_PACKAGE_PATH
     const auto shadow_program = shader::load_shader_program(AEG_FORWARD_SHADOW_SHADER_PACKAGE_PATH);
@@ -2020,7 +2020,7 @@ foundation::Result EditorSceneRuntime::Impl::initialize_graphics_resources() {
                                         {PipelineType::kGraphics, graphics, DebugName{"Editor.ForwardShadow"}});
     if (!shadow_pipeline)
         return shadow_pipeline.result;
-    shadow_pipeline = shadow_pipeline.value;
+    this->shadow_pipeline = shadow_pipeline.value;
     const auto shadow_inputs = shader_manager->binding_layout(shadow_layout.value, 3);
     if (!shadow_inputs)
         return shadow_inputs.result;
@@ -2042,7 +2042,7 @@ foundation::Result EditorSceneRuntime::Impl::initialize_graphics_resources() {
         {rhi::PipelineType::kGraphics, clustered_graphics, rhi::DebugName{"Editor.ForwardClustered"}});
     if (!clustered_pipeline)
         return clustered_pipeline.result;
-    clustered_pipeline = clustered_pipeline.value;
+    this->clustered_pipeline = clustered_pipeline.value;
     const auto clustered_inputs = shader_manager->binding_layout(clustered_layout.value, 3);
     if (!clustered_inputs)
         return clustered_inputs.result;
@@ -2073,7 +2073,7 @@ foundation::Result EditorSceneRuntime::Impl::initialize_graphics_resources() {
                                         {PipelineType::kGraphics, depth_graphics, DebugName{"Editor.Depth.Pipeline"}});
     if (!depth_pipeline)
         return depth_pipeline.result;
-    depth_pipeline = depth_pipeline.value;
+    this->depth_pipeline = depth_pipeline.value;
 #endif
 
 #ifdef AEG_GBUFFER_MESH_SHADER_PACKAGE_PATH
@@ -2113,7 +2113,7 @@ foundation::Result EditorSceneRuntime::Impl::initialize_graphics_resources() {
     if (!gbuffer_pipeline) {
         return gbuffer_pipeline.result;
     }
-    gbuffer_pipeline = gbuffer_pipeline.value;
+    this->gbuffer_pipeline = gbuffer_pipeline.value;
 #endif
 
 #ifdef AEG_DEFERRED_LIGHTING_SHADER_PACKAGE_PATH
@@ -2338,7 +2338,7 @@ foundation::Result EditorSceneRuntime::Impl::create_targets() {
     if (!color_view) {
         return color_view.result;
     }
-    color_view = color_view.value;
+    this->color_view = color_view.value;
     auto sampled_view = device->create_texture_view({color_texture,
                                                      TextureViewKind::kSampled,
                                                      TextureViewDimension::kTex2D,
@@ -2367,7 +2367,7 @@ foundation::Result EditorSceneRuntime::Impl::create_targets() {
     if (!depth_view) {
         return depth_view.result;
     }
-    depth_view = depth_view.value;
+    this->depth_view = depth_view.value;
     if (!viewport_sampler.is_valid()) {
         auto sampler = device->create_sampler({rhi::Filter::kLinear, rhi::Filter::kLinear, rhi::Filter::kLinear,
                                                rhi::AddressMode::kClampToEdge, rhi::AddressMode::kClampToEdge,
@@ -3555,7 +3555,7 @@ foundation::Result EditorSceneRuntime::Impl::prepare_frame(const engine::EngineF
     if (!lighting_graph) {
         return lighting_graph.result;
     }
-    lighting_graph = to_pipeline_handle(lighting_graph.value);
+    this->lighting_graph = to_pipeline_handle(lighting_graph.value);
     target_has_previous_frame = true;
     return Result::success();
 }

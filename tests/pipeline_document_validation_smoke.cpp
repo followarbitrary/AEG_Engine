@@ -51,7 +51,8 @@ struct Fixture final {
         FeatureAuthoringDeclaration feature_declaration;
         feature_declaration.allowed_pass_types = {pass_id};
         feature_declaration.allow_add_passes = true;
-        feature_declaration.parts = {{.part_index = 0, .domain = FeatureDomain::kRender, .name = "render"}};
+        feature_declaration.parts = {{.part_index = 0, .domain = FeatureDomain::kRender, .name = "render"},
+                                     {.part_index = 1, .domain = FeatureDomain::kPhysics, .name = "physics"}};
         feature_declaration.default_passes = {
             {.node_id = "OutlinePass", .type = pass_id, .version = {1, 0, 0}, .part_id = "render"}};
 
@@ -142,10 +143,24 @@ int main() {
         }
 
         invalid = fixture.document;
-        invalid.pass_nodes.front().part_id = "physics";
+        invalid.pass_nodes.front().part_id = "unknown";
         diagnostics = validate_pipeline_document(invalid, fixture.catalog);
         if (!has_code(diagnostics, "part.missing", "outline_pass")) {
             return 4;
+        }
+
+        invalid = fixture.document;
+        invalid.pass_nodes.front().part_id.clear();
+        diagnostics = validate_pipeline_document(invalid, fixture.catalog);
+        if (!has_code(diagnostics, "part.missing", "outline_pass")) {
+            return 10;
+        }
+
+        invalid = fixture.document;
+        invalid.pass_nodes.front().part_id = "physics";
+        diagnostics = validate_pipeline_document(invalid, fixture.catalog);
+        if (!has_code(diagnostics, "part.domain", "outline_pass")) {
+            return 11;
         }
 
         invalid = fixture.document;
@@ -180,6 +195,93 @@ int main() {
             !has_code(diagnostics, "parameter.invalid", "outline")) {
             return 8;
         }
+
+        invalid = fixture.document;
+        invalid.feature_nodes.push_back({.node_id = "outline_2",
+                                         .type = FeatureId("Game.CustomOutline"),
+                                         .version = {1, 0, 0},
+                                         .pipeline_node = "pipeline",
+                                         .point = FeaturePointId("PostProcess")});
+        invalid.pass_nodes.push_back({.node_id = "outline_pass_2",
+                                      .type = RenderPassTypeId("Game.CustomOutlinePass"),
+                                      .version = {1, 0, 0},
+                                      .feature_node = "outline_2",
+                                      .part_id = "render"});
+        invalid.edges.push_back({.edge_id = "cross_feature_order",
+                                 .kind = DocumentEdgeKind::kOrdering,
+                                 .source = {"outline_pass", 0},
+                                 .destination = {"outline_pass_2", 0},
+                                 .binding_id = 0});
+        diagnostics = validate_pipeline_document(invalid, fixture.catalog);
+        if (!has_code(diagnostics, "edge.ordering.feature", {}, "cross_feature_order"))
+            return 12;
+
+        invalid = fixture.document;
+        invalid.edges.push_back({.edge_id = "feature_pass_order",
+                                 .kind = DocumentEdgeKind::kOrdering,
+                                 .source = {"outline", 0},
+                                 .destination = {"outline_pass", 0},
+                                 .binding_id = 0});
+        diagnostics = validate_pipeline_document(invalid, fixture.catalog);
+        if (!has_code(diagnostics, "edge.ordering.type", {}, "feature_pass_order"))
+            return 17;
+
+        invalid = fixture.document;
+        auto pass_entry =
+            *fixture.catalog.find({AuthoringTypeKind::kRenderPass, RenderPassTypeId("Game.CustomOutlinePass").value()});
+        pass_entry.key = {AuthoringTypeKind::kRenderPass, RenderPassTypeId("Game.SecondPass").value()};
+        pass_entry.name = "Game.SecondPass";
+        pass_entry.display_name = "Second Pass";
+        pass_entry.declaration =
+            PassAuthoringDeclaration{.type = RenderPassTypeId("Game.SecondPass"), .allowed_queue_mask = 1};
+        auto feature_entry =
+            *fixture.catalog.find({AuthoringTypeKind::kFeature, FeatureId("Game.CustomOutline").value()});
+        auto feature_declaration = std::get<FeatureAuthoringDeclaration>(feature_entry.declaration);
+        feature_declaration.parts.push_back({.part_index = 2, .domain = FeatureDomain::kRender, .name = "render_2"});
+        feature_declaration.allowed_pass_types.push_back(RenderPassTypeId("Game.SecondPass"));
+        feature_entry.key = {AuthoringTypeKind::kFeature, FeatureId("Game.TwoRenderParts").value()};
+        feature_entry.name = "Game.TwoRenderParts";
+        feature_entry.display_name = "Two Render Parts";
+        feature_entry.declaration = std::move(feature_declaration);
+        TypeCatalog cross_part_catalog;
+        const auto* pipeline_entry =
+            fixture.catalog.find({AuthoringTypeKind::kPipeline, PipelineId("Game.CustomForward").value()});
+        if (pipeline_entry == nullptr || !cross_part_catalog.add(*pipeline_entry) ||
+            !cross_part_catalog.add(feature_entry) || !cross_part_catalog.add(pass_entry))
+            return 13;
+        invalid.feature_nodes.front().type = FeatureId("Game.TwoRenderParts");
+        invalid.pass_nodes.push_back({.node_id = "second_render_pass",
+                                      .type = RenderPassTypeId("Game.SecondPass"),
+                                      .version = {1, 0, 0},
+                                      .feature_node = "outline",
+                                      .part_id = "render_2"});
+        invalid.edges.push_back({.edge_id = "cross_part_order",
+                                 .kind = DocumentEdgeKind::kOrdering,
+                                 .source = {"outline_pass", 0},
+                                 .destination = {"second_render_pass", 0},
+                                 .binding_id = 0});
+        diagnostics = validate_pipeline_document(invalid, cross_part_catalog);
+        if (!has_code(diagnostics, "edge.ordering.part", {}, "cross_part_order"))
+            return 14;
+
+        auto fixed_catalog = fixture.catalog;
+        auto fixed_feature =
+            *fixed_catalog.find({AuthoringTypeKind::kFeature, FeatureId("Game.CustomOutline").value()});
+        auto fixed_declaration = std::get<FeatureAuthoringDeclaration>(fixed_feature.declaration);
+        fixed_declaration.allow_add_passes = false;
+        fixed_feature.key = {AuthoringTypeKind::kFeature, FeatureId("Game.FixedFeature").value()};
+        fixed_feature.name = "Game.FixedFeature";
+        fixed_feature.display_name = "Fixed Feature";
+        fixed_declaration.default_passes.clear();
+        fixed_feature.declaration = std::move(fixed_declaration);
+        if (!fixed_catalog.add(std::move(fixed_feature)))
+            return 15;
+        invalid = fixture.document;
+        invalid.feature_nodes.front().type = FeatureId("Game.FixedFeature");
+        invalid.pass_nodes.front().feature_node = "outline";
+        diagnostics = validate_pipeline_document(invalid, fixed_catalog);
+        if (!has_code(diagnostics, "pass.additional", "outline_pass"))
+            return 16;
         return 0;
     } catch (const std::exception& exception) {
         std::cerr << exception.what() << '\n';

@@ -56,9 +56,12 @@ private:
     [[nodiscard]] foundation::Result validate(const pipeline::RenderPassConfiguration& configuration) const {
         if (configuration.type != descriptor_.type || !configuration.enabled ||
             configuration.queue > rhi::QueueClass::kCopy ||
-            !(descriptor_.allowed_queue_mask & queue_bit(configuration.queue)) || !configuration.parameters.empty() ||
-            !configuration.bindings.empty())
+            !(descriptor_.allowed_queue_mask & queue_bit(configuration.queue)) || !configuration.parameters.empty())
             return foundation::invalid_argument("built-in renderer pass configuration is incompatible");
+        for (const auto& binding : configuration.bindings) {
+            if (binding.first != binding.second)
+                return foundation::invalid_argument("built-in renderer pass resource rebinding is unsupported");
+        }
         const auto commands = std::dynamic_pointer_cast<const BuiltinPassCommands>(configuration.runtime_data);
         if (!commands || commands->type != descriptor_.type || !commands->setup || !commands->execute)
             return foundation::invalid_state("built-in renderer pass requires prepared frame commands");

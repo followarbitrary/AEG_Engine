@@ -105,9 +105,9 @@ bool valid_resource_constraints(const ResourceConstraints& value) {
     const uint64_t capabilities = value.resource_class == ResourceClass::kBuffer
                                       ? (static_cast<uint64_t>(rhi::BufferCapability::kAccelerationInput) << 1) - 1
                                       : (static_cast<uint64_t>(rhi::TextureCapability::kDepthStencil) << 1) - 1;
-    constexpr auto usages =
+    constexpr auto kUsages =
         (uint64_t{1} << (static_cast<uint8_t>(rhi::ResourceUsage::kAccelerationStructureBuildWrite) + 1)) - 1;
-    if ((value.capability_mask & ~capabilities) || (value.usage_mask & ~usages))
+    if ((value.capability_mask & ~capabilities) || (value.usage_mask & ~kUsages))
         return false;
     if (value.sample_count && ((value.sample_count & (value.sample_count - 1)) || value.sample_count > 64))
         return false;
@@ -201,7 +201,7 @@ foundation::Result validate_pipeline_declaration(const PipelineAuthoringDeclarat
         incoming.emplace(stage.id, 0);
     std::unordered_set<uint64_t> point_ids;
     std::unordered_set<std::string> point_names;
-    constexpr auto known_flags =
+    constexpr auto kKnownFlags =
         static_cast<uint32_t>(FeaturePointFlags::kMayCreateArtifacts | FeaturePointFlags::kMayCreateGraphicsPass |
                               FeaturePointFlags::kMayCreateComputePass | FeaturePointFlags::kMayCreateCopyPass |
                               FeaturePointFlags::kMayUseDedicatedQueue | FeaturePointFlags::kMayWriteFinalOutput |
@@ -210,7 +210,7 @@ foundation::Result validate_pipeline_declaration(const PipelineAuthoringDeclarat
         if (!point.id.is_valid() || point.name.empty() || !incoming.contains(point.anchor_stage) ||
             static_cast<uint8_t>(point.position) > static_cast<uint8_t>(FeaturePointPosition::kAfter) ||
             !point.domains || (point.domains & ~kAllFeatureDomains) || !point.scopes ||
-            (point.scopes & ~kAllPipelineScopes) || (static_cast<uint32_t>(point.flags) & ~known_flags) ||
+            (point.scopes & ~kAllPipelineScopes) || (static_cast<uint32_t>(point.flags) & ~kKnownFlags) ||
             !point_ids.insert(point.id.value()).second || !point_names.insert(point.name).second)
             return foundation::invalid_argument("invalid or duplicate authoring feature point");
     std::set<std::pair<StageId, StageId>> orderings;
@@ -286,6 +286,15 @@ foundation::Result validate_default_edges(const TypeCatalogEntry& entry,
             if (edge.binding_id || source.second || destination.second || source.first == destination.first ||
                 resource_nodes.contains(source.first) || resource_nodes.contains(destination.first))
                 return foundation::invalid_argument("ordering edge requires distinct pass nodes without data ports");
+            const auto source_pass = std::find_if(declaration.default_passes.begin(), declaration.default_passes.end(),
+                                                  [&](const auto& pass) { return pass.node_id == source.first; });
+            const auto destination_pass =
+                std::find_if(declaration.default_passes.begin(), declaration.default_passes.end(),
+                             [&](const auto& pass) { return pass.node_id == destination.first; });
+            if (source_pass == declaration.default_passes.end() ||
+                destination_pass == declaration.default_passes.end() ||
+                source_pass->part_id != destination_pass->part_id)
+                return foundation::invalid_argument("ordering edge must stay within one Render Part");
             continue;
         }
         const BindingKey binding{edge.kind, edge.binding_id};
@@ -327,10 +336,13 @@ foundation::Result validate_feature_declaration(const TypeCatalogEntry& entry,
         return result;
     std::unordered_set<uint32_t> part_indices;
     std::map<std::string, FeatureDomain> parts;
-    for (const auto& part : declaration.parts)
+    for (uint32_t part_position = 0; part_position < declaration.parts.size(); ++part_position) {
+        const auto& part = declaration.parts[part_position];
         if (part.name.empty() || static_cast<uint8_t>(part.domain) > static_cast<uint8_t>(FeatureDomain::kStream) ||
-            !part_indices.insert(part.part_index).second || !parts.emplace(part.name, part.domain).second)
+            part.part_index != part_position || !part_indices.insert(part.part_index).second ||
+            !parts.emplace(part.name, part.domain).second)
             return foundation::invalid_argument("invalid or duplicate authoring part");
+    }
     std::unordered_set<uint64_t> allowed_passes;
     for (const auto type : declaration.allowed_pass_types)
         if (!type.is_valid() || !allowed_passes.insert(type.value()).second)
@@ -371,9 +383,9 @@ foundation::Result validate_declaration(const TypeCatalogEntry& entry) {
             break;
         case AuthoringTypeKind::kRenderPass:
             if (const auto* value = std::get_if<PassAuthoringDeclaration>(&entry.declaration)) {
-                constexpr auto queues = (uint64_t{1} << (static_cast<uint8_t>(rhi::QueueClass::kPresent) + 1)) - 1;
+                constexpr auto kQueues = (uint64_t{1} << (static_cast<uint8_t>(rhi::QueueClass::kPresent) + 1)) - 1;
                 if (!value->type.is_valid() || value->type.value() != entry.key.id ||
-                    (value->allowed_queue_mask & ~queues))
+                    (value->allowed_queue_mask & ~kQueues))
                     return foundation::invalid_argument("invalid pass declaration");
                 return foundation::Result::success();
             }

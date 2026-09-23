@@ -17,6 +17,8 @@ struct RenderPassInstanceConfiguration final {
     std::unordered_map<uint64_t, uint64_t> resource_bindings{};
     std::string part{};
     std::string source{};
+    std::vector<RenderPassInstanceId> ordered_after{};
+    FeaturePartId resolved_part{};
 };
 
 struct FeatureInstanceConfiguration final {
@@ -24,6 +26,8 @@ struct FeatureInstanceConfiguration final {
     FeatureId feature{};
     FeaturePointId point{};
     ParameterBlock parameters{};
+    /** @brief Enables declarative Pass expansion authorized by the Feature authoring declaration. */
+    bool expand_authored_passes{false};
     std::vector<RenderPassInstanceConfiguration> passes{};
     std::string part{};
     std::string source{};

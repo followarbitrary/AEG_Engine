@@ -39,10 +39,12 @@ class PipelineBuilderBackend;
 class FeatureDeclarationBackend;
 struct FeatureBuildDescriptor;
 struct PipelineInstanceConfiguration;
+struct FeatureInstanceConfiguration;
 class RenderPassBuilder;
 class RenderPassBuilderBackend;
 class RenderPassExecutionContext;
 class RenderPassExecutionContextBackend;
+class RenderPassRegistry;
 struct RenderPassConfiguration;
 
 using RenderPassSetupFunction = std::function<foundation::Result(RenderPassBuilder&)>;
@@ -86,6 +88,10 @@ struct RenderGraphFeatureContext {
     uint32_t state_layer_count{0};
     void* user_data{nullptr};
     const void* feature_data{nullptr};
+    /** Borrowed authored configuration for the current Feature instance. */
+    const FeatureInstanceConfiguration* configuration{nullptr};
+    /** Borrowed registry used to resolve authored RenderPass types. */
+    const RenderPassRegistry* render_passes{nullptr};
 
     [[nodiscard]] bool allows(FeaturePointFlags flag) const noexcept { return has_flag(point_flags, flag); }
 };
@@ -94,6 +100,9 @@ struct RenderGraphFeatureContext {
 class RenderPassBuilderBackend {
 public:
     virtual ~RenderPassBuilderBackend() = default;
+
+    [[nodiscard]] virtual foundation::ResultValue<RenderGraphBuffer> find_buffer(RenderResourceId id) const = 0;
+    [[nodiscard]] virtual foundation::ResultValue<RenderGraphTexture> find_texture(RenderResourceId id) const = 0;
 
     [[nodiscard]] virtual foundation::Result read_buffer(RenderGraphBuffer buffer, rhi::ResourceUsage usage,
                                                          rhi::PipelineStageMask pipeline_stages,
@@ -141,6 +150,8 @@ public:
     virtual ~RenderPassExecutionContextBackend() = default;
 
     [[nodiscard]] virtual RenderGraphPass pass() const noexcept = 0;
+    [[nodiscard]] virtual foundation::ResultValue<RenderGraphBuffer> find_buffer(RenderResourceId id) const = 0;
+    [[nodiscard]] virtual foundation::ResultValue<RenderGraphTexture> find_texture(RenderResourceId id) const = 0;
     [[nodiscard]] virtual foundation::ResultValue<rhi::BufferHandle> buffer(RenderGraphBuffer buffer) const = 0;
     [[nodiscard]] virtual foundation::ResultValue<rhi::TextureHandle> texture(RenderGraphTexture texture) const = 0;
     /** @brief Resolves a view prepared before the pass execute callback. */
@@ -228,6 +239,7 @@ public:
                                                                             rhi::QueueClass queue,
                                                                             RenderPassSetupFunction setup,
                                                                             RenderPassExecuteFunction execute) = 0;
+    [[nodiscard]] virtual foundation::Result add_dependency(RenderGraphPass source, RenderGraphPass destination) = 0;
 };
 
 /** @brief Public facade used by RenderFeature declaration and graph build callbacks. */
@@ -305,6 +317,7 @@ public:
     [[nodiscard]] foundation::ResultValue<RenderGraphPass> add_copy_pass(
         std::string_view name, RenderPassSetupFunction setup, RenderPassExecuteFunction execute,
         rhi::QueueClass queue = rhi::QueueClass::kCopy);
+    [[nodiscard]] foundation::Result add_dependency(RenderGraphPass source, RenderGraphPass destination);
 
     /** @brief Creates a runtime facade backed by a RenderGraph adapter. */
     RenderGraphBuilder(RenderGraphBuilderBackend& backend, const RenderGraphFeatureContext& context) noexcept;
@@ -325,6 +338,9 @@ public:
     explicit RenderPassBuilder(RenderPassBuilderBackend& backend,
                                FeaturePointFlags point_flags = FeaturePointFlags::kNone) noexcept
         : backend_(&backend), point_flags_(point_flags) {}
+
+    [[nodiscard]] foundation::ResultValue<RenderGraphBuffer> find_buffer(RenderResourceId id) const;
+    [[nodiscard]] foundation::ResultValue<RenderGraphTexture> find_texture(RenderResourceId id) const;
 
     [[nodiscard]] foundation::Result read(RenderGraphBuffer buffer, rhi::ResourceUsage usage,
                                           rhi::PipelineStageMask pipeline_stages = rhi::PipelineStage::kAllCommands,
@@ -373,6 +389,8 @@ public:
     explicit RenderPassExecutionContext(RenderPassExecutionContextBackend& backend) noexcept : backend_(&backend) {}
 
     [[nodiscard]] RenderGraphPass pass() const noexcept;
+    [[nodiscard]] foundation::ResultValue<RenderGraphBuffer> find_buffer(RenderResourceId id) const;
+    [[nodiscard]] foundation::ResultValue<RenderGraphTexture> find_texture(RenderResourceId id) const;
     [[nodiscard]] foundation::ResultValue<rhi::BufferHandle> buffer(RenderGraphBuffer buffer) const;
     [[nodiscard]] foundation::ResultValue<rhi::TextureHandle> texture(RenderGraphTexture texture) const;
     [[nodiscard]] foundation::ResultValue<rhi::BufferViewHandle> buffer_view(
@@ -844,6 +862,12 @@ public:
     [[nodiscard]] virtual foundation::Result build_render_graph(RenderGraphBuilder&) const {
         return foundation::Result::success();
     }
+    /** @brief Opts the feature into generic expansion of its authored RenderPass instances. */
+    [[nodiscard]] virtual bool uses_authored_render_passes() const noexcept { return false; }
+    [[nodiscard]] virtual bool uses_authored_render_passes_for_part(FeatureInstanceId,
+                                                                    FeaturePartId part) const noexcept {
+        return !part.is_valid() && uses_authored_render_passes();
+    }
     /** @brief True when this feature writes a composable color state output. */
     [[nodiscard]] virtual bool uses_render_state_output() const noexcept { return false; }
     /** @brief Declares the blending semantic used when this feature consumes state inputs. */
@@ -1027,6 +1051,7 @@ public:
     [[nodiscard]] FeatureDomain feature_domain() const noexcept final { return kDomain; }
     [[nodiscard]] FeatureDomainMask feature_domain_mask() const noexcept final { return to_mask(kDomain); }
     [[nodiscard]] foundation::Result collect_contributions(FeatureBuildContext& context) const final;
+    [[nodiscard]] bool uses_authored_render_passes() const noexcept override { return false; }
 
 protected:
     [[nodiscard]] virtual foundation::Result setup(BuilderType& builder) const = 0;
@@ -1079,6 +1104,23 @@ public:
 
     [[nodiscard]] FeatureDomain feature_domain() const noexcept final { return kDomain; }
     [[nodiscard]] FeatureDomainMask feature_domain_mask() const noexcept final { return kDomainMask; }
+
+    [[nodiscard]] bool uses_authored_render_passes_for_part(FeatureInstanceId instance,
+                                                            FeaturePartId selected) const noexcept final {
+        bool enabled = false;
+        uint32_t index = 0;
+        const auto visit_part = [&](const auto& part) {
+            using PartType = std::remove_cvref_t<decltype(part)>;
+            if constexpr (PartType::kDomain == FeatureDomain::kRender) {
+                if (selected == make_feature_part_id(instance, index)) {
+                    enabled = static_cast<const PipelineFeature&>(part).uses_authored_render_passes();
+                }
+            }
+            ++index;
+        };
+        std::apply([&](const auto&... part) { (visit_part(part), ...); }, parts);
+        return enabled;
+    }
 
     [[nodiscard]] foundation::Result collect_contributions(FeatureBuildContext& context) const final {
         foundation::Result result = foundation::Result::success();
@@ -1741,6 +1783,21 @@ inline foundation::Result RenderPassBuilder::read(RenderGraphBuffer buffer, rhi:
                                : backend_->read_buffer(buffer, usage, pipeline_stages, shader_stages, range);
 }
 
+inline foundation::Result RenderGraphBuilder::add_dependency(RenderGraphPass source, RenderGraphPass destination) {
+    return runtime_backend_ == nullptr ? render_graph_builder_invalid_state()
+                                       : runtime_backend_->add_dependency(source, destination);
+}
+
+inline foundation::ResultValue<RenderGraphBuffer> RenderPassBuilder::find_buffer(RenderResourceId id) const {
+    return backend_ == nullptr ? foundation::ResultValue<RenderGraphBuffer>{render_graph_builder_invalid_state(), {}}
+                               : backend_->find_buffer(id);
+}
+
+inline foundation::ResultValue<RenderGraphTexture> RenderPassBuilder::find_texture(RenderResourceId id) const {
+    return backend_ == nullptr ? foundation::ResultValue<RenderGraphTexture>{render_graph_builder_invalid_state(), {}}
+                               : backend_->find_texture(id);
+}
+
 inline foundation::Result RenderPassBuilder::write(RenderGraphBuffer buffer, rhi::ResourceUsage usage,
                                                    rhi::PipelineStageMask pipeline_stages,
                                                    rhi::ShaderStageMask shader_stages, RenderGraphBufferRange range,
@@ -1834,6 +1891,14 @@ inline foundation::Result RenderPassBuilder::declare_render_program(const Render
 
 inline RenderGraphPass RenderPassExecutionContext::pass() const noexcept {
     return backend_->pass();
+}
+
+inline foundation::ResultValue<RenderGraphBuffer> RenderPassExecutionContext::find_buffer(RenderResourceId id) const {
+    return backend_->find_buffer(id);
+}
+
+inline foundation::ResultValue<RenderGraphTexture> RenderPassExecutionContext::find_texture(RenderResourceId id) const {
+    return backend_->find_texture(id);
 }
 
 inline foundation::ResultValue<rhi::BufferHandle> RenderPassExecutionContext::buffer(RenderGraphBuffer buffer) const {
