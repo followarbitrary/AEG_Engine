@@ -220,6 +220,8 @@ struct RenderGraphExecuteDesc {
 struct RenderGraphExecutionResult {
     rhi::GpuCompletionSet queue_completions{};
     rhi::GpuSyncPoint completion{};
+    /** @brief Number of successful graphics draw commands recorded by this graph execution. */
+    uint32_t draw_call_count{0};
     uint32_t executed_pass_count{0};
     uint32_t submitted_batch_count{0};
     bool presented{false};
@@ -396,7 +398,8 @@ private:
     friend class RenderGraph;
 
     RenderPassCommandContext(RenderGraph& graph, rhi::Device& device, RenderGraphPass pass,
-                             rhi::CommandListHandle command_list, uint32_t pass_index, uint32_t frame_slot) noexcept;
+                             rhi::CommandListHandle command_list, uint32_t pass_index, uint32_t frame_slot,
+                             uint32_t& draw_call_count) noexcept;
 
     RenderGraph& graph_;
     rhi::Device& device_;
@@ -404,6 +407,7 @@ private:
     rhi::CommandListHandle command_list_{};
     uint32_t pass_index_{kInvalidHandleIndex};
     uint32_t frame_slot_{kInvalidHandleIndex};
+    uint32_t* draw_call_count_{nullptr};
     bool rendering_active_{false};
     bool rendering_started_{false};
 };

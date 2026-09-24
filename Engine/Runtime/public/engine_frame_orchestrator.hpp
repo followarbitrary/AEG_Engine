@@ -173,6 +173,8 @@ public:
     [[nodiscard]] std::size_t pipeline_count() const noexcept { return pipelines_.size(); }
     [[nodiscard]] std::size_t world_count() const noexcept { return worlds_.size(); }
     [[nodiscard]] std::size_t world_frame_count() const noexcept { return world_frames_.size(); }
+    /** @brief Number of successful draw commands recorded by the last executed frame graph. */
+    [[nodiscard]] uint32_t draw_call_count() const noexcept { return draw_call_count_; }
 
 private:
     friend struct EngineFramePreparationContext;
@@ -267,5 +269,6 @@ private:
     bool render_graph_executed_{false};
     bool frame_presented_{false};
     bool worlds_committed_{false};
+    uint32_t draw_call_count_{0};
 };
 }  // namespace aeg::engine

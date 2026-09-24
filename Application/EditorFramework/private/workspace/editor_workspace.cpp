@@ -650,9 +650,11 @@ foundation::Result EditorWorkspace::build_ui() {
             if (ImGui::Begin("##EditorStatusBar", nullptr, status_flags)) {
                 ImGui::TextDisabled("AEG Engine / Editor");
                 ImGui::SameLine();
-                ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(), ImGui::GetWindowWidth() - 240.0f));
+                ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(), ImGui::GetWindowWidth() - 360.0f));
                 const float fps = ImGui::GetIO().Framerate;
-                ImGui::TextDisabled("Frame %.1f ms  |  %.0f FPS", fps > 0.0f ? 1000.0f / fps : 0.0f, fps);
+                ImGui::TextDisabled("Frame %.1f ms  |  %.0f FPS  |  Game Draw Calls %u",
+                                    fps > 0.0f ? 1000.0f / fps : 0.0f, fps,
+                                    static_cast<unsigned int>(game_draw_calls_));
             }
             ImGui::End();
         }

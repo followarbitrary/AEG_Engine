@@ -85,6 +85,8 @@ public:
     void set_preferences_open(bool open) noexcept { preferences_open_ = open; }
     [[nodiscard]] bool preferences_open() const noexcept { return preferences_open_; }
     void set_playing(bool playing) noexcept { playing_ = playing; }
+    /** @brief Supplies the latest draw-call count from the open game project viewport. */
+    void set_game_draw_calls(uint32_t draw_calls) noexcept { game_draw_calls_ = draw_calls; }
     /** @brief Serializes the current semantic layout for an Application-owned store. */
     [[nodiscard]] foundation::Result serialize_layout(std::string& serialized) const;
     /** @brief Replaces the semantic layout from a previously serialized snapshot. */
@@ -134,6 +136,7 @@ private:
     bool building_ui_{false};
     bool preferences_open_{false};
     bool playing_{false};
+    uint32_t game_draw_calls_{0};
     int workspace_mode_{0};
     std::string active_rail_{"Scene"};
     std::string pending_panel_focus_{};

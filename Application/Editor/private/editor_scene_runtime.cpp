@@ -1176,6 +1176,13 @@ bool EditorSceneRuntime::project_loaded() const noexcept {
     return impl_ != nullptr && impl_->project_manager.loaded();
 }
 
+uint32_t EditorSceneRuntime::draw_call_count() const noexcept {
+    if (impl_ == nullptr || !impl_->project_manager.loaded() || impl_->orchestrator == nullptr) {
+        return 0;
+    }
+    return impl_->orchestrator->draw_call_count();
+}
+
 std::string_view EditorSceneRuntime::project_name() const noexcept {
     return impl_ == nullptr ? std::string_view{} : impl_->project_manager.descriptor().name;
 }

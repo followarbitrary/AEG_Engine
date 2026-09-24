@@ -3615,13 +3615,14 @@ void RenderGraph::Impl::commit_runtime_states(const std::vector<RuntimeBufferSta
 
 RenderPassCommandContext::RenderPassCommandContext(RenderGraph& graph, rhi::Device& device, RenderGraphPass pass,
                                                    rhi::CommandListHandle command_list, uint32_t pass_index,
-                                                   uint32_t frame_slot) noexcept
+                                                   uint32_t frame_slot, uint32_t& draw_call_count) noexcept
     : graph_(graph),
       device_(device),
       pass_(pass),
       command_list_(command_list),
       pass_index_(pass_index),
-      frame_slot_(frame_slot) {}
+      frame_slot_(frame_slot),
+      draw_call_count_(&draw_call_count) {}
 
 foundation::ResultValue<rhi::BufferHandle> RenderPassCommandContext::resolve_buffer(RenderGraphBuffer buffer) const {
     return graph_.impl_->resolve_buffer(buffer, frame_slot_);
@@ -3749,11 +3750,19 @@ foundation::Result RenderPassCommandContext::bind_index_buffer(rhi::BufferHandle
 }
 
 foundation::Result RenderPassCommandContext::draw(const rhi::DrawDesc& desc) {
-    return device_.draw(command_list_, desc);
+    const foundation::Result result = device_.draw(command_list_, desc);
+    if (result && draw_call_count_ != nullptr) {
+        ++*draw_call_count_;
+    }
+    return result;
 }
 
 foundation::Result RenderPassCommandContext::draw_indexed(const rhi::DrawIndexedDesc& desc) {
-    return device_.draw_indexed(command_list_, desc);
+    const foundation::Result result = device_.draw_indexed(command_list_, desc);
+    if (result && draw_call_count_ != nullptr) {
+        ++*draw_call_count_;
+    }
+    return result;
 }
 
 foundation::Result RenderPassCommandContext::dispatch(const rhi::DispatchDesc& desc) {
@@ -4183,7 +4192,7 @@ foundation::ResultValue<RenderGraphExecutionResult> RenderGraph::execute(FrameCo
 
                 PassExecutionContext context(*this, device_,
                                              RenderGraphPass{pass_index, pass.generation, impl_->graph_id},
-                                             command_list, pass_index, frame_slot);
+                                             command_list, pass_index, frame_slot, execution_result.draw_call_count);
                 try {
                     if (pass.execute) {
                         const foundation::Result execute_result = pass.execute(context);

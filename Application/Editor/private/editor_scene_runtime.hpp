@@ -175,6 +175,8 @@ public:
     /** @brief True when a render Feature can reach the active Renderer Pipeline Present stage. */
     [[nodiscard]] bool viewport_present_connected() const noexcept;
     [[nodiscard]] bool viewport_resize_pending() const noexcept;
+    /** @brief Returns draw calls recorded by the current game project's viewport frame. */
+    [[nodiscard]] uint32_t draw_call_count() const noexcept;
 
     /** @brief Intersects the edit World mesh bounds with a camera ray. */
     [[nodiscard]] foundation::ResultValue<ViewportPickResult> pick_viewport(ViewportPoint pixel, uint32_t width,

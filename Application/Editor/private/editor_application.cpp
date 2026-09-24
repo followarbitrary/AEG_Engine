@@ -4117,6 +4117,7 @@ public:
                 build_editor_menu();
                 workspace_.set_preferences_open(preferences_window_ != nullptr || preferences_open_requested_);
                 workspace_.set_playing(scene_runtime_->mode() != EditorSceneRuntime::Mode::kEdit);
+                workspace_.set_game_draw_calls(scene_runtime_ != nullptr ? scene_runtime_->draw_call_count() : 0);
                 const Result build_workspace_result = workspace_.build_ui();
                 if (!build_workspace_result) {
                     notify_runtime_result(build_workspace_result, "build_editor_workspace");

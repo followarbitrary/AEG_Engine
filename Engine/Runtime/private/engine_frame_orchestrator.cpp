@@ -549,6 +549,7 @@ foundation::Result EngineFrameOrchestrator::begin_frame(const EngineFrameDesc& d
     render_graph_executed_ = false;
     frame_presented_ = false;
     worlds_committed_ = false;
+    draw_call_count_ = 0;
     has_last_phase_ = false;
     last_phase_rank_ = 0;
 
@@ -1052,6 +1053,7 @@ foundation::Result EngineFrameOrchestrator::execute_render_graph() {
     if (!execution) {
         return execution.result;
     }
+    draw_call_count_ = execution.value.draw_call_count;
     render_graph_executed_ = true;
     return foundation::Result::success();
 }
