@@ -159,8 +159,14 @@ foundation::ResultValue<std::filesystem::path> create_project(const ProjectScaff
     ProjectFile project = parsed.value;
     project.config.name = request.name;
     project.config.project_uuid = make_uuid(root);
+    project.config.engine.template_id = request.template_id;
+    project.config.engine.sdk_requirement = request.engine_sdk;
     project.config.module.target = request.module_target;
     project.config.module.id = request.module_target;
+    project.config.startup_pipelines.clear();
+    if (!request.render_pipeline.empty()) {
+        project.config.startup_pipelines.push_back(request.render_pipeline);
+    }
     if (const foundation::Result save_result = codec.save(manifest, project); !save_result) {
         std::filesystem::remove_all(root, error);
         return {save_result, {}};

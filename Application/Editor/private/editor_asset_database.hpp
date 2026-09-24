@@ -45,6 +45,22 @@ struct EditorAssetRecord final {
     std::vector<uint64_t> dependencies{};
 };
 
+/** @brief Import settings captured by the UI and forwarded to the importer. */
+struct EditorAssetImportOptions final {
+    float mesh_scale{1.0f};
+    bool generate_normals{true};
+    bool generate_tangents{true};
+    bool generate_mipmaps{true};
+    bool texture_srgb{true};
+    uint8_t texture_compression{4};
+};
+
+struct EditorAssetImportRequest final {
+    std::filesystem::path source{};
+    std::filesystem::path destination_directory{"Assets"};
+    EditorAssetImportOptions options{};
+};
+
 /** @brief Scans project Assets and persists stable IDs in a project-local manifest. */
 class EditorAssetDatabase final {
 public:
@@ -52,6 +68,7 @@ public:
 
     [[nodiscard]] foundation::Result initialize(const std::filesystem::path& project_root);
     [[nodiscard]] foundation::Result refresh();
+    [[nodiscard]] foundation::Result import_external(const EditorAssetImportRequest& request);
     [[nodiscard]] foundation::Result reimport(uint64_t id);
     [[nodiscard]] foundation::Result rename(uint64_t id, std::string_view new_name);
     [[nodiscard]] foundation::Result remove(uint64_t id);

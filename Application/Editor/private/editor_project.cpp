@@ -80,7 +80,12 @@ constexpr std::string_view kLegacyProjectHeader{"AEG_PROJECT\t1"};
 }  // namespace
 
 foundation::Result EditorProjectManager::new_project(const std::filesystem::path& root, std::string_view name) {
-    const auto created = project::create_project({root, std::string(name), "GameModule"});
+    return new_project(ProjectCreateOptions{root, std::string(name)});
+}
+
+foundation::Result EditorProjectManager::new_project(const ProjectCreateOptions& options) {
+    const auto created = project::create_project(
+        {options.root, options.name, "GameModule", options.template_id, options.engine_sdk, options.render_pipeline});
     if (!created)
         return created.result;
     return import_project(created.value);
@@ -128,6 +133,24 @@ foundation::Result EditorProjectManager::import_project(const std::filesystem::p
 
 foundation::Result EditorProjectManager::close_project() noexcept {
     descriptor_ = {};
+    return foundation::Result::success();
+}
+
+foundation::Result EditorProjectManager::update_project_settings(const project::ProjectConfig& config) {
+    if (!loaded()) {
+        return foundation::invalid_state("Cannot update settings without an open project");
+    }
+    const std::filesystem::path file = project_file();
+    project::ProjectFileCodec codec;
+    auto existing = codec.load(file);
+    if (!existing) {
+        return existing.result;
+    }
+    existing.value.config = config;
+    if (const foundation::Result result = codec.save(file, existing.value); !result) {
+        return result;
+    }
+    descriptor_ = make_descriptor(descriptor_.root, config);
     return foundation::Result::success();
 }
 

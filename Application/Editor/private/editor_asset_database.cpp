@@ -8,6 +8,7 @@
 #include <array>
 #include <cctype>
 #include <charconv>
+#include <cmath>
 #include <fstream>
 #include <iterator>
 #include <string>
@@ -27,6 +28,18 @@ constexpr std::string_view kManifestHeader{"AEG_ASSET_DATABASE\t1"};
     std::transform(value.begin(), value.end(), value.begin(),
                    [](unsigned char character) { return static_cast<char>(std::tolower(character)); });
     return value;
+}
+
+[[nodiscard]] bool safe_relative_path(const std::filesystem::path& path) noexcept {
+    if (path.empty() || path.is_absolute() || path.has_root_name() || path.has_root_directory()) {
+        return false;
+    }
+    for (const auto& component : path.lexically_normal()) {
+        if (component == "..") {
+            return false;
+        }
+    }
+    return true;
 }
 
 [[nodiscard]] EditorAssetKind kind_for_extension(const std::string& extension) noexcept {
@@ -244,6 +257,67 @@ foundation::Result EditorAssetDatabase::initialize(const std::filesystem::path& 
         return Result::success();
     }
     return refresh();
+}
+
+foundation::Result EditorAssetDatabase::import_external(const EditorAssetImportRequest& request) {
+    if (project_root_.empty() || assets_root_.empty()) {
+        return foundation::invalid_state("Asset database is not initialized");
+    }
+    if (request.source.empty()) {
+        return foundation::invalid_argument("External asset source path is empty");
+    }
+    if (!std::isfinite(request.options.mesh_scale) || request.options.mesh_scale <= 0.0f ||
+        request.options.texture_compression > 4u) {
+        return foundation::invalid_argument("External asset import settings are invalid");
+    }
+    std::error_code error;
+    if (!std::filesystem::is_regular_file(request.source, error) || error) {
+        return foundation::not_found("External asset source file does not exist");
+    }
+    const std::string extension = lower(request.source.extension().string());
+    const bool audio_source = extension == ".wav" || extension == ".ogg";
+    if (kind_for_extension(extension) == EditorAssetKind::kUnknown && !audio_source) {
+        return foundation::unsupported("No importer is registered for this external file type");
+    }
+    if (!safe_relative_path(request.destination_directory)) {
+        return foundation::invalid_argument("External asset destination must be a safe project-relative path");
+    }
+
+    const std::filesystem::path destination =
+        (project_root_ / request.destination_directory).lexically_normal();
+    const std::filesystem::path relative_to_assets = destination.lexically_relative(assets_root_);
+    if (relative_to_assets.empty() || relative_to_assets.is_absolute() || relative_to_assets.has_root_name() ||
+        relative_to_assets.has_root_directory() || relative_to_assets.begin()->string() == "..") {
+        return foundation::invalid_argument("External asset destination must be inside the Assets directory");
+    }
+    std::filesystem::create_directories(destination, error);
+    if (error) {
+        return foundation::Result::failure(foundation::ResultCode::kUnknown,
+                                           "Cannot create external asset destination directory");
+    }
+
+    const std::filesystem::path target = destination / request.source.filename();
+    if (std::filesystem::exists(target, error) || error) {
+        return foundation::invalid_argument("An asset with the same name already exists in the destination");
+    }
+    const std::filesystem::path temporary = target.string() + ".aeg_import_tmp";
+    std::filesystem::copy_file(request.source, temporary, std::filesystem::copy_options::none, error);
+    if (error) {
+        return foundation::Result::failure(foundation::ResultCode::kUnknown,
+                                           "Cannot copy the external asset into the project");
+    }
+    std::filesystem::rename(temporary, target, error);
+    if (error) {
+        std::filesystem::remove(temporary, error);
+        return foundation::Result::failure(foundation::ResultCode::kUnknown,
+                                           "Cannot publish the external asset into the project");
+    }
+    const Result refreshed = refresh();
+    if (!refreshed) {
+        std::filesystem::remove(target, error);
+        return refreshed;
+    }
+    return Result::success();
 }
 
 foundation::Result EditorAssetDatabase::load_manifest() {

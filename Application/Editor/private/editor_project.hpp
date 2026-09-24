@@ -9,6 +9,7 @@
 #include <string_view>
 #include <vector>
 
+#include "project_context.hpp"
 #include "result.hpp"
 
 namespace aeg::application {
@@ -28,14 +29,24 @@ struct EditorRecentProject final {
     std::string name{};
 };
 
+struct ProjectCreateOptions final {
+    std::filesystem::path root{};
+    std::string name{};
+    std::string template_id{"empty"};
+    std::string engine_sdk{"1.0"};
+    std::string render_pipeline{"Assets/Pipelines/Default.aegpipe"};
+};
+
 /** @brief Creates and opens game projects without treating the engine checkout as a project. */
 class EditorProjectManager final {
 public:
     EditorProjectManager() = default;
 
     [[nodiscard]] foundation::Result new_project(const std::filesystem::path& root, std::string_view name);
+    [[nodiscard]] foundation::Result new_project(const ProjectCreateOptions& options);
     [[nodiscard]] foundation::Result import_project(const std::filesystem::path& root_or_project_file);
     [[nodiscard]] foundation::Result close_project() noexcept;
+    [[nodiscard]] foundation::Result update_project_settings(const project::ProjectConfig& config);
 
     [[nodiscard]] bool loaded() const noexcept { return descriptor_.root.has_filename(); }
     [[nodiscard]] const EditorProjectDescriptor& descriptor() const noexcept { return descriptor_; }

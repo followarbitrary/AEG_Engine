@@ -179,6 +179,9 @@ foundation::ResultValue<ProjectFile> ProjectFileCodec::load(const std::filesyste
             if (document.contains("engine")) {
                 config.engine.association = toml::find<std::string>(document, "engine", "association");
                 config.engine.sdk_requirement = toml::find<std::string>(document, "engine", "sdk_requirement");
+                if (toml::find(document, "engine").contains("template")) {
+                    config.engine.template_id = toml::find<std::string>(document, "engine", "template");
+                }
             }
             if (document.contains("module")) {
                 config.module.id = toml::find<std::string>(document, "module", "id");
@@ -230,6 +233,7 @@ foundation::Result ProjectFileCodec::save(const std::filesystem::path& file, con
             document["engine"] = toml::table{};
             document["engine"]["association"] = config.engine.association;
             document["engine"]["sdk_requirement"] = config.engine.sdk_requirement;
+            document["engine"]["template"] = config.engine.template_id;
             document["module"] = toml::table{};
             document["module"]["id"] = config.module.id;
             document["module"]["target"] = config.module.target;

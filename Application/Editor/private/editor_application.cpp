@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -55,7 +56,7 @@
 #include "pipeline.hpp"
 #include "pipeline_overview_layout.hpp"
 #include "preferences/editor_preference_controller.hpp"
-#include "project_dialog_ui.hpp"
+#include "project_context.hpp"
 #include "render_graph.hpp"
 #include "render_state_flow.hpp"
 #include "renderer.hpp"
@@ -69,13 +70,19 @@ struct ImGuiWindow;
 namespace {
 using aeg::application::ComponentUpdateView;
 using aeg::application::EditorAssetStatus;
+using aeg::application::EditorAssetImportRequest;
 using aeg::application::EditorFontRepository;
+using aeg::application::EditorProjectManager;
+using aeg::application::EditorRecentProject;
 using aeg::application::EditorPreferenceController;
 using aeg::application::EditorPreferenceControllerDesc;
 using aeg::application::EditorPreferenceStore;
 using aeg::application::EditorResourceDescriptor;
 using aeg::application::EditorResourceKind;
 using aeg::application::EditorSceneRuntime;
+using aeg::application::ProjectCreateOptions;
+using aeg::application::project::ProjectConfig;
+using aeg::application::project::ProjectFileCodec;
 using aeg::application::EditorSystemFontCatalog;
 using aeg::application::HierarchyTransformPolicy;
 using aeg::application::SelectionOperation;
@@ -252,6 +259,15 @@ struct PipelineInspectorSelection {
 };
 std::optional<PipelineInspectorSelection> pipeline_inspector_selection;
 
+template <std::size_t Size>
+void set_text_buffer(std::array<char, Size>& buffer, std::string_view value) {
+    std::fill(buffer.begin(), buffer.end(), '\0');
+    const std::size_t length = std::min(value.size(), buffer.size() - 1u);
+    if (length != 0u) {
+        std::memcpy(buffer.data(), value.data(), length);
+    }
+}
+
 enum class EditorDocumentActionType : uint8_t {
     kNewScene,
     kOpenScene,
@@ -259,6 +275,7 @@ enum class EditorDocumentActionType : uint8_t {
     kSaveAsScene,
     kNewProject,
     kImportProject,
+    kCloseProject,
     kCloseEditor,
 };
 
@@ -266,12 +283,31 @@ struct EditorDocumentAction final {
     EditorDocumentActionType type{EditorDocumentActionType::kNewScene};
     std::filesystem::path path{};
     std::string name{};
+    std::optional<ProjectCreateOptions> project_options{};
 };
 
 using EditorDocumentActionCallback = std::function<void(EditorDocumentAction)>;
 
 [[nodiscard]] uint32_t resource_kind_value(EditorResourceKind kind) noexcept {
     return static_cast<uint32_t>(kind);
+}
+
+[[nodiscard]] const char* editor_resource_kind_name(EditorResourceKind kind) noexcept {
+    switch (kind) {
+        case EditorResourceKind::kMesh:
+            return "Mesh";
+        case EditorResourceKind::kMaterial:
+            return "Material";
+        case EditorResourceKind::kTexture:
+            return "Texture";
+        case EditorResourceKind::kScene:
+            return "Scene";
+        case EditorResourceKind::kFont:
+            return "Font";
+        case EditorResourceKind::kUnknown:
+            return "File";
+    }
+    return "File";
 }
 
 class SceneViewportPanel final : public aeg::editor::EditorPanel {
@@ -3167,7 +3203,8 @@ private:
 /** Presents the real project filesystem rather than a flattened asset database. */
 class ProjectPanel final : public aeg::editor::EditorPanel {
 public:
-    explicit ProjectPanel(EditorSceneRuntime& runtime) noexcept : runtime_(runtime) {}
+    ProjectPanel(EditorSceneRuntime& runtime, std::function<void()> close_project) noexcept
+        : runtime_(runtime), close_project_(std::move(close_project)) {}
 
     void build_ui() override {
         ImGui::Begin("Project");
@@ -3190,9 +3227,17 @@ public:
         ImGui::TextColored(ImVec4{0.33f, 0.76f, 0.68f, 1.0f}, "●");
         ImGui::SameLine(0.0f, 3.0f);
         ImGui::TextDisabled("Open");
+        const float close_width = ImGui::CalcTextSize("Close Project").x + ImGui::GetStyle().FramePadding.x * 2.0f;
+        const float sync_width = ImGui::CalcTextSize("Sync").x + ImGui::GetStyle().FramePadding.x * 2.0f;
         ImGui::SameLine();
-        ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(), ImGui::GetWindowWidth() - 57.0f));
-        if (ImGui::SmallButton("Sync")) {
+        ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(),
+                                      ImGui::GetWindowWidth() - close_width - sync_width -
+                                          ImGui::GetStyle().ItemSpacing.x - 12.0f));
+        if (ImGui::SmallButton("Close Project##ProjectClose") && close_project_) {
+            close_project_();
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Sync##ProjectSync")) {
             last_operation_ = runtime_.refresh_assets();
         }
         ImGui::EndChild();
@@ -3433,6 +3478,7 @@ private:
     }
 
     EditorSceneRuntime& runtime_;
+    std::function<void()> close_project_;
     std::array<char, 128> filter_{};
     std::filesystem::path selected_path_{};
     Result last_operation_{Result::success()};
@@ -3656,6 +3702,9 @@ public:
                 }
             }
         }
+        // Keep startup non-modal. Users can open the hub from File > Project Hub
+        // when they want to create or choose a project.
+        project_hub_pending_ = false;
 
         const aeg::platform::WindowSurfaceBinding surface_binding = window_->surface_binding();
         if (!surface_binding.is_valid()) {
@@ -3781,7 +3830,10 @@ public:
                            "register_hierarchy_panel") ||
             !report_result(workspace_.register_panel(
                                EditorPanelDescriptor{"project", "Project", EditorDockRegion::kLeft, true, true, true},
-                               std::make_unique<ProjectPanel>(*scene_runtime_)),
+                               std::make_unique<ProjectPanel>(*scene_runtime_, [this] {
+                                   request_confirmed_document_action(
+                                       EditorDocumentAction{EditorDocumentActionType::kCloseProject});
+                               })),
                            "register_project_panel") ||
             !report_result(workspace_.register_panel(EditorPanelDescriptor{"inspector", "Inspector",
                                                                            EditorDockRegion::kRight, true, true, true},
@@ -4286,11 +4338,6 @@ public:
     }
 
 private:
-    enum class ProjectDialogMode : uint8_t {
-        kNew,
-        kImport,
-    };
-
     enum class SceneDialogMode : uint8_t {
         kOpen,
         kSaveAs,
@@ -4602,6 +4649,7 @@ private:
                                  action.type == EditorDocumentActionType::kOpenScene ||
                                  action.type == EditorDocumentActionType::kNewProject ||
                                  action.type == EditorDocumentActionType::kImportProject ||
+                                 action.type == EditorDocumentActionType::kCloseProject ||
                                  action.type == EditorDocumentActionType::kCloseEditor;
         if (destructive && (scene_runtime_->dirty() || pipeline_drafts_.dirty())) {
             pending_document_action_ = std::move(action);
@@ -4642,17 +4690,31 @@ private:
                 result = save_scene_as_and_apply_pipeline_drafts(action.path);
                 break;
             case EditorDocumentActionType::kNewProject:
-                result = scene_runtime_->new_project(action.path, action.name);
+                result = action.project_options.has_value()
+                             ? scene_runtime_->new_project(*action.project_options)
+                             : scene_runtime_->new_project(action.path, action.name);
                 if (result) {
                     pipeline_saved_orderings_.clear();
                     pipeline_layouts_.clear();
                     pipeline_saved_blends_.clear();
+                    project_hub_operation_ = Result::success();
                 }
                 break;
             case EditorDocumentActionType::kImportProject:
                 result = scene_runtime_->import_project(action.path);
                 if (result)
                     result = restore_pipeline_document();
+                if (result)
+                    project_hub_operation_ = Result::success();
+                break;
+            case EditorDocumentActionType::kCloseProject:
+                result = scene_runtime_->close_project();
+                if (result) {
+                    pipeline_saved_orderings_.clear();
+                    pipeline_layouts_.clear();
+                    pipeline_saved_blends_.clear();
+                    project_hub_pending_ = false;
+                }
                 break;
             case EditorDocumentActionType::kCloseEditor:
                 close_confirmation_requested_ = false;
@@ -4660,6 +4722,11 @@ private:
                 return;
         }
         if (!result) {
+            if (action.type == EditorDocumentActionType::kNewProject ||
+                action.type == EditorDocumentActionType::kImportProject) {
+                project_hub_operation_ = result;
+                project_hub_pending_ = true;
+            }
             notify_runtime_result(result, "editor_document_action");
         }
     }
@@ -4738,33 +4805,49 @@ private:
     void build_workspace_navigation_menu() {
         if (scene_runtime_ == nullptr)
             return;
+        const bool has_project = scene_runtime_->project_loaded();
+        const bool can_edit = has_project && scene_runtime_->mode() == EditorSceneRuntime::Mode::kEdit &&
+                              !scene_runtime_->component_edit_active();
         const auto report_history_result = [this](const Result& result, std::string_view operation) {
             if (!result && result.code != ResultCode::kNotFound)
                 notify_runtime_result(result, operation);
         };
         if (ImGui::BeginMenu("File")) {
+            const auto open_project_hub = [this] {
+                project_hub_operation_ = Result::success();
+                project_hub_pending_ = true;
+            };
+            if (ImGui::MenuItem("Project Hub...")) {
+                open_project_hub();
+            }
             if (ImGui::MenuItem("New Project...")) {
-                project_dialog_mode_ = ProjectDialogMode::kNew;
-                project_dialog_pending_ = true;
-                std::fill(project_path_buffer_.begin(), project_path_buffer_.end(), '\0');
-                std::fill(project_name_buffer_.begin(), project_name_buffer_.end(), '\0');
-                const std::string default_path =
-                    (std::filesystem::current_path().parent_path() / "AEG Game Project").string();
-                const std::string default_name = "Game Project";
-                std::memcpy(project_path_buffer_.data(), default_path.data(),
-                            std::min(default_path.size(), project_path_buffer_.size() - 1u));
-                std::memcpy(project_name_buffer_.data(), default_name.data(),
-                            std::min(default_name.size(), project_name_buffer_.size() - 1u));
-                project_operation_ = Result::success();
+                open_project_hub();
+            }
+            if (ImGui::MenuItem("Open Project...", "Ctrl+Shift+O")) {
+                open_project_hub();
             }
             if (ImGui::MenuItem("Import Project...")) {
-                project_dialog_mode_ = ProjectDialogMode::kImport;
-                project_dialog_pending_ = true;
-                std::fill(project_path_buffer_.begin(), project_path_buffer_.end(), '\0');
-                const std::string default_path = std::filesystem::current_path().string();
-                std::memcpy(project_path_buffer_.data(), default_path.data(),
-                            std::min(default_path.size(), project_path_buffer_.size() - 1u));
-                project_operation_ = Result::success();
+                open_project_hub();
+            }
+            if (ImGui::MenuItem("Import Asset...", "Ctrl+Alt+I", false, can_edit)) {
+                import_options_pending_ = true;
+            }
+            if (ImGui::MenuItem("Save Scene", "Ctrl+S", false, can_edit)) {
+                request_document_action(EditorDocumentAction{EditorDocumentActionType::kSaveScene});
+            }
+            if (ImGui::MenuItem("Save Scene As...", "Ctrl+Shift+S", false, can_edit)) {
+                request_document_action(EditorDocumentAction{EditorDocumentActionType::kSaveAsScene,
+                                                             scene_runtime_->scene_path()});
+            }
+            if (ImGui::MenuItem("Project Settings...", nullptr, false, has_project)) {
+                project_settings_pending_ = true;
+            }
+            if (ImGui::MenuItem("Close Project", "Ctrl+Shift+W", false, has_project)) {
+                request_confirmed_document_action(EditorDocumentAction{EditorDocumentActionType::kCloseProject});
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Exit", "Alt+F4")) {
+                close_confirmation_requested_ = true;
             }
             ImGui::EndMenu();
         }
@@ -4776,8 +4859,11 @@ private:
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Assets")) {
-            if (ImGui::MenuItem("Refresh Project Assets"))
+            if (ImGui::MenuItem("Refresh Project Assets", "F5", false, has_project))
                 notify_runtime_result(workspace_.invoke_view_action("refresh_assets"), "refresh_project_assets_menu");
+            if (ImGui::MenuItem("Asset Registry", nullptr, false, has_project)) {
+                registry_viewer_pending_ = true;
+            }
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Pipeline")) {
@@ -4792,11 +4878,646 @@ private:
         }
     }
 
-    /** @brief Handles Edit history shortcuts and deferred project dialogs. */
+    void build_project_hub() {
+        if (scene_runtime_ == nullptr) {
+            return;
+        }
+        if (!project_hub_initialized_) {
+            std::filesystem::path default_base = std::filesystem::current_path().parent_path();
+            if (!resource_root_.empty()) {
+                default_base = resource_root_;
+                std::string leaf = default_base.filename().string();
+                std::transform(leaf.begin(), leaf.end(), leaf.begin(),
+                               [](unsigned char value) { return static_cast<char>(std::tolower(value)); });
+                if (leaf == "debug" || leaf == "release") {
+                    default_base = default_base.parent_path();
+                    leaf = default_base.filename().string();
+                    std::transform(leaf.begin(), leaf.end(), leaf.begin(),
+                                   [](unsigned char value) { return static_cast<char>(std::tolower(value)); });
+                }
+                if (leaf == "build" || leaf == "cmake-build-debug" || leaf == "cmake-build-release") {
+                    default_base = default_base.parent_path();
+                }
+            }
+            const std::string default_path = default_base.string();
+            const std::string default_name = "AEG Game Project";
+            std::memcpy(project_hub_path_buffer_.data(), default_path.data(),
+                        std::min(default_path.size(), project_hub_path_buffer_.size() - 1u));
+            std::memcpy(project_hub_name_buffer_.data(), default_name.data(),
+                        std::min(default_name.size(), project_hub_name_buffer_.size() - 1u));
+            set_text_buffer(project_hub_open_path_buffer_, {});
+            project_hub_initialized_ = true;
+        }
+        if (project_hub_pending_) {
+            ImGui::OpenPopup("ProjectHub");
+            project_hub_pending_ = false;
+            project_hub_close_requested_ = true;
+        }
+        if (const ImGuiViewport* viewport = ImGui::GetMainViewport(); viewport != nullptr) {
+            ImGui::SetNextWindowViewport(viewport->ID);
+            ImGui::SetNextWindowPos(viewport->GetCenter(), ImGuiCond_Always, ImVec2{0.5f, 0.5f});
+            ImGui::SetNextWindowSize(
+                ImVec2{std::min(1280.0f, viewport->WorkSize.x * 0.82f), std::min(700.0f, viewport->WorkSize.y * 0.72f)},
+                ImGuiCond_Always);
+        }
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2{20.0f, 16.0f});
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 4.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2{8.0f, 6.0f});
+        ImGui::PushStyleColor(ImGuiCol_PopupBg, ImVec4{0.065f, 0.108f, 0.132f, 1.0f});
+        ImGui::PushStyleColor(ImGuiCol_Border, ImVec4{0.23f, 0.38f, 0.44f, 1.0f});
+        ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4{0.105f, 0.170f, 0.205f, 1.0f});
+        if (!ImGui::BeginPopupModal(
+                "ProjectHub", &project_hub_close_requested_,
+                ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings)) {
+            ImGui::PopStyleColor(3);
+            ImGui::PopStyleVar(4);
+            return;
+        }
+        const ImU32 accent = IM_COL32(103, 224, 194, 255);
+        const ImU32 icon_blue = IM_COL32(166, 209, 224, 255);
+        const ImU32 muted = IM_COL32(156, 177, 188, 255);
+        const ImU32 card_fill = IM_COL32(25, 42, 51, 255);
+        const ImU32 card_border = IM_COL32(73, 99, 111, 255);
+        const auto draw_project_cube_icon = [](ImDrawList* draw, ImVec2 center, float radius, ImU32 color) {
+            const ImVec2 top{center.x, center.y - radius};
+            const ImVec2 upper_right{center.x + radius * 0.88f, center.y - radius * 0.48f};
+            const ImVec2 lower_right{center.x + radius * 0.88f, center.y + radius * 0.55f};
+            const ImVec2 bottom{center.x, center.y + radius};
+            const ImVec2 lower_left{center.x - radius * 0.88f, center.y + radius * 0.55f};
+            const ImVec2 upper_left{center.x - radius * 0.88f, center.y - radius * 0.48f};
+            draw->AddLine(top, upper_right, color, 2.4f);
+            draw->AddLine(upper_right, lower_right, color, 2.4f);
+            draw->AddLine(lower_right, bottom, color, 2.4f);
+            draw->AddLine(bottom, lower_left, color, 2.4f);
+            draw->AddLine(lower_left, upper_left, color, 2.4f);
+            draw->AddLine(upper_left, top, color, 2.4f);
+            draw->AddLine(upper_left, center, color, 2.4f);
+            draw->AddLine(upper_right, center, color, 2.4f);
+            draw->AddLine(center, bottom, color, 2.4f);
+        };
+        const auto draw_project_file_icon = [icon_blue](ImDrawList* draw, ImVec2 top_left) {
+            draw->AddRect(top_left, ImVec2{top_left.x + 22.0f, top_left.y + 29.0f}, icon_blue, 2.0f, 0, 2.0f);
+            draw->AddLine(ImVec2{top_left.x + 14.0f, top_left.y}, ImVec2{top_left.x + 22.0f, top_left.y + 8.0f},
+                          icon_blue, 2.0f);
+            draw->AddLine(ImVec2{top_left.x + 14.0f, top_left.y}, ImVec2{top_left.x + 14.0f, top_left.y + 8.0f},
+                          icon_blue, 2.0f);
+        };
+        const auto fit_project_hub_text = [](std::string text, float width, bool prefix_ellipsis = false) {
+            constexpr const char* ellipsis = "...";
+            if (width <= 0.0f) {
+                return std::string{};
+            }
+            if (ImGui::CalcTextSize(text.c_str()).x <= width) {
+                return text;
+            }
+            if (ImGui::CalcTextSize(ellipsis).x > width) {
+                return std::string{};
+            }
+            if (prefix_ellipsis) {
+                std::size_t first = 0u;
+                while (first < text.size() &&
+                       ImGui::CalcTextSize((std::string{ellipsis} + text.substr(first)).c_str()).x > width) {
+                    ++first;
+                    while (first < text.size() && (static_cast<unsigned char>(text[first]) & 0xc0u) == 0x80u) {
+                        ++first;
+                    }
+                }
+                return std::string{ellipsis} + text.substr(first);
+            }
+            while (!text.empty() && ImGui::CalcTextSize((text + ellipsis).c_str()).x > width) {
+                std::size_t last = text.size() - 1u;
+                while (last > 0u && (static_cast<unsigned char>(text[last]) & 0xc0u) == 0x80u) {
+                    --last;
+                }
+                text.resize(last);
+            }
+            return text.empty() ? std::string{} : text + ellipsis;
+        };
+        const auto open_project_from_path = [this](const std::filesystem::path& path) {
+            EditorDocumentAction action{};
+            action.type = EditorDocumentActionType::kImportProject;
+            action.path = path;
+            ImGui::CloseCurrentPopup();
+            request_confirmed_document_action(std::move(action));
+        };
+        if (!project_hub_operation_) {
+            ImGui::TextColored(ImVec4{1.0f, 0.35f, 0.25f, 1.0f}, "%s", project_hub_operation_.message.c_str());
+            ImGui::Separator();
+        }
+
+        EditorProjectManager recent_manager;
+        const auto recent_result = recent_manager.recent_projects();
+        const std::vector<EditorRecentProject> recent_projects =
+            recent_result ? std::move(recent_result.value) : std::vector<EditorRecentProject>{};
+        ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2{16.0f, 0.0f});
+        if (ImGui::BeginTable(
+                "ProjectHubColumns", 2,
+                ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_ScrollY,
+                ImVec2{0.0f, std::max(200.0f, ImGui::GetContentRegionAvail().y - 55.0f)})) {
+            ImGui::TableSetupColumn("Create New Project", ImGuiTableColumnFlags_WidthStretch, 0.61f);
+            ImGui::TableSetupColumn("Recent Projects", ImGuiTableColumnFlags_WidthStretch, 0.39f);
+            ImGui::TableNextColumn();
+            {
+                const ImVec2 icon_pos = ImGui::GetCursorScreenPos();
+                ImGui::Dummy(ImVec2{62.0f, 64.0f});
+                draw_project_cube_icon(ImGui::GetWindowDrawList(), ImVec2{icon_pos.x + 30.0f, icon_pos.y + 31.0f},
+                                       23.0f, accent);
+                ImGui::SameLine(0.0f, 12.0f);
+                ImGui::BeginGroup();
+                ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * 1.32f);
+                ImGui::TextUnformatted("Create New Project");
+                ImGui::PopFont();
+                ImGui::TextDisabled("Name your project and choose a starting setup.");
+                ImGui::EndGroup();
+            }
+            ImGui::Separator();
+            ImGui::Dummy(ImVec2{0.0f, 16.0f});
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2{10.0f, 8.0f});
+            if (ImGui::BeginTable("ProjectHubNameLocation", 2, ImGuiTableFlags_SizingStretchProp)) {
+                ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch, 0.48f);
+                ImGui::TableSetupColumn("Location", ImGuiTableColumnFlags_WidthStretch, 0.52f);
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted("Project Name");
+                ImGui::SetNextItemWidth(-1.0f);
+                ImGui::InputText("##ProjectHubName", project_hub_name_buffer_.data(), project_hub_name_buffer_.size());
+                ImGui::TextDisabled("Used for the new project folder.");
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted("Project Location");
+                ImGui::SetNextItemWidth(-105.0f);
+                ImGui::InputText("##ProjectHubCreatePath", project_hub_path_buffer_.data(),
+                                 project_hub_path_buffer_.size());
+                ImGui::SameLine();
+                if (ImGui::Button("Browse...##ProjectHubCreatePath")) {
+                    const auto selection = aeg::application::select_directory(
+                        window_ != nullptr ? window_->surface_binding() : aeg::platform::WindowSurfaceBinding{},
+                        "Select the parent directory for the new project", project_hub_path_buffer_.data());
+                    if (selection) {
+                        set_text_buffer(project_hub_path_buffer_, selection.value);
+                    } else if (selection.result.code != ResultCode::kCancelled) {
+                        project_hub_operation_ = selection.result;
+                    }
+                }
+                ImGui::TextDisabled("A new project folder will be created here.");
+                ImGui::EndTable();
+            }
+            ImGui::PopStyleVar();
+            ImGui::Dummy(ImVec2{0.0f, 10.0f});
+            ImGui::TextUnformatted("Template");
+            if (ImGui::BeginTable("ProjectHubTemplates", 3, ImGuiTableFlags_SizingStretchSame)) {
+                const char* titles[] = {"Empty", "Forward", "Deferred"};
+                const char* descriptions[] = {"No preset", "Forward profile", "Deferred profile"};
+                for (int index = 0; index < 3; ++index) {
+                    ImGui::TableNextColumn();
+                    ImGui::PushID(index);
+                    const ImVec2 card_size{ImGui::GetContentRegionAvail().x, 76.0f};
+                    ImGui::InvisibleButton("TemplateCard", card_size);
+                    const bool clicked = ImGui::IsItemClicked();
+                    const bool hovered = ImGui::IsItemHovered();
+                    if (clicked) {
+                        project_hub_template_index_ = index;
+                    }
+                    if (hovered) {
+                        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                    }
+                    const ImVec2 card_min = ImGui::GetItemRectMin();
+                    const ImVec2 card_max = ImGui::GetItemRectMax();
+                    ImDrawList* draw = ImGui::GetWindowDrawList();
+                    const bool selected = project_hub_template_index_ == index;
+                    draw->AddRectFilled(card_min, card_max,
+                                        selected  ? IM_COL32(29, 68, 68, 255)
+                                        : hovered ? IM_COL32(34, 56, 67, 255)
+                                                  : card_fill,
+                                        7.0f);
+                    draw->AddRect(card_min, card_max, selected ? accent : card_border, 7.0f, 0, selected ? 2.0f : 1.0f);
+                    if (index == 0) {
+                        draw_project_cube_icon(draw, ImVec2{card_min.x + 30.0f, card_min.y + 38.0f}, 16.0f, accent);
+                    } else if (index == 1) {
+                        draw->AddTriangle(ImVec2{card_min.x + 20.0f, card_min.y + 22.0f},
+                                          ImVec2{card_min.x + 20.0f, card_min.y + 54.0f},
+                                          ImVec2{card_min.x + 46.0f, card_min.y + 38.0f}, icon_blue, 2.2f);
+                    } else {
+                        for (int layer = 0; layer < 3; ++layer) {
+                            const float y = card_min.y + 25.0f + layer * 10.0f;
+                            draw->AddPolyline(std::array<ImVec2, 4>{ImVec2{card_min.x + 18.0f, y},
+                                                                    ImVec2{card_min.x + 32.0f, y - 8.0f},
+                                                                    ImVec2{card_min.x + 46.0f, y},
+                                                                    ImVec2{card_min.x + 32.0f, y + 8.0f}}
+                                                  .data(),
+                                              4, icon_blue, ImDrawFlags_Closed, 2.2f);
+                        }
+                    }
+                    const float card_text_width = std::max(0.0f, card_max.x - (card_min.x + 62.0f) - 10.0f);
+                    const std::string title = fit_project_hub_text(titles[index], card_text_width);
+                    const std::string description = fit_project_hub_text(descriptions[index], card_text_width);
+                    draw->PushClipRect(card_min, card_max, true);
+                    draw->AddText(ImVec2{card_min.x + 62.0f, card_min.y + 18.0f}, IM_COL32(233, 242, 246, 255),
+                                  title.c_str());
+                    draw->AddText(ImVec2{card_min.x + 62.0f, card_min.y + 43.0f}, muted, description.c_str());
+                    draw->PopClipRect();
+                    ImGui::PopID();
+                }
+                ImGui::EndTable();
+            }
+            ImGui::Dummy(ImVec2{0.0f, 14.0f});
+            const char* engine_sdks[] = {"1.0", "2.0"};
+            const char* pipelines[] = {"Forward", "Deferred"};
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2{10.0f, 8.0f});
+            if (ImGui::BeginTable("ProjectHubEngineRenderer", 2, ImGuiTableFlags_SizingStretchSame)) {
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted("Engine Version");
+                ImGui::SetNextItemWidth(-1.0f);
+                ImGui::Combo("##ProjectHubSdk", &project_hub_sdk_index_, engine_sdks, IM_ARRAYSIZE(engine_sdks));
+                ImGui::TextDisabled("Saved as this project's version.");
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted("Startup Renderer");
+                ImGui::SetNextItemWidth(-1.0f);
+                ImGui::Combo("##ProjectHubPipeline", &project_hub_pipeline_index_, pipelines, IM_ARRAYSIZE(pipelines));
+                ImGui::TextDisabled("The renderer used when the project opens.");
+                ImGui::EndTable();
+            }
+            ImGui::PopStyleVar();
+            ImGui::Dummy(ImVec2{0.0f, 14.0f});
+            const bool can_create = project_hub_name_buffer_[0] != '\0' && project_hub_path_buffer_[0] != '\0';
+            ImGui::BeginDisabled(!can_create);
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4{0.25f, 0.58f, 0.53f, 1.0f});
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4{0.30f, 0.66f, 0.59f, 1.0f});
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4{0.20f, 0.50f, 0.46f, 1.0f});
+            if (ImGui::Button("+  Create Project", ImVec2{-1.0f, 56.0f})) {
+                ProjectCreateOptions options{};
+                options.root = std::filesystem::path(project_hub_path_buffer_.data()) / project_hub_name_buffer_.data();
+                options.name = project_hub_name_buffer_.data();
+                options.template_id = project_hub_template_index_ == 2
+                                          ? "deferred"
+                                          : (project_hub_template_index_ == 1 ? "forward" : "empty");
+                options.engine_sdk = project_hub_sdk_index_ == 1 ? "2.0" : "1.0";
+                options.render_pipeline = project_hub_pipeline_index_ == 1 ? "Assets/Pipelines/Deferred.aegpipe"
+                                                                           : "Assets/Pipelines/Forward.aegpipe";
+                EditorDocumentAction action{};
+                action.type = EditorDocumentActionType::kNewProject;
+                action.project_options = std::move(options);
+                ImGui::CloseCurrentPopup();
+                request_confirmed_document_action(std::move(action));
+            }
+            ImGui::PopStyleColor(3);
+            ImGui::EndDisabled();
+            ImGui::TextDisabled("Both renderers are included. You can change the startup choice later.");
+
+            ImGui::TableNextColumn();
+            {
+                const ImVec2 icon_pos = ImGui::GetCursorScreenPos();
+                ImGui::Dummy(ImVec2{58.0f, 64.0f});
+                ImDrawList* draw = ImGui::GetWindowDrawList();
+                const ImVec2 center{icon_pos.x + 29.0f, icon_pos.y + 31.0f};
+                draw->AddCircle(center, 21.0f, icon_blue, 32, 2.2f);
+                draw->AddLine(center, ImVec2{center.x, center.y - 12.0f}, icon_blue, 2.2f);
+                draw->AddLine(center, ImVec2{center.x + 10.0f, center.y + 8.0f}, icon_blue, 2.2f);
+                ImGui::SameLine(0.0f, 10.0f);
+                ImGui::BeginGroup();
+                ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * 1.28f);
+                ImGui::TextUnformatted("Recent Projects");
+                ImGui::PopFont();
+                ImGui::TextDisabled("Open a project you've worked on before.");
+                ImGui::EndGroup();
+            }
+            ImGui::Separator();
+            ImGui::Dummy(ImVec2{0.0f, 11.0f});
+            const float recent_list_height =
+                std::min(330.0f, std::max(170.0f, ImGui::GetContentRegionAvail().y - 105.0f));
+            ImGui::BeginChild("ProjectHubRecentList", ImVec2{0.0f, recent_list_height}, false);
+            if (recent_projects.empty()) {
+                ImGui::TextDisabled("No recent projects yet.");
+            }
+            for (const auto& recent : recent_projects) {
+                ImGui::PushID(recent.root.string().c_str());
+                ImGui::InvisibleButton("RecentProjectCard", ImVec2{-1.0f, 60.0f});
+                const bool hovered = ImGui::IsItemHovered();
+                if (hovered) {
+                    ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                    ImGui::SetTooltip("%s", recent.root.string().c_str());
+                }
+                if (ImGui::IsItemClicked()) {
+                    project_hub_selected_root_ = recent.root;
+                    open_project_from_path(recent.root);
+                }
+                const ImVec2 card_min = ImGui::GetItemRectMin();
+                const ImVec2 card_max = ImGui::GetItemRectMax();
+                ImDrawList* draw = ImGui::GetWindowDrawList();
+                draw->AddRectFilled(card_min, card_max, hovered ? IM_COL32(34, 57, 67, 255) : card_fill, 7.0f);
+                draw->AddRect(card_min, card_max, hovered ? icon_blue : card_border, 7.0f, 0, 1.0f);
+                draw_project_file_icon(draw, ImVec2{card_min.x + 18.0f, card_min.y + 15.0f});
+                const float text_x = card_min.x + 66.0f;
+                const float available_text_width = card_max.x - text_x - 15.0f;
+                const std::string display_name = fit_project_hub_text(recent.name, available_text_width);
+                const std::string display_path = fit_project_hub_text(recent.root.string(), available_text_width, true);
+                draw->PushClipRect(card_min, card_max, true);
+                draw->AddText(ImVec2{text_x, card_min.y + 11.0f}, IM_COL32(233, 242, 246, 255), display_name.c_str());
+                draw->AddText(ImVec2{text_x, card_min.y + 33.0f}, muted, display_path.c_str());
+                draw->PopClipRect();
+                ImGui::PopID();
+            }
+            ImGui::EndChild();
+            if (!recent_result) {
+                ImGui::TextColored(ImVec4{1.0f, 0.35f, 0.25f, 1.0f}, "%s", recent_result.result.message.c_str());
+            }
+            ImGui::Dummy(ImVec2{0.0f, 8.0f});
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4{0.16f, 0.28f, 0.34f, 1.0f});
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4{0.20f, 0.35f, 0.42f, 1.0f});
+            if (ImGui::Button("Open Existing Project...", ImVec2{-1.0f, 48.0f})) {
+                const auto selection = aeg::application::select_directory(
+                    window_ != nullptr ? window_->surface_binding() : aeg::platform::WindowSurfaceBinding{},
+                    "Select a game project directory", project_hub_open_path_buffer_.data());
+                if (selection) {
+                    set_text_buffer(project_hub_open_path_buffer_, selection.value);
+                    open_project_from_path(selection.value);
+                } else if (selection.result.code != ResultCode::kCancelled) {
+                    project_hub_operation_ = selection.result;
+                }
+            }
+            ImGui::PopStyleColor(2);
+            ImGui::TextDisabled("Find a project folder on this computer.");
+            ImGui::EndTable();
+        }
+        ImGui::PopStyleVar();
+
+        ImGui::Separator();
+        const float close_hub_width = 150.0f;
+        const float close_hub_height = 32.0f;
+        ImGui::SetCursorPosY(std::max(ImGui::GetCursorPosY(),
+                                      ImGui::GetWindowHeight() - close_hub_height - ImGui::GetStyle().WindowPadding.y));
+        ImGui::SetCursorPosX(ImGui::GetWindowWidth() - close_hub_width - ImGui::GetStyle().WindowPadding.x);
+        if (ImGui::Button("Close Hub", ImVec2{close_hub_width, close_hub_height})) {
+            project_hub_operation_ = Result::success();
+            ImGui::CloseCurrentPopup();
+        }
+
+        ImGui::EndPopup();
+        ImGui::PopStyleColor(3);
+        ImGui::PopStyleVar(4);
+    }
+
+    void begin_project_settings() {
+        project_settings_loaded_ = false;
+        if (scene_runtime_ == nullptr || !scene_runtime_->project_loaded()) {
+            project_settings_operation_ = aeg::foundation::invalid_state("No project is open");
+            return;
+        }
+        const auto project_file = aeg::application::project::discover_project_file(scene_runtime_->project_root());
+        if (!project_file) {
+            project_settings_operation_ = project_file.result;
+            return;
+        }
+        const auto loaded = ProjectFileCodec{}.load(project_file.value);
+        if (!loaded) {
+            project_settings_operation_ = loaded.result;
+            return;
+        }
+        project_settings_draft_ = loaded.value.config;
+        set_text_buffer(project_settings_name_, project_settings_draft_.name);
+        set_text_buffer(project_settings_sdk_, project_settings_draft_.engine.sdk_requirement);
+        set_text_buffer(project_settings_target_, project_settings_draft_.target);
+        set_text_buffer(project_settings_scene_, project_settings_draft_.startup_scene.generic_string());
+        set_text_buffer(project_settings_assets_, project_settings_draft_.paths.assets.generic_string());
+        set_text_buffer(project_settings_source_, project_settings_draft_.paths.source.generic_string());
+        set_text_buffer(project_settings_cache_, project_settings_draft_.paths.cache.generic_string());
+        set_text_buffer(project_settings_pipeline_, project_settings_draft_.startup_pipelines.empty()
+                                                       ? std::string_view{}
+                                                       : project_settings_draft_.startup_pipelines.front().generic_string());
+        project_settings_operation_ = Result::success();
+        project_settings_loaded_ = true;
+    }
+
+    void build_project_settings_modal() {
+        if (project_settings_pending_) {
+            project_settings_pending_ = false;
+            begin_project_settings();
+            ImGui::OpenPopup("ProjectSettings");
+        }
+        if (!ImGui::BeginPopupModal("ProjectSettings", nullptr,
+                                   ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse)) {
+            return;
+        }
+        ImGui::TextUnformatted("Project Settings");
+        ImGui::TextDisabled("Saved to Project.aegproj; startup changes take effect when the project is reopened.");
+        ImGui::Separator();
+        if (!project_settings_operation_) {
+            ImGui::TextColored(ImVec4{1.0f, 0.35f, 0.25f, 1.0f}, "%s", project_settings_operation_.message.c_str());
+        }
+        if (project_settings_loaded_) {
+            if (ImGui::BeginTabBar("ProjectSettingsTabs")) {
+                if (ImGui::BeginTabItem("General")) {
+                    ImGui::InputText("Name", project_settings_name_.data(), project_settings_name_.size());
+                    ImGui::InputText("Engine SDK", project_settings_sdk_.data(), project_settings_sdk_.size());
+                    ImGui::InputText("Target", project_settings_target_.data(), project_settings_target_.size());
+                    ImGui::InputText("Startup Scene", project_settings_scene_.data(), project_settings_scene_.size());
+                    ImGui::InputText("Startup Pipeline", project_settings_pipeline_.data(),
+                                     project_settings_pipeline_.size());
+                    ImGui::EndTabItem();
+                }
+                if (ImGui::BeginTabItem("Directories")) {
+                    ImGui::BeginDisabled();
+                    ImGui::InputText("Assets", project_settings_assets_.data(), project_settings_assets_.size());
+                    ImGui::InputText("Source", project_settings_source_.data(), project_settings_source_.size());
+                    ImGui::InputText("Cache", project_settings_cache_.data(), project_settings_cache_.size());
+                    ImGui::EndDisabled();
+                    ImGui::TextDisabled("Directory mapping is fixed for the current editor session.");
+                    ImGui::EndTabItem();
+                }
+                ImGui::EndTabBar();
+            }
+        }
+        if (ImGui::Button("Apply", ImVec2{90.0f, 0.0f}) && project_settings_loaded_) {
+            project_settings_draft_.name = project_settings_name_.data();
+            project_settings_draft_.engine.sdk_requirement = project_settings_sdk_.data();
+            project_settings_draft_.target = project_settings_target_.data();
+            project_settings_draft_.startup_scene = project_settings_scene_.data();
+            project_settings_draft_.paths.assets = project_settings_assets_.data();
+            project_settings_draft_.paths.source = project_settings_source_.data();
+            project_settings_draft_.paths.cache = project_settings_cache_.data();
+            project_settings_draft_.startup_pipelines.clear();
+            if (project_settings_pipeline_[0] != '\0') {
+                project_settings_draft_.startup_pipelines.emplace_back(project_settings_pipeline_.data());
+            }
+            if (project_settings_draft_.name.empty() || project_settings_draft_.paths.assets.empty()) {
+                project_settings_operation_ = aeg::foundation::invalid_argument(
+                    "Project name and Assets directory are required");
+            } else {
+                project_settings_operation_ = scene_runtime_->update_project_settings(project_settings_draft_);
+                if (project_settings_operation_) {
+                    ImGui::CloseCurrentPopup();
+                    project_settings_loaded_ = false;
+                }
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2{90.0f, 0.0f})) {
+            project_settings_loaded_ = false;
+            project_settings_operation_ = Result::success();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+
+    void build_import_options_modal() {
+        if (import_options_pending_) {
+            import_options_pending_ = false;
+            set_text_buffer(import_source_buffer_, {});
+            set_text_buffer(import_destination_buffer_, "Assets");
+            import_mesh_scale_ = 1.0f;
+            import_generate_normals_ = true;
+            import_generate_tangents_ = true;
+            import_generate_mipmaps_ = true;
+            import_texture_srgb_ = true;
+            import_texture_compression_ = 4;
+            import_operation_ = Result::success();
+            ImGui::OpenPopup("ImportOptions");
+        }
+        if (!ImGui::BeginPopupModal("ImportOptions", nullptr,
+                                   ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse)) {
+            return;
+        }
+        ImGui::TextUnformatted("Import Options");
+        ImGui::TextDisabled("The importer copies the source into the project and refreshes the Asset Registry.");
+        ImGui::InputText("Source file", import_source_buffer_.data(), import_source_buffer_.size());
+        ImGui::InputText("Destination", import_destination_buffer_.data(), import_destination_buffer_.size());
+        const std::filesystem::path source = import_source_buffer_.data();
+        std::string extension = source.extension().string();
+        std::transform(extension.begin(), extension.end(), extension.begin(),
+                       [](unsigned char character) { return static_cast<char>(std::tolower(character)); });
+        const bool mesh = extension == ".fbx" || extension == ".obj" || extension == ".gltf" || extension == ".glb";
+        const bool texture = extension == ".png" || extension == ".jpg" || extension == ".jpeg" || extension == ".tga";
+        const bool audio = extension == ".wav" || extension == ".ogg";
+        if (mesh) {
+            if (ImGui::CollapsingHeader("Mesh", ImGuiTreeNodeFlags_DefaultOpen)) {
+                ImGui::DragFloat("Scale", &import_mesh_scale_, 0.01f, 0.001f, 100.0f, "%.3f");
+                ImGui::Checkbox("Generate Normals", &import_generate_normals_);
+                ImGui::Checkbox("Generate Tangents", &import_generate_tangents_);
+            }
+        } else if (texture) {
+            if (ImGui::CollapsingHeader("Texture", ImGuiTreeNodeFlags_DefaultOpen)) {
+                const char* compression[] = {"None", "BC1", "BC3", "BC5", "BC7"};
+                ImGui::Combo("Compression", &import_texture_compression_, compression, IM_ARRAYSIZE(compression));
+                ImGui::Checkbox("Generate Mipmaps", &import_generate_mipmaps_);
+                ImGui::Checkbox("sRGB", &import_texture_srgb_);
+            }
+        } else if (audio) {
+            ImGui::TextDisabled("Audio import uses the project audio defaults.");
+        } else {
+            ImGui::TextDisabled("Select an FBX, PNG, WAV, or another supported asset file.");
+        }
+        if (!import_operation_) {
+            ImGui::TextColored(ImVec4{1.0f, 0.35f, 0.25f, 1.0f}, "%s", import_operation_.message.c_str());
+        }
+        const bool can_import = scene_runtime_ != nullptr && scene_runtime_->project_loaded() &&
+                                import_source_buffer_[0] != '\0' && import_destination_buffer_[0] != '\0';
+        if (ImGui::Button("Import", ImVec2{90.0f, 0.0f}) && can_import) {
+            EditorAssetImportRequest request{};
+            request.source = import_source_buffer_.data();
+            request.destination_directory = import_destination_buffer_.data();
+            request.options.mesh_scale = import_mesh_scale_;
+            request.options.generate_normals = import_generate_normals_;
+            request.options.generate_tangents = import_generate_tangents_;
+            request.options.generate_mipmaps = import_generate_mipmaps_;
+            request.options.texture_srgb = import_texture_srgb_;
+            request.options.texture_compression = static_cast<uint8_t>(std::clamp(import_texture_compression_, 0, 4));
+            import_operation_ = scene_runtime_->import_external_asset(request);
+            if (import_operation_) {
+                ImGui::CloseCurrentPopup();
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2{90.0f, 0.0f})) {
+            import_operation_ = Result::success();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+
+    void build_registry_viewer_modal() {
+        if (registry_viewer_pending_) {
+            registry_viewer_pending_ = false;
+            set_text_buffer(registry_search_buffer_, {});
+            ImGui::OpenPopup("AssetRegistry");
+        }
+        if (!ImGui::BeginPopupModal("AssetRegistry", nullptr,
+                                   ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse)) {
+            return;
+        }
+        ImGui::TextUnformatted("Asset Registry");
+        ImGui::TextDisabled("Runtime registry IDs are stable across refresh and rename operations.");
+        ImGui::SetNextItemWidth(280.0f);
+        ImGui::InputTextWithHint("##RegistrySearch", "Search path, name or ID...", registry_search_buffer_.data(),
+                                 registry_search_buffer_.size());
+        const std::string_view filter{registry_search_buffer_.data()};
+        const auto records = scene_runtime_ != nullptr ? scene_runtime_->asset_records()
+                                                        : std::span<const aeg::application::EditorAssetRecord>{};
+        if (ImGui::BeginTable("AssetRegistryTable", 8,
+                              ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp |
+                                  ImGuiTableFlags_ScrollY,
+                              ImVec2{760.0f, 320.0f})) {
+            ImGui::TableSetupColumn("ID");
+            ImGui::TableSetupColumn("Name");
+            ImGui::TableSetupColumn("Type");
+            ImGui::TableSetupColumn("Status");
+            ImGui::TableSetupColumn("Size");
+            ImGui::TableSetupColumn("Deps");
+            ImGui::TableSetupColumn("Path");
+            ImGui::TableSetupColumn("Actions");
+            ImGui::TableHeadersRow();
+            for (const aeg::application::EditorAssetRecord& record : records) {
+                const std::string id = std::to_string(record.id);
+                if (!filter.empty() && record.display_name.find(filter) == std::string::npos &&
+                    record.relative_path.find(filter) == std::string::npos && id.find(filter) == std::string::npos) {
+                    continue;
+                }
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                ImGui::Text("%016llx", static_cast<unsigned long long>(record.id));
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(record.display_name.c_str());
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(editor_asset_kind_name(record.kind).data());
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(editor_asset_status_name(record.status).data());
+                ImGui::TableNextColumn();
+                ImGui::Text("%llu", static_cast<unsigned long long>(record.file_size));
+                ImGui::TableNextColumn();
+                ImGui::Text("%llu", static_cast<unsigned long long>(record.dependencies.size()));
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(record.relative_path.c_str());
+                ImGui::TableNextColumn();
+                ImGui::PushID(static_cast<int>(record.id & 0x7fffffff));
+                if (ImGui::SmallButton("Copy ID")) {
+                    ImGui::SetClipboardText(id.c_str());
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Reimport") && scene_runtime_ != nullptr) {
+                    notify_runtime_result(scene_runtime_->reimport_asset(record.id), "reimport_asset_registry_row");
+                }
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+        if (ImGui::Button("Refresh", ImVec2{90.0f, 0.0f}) && scene_runtime_ != nullptr) {
+            notify_runtime_result(scene_runtime_->refresh_assets(), "refresh_asset_registry");
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Close", ImVec2{90.0f, 0.0f})) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+
+    /** @brief Handles Edit history shortcuts and project hub/document dialogs. */
     void build_editor_menu() {
         if (scene_runtime_ == nullptr) {
             return;
         }
+
+        build_project_hub();
+        build_project_settings_modal();
+        build_import_options_modal();
+        build_registry_viewer_modal();
 
         const ImGuiIO& io = ImGui::GetIO();
         const auto report_history_result = [this](const Result& result, std::string_view operation) {
@@ -4817,57 +5538,6 @@ private:
             report_history_result(result, "redo_editor_shortcut");
         }
 
-        if (project_dialog_pending_) {
-            ImGui::OpenPopup("ProjectDialog");
-            project_dialog_pending_ = false;
-        }
-        if (ImGui::BeginPopupModal("ProjectDialog", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-            const bool creating = project_dialog_mode_ == ProjectDialogMode::kNew;
-            ImGui::TextUnformatted(creating ? "Create a game project" : "Import a game project");
-            static_cast<void>(aeg::application::draw_project_dialog_field(
-                "Project directory", "##ProjectDirectory", project_path_buffer_.data(), project_path_buffer_.size()));
-            ImGui::SameLine();
-            if (ImGui::Button("Browse...##ProjectDirectory")) {
-                const auto selection = aeg::application::select_directory(
-                    window_ != nullptr ? window_->surface_binding() : aeg::platform::WindowSurfaceBinding{},
-                    creating ? "Select the new project directory" : "Select a game project directory",
-                    project_path_buffer_.data());
-                if (selection) {
-                    std::fill(project_path_buffer_.begin(), project_path_buffer_.end(), '\0');
-                    std::memcpy(project_path_buffer_.data(), selection.value.data(),
-                                std::min(selection.value.size(), project_path_buffer_.size() - 1u));
-                    project_operation_ = Result::success();
-                } else if (selection.result.code != ResultCode::kCancelled) {
-                    project_operation_ = selection.result;
-                }
-            }
-            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
-                ImGui::SetTooltip("Choose a project folder");
-            }
-            if (creating) {
-                static_cast<void>(aeg::application::draw_project_dialog_field(
-                    "Project name", "##ProjectName", project_name_buffer_.data(), project_name_buffer_.size()));
-            }
-            if (!project_operation_) {
-                ImGui::TextColored(ImVec4{1.0f, 0.35f, 0.25f, 1.0f}, "%s", project_operation_.message.c_str());
-            }
-            if (ImGui::Button(creating ? "Create" : "Import", ImVec2{90.0f, 0.0f})) {
-                EditorDocumentAction action{};
-                action.type =
-                    creating ? EditorDocumentActionType::kNewProject : EditorDocumentActionType::kImportProject;
-                action.path = project_path_buffer_.data();
-                action.name = project_name_buffer_.data();
-                project_operation_ = Result::success();
-                ImGui::CloseCurrentPopup();
-                request_confirmed_document_action(std::move(action));
-            }
-            ImGui::SameLine();
-            if (ImGui::Button("Cancel", ImVec2{90.0f, 0.0f})) {
-                project_operation_ = Result::success();
-                ImGui::CloseCurrentPopup();
-            }
-            ImGui::EndPopup();
-        }
         build_document_dialogs();
     }
 
@@ -6558,11 +7228,41 @@ private:
     std::array<char, 512> scene_path_buffer_{};
     Result scene_operation_{Result::success()};
     Result unsaved_operation_{Result::success()};
-    ProjectDialogMode project_dialog_mode_{ProjectDialogMode::kNew};
-    bool project_dialog_pending_{false};
-    std::array<char, 512> project_path_buffer_{};
-    std::array<char, 128> project_name_buffer_{};
-    Result project_operation_{Result::success()};
+    bool project_hub_pending_{false};
+    bool project_hub_close_requested_{false};
+    bool project_hub_initialized_{false};
+    std::filesystem::path project_hub_selected_root_{};
+    std::array<char, 512> project_hub_open_path_buffer_{};
+    std::array<char, 512> project_hub_path_buffer_{};
+    std::array<char, 128> project_hub_name_buffer_{};
+    int project_hub_template_index_{0};
+    int project_hub_sdk_index_{0};
+    int project_hub_pipeline_index_{0};
+    Result project_hub_operation_{Result::success()};
+    bool project_settings_pending_{false};
+    bool project_settings_loaded_{false};
+    ProjectConfig project_settings_draft_{};
+    std::array<char, 128> project_settings_name_{};
+    std::array<char, 64> project_settings_sdk_{};
+    std::array<char, 128> project_settings_target_{};
+    std::array<char, 256> project_settings_scene_{};
+    std::array<char, 128> project_settings_pipeline_{};
+    std::array<char, 128> project_settings_assets_{};
+    std::array<char, 128> project_settings_source_{};
+    std::array<char, 128> project_settings_cache_{};
+    Result project_settings_operation_{Result::success()};
+    bool import_options_pending_{false};
+    std::array<char, 512> import_source_buffer_{};
+    std::array<char, 128> import_destination_buffer_{};
+    float import_mesh_scale_{1.0f};
+    bool import_generate_normals_{true};
+    bool import_generate_tangents_{true};
+    bool import_generate_mipmaps_{true};
+    bool import_texture_srgb_{true};
+    int import_texture_compression_{4};
+    Result import_operation_{Result::success()};
+    bool registry_viewer_pending_{false};
+    std::array<char, 256> registry_search_buffer_{};
 };
 
 uint32_t parse_frame_limit(int argc, char** argv) {

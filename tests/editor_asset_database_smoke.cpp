@@ -102,7 +102,71 @@ int main() {
         !require(reopened.find(hero_id) != nullptr, "asset database smoke lost stable ID after reload")) {
         return 9;
     }
+
+    const auto external_root = std::filesystem::temp_directory_path() / "aeg_editor_external_import_smoke";
+    std::filesystem::remove_all(external_root, error);
+    std::filesystem::create_directories(external_root / "Assets", error);
+    if (!require(!error, "asset database smoke could not create external import project")) {
+        std::filesystem::remove_all(root, error);
+        return 10;
+    }
+    const auto external_source = external_root / "incoming.obj";
+    std::ofstream(external_source) << "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n";
+    const auto audio_source = external_root / "incoming.wav";
+    std::ofstream(audio_source, std::ios::binary) << "RIFF";
+    aeg::application::EditorAssetDatabase importing;
+    if (!require(static_cast<bool>(importing.initialize(external_root)),
+                 "asset database smoke external import initialization failed")) {
+        std::filesystem::remove_all(root, error);
+        std::filesystem::remove_all(external_root, error);
+        return 11;
+    }
+    aeg::application::EditorAssetImportRequest import_request{};
+    import_request.source = external_source;
+    import_request.destination_directory = "Assets/Imported";
+    if (!require(static_cast<bool>(importing.import_external(import_request)),
+                 "asset database smoke external import failed") ||
+        !require(std::filesystem::exists(external_root / "Assets" / "Imported" / "incoming.obj"),
+                 "asset database smoke external import did not copy source")) {
+        std::filesystem::remove_all(root, error);
+        std::filesystem::remove_all(external_root, error);
+        return 12;
+    }
+    import_request.source = audio_source;
+    import_request.destination_directory = "Assets/ImportedAudio";
+    if (!require(static_cast<bool>(importing.import_external(import_request)),
+                 "asset database smoke audio import entry point failed") ||
+        !require(std::filesystem::exists(external_root / "Assets" / "ImportedAudio" / "incoming.wav"),
+                 "asset database smoke audio import did not copy source")) {
+        std::filesystem::remove_all(root, error);
+        std::filesystem::remove_all(external_root, error);
+        return 13;
+    }
+    import_request.source = external_source;
+    import_request.destination_directory = "Assets/Imported";
+    if (!require(!importing.import_external(import_request),
+                 "asset database smoke external import overwrote an existing destination")) {
+        std::filesystem::remove_all(root, error);
+        std::filesystem::remove_all(external_root, error);
+        return 14;
+    }
+    import_request.destination_directory = "Assets/../Outside";
+    if (!require(!importing.import_external(import_request),
+                 "asset database smoke external import escaped Assets directory")) {
+        std::filesystem::remove_all(root, error);
+        std::filesystem::remove_all(external_root, error);
+        return 15;
+    }
+    import_request.destination_directory = "Assets/ImportedAgain";
+    import_request.options.mesh_scale = 0.0f;
+    if (!require(!importing.import_external(import_request),
+                 "asset database smoke accepted an invalid import scale")) {
+        std::filesystem::remove_all(root, error);
+        std::filesystem::remove_all(external_root, error);
+        return 16;
+    }
     std::filesystem::remove_all(root, error);
+    std::filesystem::remove_all(external_root, error);
     std::cout << "Editor asset database smoke passed\n";
     return 0;
 }

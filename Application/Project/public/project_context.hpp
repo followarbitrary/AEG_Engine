@@ -42,6 +42,7 @@ struct ProjectModuleConfig final {
 struct ProjectEngineConfig final {
     std::string association{"AEG"};
     std::string sdk_requirement{"1.0"};
+    std::string template_id{"empty"};
 };
 
 /** @brief Stable settings loaded from one .aegproject TOML file. */

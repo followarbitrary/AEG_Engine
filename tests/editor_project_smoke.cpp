@@ -7,6 +7,7 @@
 #include <iostream>
 
 #include "editor_project.hpp"
+#include "project_context.hpp"
 
 namespace {
 bool require(bool condition, const char* message) {
@@ -82,6 +83,50 @@ int main() {
         std::filesystem::remove_all(root, error);
         return 3;
     }
+
+    const auto options_root = std::filesystem::temp_directory_path() / "aeg_editor_project_options_smoke";
+    std::filesystem::remove_all(options_root, error);
+    aeg::application::ProjectCreateOptions options{};
+    options.root = options_root;
+    options.name = "Options Game";
+    options.engine_sdk = "2.0";
+    options.render_pipeline = "Assets/Pipelines/Deferred.aegpipe";
+    aeg::application::EditorProjectManager configured;
+    if (!require(static_cast<bool>(configured.new_project(options)),
+                 "editor project smoke configured project creation failed")) {
+        std::filesystem::remove_all(root, error);
+        std::filesystem::remove_all(options_root, error);
+        return 8;
+    }
+    const auto configured_file = aeg::application::project::ProjectFileCodec{}.load(
+        options_root / "Project.aegproj");
+    if (!require(static_cast<bool>(configured_file), "editor project smoke configured file could not be loaded") ||
+        !require(configured_file.value.config.engine.sdk_requirement == "2.0",
+                 "editor project smoke did not persist configured SDK") ||
+        !require(!configured_file.value.config.startup_pipelines.empty() &&
+                     configured_file.value.config.startup_pipelines.front() == options.render_pipeline,
+                 "editor project smoke did not persist configured pipeline")) {
+        std::filesystem::remove_all(root, error);
+        std::filesystem::remove_all(options_root, error);
+        return 9;
+    }
+    auto updated_config = configured_file.value.config;
+    updated_config.name = "Updated Options Game";
+    if (!require(static_cast<bool>(configured.update_project_settings(updated_config)),
+                 "editor project smoke settings update failed")) {
+        std::filesystem::remove_all(root, error);
+        std::filesystem::remove_all(options_root, error);
+        return 10;
+    }
+    const auto updated_file = aeg::application::project::ProjectFileCodec{}.load(
+        options_root / "Project.aegproj");
+    if (!require(static_cast<bool>(updated_file) && updated_file.value.config.name == "Updated Options Game",
+                 "editor project smoke settings update was not persisted")) {
+        std::filesystem::remove_all(root, error);
+        std::filesystem::remove_all(options_root, error);
+        return 11;
+    }
+
     std::filesystem::create_directories(root / "Scenes", error);
     if (!require(!error, "editor project smoke cannot create legacy scene directory")) {
         std::filesystem::remove_all(root, error);

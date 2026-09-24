@@ -5139,6 +5139,10 @@ std::vector<ecs::ComponentTypeId> EditorSceneRuntime::selected_component_types()
     return result;
 }
 
+std::span<const EditorAssetRecord> EditorSceneRuntime::asset_records() const noexcept {
+    return impl_ == nullptr ? std::span<const EditorAssetRecord>{} : impl_->asset_database.assets();
+}
+
 std::vector<EditorResourceDescriptor> EditorSceneRuntime::resource_descriptors() const {
     std::vector<EditorResourceDescriptor> result{};
     if (impl_ == nullptr || !impl_->project_manager.loaded()) {
@@ -5371,13 +5375,17 @@ bool EditorSceneRuntime::component_edit_active() const noexcept {
 }
 
 foundation::Result EditorSceneRuntime::new_project(const std::filesystem::path& root, std::string_view name) {
+    return new_project(ProjectCreateOptions{root, std::string(name)});
+}
+
+foundation::Result EditorSceneRuntime::new_project(const ProjectCreateOptions& options) {
     if (impl_ == nullptr || !impl_->initialized) {
         return foundation::invalid_state("Editor scene runtime is not initialized");
     }
     if (impl_->mode != Mode::kEdit || impl_->transform_edit.active || impl_->component_edit_active) {
         return foundation::invalid_state("New Project requires Edit mode without an active edit transaction");
     }
-    if (const Result result = impl_->project_manager.new_project(root, name); !result) {
+    if (const Result result = impl_->project_manager.new_project(options); !result) {
         return result;
     }
     if (const Result result = impl_->asset_database.initialize(impl_->project_manager.descriptor().root); !result) {
@@ -5398,6 +5406,16 @@ foundation::Result EditorSceneRuntime::new_project(const std::filesystem::path& 
     if (const auto result = save_scene(); !result)
         return result;
     return impl_->restore_startup_renderer();
+}
+
+foundation::Result EditorSceneRuntime::update_project_settings(const project::ProjectConfig& config) {
+    if (impl_ == nullptr || !impl_->initialized) {
+        return foundation::invalid_state("Editor scene runtime is not initialized");
+    }
+    if (impl_->mode != Mode::kEdit || impl_->transform_edit.active || impl_->component_edit_active) {
+        return foundation::invalid_state("Project settings require Edit mode without an active edit transaction");
+    }
+    return impl_->project_manager.update_project_settings(config);
 }
 
 foundation::Result EditorSceneRuntime::import_project(const std::filesystem::path& root_or_project_file) {
@@ -5457,6 +5475,34 @@ foundation::Result EditorSceneRuntime::import_project(const std::filesystem::pat
     }
     if (const auto result = save_scene(); !result)
         return result;
+    return impl_->restore_startup_renderer();
+}
+
+foundation::Result EditorSceneRuntime::close_project() {
+    if (impl_ == nullptr || !impl_->initialized) {
+        return foundation::invalid_state("Editor scene runtime is not initialized");
+    }
+    if (!impl_->project_manager.loaded()) {
+        return Result::success();
+    }
+    if (impl_->mode != Mode::kEdit || impl_->transform_edit.active || impl_->component_edit_active) {
+        return foundation::invalid_state("Close Project requires Edit mode without an active edit transaction");
+    }
+    if (const Result result = impl_->project_manager.close_project(); !result) {
+        return result;
+    }
+    impl_->asset_database = EditorAssetDatabase{};
+    impl_->project_renderer_pipeline.reset();
+    impl_->project_pipeline_authoring = {};
+    if (const Result result = impl_->synchronize_asset_pipeline(); !result) {
+        return result;
+    }
+    if (const Result result = impl_->reset_scene_for_project(); !result) {
+        return result;
+    }
+    if (const Result result = save_scene(); !result) {
+        return result;
+    }
     return impl_->restore_startup_renderer();
 }
 
@@ -5676,6 +5722,26 @@ foundation::Result EditorSceneRuntime::refresh_assets() {
     const Result result = impl_->asset_database.refresh();
     if (!result) {
         return result;
+    }
+    if (const Result authoring = impl_->reload_project_pipeline_authoring(); !authoring) {
+        return authoring;
+    }
+    return impl_->synchronize_asset_pipeline();
+}
+
+foundation::Result EditorSceneRuntime::import_external_asset(const EditorAssetImportRequest& request) {
+    if (impl_ == nullptr || !impl_->initialized) {
+        return foundation::invalid_state("Editor scene runtime is not initialized");
+    }
+    if (impl_->mode != Mode::kEdit) {
+        return foundation::invalid_state("Asset import is only available in Edit mode");
+    }
+    if (!impl_->project_manager.loaded()) {
+        return foundation::invalid_state("No game project is open");
+    }
+    const Result imported = impl_->asset_database.import_external(request);
+    if (!imported) {
+        return imported;
     }
     if (const Result authoring = impl_->reload_project_pipeline_authoring(); !authoring) {
         return authoring;

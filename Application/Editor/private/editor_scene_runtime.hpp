@@ -233,10 +233,14 @@ public:
     [[nodiscard]] foundation::Result save_scene();
     [[nodiscard]] foundation::Result save_scene_as(const std::filesystem::path& path);
     [[nodiscard]] foundation::Result new_project(const std::filesystem::path& root, std::string_view name);
+    [[nodiscard]] foundation::Result new_project(const ProjectCreateOptions& options);
     [[nodiscard]] foundation::Result import_project(const std::filesystem::path& root_or_project_file);
+    [[nodiscard]] foundation::Result close_project();
+    [[nodiscard]] foundation::Result update_project_settings(const project::ProjectConfig& config);
 
     /** @brief Refreshes the project-local Asset Browser index. */
     [[nodiscard]] foundation::Result refresh_assets();
+    [[nodiscard]] foundation::Result import_external_asset(const EditorAssetImportRequest& request);
     [[nodiscard]] foundation::Result reimport_asset(uint64_t id);
     [[nodiscard]] foundation::Result rename_asset(uint64_t id, std::string_view new_name);
     [[nodiscard]] foundation::Result remove_asset(uint64_t id);
@@ -279,6 +283,7 @@ public:
 
     /** @brief Returns the stable component identities visible to the selected entity. */
     [[nodiscard]] std::vector<ecs::ComponentTypeId> selected_component_types() const;
+    [[nodiscard]] std::span<const EditorAssetRecord> asset_records() const noexcept;
     [[nodiscard]] std::vector<EditorResourceDescriptor> resource_descriptors() const;
     [[nodiscard]] bool is_resource_valid(EditorResourceKind kind, uint64_t id) const noexcept;
 
