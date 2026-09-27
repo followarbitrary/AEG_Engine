@@ -1184,7 +1184,9 @@ target_include_directories(aeg_scene
         ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Scene/public
 )
 target_link_libraries(aeg_scene PUBLIC aeg_world aeg_serialization)
-target_link_libraries(aeg_application_tooling PUBLIC aeg_scene)
+if (TARGET aeg_application_tooling)
+    target_link_libraries(aeg_application_tooling PUBLIC aeg_scene)
+endif()
 
 if (MSVC)
     target_compile_options(aeg_scene PRIVATE /W4 /permissive-)
