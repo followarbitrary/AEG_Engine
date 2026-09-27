@@ -417,6 +417,18 @@ foundation::ResultValue<renderer::RenderMaterialResource> RuntimeAssetResolver::
     const auto decoded = cache_->load_material(asset_id.value);
     if (!decoded)
         return {decoded.result, {}};
+    std::vector<std::byte> authored_parameters;
+    if (!decoded.value.payload.parameters.empty()) {
+        if (upload_context_.material_shader_program == nullptr)
+            return {foundation::invalid_argument(
+                        "Runtime material authored parameters require a host shader reflection contract"),
+                    {}};
+        const auto packed =
+            shader::pack_parameter_block(*upload_context_.material_shader_program, decoded.value.payload.parameters);
+        if (!packed)
+            return {packed.result, {}};
+        authored_parameters = packed.value;
+    }
     // The payload carries a shader UUID, but the current runtime has no
     // reflection/packing table that can translate arbitrary logical texture
     // bindings into the renderer's descriptor slots. Keep the accepted ABI
@@ -429,17 +441,6 @@ foundation::ResultValue<renderer::RenderMaterialResource> RuntimeAssetResolver::
     }
     if (decoded.value.payload.shader != upload_context_.material_shader) {
         return {foundation::invalid_argument("Runtime material shader does not match the host shader contract"), {}};
-    }
-    std::vector<std::byte> authored_parameters;
-    if (!decoded.value.payload.parameters.empty()) {
-        if (upload_context_.material_shader_program == nullptr)
-            return {foundation::not_ready("Material authored parameters require a host shader reflection contract"),
-                    {}};
-        const auto packed =
-            shader::pack_parameter_block(*upload_context_.material_shader_program, decoded.value.payload.parameters);
-        if (!packed)
-            return {packed.result, {}};
-        authored_parameters = packed.value;
     }
     if (decoded.value.payload.textures.size() != 1u) {
         return {foundation::invalid_argument("Runtime material requires exactly one texture binding"), {}};
