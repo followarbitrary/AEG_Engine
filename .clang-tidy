@@ -2,7 +2,7 @@
 Checks: '-*,readability-identifier-naming'
 WarningsAsErrors: ''
 HeaderFilterRegex: '.*[/\\](Engine|tests|Application)[/\\].*'
-ExcludeHeaderFilterRegex: '.*[/\\]ThirdParty[/\\].*'
+ExcludeHeaderFilterRegex: '.*[/\\](ThirdParty|Engine[/\\]Module[/\\]abi)[/\\].*'
 FormatStyle: file
 CheckOptions:
   readability-identifier-naming.ClassCase: CamelCase

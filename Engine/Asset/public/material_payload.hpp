@@ -26,5 +26,6 @@ struct MaterialPayload final {
     pipeline::ParameterBlock parameters{};
 };
 
+[[nodiscard]] foundation::ResultValue<std::vector<std::byte>> encode_material_payload(const MaterialPayload& payload);
 [[nodiscard]] foundation::ResultValue<MaterialPayload> decode_material_payload(std::span<const std::byte> bytes);
 }  // namespace aeg::asset

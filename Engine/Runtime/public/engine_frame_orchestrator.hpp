@@ -62,6 +62,38 @@ private:
 using EngineFramePreparationFunction = std::function<foundation::Result(const EngineFramePreparationContext& context)>;
 
 /**
+ * @brief Context supplied after RenderFeature graph construction and before execution.
+ *
+ * The callback is
+ * intended for frame-local terminal work such as copying the
+ * authored SceneColor into a readback allocation. It may
+ * add passes and
+ * dependencies to the active RenderGraph, but must not retain this context or
+ * mutate
+ * feature-resource bindings.
+ */
+struct EngineFramePostBuildContext final {
+    render_graph::FrameContext& frame_context;
+    render_graph::RenderGraph& render_graph;
+    const rhi::FrameAcquireResult* acquired_frame{nullptr};
+    /** @brief Logical RenderGraph texture for the acquired swapchain image. */
+    render_graph::RenderGraphTexture swapchain_resource{};
+
+private:
+    EngineFramePostBuildContext(render_graph::FrameContext& frame_context, render_graph::RenderGraph& render_graph,
+                                const rhi::FrameAcquireResult* acquired_frame,
+                                render_graph::RenderGraphTexture swapchain_resource) noexcept
+        : frame_context(frame_context),
+          render_graph(render_graph),
+          acquired_frame(acquired_frame),
+          swapchain_resource(swapchain_resource) {}
+
+    friend class EngineFrameOrchestrator;
+};
+
+using EngineFramePostBuildFunction = std::function<foundation::Result(const EngineFramePostBuildContext& context)>;
+
+/**
  * @brief Immutable World input supplied while resolving one generated RenderView.
  *
  * The snapshot is borrowed
@@ -117,6 +149,8 @@ struct EngineFrameDesc final {
     bool require_resolved_render_resources{false};
     /** @brief Optional controlled hook run before RenderFeature graph construction. */
     EngineFramePreparationFunction render_feature_preparation{};
+    /** @brief Optional controlled hook run after RenderFeature graph construction and before execution. */
+    EngineFramePostBuildFunction render_feature_post_build{};
     /** Built-in variants use the same pass registry that compiles their documents. */
     const pipeline::RenderPassRegistry* render_passes{nullptr};
 };
@@ -212,6 +246,7 @@ private:
     [[nodiscard]] foundation::Result bind_feature_texture(pipeline::RenderResourceId id,
                                                           render_graph::RenderGraphTexture texture);
     [[nodiscard]] foundation::Result build_render_features();
+    [[nodiscard]] foundation::Result post_build_render_features();
     [[nodiscard]] foundation::Result execute_render_graph();
     [[nodiscard]] foundation::Result release_frame_artifacts();
     [[nodiscard]] foundation::Result finish_frame(bool clear_state);
@@ -266,6 +301,7 @@ private:
     bool frame_active_{false};
     bool render_feature_prepared_{false};
     bool render_features_built_{false};
+    bool render_feature_post_built_{false};
     bool render_graph_executed_{false};
     bool frame_presented_{false};
     bool worlds_committed_{false};

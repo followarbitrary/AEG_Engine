@@ -19,3 +19,15 @@ bound to a `PipelineScopeHost`, compiled through the registered
 executes those hosts through the shared `PipelineScheduler`; shutdown
 deactivates them before unloading the static module. This keeps package-only
 launch on the same host/compiler/scheduler path used by Editor preview.
+
+The runtime asset cache also accepts the `AEGF` v1 Font payload and retains its
+validated CPU bytes for a host-side text system. GPU atlas generation and
+`TextRenderer` draw submission remain separate renderer work.
+
+## Release smoke
+
+The external project gate configures a copied game template, cooks a package, and launches the static executable with `--headless --offscreen --frames 120 --trace`. The delivery directory is limited to `MyGameExecutable.exe`, `game.aegbin`, `game.manifest`, and `game.manifest.bin`, then relaunches without Source or Editor files.
+
+```powershell
+ctest --test-dir build -C Debug --output-on-failure -R "^aeg_game_project_runtime$"
+```

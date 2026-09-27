@@ -11,7 +11,7 @@
 namespace aeg::asset {
 namespace {
 using namespace pipeline;
-constexpr uint32_t kVersion = 1;
+constexpr uint32_t kVersion = 2;
 constexpr uint32_t kMaxCount = 1'000'000;
 constexpr uint32_t kMaxString = 16 * 1024 * 1024;
 
@@ -191,8 +191,11 @@ foundation::ResultValue<std::vector<std::byte>> encode_pipeline_asset(const Pipe
         return {foundation::invalid_argument("Pipeline asset document identity is invalid"), {}};
     if (document.pipeline_nodes.size() > kMaxCount || document.feature_nodes.size() > kMaxCount ||
         document.pass_nodes.size() > kMaxCount || document.resources.size() > kMaxCount ||
-        document.edges.size() > kMaxCount)
+        document.edges.size() > kMaxCount || document.present_connections.size() > kMaxCount)
         return {foundation::invalid_argument("Pipeline asset document is too large"), {}};
+    for (const auto& source : document.present_connections)
+        if (source.empty())
+            return {foundation::invalid_argument("Pipeline asset Present connection is invalid"), {}};
     Writer writer;
     writer.bytes.insert(writer.bytes.end(), {static_cast<std::byte>('A'), static_cast<std::byte>('E'),
                                              static_cast<std::byte>('G'), static_cast<std::byte>('P')});
@@ -257,6 +260,9 @@ foundation::ResultValue<std::vector<std::byte>> encode_pipeline_asset(const Pipe
         writer.id(edge.destination.port_id);
         writer.value(edge.binding_id);
     }
+    writer.value(static_cast<uint32_t>(document.present_connections.size()));
+    for (const auto& source : document.present_connections)
+        writer.string(source);
     return {foundation::Result::success(), std::move(writer.bytes)};
 }
 
@@ -270,8 +276,8 @@ foundation::ResultValue<PipelineDocument> decode_pipeline_asset(std::span<const 
         item = static_cast<char>(byte);
     }
     uint32_t version{}, schema{};
-    if (magic != std::array<char, 4>{'A', 'E', 'G', 'P'} || !reader.value(version) || version != kVersion ||
-        !reader.value(schema) || schema == 0)
+    if (magic != std::array<char, 4>{'A', 'E', 'G', 'P'} || !reader.value(version) ||
+        (version != 1 && version != kVersion) || !reader.value(schema) || schema == 0)
         return {foundation::invalid_argument("Pipeline asset header is invalid"), {}};
     PipelineDocument document;
     document.schema_version = schema;
@@ -385,6 +391,17 @@ foundation::ResultValue<PipelineDocument> decode_pipeline_asset(std::span<const 
             (edge.source.port_id == 0 || edge.destination.port_id == 0 || edge.binding_id == 0))
             return {foundation::invalid_argument("Pipeline asset data edge binding is invalid"), {}};
         document.edges.push_back(std::move(edge));
+    }
+    if (version >= 2) {
+        if (!count(size))
+            return {foundation::invalid_argument("Pipeline asset Present connection count is invalid"), {}};
+        document.present_connections.reserve(size);
+        for (uint32_t i = 0; i < size; ++i) {
+            std::string source;
+            if (!reader.string(source) || source.empty())
+                return {foundation::invalid_argument("Pipeline asset Present connection is invalid"), {}};
+            document.present_connections.push_back(std::move(source));
+        }
     }
     if (reader.offset != reader.bytes.size() || !unique_node(document))
         return {foundation::invalid_argument("Pipeline asset contains duplicate or trailing data"), {}};

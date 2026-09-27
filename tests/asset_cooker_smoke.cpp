@@ -1,15 +1,18 @@
+#include <array>
 #include <cassert>
 #include <chrono>
 #include <cstddef>
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "asset_cooker.hpp"
 #include "cooked_asset.hpp"
+#include "font_payload.hpp"
 
 namespace {
 class TestImporter final : public aeg::tooling::AssetImporter {
@@ -80,6 +83,38 @@ int main() {
     assert(decoded);
     assert(decoded.value.kind == aeg::tooling::AssetKind::kTexture);
     assert(decoded.value.payload.size() == 16U);
+
+    // Font payloads are copied into the runtime ABI and retain their face index.
+    for (const auto kind : {aeg::tooling::AssetKind::kFont}) {
+        const auto source_path = root / "Assets" / "sample_font.ttf";
+        // Minimal well-formed sfnt directory (no tables) for importer validation.
+        const std::array<unsigned char, 12> minimal_font{0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+                                                         0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+        std::ofstream font_stream(source_path, std::ios::binary);
+        font_stream.write(reinterpret_cast<const char*>(minimal_font.data()),
+                          static_cast<std::streamsize>(minimal_font.size()));
+        font_stream.close();
+        const aeg::tooling::AssetMeta unsupported_meta{
+            1,
+            {uuid("33333333-4444-5555-6666-777777777777")},
+            "test",
+            {{{uuid("dddddddd-eeee-ffff-0000-111111111111")}, kind, "main"}}};
+        assert(meta_codec.save(source_path.string() + ".meta", unsupported_meta));
+        aeg::tooling::AssetCooker font_cooker(root / "Cache" / "Cooked");
+        assert(font_cooker.register_default_importers());
+        const auto cooked = font_cooker.cook(source_path);
+        assert(cooked);
+        assert(cooked.value.artifacts.size() == 1U);
+        const auto decoded_font = aeg::tooling::CookedAssetCodec{}.decode(cooked.value.artifacts[0].bytes);
+        assert(decoded_font);
+        assert(decoded_font.value.kind == kind);
+        assert(decoded_font.value.payload.size() > 16U);
+        const auto font_payload = aeg::asset::decode_font_payload(
+            std::span<const std::byte>{decoded_font.value.payload.data(), decoded_font.value.payload.size()});
+        assert(font_payload);
+        assert(font_payload.value.face_index == 0U);
+        assert(font_payload.value.font_bytes.size() == 12U);
+    }
 
     std::filesystem::remove_all(root);
     return 0;

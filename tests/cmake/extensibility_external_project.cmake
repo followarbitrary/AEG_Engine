@@ -84,9 +84,79 @@ endforeach()
 set(RUNTIME_TRACE "${TEST_ROOT}/runtime-trace.txt")
 execute_process(
     COMMAND "${BUILD_ROOT}/Debug/MyGameExecutable.exe" --manifest "${DELIVERY}/game.manifest"
-            --frames 2 --headless --offscreen --trace "${RUNTIME_TRACE}"
+            --frames 120 --headless --offscreen --trace "${RUNTIME_TRACE}"
     WORKING_DIRECTORY "${TEST_ROOT}" RESULT_VARIABLE run_result OUTPUT_VARIABLE run_output ERROR_VARIABLE run_error)
 if (NOT run_result EQUAL 0 OR NOT EXISTS "${RUNTIME_TRACE}")
     message(FATAL_ERROR "Package-only static game launch failed:\n${run_output}\n${run_error}")
+endif()
+file(STRINGS "${RUNTIME_TRACE}" runtime_frames REGEX "^frame [0-9]+$")
+list(LENGTH runtime_frames runtime_frame_count)
+if (NOT runtime_frame_count EQUAL 120)
+    message(FATAL_ERROR "Runtime trace contains ${runtime_frame_count} frames; expected 120")
+endif()
+
+# Keep the delivery directory package-only.  The executable is copied beside
+# the cooked artifacts and launched from a clean directory so accidental
+# source/editor dependencies are observable.
+set(PUBLISH_ROOT "${TEST_ROOT}/published")
+file(REMOVE_RECURSE "${PUBLISH_ROOT}")
+file(MAKE_DIRECTORY "${PUBLISH_ROOT}")
+file(COPY "${BUILD_ROOT}/Debug/MyGameExecutable.exe" DESTINATION "${PUBLISH_ROOT}")
+file(COPY "${DELIVERY}/game.aegbin" "${DELIVERY}/game.manifest" "${DELIVERY}/game.manifest.bin"
+     DESTINATION "${PUBLISH_ROOT}")
+file(REMOVE_RECURSE "${PUBLISH_ROOT}/Source" "${PUBLISH_ROOT}/Assets" "${PUBLISH_ROOT}/Editor")
+set(PUBLISHED_TRACE "${TEST_ROOT}/published-trace.txt")
+execute_process(
+    COMMAND "${PUBLISH_ROOT}/MyGameExecutable.exe" --manifest "${PUBLISH_ROOT}/game.manifest"
+            --frames 120 --headless --offscreen --trace "${PUBLISHED_TRACE}"
+    WORKING_DIRECTORY "${PUBLISH_ROOT}" RESULT_VARIABLE published_result
+    OUTPUT_VARIABLE published_output ERROR_VARIABLE published_error)
+if (NOT published_result EQUAL 0 OR NOT EXISTS "${PUBLISHED_TRACE}")
+    message(FATAL_ERROR "Published package-only launch failed:\n${published_output}\n${published_error}")
+endif()
+file(STRINGS "${PUBLISHED_TRACE}" published_frames REGEX "^frame [0-9]+$")
+list(LENGTH published_frames published_frame_count)
+if (NOT published_frame_count EQUAL 120)
+    message(FATAL_ERROR "Published trace contains ${published_frame_count} frames; expected 120")
+endif()
+
+if (AEG_GAME_PROJECT_RUNTIME)
+    # Exercise initialization failures with isolated copies.  Each fixture is
+    # expected to fail before the first frame and must identify its bad input.
+    function(expect_runtime_failure NAME EXPECTED)
+        set(FIXTURE "${TEST_ROOT}/negative-${NAME}")
+        file(REMOVE_RECURSE "${FIXTURE}")
+        file(MAKE_DIRECTORY "${FIXTURE}")
+        file(COPY "${PUBLISH_ROOT}/MyGameExecutable.exe" "${PUBLISH_ROOT}/game.aegbin"
+             "${PUBLISH_ROOT}/game.manifest" "${PUBLISH_ROOT}/game.manifest.bin" DESTINATION "${FIXTURE}")
+        set(FIXTURE_MANIFEST "${FIXTURE}/game.manifest")
+        if (NAME STREQUAL "corrupt-package")
+            file(WRITE "${FIXTURE}/game.aegbin" "corrupt")
+        elseif (NAME STREQUAL "package-digest")
+            file(APPEND "${FIXTURE}/game.aegbin" "tampered")
+        elseif (NAME STREQUAL "startup-scene")
+            file(WRITE "${FIXTURE}/game.aegbin" "missing-startup-scene")
+        elseif (NAME STREQUAL "module-contract")
+            file(READ "${FIXTURE_MANIFEST}" text_manifest)
+            string(REPLACE "build_id = \"dev\"" "build_id = \"fixture-contract\"" text_manifest "${text_manifest}")
+            file(WRITE "${FIXTURE_MANIFEST}" "${text_manifest}")
+        elseif (NAME STREQUAL "dependency")
+            file(WRITE "${FIXTURE}/game.aegbin" "missing-mesh-material-texture")
+        endif()
+        execute_process(
+            COMMAND "${FIXTURE}/MyGameExecutable.exe" --manifest "${FIXTURE_MANIFEST}"
+                    --frames 1 --headless --offscreen
+            WORKING_DIRECTORY "${FIXTURE}" RESULT_VARIABLE fixture_result
+            OUTPUT_VARIABLE fixture_output ERROR_VARIABLE fixture_error)
+        set(FIXTURE_DIAGNOSTIC "${fixture_output}${fixture_error}")
+        if (fixture_result EQUAL 0 OR NOT FIXTURE_DIAGNOSTIC MATCHES "${EXPECTED}")
+            message(FATAL_ERROR "Negative fixture ${NAME} unexpectedly passed or lost identity (${EXPECTED}):\n${FIXTURE_DIAGNOSTIC}")
+        endif()
+    endfunction()
+    expect_runtime_failure("corrupt-package" "Asset package|package")
+    expect_runtime_failure("package-digest" "package digest|Asset package")
+    expect_runtime_failure("startup-scene" "Startup scene|package")
+    expect_runtime_failure("module-contract" "manifests disagree|identity|contract|build identity")
+    expect_runtime_failure("dependency" "package|asset|scene")
 endif()
 message(STATUS "External game project passed: ${PROJECT_ROOT}")

@@ -12,6 +12,12 @@ constexpr uint32_t kMagic = 0x314e5341u;  // ASN1
 constexpr uint32_t kMaxCount = 1'000'000;
 constexpr uint32_t kMaxString = 16u * 1024u * 1024u;
 constexpr std::size_t kMaxSceneBlob = 64u * 1024u * 1024u;
+bool valid_entity_uuid(const std::array<uint8_t, 16>& uuid) {
+    return std::any_of(uuid.begin(), uuid.end(), [](uint8_t byte) { return byte != 0; });
+}
+bool valid_kind(AssetKind kind) {
+    return static_cast<uint8_t>(kind) <= static_cast<uint8_t>(AssetKind::kShader);
+}
 
 std::string reference_key(const SceneAssetReference& reference) {
     std::string key(reinterpret_cast<const char*>(reference.scene_entity_uuid.data()),
@@ -77,6 +83,33 @@ struct Writer final {
 };
 }  // namespace
 
+bool has_scene_payload_header(std::span<const std::byte> bytes) noexcept {
+    if (bytes.size() < sizeof(uint32_t))
+        return false;
+    uint32_t magic = 0;
+    std::memcpy(&magic, bytes.data(), sizeof(magic));
+    return magic == kMagic;
+}
+
+foundation::Result relocate_scene_assets(ScenePayload& payload, std::span<const uint64_t> stable_ids,
+                                         const SceneAssetResolver& resolve) {
+    if (stable_ids.size() != payload.references.size())
+        return foundation::invalid_argument("Scene relocation stable-id count does not match references");
+    if (!resolve)
+        return foundation::invalid_argument("Scene relocation resolver is missing");
+    for (std::size_t index = 0; index < payload.references.size(); ++index) {
+        if (stable_ids[index] == 0)
+            return foundation::invalid_argument("Scene relocation stable id is zero");
+        const auto resolved = resolve(stable_ids[index]);
+        if (!resolved)
+            return resolved.result;
+        if (resolved.value == AssetId{})
+            return foundation::invalid_argument("Scene relocation resolved to zero AssetId");
+        payload.references[index].asset = resolved.value;
+    }
+    return foundation::Result::success();
+}
+
 foundation::ResultValue<std::vector<std::byte>> encode_scene_payload(const ScenePayload& payload) {
     if (payload.schema_version == 0 || payload.serialized_scene.size() > kMaxSceneBlob ||
         payload.serialized_scene.size() > UINT32_MAX || payload.references.size() > kMaxCount) {
@@ -89,7 +122,9 @@ foundation::ResultValue<std::vector<std::byte>> encode_scene_payload(const Scene
     writer.blob(payload.serialized_scene);
     writer.value(static_cast<uint32_t>(payload.references.size()));
     for (const SceneAssetReference& reference : payload.references) {
-        if (reference.component_type.empty() || reference.field_id == 0 || reference.asset == AssetId{} ||
+        if (!valid_entity_uuid(reference.scene_entity_uuid) || reference.component_type.empty() ||
+            reference.component_type.size() > kMaxString || reference.component_version == 0 ||
+            reference.field_id == 0 || reference.asset == AssetId{} || !valid_kind(reference.kind) ||
             !keys.insert(reference_key(reference)).second) {
             return {foundation::invalid_argument("Scene payload reference is invalid or duplicated"), {}};
         }
@@ -120,9 +155,10 @@ foundation::ResultValue<ScenePayload> decode_scene_payload(std::span<const std::
         for (uint8_t& byte : reference.scene_entity_uuid)
             if (!reader.value(byte))
                 return {foundation::invalid_argument("Scene payload entity UUID is truncated"), {}};
-        if (!reader.string(reference.component_type) || reference.component_type.empty() ||
-            !reader.value(reference.component_version) || !reader.value(reference.field_id) ||
-            reference.field_id == 0 || !reader.uuid(reference.asset) || !reader.value(kind) ||
+        if (!valid_entity_uuid(reference.scene_entity_uuid) || !reader.string(reference.component_type) ||
+            reference.component_type.empty() || !reader.value(reference.component_version) ||
+            !reader.value(reference.field_id) || reference.component_version == 0 || reference.field_id == 0 ||
+            !reader.uuid(reference.asset) || reference.asset == AssetId{} || !reader.value(kind) ||
             kind > static_cast<uint8_t>(AssetKind::kShader) || !keys.insert(reference_key(reference)).second) {
             return {foundation::invalid_argument("Scene payload reference is invalid or duplicated"), {}};
         }

@@ -14,3 +14,7 @@ Engine 所有的 `encode_cooked_asset()`；运行时从包中读取同一份经�
 
 `CompositeFeature` 的 Part 由 Pipeline 运行时映射为稳定的 `FeaturePartId`。
 RenderPass 的编排仍由父级 Feature 和 Render Part 负责；运行时资产层不拥有也不执行这些 Pass。
+
+发布包由 `game.manifest.bin` 绑定项目、模块契约、启动 Scene、启动 Pipeline 和 `game.aegbin` 摘要。运行时在首帧前校验这些身份以及 Scene 的引用资产；发布目录不需要源资产、Editor 或 Tooling 文件。
+
+Font 资产使用 `AEGF` v1 载荷保存字体原始字节和 collection face index。运行时资产缓存可以校验并加载该 CPU 载荷；glyph rasterization、atlas 上传和 `TextRenderer` 绘制仍属于后续 renderer 功能。

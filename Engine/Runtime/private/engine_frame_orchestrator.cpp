@@ -1040,6 +1040,37 @@ foundation::Result EngineFrameOrchestrator::build_render_features() {
     return foundation::Result::success();
 }
 
+foundation::Result EngineFrameOrchestrator::post_build_render_features() {
+    if (render_feature_post_built_) {
+        return foundation::Result::success();
+    }
+    if (!render_features_built_) {
+        return invalid_state("RenderFeature post-build hook requires a built render graph");
+    }
+    if (frame_desc_.render_feature_post_build) {
+        const EngineFramePostBuildContext post_build_context{
+            frame_context_,
+            render_graph_,
+            frame_context_.acquired_frame(),
+            swapchain_resource_,
+        };
+        try {
+            if (const foundation::Result result = frame_desc_.render_feature_post_build(post_build_context); !result) {
+                return result;
+            }
+        } catch (const std::bad_alloc&) {
+            return out_of_memory("render feature post-build allocation failed");
+        } catch (const std::exception& exception) {
+            return foundation::unknown_exception(exception);
+        } catch (...) {
+            return foundation::Result::failure(foundation::ResultCode::kUnknown,
+                                               "render feature post-build hook threw an unknown exception");
+        }
+    }
+    render_feature_post_built_ = true;
+    return foundation::Result::success();
+}
+
 foundation::Result EngineFrameOrchestrator::execute_render_graph() {
     if (render_graph_executed_) {
         return foundation::Result::success();
@@ -1228,6 +1259,9 @@ foundation::Result EngineFrameOrchestrator::execute_registered_phase(pipeline::P
         if (const foundation::Result result = build_render_features(); !result) {
             return result;
         }
+        if (const foundation::Result result = post_build_render_features(); !result) {
+            return result;
+        }
     } else if (mode == PhaseExecutionMode::kFrame && is_builtin_phase(phase, pipeline::EnginePhase::kRenderExecute)) {
         if (const foundation::Result result = execute_render_graph(); !result) {
             return result;
@@ -1363,6 +1397,7 @@ foundation::Result EngineFrameOrchestrator::clear_frame_state() noexcept {
     frame_active_ = false;
     render_feature_prepared_ = false;
     render_features_built_ = false;
+    render_feature_post_built_ = false;
     render_graph_executed_ = false;
     frame_presented_ = false;
     worlds_committed_ = false;

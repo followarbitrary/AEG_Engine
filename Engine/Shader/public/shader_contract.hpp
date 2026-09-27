@@ -12,6 +12,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "pipeline_authoring_types.hpp"
 #include "result.hpp"
 #include "rhi.hpp"
 
@@ -45,15 +46,29 @@ struct ShaderConstantRange {
     std::string name{};
 };
 
+/** @brief Scalar representation used by a shader-owned material parameter block. */
+enum class ShaderParameterType : std::uint8_t { kBool, kInt32, kUInt32, kFloat32, kFloat32x2, kFloat32x3, kFloat32x4 };
+
+/** @brief Reflected field in the material parameter constant buffer. */
+struct ShaderParameterField {
+    std::uint64_t id{0};
+    ShaderParameterType type{ShaderParameterType::kFloat32};
+    std::uint32_t offset{0};
+    std::uint32_t size{0};
+    std::vector<std::byte> default_value{};
+    std::string name{};
+};
+
 /** @brief Complete normalized reflection data for a shader program. */
 struct ShaderReflection {
     std::vector<ShaderResourceBinding> resources{};
     std::vector<ShaderVertexInput> vertex_inputs{};
     std::vector<ShaderConstantRange> constant_ranges{};
+    std::vector<ShaderParameterField> parameters{};
 
     /** @brief Reports whether the program declares no reflected interface. */
     [[nodiscard]] bool empty() const noexcept {
-        return resources.empty() && vertex_inputs.empty() && constant_ranges.empty();
+        return resources.empty() && vertex_inputs.empty() && constant_ranges.empty() && parameters.empty();
     }
 };
 
@@ -130,6 +145,14 @@ private:
 [[nodiscard]] foundation::ResultValue<ShaderProgram> load_shader_program(const std::filesystem::path& path);
 /** @brief Loads and validates a compiled shader package already resident in memory. */
 [[nodiscard]] foundation::ResultValue<ShaderProgram> load_shader_program(std::span<const std::byte> bytes);
+
+/** @brief Validates authored material values against reflected shader fields. */
+[[nodiscard]] foundation::Result validate_parameter_block(const ShaderProgram& program,
+                                                          const pipeline::ParameterBlock& values);
+
+/** @brief Packs reflected numeric material values into the shader constant-buffer ABI. */
+[[nodiscard]] foundation::ResultValue<std::vector<std::byte>> pack_parameter_block(
+    const ShaderProgram& program, const pipeline::ParameterBlock& values);
 
 /**
  * @brief Validates shader contracts, caches layouts, and creates RHI pipelines.

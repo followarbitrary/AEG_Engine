@@ -74,3 +74,9 @@ Engine 的编解码接口，但 Engine 不依赖 Tooling；因此“资产由 Ap
 模块不得复制这些基础类型。
 
 Logo 与品牌资源位于 [`Assets/Branding`](Assets/Branding/)。
+
+发布回归会在隔离目录运行 120 帧，并检查包外没有 Source 或 Editor 依赖：
+
+```powershell
+ctest --test-dir build -C Debug --output-on-failure -R "^aeg_game_project_runtime$"
+```

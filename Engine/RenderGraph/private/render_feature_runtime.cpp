@@ -445,7 +445,7 @@ foundation::ResultValue<pipeline::RenderGraphTexture> RenderGraphBuilderBackendI
     }
     const auto iterator = textures_.find(id);
     if (iterator == textures_.end()) {
-        return {not_found("render graph texture resource id is not registered"), {}};
+        return {not_found("render graph texture resource id is not registered: " + std::to_string(id.value())), {}};
     }
     return {foundation::Result::success(), iterator->second};
 }

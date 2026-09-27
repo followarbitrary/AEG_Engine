@@ -172,6 +172,10 @@ public:
                                                      SceneEntityRemovalPolicy policy);
     /** @brief Adds one reflected component payload to the scene document. */
     [[nodiscard]] foundation::Result add_component(SceneComponentRecord component);
+    /** @brief Replaces one reflected component's serialized payload in place. */
+    [[nodiscard]] foundation::Result replace_component_payload(SceneEntityId entity,
+                                                               ecs::ComponentTypeId component_type,
+                                                               std::vector<uint8_t> payload);
     /** @brief Encodes one reflected component value and adds it to the scene document. */
     [[nodiscard]] foundation::Result add_reflected_component(SceneEntityId entity, ecs::ComponentTypeId component_type,
                                                              const reflection::TypeRegistry& registry,

@@ -19,6 +19,24 @@
 #endif
 
 namespace aeg::tooling {
+foundation::Result StableAssetIdIndex::add(uint64_t stable_id, AssetId asset) {
+    if (stable_id == 0 || asset == AssetId{})
+        return foundation::invalid_argument("Stable asset id index entry is invalid");
+    const auto [it, inserted] = entries_.emplace(stable_id, asset);
+    if (!inserted && it->second != asset)
+        return foundation::invalid_argument("Stable asset id maps to conflicting AssetId");
+    return foundation::Result::success();
+}
+
+foundation::ResultValue<AssetId> StableAssetIdIndex::resolve(uint64_t stable_id) const {
+    if (stable_id == 0)
+        return {foundation::invalid_argument("Stable asset id is zero"), {}};
+    const auto it = entries_.find(stable_id);
+    if (it == entries_.end())
+        return {foundation::not_found("Stable asset id has no AssetId mapping"), {}};
+    return {foundation::Result::success(), it->second};
+}
+
 namespace {
 constexpr uint32_t kCurrentMetaVersion = 1;
 

@@ -3,6 +3,7 @@
  * @brief Implements shader-package parsing, reflection validation, and layout caching.
  */
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -109,6 +110,23 @@ constexpr std::uint32_t kKnownBindingFlags = static_cast<std::uint32_t>(rhi::Bin
     return (static_cast<std::uint32_t>(flags) & ~kKnownBindingFlags) == 0;
 }
 
+[[nodiscard]] std::uint32_t shader_parameter_type_size(ShaderParameterType type) noexcept {
+    switch (type) {
+        case ShaderParameterType::kBool:
+        case ShaderParameterType::kInt32:
+        case ShaderParameterType::kUInt32:
+        case ShaderParameterType::kFloat32:
+            return 4;
+        case ShaderParameterType::kFloat32x2:
+            return 8;
+        case ShaderParameterType::kFloat32x3:
+            return 12;
+        case ShaderParameterType::kFloat32x4:
+            return 16;
+    }
+    return 0;
+}
+
 [[nodiscard]] bool checked_region(std::size_t data_size, std::uint64_t offset, std::uint64_t size) noexcept {
     return offset <= data_size && size <= data_size - offset;
 }
@@ -195,7 +213,9 @@ template <typename T>
     if (header.version != asset::kVersion) {
         return invalid_package("Shader package version is unsupported");
     }
-    if (header.header_size != sizeof(asset::FileHeader) || data.size() < header.header_size) {
+    if ((header.header_size != sizeof(asset::FileHeader) &&
+         header.header_size != sizeof(asset::FileHeader) + sizeof(asset::ParameterTableHeader)) ||
+        data.size() < header.header_size) {
         return invalid_package("Shader package header size is invalid");
     }
     if (header.total_size != data.size()) {
@@ -218,6 +238,40 @@ template <typename T>
     }
     if (header.stage_count == 0) {
         return invalid_package("Shader package contains no shader stages");
+    }
+    return Result::success();
+}
+
+[[nodiscard]] Result parse_parameter_records(const std::vector<std::byte>& data, const asset::FileHeader& header,
+                                             ShaderReflection& reflection) {
+    if (header.header_size == sizeof(asset::FileHeader))
+        return Result::success();
+    asset::ParameterTableHeader table{};
+    if (!read_object(data, sizeof(asset::FileHeader), table) ||
+        !checked_array_region(data.size(), table.parameter_offset, table.parameter_count,
+                              sizeof(asset::ParameterRecord)))
+        return invalid_package("Shader parameter table is out of bounds");
+    reflection.parameters.reserve(table.parameter_count);
+    for (std::uint32_t index = 0; index < table.parameter_count; ++index) {
+        asset::ParameterRecord record{};
+        std::uint32_t offset = 0;
+        if (!checked_record_offset(table.parameter_offset, index, sizeof(record), offset) ||
+            !read_object(data, offset, record))
+            return invalid_package("Shader parameter record cannot be read");
+        if (record.reserved0 != 0 || record.reserved1 != 0 || record.reserved2 != 0 ||
+            !checked_region(data.size(), record.default_offset, record.default_size) ||
+            !string_region(data, header, record.name_offset, record.name_size))
+            return invalid_package("Shader parameter record is invalid");
+        ShaderParameterField field{};
+        field.id = record.id;
+        field.type = static_cast<ShaderParameterType>(record.type);
+        field.offset = record.offset;
+        field.size = record.size;
+        field.name = read_string(data, header, record.name_offset, record.name_size);
+        field.default_value.resize(record.default_size);
+        if (record.default_size != 0)
+            std::memcpy(field.default_value.data(), data.data() + record.default_offset, record.default_size);
+        reflection.parameters.push_back(std::move(field));
     }
     return Result::success();
 }
@@ -485,6 +539,33 @@ void append_hash_string(std::uint64_t& hash, std::string_view value) noexcept {
         previous_end = static_cast<std::uint64_t>(range->offset) + range->size;
         has_previous_range = true;
     }
+    std::set<std::uint64_t> parameter_ids;
+    std::vector<const ShaderParameterField*> parameters;
+    parameters.reserve(program.contract.reflection.parameters.size());
+    for (const ShaderParameterField& parameter : program.contract.reflection.parameters) {
+        if (parameter.id == 0 || !parameter_ids.insert(parameter.id).second ||
+            shader_parameter_type_size(parameter.type) != parameter.size || parameter.offset % 4u != 0 ||
+            parameter.size % 4u != 0 || parameter.default_value.size() != parameter.size) {
+            return Result::failure(ResultCode::kInvalidArgument, "Shader parameter field is invalid");
+        }
+        const std::uint64_t end = static_cast<std::uint64_t>(parameter.offset) + parameter.size;
+        if (end > std::numeric_limits<std::uint32_t>::max()) {
+            return Result::failure(ResultCode::kInvalidArgument,
+                                   "Shader parameter field exceeds the constant-buffer ABI");
+        }
+        parameters.push_back(&parameter);
+    }
+    std::sort(parameters.begin(), parameters.end(),
+              [](const ShaderParameterField* lhs, const ShaderParameterField* rhs) {
+                  return std::pair{lhs->offset, lhs->size} < std::pair{rhs->offset, rhs->size};
+              });
+    std::uint64_t parameter_end = 0;
+    for (const ShaderParameterField* parameter : parameters) {
+        if (parameter->offset < parameter_end) {
+            return Result::failure(ResultCode::kInvalidArgument, "Shader parameter fields overlap");
+        }
+        parameter_end = static_cast<std::uint64_t>(parameter->offset) + parameter->size;
+    }
     return Result::success();
 }
 }  // namespace
@@ -538,6 +619,9 @@ ResultValue<ShaderProgram> load_shader_program(const std::filesystem::path& path
     if (const Result result = parse_constant_records(data, header, program.contract.reflection); !result) {
         return {result, {}};
     }
+    if (const Result result = parse_parameter_records(data, header, program.contract.reflection); !result) {
+        return {result, {}};
+    }
 
     const Result validation = validate_reflection(program);
     if (!validation) {
@@ -581,11 +665,119 @@ ResultValue<ShaderProgram> load_shader_program(std::span<const std::byte> bytes)
     if (const Result result = parse_constant_records(data, header, program.contract.reflection); !result) {
         return {result, {}};
     }
+    if (const Result result = parse_parameter_records(data, header, program.contract.reflection); !result) {
+        return {result, {}};
+    }
     const Result validation = validate_reflection(program);
     if (!validation) {
         return {validation, {}};
     }
     return {Result::success(), std::move(program)};
+}
+
+namespace {
+[[nodiscard]] bool parameter_value_bytes(ShaderParameterType type, const pipeline::ParameterValue& value,
+                                         std::span<std::byte> output) noexcept {
+    auto write_scalar = [&output](const auto& scalar) {
+        if (output.size() != sizeof(scalar))
+            return false;
+        std::memcpy(output.data(), &scalar, sizeof(scalar));
+        return true;
+    };
+    switch (type) {
+        case ShaderParameterType::kBool:
+            if (const auto* v = std::get_if<bool>(&value)) {
+                const std::uint32_t encoded = *v ? 1u : 0u;
+                return write_scalar(encoded);
+            }
+            return false;
+        case ShaderParameterType::kInt32:
+            if (const auto* v = std::get_if<std::int64_t>(&value)) {
+                if (*v < std::numeric_limits<std::int32_t>::min() || *v > std::numeric_limits<std::int32_t>::max())
+                    return false;
+                const std::int32_t encoded = static_cast<std::int32_t>(*v);
+                return write_scalar(encoded);
+            }
+            return false;
+        case ShaderParameterType::kUInt32:
+            if (const auto* v = std::get_if<std::uint64_t>(&value)) {
+                if (*v > std::numeric_limits<std::uint32_t>::max())
+                    return false;
+                const std::uint32_t encoded = static_cast<std::uint32_t>(*v);
+                return write_scalar(encoded);
+            }
+            return false;
+        case ShaderParameterType::kFloat32:
+            if (const auto* v = std::get_if<double>(&value)) {
+                if (!std::isfinite(*v) || *v < -std::numeric_limits<float>::max() ||
+                    *v > std::numeric_limits<float>::max())
+                    return false;
+                const float encoded = static_cast<float>(*v);
+                return write_scalar(encoded);
+            }
+            return false;
+        case ShaderParameterType::kFloat32x2:
+        case ShaderParameterType::kFloat32x3:
+        case ShaderParameterType::kFloat32x4: {
+            const std::size_t count = type == ShaderParameterType::kFloat32x2   ? 2u
+                                      : type == ShaderParameterType::kFloat32x3 ? 3u
+                                                                                : 4u;
+            const auto* vector = std::get_if<std::vector<double>>(&value);
+            if (vector == nullptr || vector->size() != count || output.size() != count * sizeof(float))
+                return false;
+            for (std::size_t index = 0; index < count; ++index) {
+                if (!std::isfinite((*vector)[index]) || (*vector)[index] < -std::numeric_limits<float>::max() ||
+                    (*vector)[index] > std::numeric_limits<float>::max())
+                    return false;
+                const float encoded = static_cast<float>((*vector)[index]);
+                std::memcpy(output.data() + index * sizeof(float), &encoded, sizeof(encoded));
+            }
+            return true;
+        }
+    }
+    return false;
+}
+}  // namespace
+
+Result validate_parameter_block(const ShaderProgram& program, const pipeline::ParameterBlock& values) {
+    if (const Result result = validate_reflection(program); !result)
+        return result;
+    for (const auto& [id, value] : values) {
+        const auto found =
+            std::find_if(program.contract.reflection.parameters.begin(), program.contract.reflection.parameters.end(),
+                         [id](const ShaderParameterField& field) { return field.id == id; });
+        if (found == program.contract.reflection.parameters.end())
+            return Result::failure(ResultCode::kInvalidArgument, "Authored shader parameter id is not reflected");
+        std::vector<std::byte> scratch(found->size);
+        if (!parameter_value_bytes(found->type, value, scratch))
+            return Result::failure(ResultCode::kInvalidArgument, "Authored shader parameter type or range is invalid");
+    }
+    return Result::success();
+}
+
+ResultValue<std::vector<std::byte>> pack_parameter_block(const ShaderProgram& program,
+                                                         const pipeline::ParameterBlock& values) {
+    if (const Result result = validate_parameter_block(program, values); !result)
+        return {result, {}};
+    std::size_t buffer_size = 0;
+    for (const ShaderConstantRange& range : program.contract.reflection.constant_ranges)
+        buffer_size = std::max(buffer_size, static_cast<std::size_t>(range.offset) + range.size);
+    for (const ShaderParameterField& field : program.contract.reflection.parameters)
+        buffer_size = std::max(buffer_size, static_cast<std::size_t>(field.offset) + field.size);
+    std::vector<std::byte> packed(buffer_size);
+    for (const ShaderParameterField& field : program.contract.reflection.parameters) {
+        const auto found = values.find(field.id);
+        const pipeline::ParameterValue& value = found == values.end() ? pipeline::ParameterValue{} : found->second;
+        if (found == values.end()) {
+            if (field.default_value.size() != field.size)
+                return {Result::failure(ResultCode::kInvalidArgument, "Shader parameter default value is invalid"), {}};
+            std::memcpy(packed.data() + field.offset, field.default_value.data(), field.size);
+        } else if (!parameter_value_bytes(field.type, value,
+                                          std::span<std::byte>{packed}.subspan(field.offset, field.size))) {
+            return {Result::failure(ResultCode::kInvalidArgument, "Authored shader parameter cannot be packed"), {}};
+        }
+    }
+    return {Result::success(), std::move(packed)};
 }
 
 ShaderManager::ShaderManager(rhi::Device& device) : device_(device) {}
@@ -647,6 +839,23 @@ std::uint64_t ShaderManager::hash_contract(const ShaderProgram& program) const {
         append_hash_value(hash, range->size);
         append_hash_value(hash, static_cast<std::uint32_t>(range->shader_stages));
         append_hash_string(hash, range->name);
+    }
+    std::vector<const ShaderParameterField*> parameters;
+    parameters.reserve(program.contract.reflection.parameters.size());
+    for (const ShaderParameterField& parameter : program.contract.reflection.parameters) {
+        parameters.push_back(&parameter);
+    }
+    std::sort(parameters.begin(), parameters.end(),
+              [](const ShaderParameterField* lhs, const ShaderParameterField* rhs) { return lhs->id < rhs->id; });
+    for (const ShaderParameterField* parameter : parameters) {
+        append_hash_value(hash, parameter->id);
+        append_hash_value(hash, static_cast<std::uint8_t>(parameter->type));
+        append_hash_value(hash, parameter->offset);
+        append_hash_value(hash, parameter->size);
+        append_hash_string(hash, parameter->name);
+        for (const std::byte value : parameter->default_value) {
+            append_hash_value(hash, static_cast<std::uint8_t>(value));
+        }
     }
     return hash;
 }

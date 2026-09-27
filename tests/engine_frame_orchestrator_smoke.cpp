@@ -30,6 +30,8 @@ struct OrchestratorState final {
     std::vector<PhaseId> executed_phases{};
     void* expected_frame_user_data{nullptr};
     uint32_t render_pass_execution_count{0};
+    uint32_t post_build_pass_execution_count{0};
+    bool post_build_hook_invoked{false};
     bool render_feature_received_user_data{false};
 };
 
@@ -103,6 +105,12 @@ public:
         if (const Result result =
                 add_phase_task(aeg::pipeline::StageId("PostFrameStage"), aeg::pipeline::TaskId("PostFrameTask"),
                                EnginePhase::kFrameEnd, kPostFramePhase, TimePolicy::kFrame);
+            !result) {
+            return result;
+        }
+        if (const Result result = add_phase_task(aeg::pipeline::StageId("PresentStage"),
+                                                 aeg::pipeline::TaskId("PresentTask"), EnginePhase::kPresent,
+                                                 aeg::pipeline::to_phase_id(EnginePhase::kPresent), TimePolicy::kFrame);
             !result) {
             return result;
         }
@@ -266,16 +274,29 @@ int main() {
     }
     aeg::engine::EngineFrameDesc frame_desc{};
     frame_desc.user_data = &frame_user_data;
+    frame_desc.render_feature_post_build = [&state](const aeg::engine::EngineFramePostBuildContext& context) {
+        state.post_build_hook_invoked = true;
+        const auto pass = context.render_graph.add_pass(
+            "OrchestratorPostBuildPass", aeg::rhi::QueueClass::kGraphics,
+            [](aeg::render_graph::PassBuilder& builder) {
+                builder.set_side_effects();
+                return Result::success();
+            },
+            [&state](aeg::render_graph::RenderPassCommandContext&) {
+                ++state.post_build_pass_execution_count;
+                return Result::success();
+            });
+        return pass ? Result::success() : pass.result;
+    };
     if (const Result result = runtime.tick(frame_desc); !result || runtime.frame_number() != 1) {
         return 10;
     }
     const std::vector<PhaseId> expected_frame_phases{
-        kBeforeStartupPhase,
-        kPreFramePhase,
-        kFramePhase,
+        kBeforeStartupPhase, kPreFramePhase, kFramePhase, aeg::pipeline::to_phase_id(EnginePhase::kPresent),
         kPostFramePhase,
     };
     if (state.executed_phases != expected_frame_phases || state.render_pass_execution_count != 1 ||
+        state.post_build_pass_execution_count != 1 || !state.post_build_hook_invoked ||
         !state.render_feature_received_user_data) {
         return 11;
     }
@@ -290,7 +311,8 @@ int main() {
         return 12;
     }
     const std::vector<PhaseId> expected_lifecycle_phases{
-        kBeforeStartupPhase, kPreFramePhase, kFramePhase, kPostFramePhase, kAfterShutdownPhase,
+        kBeforeStartupPhase, kPreFramePhase,      kFramePhase, aeg::pipeline::to_phase_id(EnginePhase::kPresent),
+        kPostFramePhase,     kAfterShutdownPhase,
     };
     return state.executed_phases == expected_lifecycle_phases ? 0 : 13;
 }

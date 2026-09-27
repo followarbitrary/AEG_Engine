@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <map>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -50,6 +51,17 @@ struct AssetMeta final {
     SourceId source{};
     std::string importer{};
     std::vector<CookedProduct> products{};
+};
+
+/** @brief Cook-time index translating editor stable ids to canonical runtime AssetIds. */
+class StableAssetIdIndex final {
+public:
+    [[nodiscard]] foundation::Result add(uint64_t stable_id, AssetId asset);
+    [[nodiscard]] foundation::ResultValue<AssetId> resolve(uint64_t stable_id) const;
+    [[nodiscard]] std::size_t size() const noexcept { return entries_.size(); }
+
+private:
+    std::map<uint64_t, AssetId> entries_{};
 };
 
 /** @brief Parses and writes versioned `.meta` TOML files. */

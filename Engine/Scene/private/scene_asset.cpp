@@ -605,6 +605,25 @@ foundation::Result SceneAsset::add_component(SceneComponentRecord component) {
     return foundation::Result::success();
 }
 
+foundation::Result SceneAsset::replace_component_payload(SceneEntityId entity, ecs::ComponentTypeId component_type,
+                                                         std::vector<uint8_t> payload) {
+    if (!entity.is_valid() || !component_type.is_valid()) {
+        return invalid_argument("Scene component payload replacement identity is invalid");
+    }
+    const auto found =
+        std::find_if(components_.begin(), components_.end(), [entity, component_type](const auto& value) {
+            return value.entity == entity && value.component_type == component_type;
+        });
+    if (found == components_.end()) {
+        return not_found("Scene component is not present on the entity");
+    }
+    if (payload.empty()) {
+        return invalid_argument("Scene component payload replacement is empty");
+    }
+    found->payload = std::move(payload);
+    return foundation::Result::success();
+}
+
 foundation::Result SceneAsset::add_reflected_component(SceneEntityId entity, ecs::ComponentTypeId component_type,
                                                        const reflection::TypeRegistry& registry,
                                                        reflection::TypeId schema_type, const void* value) {
