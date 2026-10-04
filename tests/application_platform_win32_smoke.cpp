@@ -2,6 +2,7 @@
  * @file application_platform_win32_smoke.cpp
  * @brief Verifies the Application-owned Win32 window adapter.
  */
+#include <cstdio>
 #include <filesystem>
 #include <limits>
 #include <memory>
@@ -143,6 +144,83 @@ int main() {
                                                   MAKELPARAM(borderless_rect.right - 20, borderless_rect.top + 4));
     if (chrome_close_hit != HTCLIENT) {
         return 106;
+    }
+    const LRESULT chrome_title_hit = SendMessageW(borderless_native, WM_NCHITTEST, 0,
+                                                  MAKELPARAM(borderless_rect.left + 120, borderless_rect.top + 16));
+    if (chrome_title_hit != HTCAPTION) {
+        return 107;
+    }
+    const LRESULT chrome_content_hit = SendMessageW(borderless_native, WM_NCHITTEST, 0,
+                                                    MAKELPARAM(borderless_rect.left + 120, borderless_rect.top + 120));
+    if (chrome_content_hit != HTCLIENT) {
+        return 108;
+    }
+    if (!borderless_window->set_visible(true)) {
+        return 109;
+    }
+    MONITORINFO borderless_monitor{};
+    borderless_monitor.cbSize = sizeof(borderless_monitor);
+    if (GetMonitorInfoW(MonitorFromWindow(borderless_native, MONITOR_DEFAULTTONEAREST), &borderless_monitor) == FALSE) {
+        return 113;
+    }
+    // A title double-click toggles the custom borderless window just like a
+    // native caption double-click. The client area itself must not do so.
+    SendMessageW(borderless_native, WM_LBUTTONDBLCLK, MK_LBUTTON, MAKELPARAM(120, 16));
+    if (!borderless_window->state().maximized) {
+        return 110;
+    }
+    const RECT maximized_rect = [&] {
+        RECT value{};
+        GetWindowRect(borderless_native, &value);
+        return value;
+    }();
+    // Custom chrome exposes the full client rectangle. Maximization must fit
+    // the work area exactly, without hiding the title or covering the taskbar.
+    const RECT work_rect = borderless_monitor.rcWork;
+    if (EqualRect(&maximized_rect, &work_rect) == FALSE) {
+        std::fprintf(stderr, "Borderless maximize bounds: got (%ld, %ld, %ld, %ld), work area (%ld, %ld, %ld, %ld)\n",
+                     maximized_rect.left, maximized_rect.top, maximized_rect.right, maximized_rect.bottom,
+                     work_rect.left, work_rect.top, work_rect.right, work_rect.bottom);
+        return 114;
+    }
+    POINT maximized_client_origin{};
+    RECT maximized_client_rect{};
+    if (ClientToScreen(borderless_native, &maximized_client_origin) == FALSE ||
+        GetClientRect(borderless_native, &maximized_client_rect) == FALSE ||
+        maximized_client_origin.x != work_rect.left || maximized_client_origin.y != work_rect.top ||
+        maximized_client_rect.right != work_rect.right - work_rect.left ||
+        maximized_client_rect.bottom != work_rect.bottom - work_rect.top) {
+        return 115;
+    }
+    const LRESULT maximized_title_hit = SendMessageW(
+        borderless_native, WM_NCHITTEST, 0,
+        MAKELPARAM(maximized_rect.left + 120, maximized_rect.top + 16));
+    if (maximized_title_hit != HTCLIENT) {
+        return 111;
+    }
+    const std::array<POINT, 8> maximized_edge_points{
+        POINT{maximized_rect.left + 1, maximized_rect.top + 120},
+        POINT{maximized_rect.right - 2, maximized_rect.top + 120},
+        POINT{maximized_rect.left + 120, maximized_rect.top + 1},
+        POINT{maximized_rect.left + 120, maximized_rect.bottom - 2},
+        POINT{maximized_rect.left + 1, maximized_rect.top + 1},
+        POINT{maximized_rect.right - 2, maximized_rect.top + 1},
+        POINT{maximized_rect.left + 1, maximized_rect.bottom - 2},
+        POINT{maximized_rect.right - 2, maximized_rect.bottom - 2},
+    };
+    for (const POINT point : maximized_edge_points) {
+        if (SendMessageW(borderless_native, WM_NCHITTEST, 0, MAKELPARAM(point.x, point.y)) != HTCLIENT) {
+            return 117;
+        }
+    }
+    SendMessageW(borderless_native, WM_LBUTTONDBLCLK, MK_LBUTTON, MAKELPARAM(120, 16));
+    if (borderless_window->state().maximized) {
+        return 112;
+    }
+    RECT restored_rect{};
+    if (GetWindowRect(borderless_native, &restored_rect) == FALSE ||
+        EqualRect(&restored_rect, &borderless_rect) == FALSE) {
+        return 116;
     }
     if (!system->destroy_window(borderless_window->id())) {
         return 104;

@@ -868,6 +868,18 @@ public:
                                                                     FeaturePartId part) const noexcept {
         return !part.is_valid() && uses_authored_render_passes();
     }
+    /**
+     * @brief Indicates that the feature's own graph builder consumes authored
+     *        RenderPass instances instead of the generic adapter.
+     *
+     * Built-in features use this when they need to bind authored instances to
+     * engine-owned resource and command contracts while still honoring the
+     * authored pass order.
+     */
+    [[nodiscard]] virtual bool handles_authored_render_passes_for_part(FeatureInstanceId,
+                                                                        FeaturePartId) const noexcept {
+        return false;
+    }
     /** @brief True when this feature writes a composable color state output. */
     [[nodiscard]] virtual bool uses_render_state_output() const noexcept { return false; }
     /** @brief Declares the blending semantic used when this feature consumes state inputs. */

@@ -28,6 +28,8 @@ struct EditorWorkspaceActionDescriptor final {
     std::function<foundation::Result()> callback{};
     /** @brief Whether this command is listed under View rather than invoked by another control. */
     bool show_in_view_menu{true};
+    /** @brief Optional live availability check; unavailable commands remain discoverable but disabled. */
+    std::function<bool()> enabled{};
 
     /** @brief Returns whether the action can be registered. */
     [[nodiscard]] bool is_valid() const noexcept { return !key.empty() && !title.empty() && callback != nullptr; }
@@ -85,6 +87,9 @@ public:
     void set_preferences_open(bool open) noexcept { preferences_open_ = open; }
     [[nodiscard]] bool preferences_open() const noexcept { return preferences_open_; }
     void set_playing(bool playing) noexcept { playing_ = playing; }
+    void set_paused(bool paused) noexcept { paused_ = paused; }
+    /** @brief Sets a user-sized navigation rail in pixels; zero restores automatic sizing. */
+    void set_navigation_width(float width) noexcept { navigation_width_ = width > 0.0f ? width : 0.0f; }
     /** @brief Supplies the latest draw-call count from the open game project viewport. */
     void set_game_draw_calls(uint32_t draw_calls) noexcept { game_draw_calls_ = draw_calls; }
     /** @brief Serializes the current semantic layout for an Application-owned store. */
@@ -136,8 +141,9 @@ private:
     bool building_ui_{false};
     bool preferences_open_{false};
     bool playing_{false};
+    bool paused_{false};
+    float navigation_width_{0.0f};
     uint32_t game_draw_calls_{0};
-    int workspace_mode_{0};
     std::string active_rail_{"Scene"};
     std::string pending_panel_focus_{};
 };

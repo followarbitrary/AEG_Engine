@@ -168,14 +168,9 @@ constexpr pipeline::Version kVersion{1, 0, 0};
     declaration.allowed_pass_types = std::move(allowed);
     declaration.default_passes = std::move(passes);
     declaration.default_resources = std::move(resources);
-    for (size_t index = 1; index < declaration.default_passes.size(); ++index) {
-        declaration.default_edges.push_back({.edge_id = declaration.default_passes[index - 1].node_id + "_to_" +
-                                                        declaration.default_passes[index].node_id,
-                                             .kind = pipeline::DocumentEdgeKind::kOrdering,
-                                             .source = {declaration.default_passes[index - 1].node_id, 0},
-                                             .destination = {declaration.default_passes[index].node_id, 0},
-                                             .binding_id = 0});
-    }
+    // Default Passes are an editable starting arrangement. Resource flows
+    // establish producer-before-consumer dependencies; a hidden order-only
+    // chain would make otherwise independent Passes impossible to reorder.
     for (const auto& resource : declaration.default_resources) {
         const auto binding = resource.resource_id.value();
         for (const auto& pass : declaration.default_passes) {
@@ -194,7 +189,10 @@ constexpr pipeline::Version kVersion{1, 0, 0};
             }
         }
     }
-    declaration.allow_add_passes = false;
+    // Built-in renderer graphs are shipped as editable authored templates.
+    // VariantFeature consumes their pass instances using the same engine
+    // implementations while honoring the current graph order and membership.
+    declaration.allow_add_passes = true;
     return {.key = {pipeline::AuthoringTypeKind::kFeature, id.value()},
             .version = kVersion,
             .owner_module = kRendererModule,

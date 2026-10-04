@@ -103,6 +103,8 @@ public:
 
     /** @brief Builds category navigation and the Fonts preference page. */
     void build_ui() override;
+    /** @brief Builds Preferences with the common title bar in its native window. */
+    void build_ui(const EditorPanelBuildContext& context) override;
 
 private:
     enum class Page : uint8_t {

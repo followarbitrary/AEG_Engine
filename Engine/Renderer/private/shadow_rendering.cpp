@@ -73,13 +73,15 @@ foundation::ResultValue<RenderShadowView> make_directional_shadow_view(const Ren
 }
 
 foundation::Result build_shadow_render_graph(pipeline::RenderGraphBuilder& builder, const RenderFeatureContext& context,
-                                             const RenderShadowView& shadow, pipeline::RenderGraphTexture target) {
+                                             const RenderShadowView& shadow, pipeline::RenderGraphTexture target,
+                                             pipeline::RenderPassInstanceId authored_instance) {
     if (!context.is_valid() || render_feature_context(builder) != &context || !target.is_valid())
         return foundation::invalid_argument("shadow graph context or target is invalid");
     if (shadow.enabled) {
         const auto& snapshot = *context.scene_snapshot;
         const auto& casters = snapshot.shadow_casters.empty() ? snapshot.instances : snapshot.shadow_casters;
-        return build_depth_render_graph(builder, context, shadow.view, target, "Renderer.ShadowPass", casters);
+        return build_depth_render_graph(builder, context, shadow.view, target, "Renderer.ShadowPass", casters,
+                                        authored_instance);
     }
     const auto pass = detail::add_builtin_render_pass(
         builder, context, kShadowPassTypeId,
@@ -87,11 +89,12 @@ foundation::Result build_shadow_render_graph(pipeline::RenderGraphBuilder& build
             return pass.use_depth_stencil_attachment(target, rhi::LoadOp::kClear, rhi::StoreOp::kStore, 1, 0,
                                                      rhi::ResourceUsage::kSampledRead);
         },
-        [](pipeline::RenderPassExecutionContext& execution) {
+         [](pipeline::RenderPassExecutionContext& execution) {
             if (const auto result = execution.begin_rendering(); !result)
                 return result;
             return execution.end_rendering();
-        });
+        },
+        authored_instance);
     return pass ? foundation::Result::success() : pass.result;
 }
 }  // namespace aeg::renderer

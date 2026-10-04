@@ -23,6 +23,12 @@ const FeatureNodeDocument* find_feature(const PipelineDocument& document, std::s
     return found == document.feature_nodes.end() ? nullptr : &*found;
 }
 
+const PassNodeDocument* find_pass(const PipelineDocument& document, std::string_view id) {
+    const auto found = std::find_if(document.pass_nodes.begin(), document.pass_nodes.end(),
+                                    [&](const auto& node) { return node.node_id == id; });
+    return found == document.pass_nodes.end() ? nullptr : &*found;
+}
+
 void sort_palette(std::vector<EditorPaletteEntry>& entries) {
     std::stable_sort(entries.begin(), entries.end(), [](const auto& left, const auto& right) {
         if (left.label != right.label)
@@ -75,6 +81,13 @@ foundation::ResultValue<std::vector<EditorPaletteEntry>> build_composition_palet
             return {foundation::invalid_argument("Feature catalog declaration is invalid"), {}};
         if (!declaration->allow_add_passes)
             return {foundation::Result::success(), std::move(result)};
+        if (address.part_id.empty()) {
+            std::size_t render_parts = 0;
+            for (const auto& part : declaration->parts)
+                render_parts += part.domain == pipeline::FeatureDomain::kRender ? 1U : 0U;
+            if (render_parts > 1U || (!declaration->parts.empty() && render_parts == 0U))
+                return {foundation::Result::success(), std::move(result)};
+        }
         for (const auto type : declaration->allowed_pass_types) {
             const auto* pass = catalog.find({pipeline::AuthoringTypeKind::kRenderPass, type.value()});
             if (pass)
@@ -83,6 +96,52 @@ foundation::ResultValue<std::vector<EditorPaletteEntry>> build_composition_palet
     }
     sort_palette(result);
     return {foundation::Result::success(), std::move(result)};
+}
+
+pipeline::TypeCatalogEntry make_empty_custom_type(pipeline::AuthoringTypeKind kind, std::string_view name_view) {
+    using namespace pipeline;
+    const std::string name{name_view};
+    TypeCatalogEntry entry;
+    entry.version = {1, 0, 0};
+    entry.owner_module = ModuleId("Editor.FlowGraph");
+    entry.name = name;
+    const auto separator = name.find_last_of('.');
+    entry.display_name = "Empty " + name.substr(separator == std::string::npos ? 0 : separator + 1);
+    entry.domains = to_mask(FeatureDomain::kRender);
+    entry.scopes = kAllPipelineScopes;
+    if (kind == AuthoringTypeKind::kPipeline) {
+        const StageId stage_id(name + ".Stage");
+        const FeaturePointId point_id(name + ".Point");
+        entry.key = {kind, PipelineId(name).value()};
+        entry.domains = kAllFeatureDomains;
+        entry.declaration = PipelineAuthoringDeclaration{
+            .stages = {{.id = stage_id,
+                        .name = "Build",
+                        .phase = PhaseId("RenderBuild"),
+                        .execution_domain = ExecutionDomain::kRenderThread,
+                        .time_policy = TimePolicy::kFrame,
+                        .editable = true}},
+            .feature_points = {{.id = point_id,
+                                .name = "Feature Point",
+                                .anchor_stage = stage_id,
+                                .position = FeaturePointPosition::kAfter,
+                                .domains = kAllFeatureDomains,
+                                .scopes = kAllPipelineScopes,
+                                .flags = FeaturePointFlags::kMayCreateArtifacts |
+                                         FeaturePointFlags::kMayCreateGraphicsPass |
+                                         FeaturePointFlags::kMayCreateComputePass |
+                                         FeaturePointFlags::kMayCreateCopyPass}}};
+    } else if (kind == AuthoringTypeKind::kFeature) {
+        entry.key = {kind, FeatureId(name).value()};
+        entry.declaration = FeatureAuthoringDeclaration{
+            .parts = {{.part_index = 0, .domain = FeatureDomain::kRender, .name = "render"}},
+            .allow_add_passes = true};
+    } else {
+        const RenderPassTypeId pass_id(name);
+        entry.key = {kind, pass_id.value()};
+        entry.declaration = PassAuthoringDeclaration{.type = pass_id, .allowed_queue_mask = 1};
+    }
+    return entry;
 }
 
 foundation::ResultValue<EditorDiagnosticTarget> resolve_composition_diagnostic(
@@ -105,9 +164,56 @@ foundation::ResultValue<EditorDiagnosticTarget> resolve_composition_diagnostic(
                 target.graph = {EditorGraphKind::kPass, feature ? feature->pipeline_node : std::string{},
                                 node.feature_node, node.part_id};
             }
-        for (const auto& node : document.resources)
-            if (node.node_id == diagnostic.node_id)
-                target.graph = {EditorGraphKind::kPass, {}, {}, {}};
+        for (const auto& node : document.resources) {
+            if (node.node_id != diagnostic.node_id)
+                continue;
+            const auto separator = node.node_id.find('/');
+            const std::string owner = separator == std::string::npos ? std::string{} : node.node_id.substr(0, separator);
+            const auto feature = find_feature(document, owner);
+            target.graph = {EditorGraphKind::kPass, feature ? feature->pipeline_node : std::string{}, owner, {}};
+            // Resource cards are intentionally hidden in the strict Pass
+            // canvas. Locate the nearest visible Pass so diagnostics still
+            // have a useful target instead of selecting an ID that cannot be
+            // rendered by the current graph projection.
+            const auto pass_for_resource = std::find_if(
+                document.edges.begin(), document.edges.end(), [&](const auto& edge) {
+                    const std::string_view candidate = edge.source.node_id == node.node_id
+                                                            ? edge.destination.node_id
+                                                            : edge.destination.node_id == node.node_id
+                                                                ? edge.source.node_id
+                                                                : std::string_view{};
+                    return !candidate.empty() && std::any_of(
+                                                     document.pass_nodes.begin(), document.pass_nodes.end(),
+                                                     [&](const auto& pass) {
+                                                         return pass.node_id == candidate &&
+                                                                (feature == nullptr || pass.feature_node == feature->node_id);
+                                                     });
+                });
+            if (pass_for_resource != document.edges.end()) {
+                target.node_id = pass_for_resource->source.node_id == node.node_id
+                                     ? pass_for_resource->destination.node_id
+                                     : pass_for_resource->source.node_id;
+                const auto pass = find_pass(document, target.node_id);
+                if (pass != nullptr)
+                    target.graph = {EditorGraphKind::kPass, feature ? feature->pipeline_node : std::string{},
+                                    pass->feature_node, pass->part_id};
+            } else if (feature != nullptr) {
+                const auto fallback_pass = std::find_if(document.pass_nodes.begin(), document.pass_nodes.end(),
+                                                       [&](const auto& pass) {
+                                                           return pass.feature_node == feature->node_id;
+                                                       });
+                if (fallback_pass != document.pass_nodes.end()) {
+                    target.node_id = fallback_pass->node_id;
+                    target.graph = {EditorGraphKind::kPass, feature->pipeline_node, fallback_pass->feature_node,
+                                    fallback_pass->part_id};
+                } else {
+                    target.node_id = feature->node_id;
+                    target.graph = {EditorGraphKind::kFeature, feature->pipeline_node, {}, {}};
+                }
+            } else {
+                target.node_id.clear();
+            }
+        }
     }
     if (target.node_id.empty() && target.edge_id.empty())
         return {foundation::Result::success(), std::move(target)};

@@ -1325,7 +1325,9 @@ foundation::Result RenderGraphFeatureRuntime::build() {
             feature_configuration != nullptr && feature_configuration->expand_authored_passes;
         const bool legacy_expands_authored_passes = feature_implementation->uses_authored_render_passes_for_part(
             contribution.feature_instance, contribution.part);
-        if (expands_authored_passes || legacy_expands_authored_passes) {
+        const bool feature_handles_authored_passes = feature_implementation->handles_authored_render_passes_for_part(
+            contribution.feature_instance, contribution.part);
+        if ((expands_authored_passes || legacy_expands_authored_passes) && !feature_handles_authored_passes) {
             foundation::Result authored_pass_result;
             try {
                 authored_pass_result = expand_authored_render_passes(builder, feature_context);

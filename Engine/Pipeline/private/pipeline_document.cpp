@@ -1,11 +1,12 @@
 #include <algorithm>
 #include <cmath>
+#include <iomanip>
+#include <locale>
 #include <map>
 #include <set>
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
-
 #include "pipeline_authoring.hpp"
 
 namespace aeg::pipeline {
@@ -372,7 +373,9 @@ std::vector<DocumentDiagnostic> validate_pipeline_document(const PipelineDocumen
             diagnostic(result, "port.binding", "edge binding does not match declared port bindings", {}, edge.edge_id);
         }
         const std::string destination_key = edge.destination.node_id + ":" + std::to_string(edge.destination.port_id);
-        if (++incoming_connections[destination_key] > destination_port->max_connections) {
+        const bool explicit_variadic_destination = destination_port->input &&
+            destination_port->input->variadic_group_id != 0;
+        if (!explicit_variadic_destination && ++incoming_connections[destination_key] > destination_port->max_connections) {
             diagnostic(result, "port.multiplicity", "input port has too many connections", {}, edge.edge_id,
                        edge.destination.port_id);
         }
@@ -397,17 +400,10 @@ std::vector<DocumentDiagnostic> validate_pipeline_document(const PipelineDocumen
         }
     }
 
-    for (const auto& [node, entry] : node_entries) {
-        if (const auto pass = passes.find(node); pass != passes.end() && !pass->second->enabled)
-            continue;
-        if (const auto feature = features.find(node); feature != features.end() && !feature->second->enabled)
-            continue;
-        for (const auto& port : entry->ports) {
-            if (port.direction == PortDirection::kInput && port.required &&
-                incoming_connections[node + ":" + std::to_string(port.id)] < port.min_connections)
-                diagnostic(result, "port.required", "required input port is disconnected", node, {}, port.id);
-        }
-    }
+    // Legacy ports retain their historical edge cardinality checks. Explicit
+    // FlowGraph input contracts are validated by the dedicated source/slot pass.
+    const auto explicit_input_diagnostics = validate_flowgraph_inputs(document, catalog);
+    result.insert(result.end(), explicit_input_diagnostics.begin(), explicit_input_diagnostics.end());
 
     std::unordered_set<std::string> layout_ids;
     for (const auto& layout : document.layouts) {
@@ -519,28 +515,182 @@ std::vector<DocumentDiagnostic> validate_pipeline_document(const PipelineDocumen
 
 std::string document_semantic_digest(const PipelineDocument& document) {
     std::ostringstream out;
-    out << document.schema_version << '|' << document.asset_uuid << '|' << document.name;
+    out.imbue(std::locale::classic());
+    out << "AEG.FlowGraph.SemanticDigest.1\n";
+    const auto field = [](std::ostream& stream, std::string_view text) {
+        stream << text.size() << ':' << text;
+    };
+    const auto emit_value = [&](std::ostream& stream, const ParameterValue& item) {
+        if (const auto* v = std::get_if<bool>(&item))
+            stream << "b" << (*v ? 1 : 0);
+        else if (const auto* v = std::get_if<int64_t>(&item))
+            stream << "i" << *v;
+        else if (const auto* v = std::get_if<uint64_t>(&item))
+            stream << "u" << *v;
+        else if (const auto* v = std::get_if<double>(&item))
+            stream << "f" << std::setprecision(17) << *v;
+        else if (const auto* v = std::get_if<std::string>(&item)) {
+            stream << "s";
+            field(stream, *v);
+        } else if (const auto* v = std::get_if<std::vector<double>>(&item)) {
+            stream << "v" << v->size();
+            for (const double element : *v)
+                stream << ':' << std::setprecision(17) << element;
+        } else if (const auto* v = std::get_if<AssetReference>(&item)) {
+            stream << "a";
+            field(stream, v->uuid);
+        }
+    };
+    const auto emit_parameters = [&](std::ostream& stream, const ParameterBlock& block) {
+        stream << block.size();
+        for (const auto& [id, item] : block) {
+            stream << ':' << id << '=';
+            emit_value(stream, item);
+        }
+    };
+    const auto emit_version = [](std::ostream& stream, Version item) {
+        stream << item.major << '.' << item.minor << '.' << item.patch;
+    };
+    const auto append_records = [&](std::vector<std::string>& records) {
+        std::sort(records.begin(), records.end());
+        for (const auto& item : records)
+            out << item.size() << item;
+        records.clear();
+    };
+
+    field(out, document.asset_uuid);
+    field(out, document.name);
+    out << document.schema_version << ':' << document.graph_version << '\n';
+    std::vector<uint64_t> modules;
+    for (const auto id : document.module_requirements)
+        modules.push_back(id.value());
+    std::sort(modules.begin(), modules.end());
+    out << "M" << modules.size();
+    for (const auto id : modules)
+        out << ':' << id;
+
+    std::vector<std::string> records;
     for (const auto& node : document.pipeline_nodes) {
-        out << "|P:" << node.node_id << ':' << node.type.value() << ':' << static_cast<uint32_t>(node.scope);
+        std::ostringstream item;
+        item << 'P';
+        field(item, node.node_id);
+        item << node.type.value() << ':';
+        emit_version(item, node.version);
+        item << ':' << static_cast<uint32_t>(node.scope);
+        field(item, node.owner_binding);
+        emit_parameters(item, node.parameters);
+        records.push_back(item.str());
     }
+    append_records(records);
     for (const auto& node : document.feature_nodes) {
-        out << "|F:" << node.node_id << ':' << node.type.value() << ':' << node.pipeline_node << ':'
-            << node.point.value() << ':' << node.enabled;
+        std::ostringstream item;
+        item << 'F';
+        field(item, node.node_id);
+        item << node.type.value() << ':';
+        emit_version(item, node.version);
+        field(item, node.pipeline_node);
+        item << node.point.value() << ':' << node.enabled;
+        emit_parameters(item, node.parameters);
+        records.push_back(item.str());
     }
+    append_records(records);
     for (const auto& node : document.pass_nodes) {
-        out << "|R:" << node.node_id << ':' << node.type.value() << ':' << node.feature_node << ':' << node.part_id
-            << ':' << node.enabled;
+        std::ostringstream item;
+        item << 'R';
+        field(item, node.node_id);
+        item << node.type.value() << ':';
+        emit_version(item, node.version);
+        field(item, node.feature_node);
+        field(item, node.part_id);
+        item << node.enabled;
+        emit_parameters(item, node.parameters);
+        records.push_back(item.str());
+    }
+    append_records(records);
+    // Pass collection order is executable authoring state. Keep unrelated
+    // Features canonical, but preserve the order within each Feature part so
+    // a reorder invalidates cached compilation even when no edge changes.
+    std::map<std::pair<std::string, std::string>, std::vector<std::string>> pass_order;
+    for (const auto& node : document.pass_nodes)
+        pass_order[{node.feature_node, node.part_id}].push_back(node.node_id);
+    out << "O" << pass_order.size();
+    for (const auto& [owner, nodes] : pass_order) {
+        field(out, owner.first);
+        field(out, owner.second);
+        out << nodes.size();
+        for (const auto& node_id : nodes)
+            field(out, node_id);
     }
     for (const auto& resource : document.resources) {
-        out << "|Q:" << resource.node_id << ':' << resource.resource_id.value();
+        std::ostringstream item;
+        item << 'Q';
+        field(item, resource.node_id);
+        item << resource.resource_id.value() << ':' << resource.type.value() << ':' << resource.version << ':'
+             << static_cast<uint32_t>(resource.owner_scope) << ':' << resource.visible_to << ':'
+             << resource.external_input << ':' << static_cast<uint32_t>(resource.storage) << ':'
+             << static_cast<uint32_t>(resource.lifetime) << ':' << static_cast<uint32_t>(resource.ownership) << ':'
+             << static_cast<uint32_t>(resource.resource_constraints.resource_class);
+        field(item, resource.resource_constraints.size_rule);
+        item << resource.resource_constraints.sample_count << ':' << resource.resource_constraints.capability_mask << ':'
+             << resource.resource_constraints.usage_mask;
+        for (const auto& format : resource.resource_constraints.formats)
+            field(item, format);
+        emit_parameters(item, resource.parameters);
+        records.push_back(item.str());
     }
+    append_records(records);
     for (const auto& edge : document.edges) {
-        out << "|E:" << edge.edge_id << ':' << static_cast<uint32_t>(edge.kind) << ':' << edge.source.node_id << ':'
-            << edge.source.port_id << ':' << edge.destination.node_id << ':' << edge.destination.port_id << ':'
-            << edge.binding_id;
+        std::ostringstream item;
+        item << 'E';
+        field(item, edge.edge_id);
+        item << static_cast<uint32_t>(edge.kind) << ':';
+        field(item, edge.source.node_id);
+        item << edge.source.port_id << ':' << edge.source.slot_id;
+        field(item, edge.destination.node_id);
+        item << edge.destination.port_id << ':' << edge.destination.slot_id << ':' << edge.binding_id;
+        records.push_back(item.str());
     }
-    for (const auto& source_node : document.present_connections)
-        out << "|Present:" << source_node;
+    append_records(records);
+    for (const auto& binding : document.input_bindings) {
+        std::ostringstream item;
+        item << 'I';
+        field(item, binding.node_id);
+        item << binding.port_id << ':' << binding.slot_id << ':' << static_cast<uint32_t>(binding.source) << ':'
+             << static_cast<uint32_t>(binding.status);
+        for (const auto& edge_id : binding.edge_ids)
+            field(item, edge_id);
+        field(item, binding.asset.uuid);
+        field(item, binding.product_id);
+        field(item, binding.target_variant);
+        item << binding.content_revision << ':' << binding.default_id << ':' << binding.default_revision;
+        emit_value(item, binding.literal);
+        field(item, binding.context_key);
+        records.push_back(item.str());
+    }
+    append_records(records);
+    for (const auto& slot : document.variadic_slots) {
+        std::ostringstream item;
+        item << 'S';
+        field(item, slot.node_id);
+        item << slot.group_id << ':' << slot.slot_id << ':' << slot.order;
+        emit_parameters(item, slot.parameters);
+        records.push_back(item.str());
+    }
+    append_records(records);
+    std::vector<std::string> present = document.present_connections;
+    std::sort(present.begin(), present.end());
+    for (const auto& item : present) {
+        out << 'T';
+        field(out, item);
+    }
+    for (const auto& extension : document.extensions) {
+        std::ostringstream item;
+        item << static_cast<uint32_t>(extension.encoding);
+        field(item, extension.owner_node);
+        field(item, extension.payload);
+        records.push_back(item.str());
+    }
+    append_records(records);
     return out.str();
 }
 
@@ -554,6 +704,7 @@ foundation::ResultValue<PreparedPipelineDocument> prepare_pipeline_document(cons
     }
     PreparedPipelineDocument prepared;
     prepared.semantic_digest = document_semantic_digest(document);
+    prepared.graph_version = std::to_string(document.graph_version);
     std::unordered_map<std::string, const ResourceNodeDocument*> resource_nodes;
     resource_nodes.reserve(document.resources.size());
     for (const ResourceNodeDocument& resource : document.resources) {
@@ -605,9 +756,6 @@ foundation::ResultValue<PreparedPipelineDocument> prepare_pipeline_document(cons
         std::vector<std::vector<uint32_t>> outgoing(passes.size());
         std::vector<uint32_t> incoming(passes.size(), 0);
         for (const DocumentEdge& edge : edges) {
-            if (edge.kind != DocumentEdgeKind::kOrdering) {
-                continue;
-            }
             const auto source = indices.find(edge.source.node_id);
             const auto destination = indices.find(edge.destination.node_id);
             if (source == indices.end() || destination == indices.end()) {
@@ -780,7 +928,13 @@ foundation::ResultValue<PreparedPipelineDocument> prepare_pipeline_document(cons
                     return {result.result, {}};
                 }
             }
-            if (has_explicit_passes) {
+            // An explicit Feature node is an authored override even when its
+            // Pass collection is empty.  This distinction is what makes
+            // deleting the last built-in Pass a real edit instead of silently
+            // re-materializing the declaration defaults.  Only an implicit
+            // default Feature (with no authored Feature node) receives the
+            // declaration's default Pass collection.
+            if (has_explicit_passes || feature.explicit_node) {
                 ordering_edges.assign(document.edges.begin(), document.edges.end());
             } else {
                 ordering_edges = feature_declaration->default_edges;
@@ -793,6 +947,39 @@ foundation::ResultValue<PreparedPipelineDocument> prepare_pipeline_document(cons
                     }
                 }
             }
+            if (feature_declaration->allow_add_passes && feature_entry->owner_module == ModuleId("Renderer")) {
+                // Older editable renderer documents may still carry the
+                // hidden order-only chain emitted by previous defaults.
+                // Authored Pass order now comes from the current collection
+                // and its visible data flows, so that legacy chain cannot
+                // silently pin independent Passes to their old positions.
+                std::erase_if(ordering_edges, [](const DocumentEdge& edge) {
+                    return edge.kind == DocumentEdgeKind::kOrdering;
+                });
+            }
+            // Every data connection establishes producer-before-consumer. A
+            // resource relay therefore becomes a pass dependency even though
+            // the resource node itself is not a RenderPass instance.
+            std::set<std::pair<std::string, std::string>> derived_dependencies;
+            std::vector<DocumentEdge> derived_edges;
+            for (const auto& left : ordering_edges) {
+                if (left.kind == DocumentEdgeKind::kOrdering)
+                    continue;
+                for (const auto& right : ordering_edges) {
+                    if (right.kind == DocumentEdgeKind::kOrdering ||
+                        left.destination.node_id != right.source.node_id ||
+                        left.source.node_id == right.destination.node_id)
+                        continue;
+                    const auto dependency = std::make_pair(left.source.node_id, right.destination.node_id);
+                    if (!derived_dependencies.insert(dependency).second)
+                        continue;
+                    derived_edges.push_back({"@data:" + left.edge_id + ":" + right.edge_id,
+                                             DocumentEdgeKind::kOrdering,
+                                             {left.source.node_id, 0, 0},
+                                             {right.destination.node_id, 0, 0}, 0});
+                }
+            }
+            ordering_edges.insert(ordering_edges.end(), derived_edges.begin(), derived_edges.end());
             if (const foundation::Result order_result = sort_passes(feature_configuration.passes, ordering_edges);
                 !order_result) {
                 return {order_result, {}};
@@ -802,6 +989,16 @@ foundation::ResultValue<PreparedPipelineDocument> prepare_pipeline_document(cons
         prepared.configurations.push_back(std::move(configuration));
     }
     prepared.composition_edges = document.edges;
+    std::map<std::pair<std::string, std::string>, std::vector<std::string>> data_dependencies;
+    for (const auto& edge : document.edges) {
+        if (edge.kind == DocumentEdgeKind::kOrdering)
+            continue;
+        data_dependencies[{edge.source.node_id, edge.destination.node_id}].push_back(edge.edge_id);
+    }
+    for (auto& [nodes, edge_ids] : data_dependencies) {
+        std::sort(edge_ids.begin(), edge_ids.end());
+        prepared.data_dependencies.push_back({nodes.first, nodes.second, std::move(edge_ids)});
+    }
     for (const auto& node : document.pipeline_nodes) {
         prepared.source_map.emplace(node.node_id, node.node_id);
     }

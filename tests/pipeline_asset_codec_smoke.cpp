@@ -16,12 +16,27 @@ int main() {
                                 .scope = pipeline::PipelineScope::kFrame,
                                 .parameters = {{1, pipeline::ParameterValue{uint64_t{0xffffffffffffffffull}}}}}};
     document.layouts = {{"pipeline", 88.0, 42.0, true}};
-    document.edges.push_back({"order", pipeline::DocumentEdgeKind::kOrdering, {"pipeline", 0}, {"pipeline", 0}, 0});
+    document.edges.push_back({"order", pipeline::DocumentEdgeKind::kOrdering, {"pipeline", 0, 0},
+                              {"pipeline", 0, 0}, 0});
+    document.input_bindings.push_back({.node_id = "pipeline",
+                                       .port_id = 99,
+                                       .slot_id = 4,
+                                       .source = pipeline::InputSourceKind::kAsset,
+                                       .asset = pipeline::AssetReference{"00000000-0000-0000-0000-000000000123"},
+                                       .content_revision = 2,
+                                       .literal = uint64_t{7},
+                                       .status = pipeline::InputBindingStatus::kBound});
+    document.variadic_slots.push_back({.node_id = "pipeline", .group_id = 88, .slot_id = 4, .order = 3,
+                                       .parameters = {{5, uint64_t{6}}}});
     const auto encoded = tooling::encode_pipeline_asset(document);
     if (!encoded)
         return 1;
     const auto decoded = asset::decode_pipeline_asset(encoded.value);
-    if (!decoded || decoded.value.layouts.size() != 0 || decoded.value.pipeline_nodes.size() != 1)
+    if (!decoded || decoded.value.layouts.size() != 0 || decoded.value.pipeline_nodes.size() != 1 ||
+        decoded.value.input_bindings.size() != 1 || decoded.value.variadic_slots.size() != 1 ||
+        decoded.value.input_bindings.front().asset.uuid != "00000000-0000-0000-0000-000000000123" ||
+        decoded.value.input_bindings.front().content_revision != 2 ||
+        decoded.value.variadic_slots.front().parameters.at(5) != pipeline::ParameterValue{uint64_t{6}})
         return 2;
     const auto reencoded = tooling::encode_pipeline_asset(decoded.value);
     if (!reencoded || encoded.value != reencoded.value)

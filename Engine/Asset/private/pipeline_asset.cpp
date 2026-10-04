@@ -6,12 +6,15 @@
 #include <cstring>
 #include <limits>
 #include <string>
+#include <tuple>
+#include <map>
+#include <set>
 #include <unordered_set>
 
 namespace aeg::asset {
 namespace {
 using namespace pipeline;
-constexpr uint32_t kVersion = 2;
+constexpr uint32_t kVersion = 3;
 constexpr uint32_t kMaxCount = 1'000'000;
 constexpr uint32_t kMaxString = 16 * 1024 * 1024;
 
@@ -181,6 +184,16 @@ bool unique_node(const PipelineDocument& document) {
     for (const auto& edge : document.edges)
         if (edge.edge_id.empty() || !edges.insert(edge.edge_id).second)
             return false;
+    std::set<std::tuple<std::string, uint64_t, uint64_t>> bindings;
+    for (const auto& binding : document.input_bindings)
+        if (binding.node_id.empty() || binding.port_id == 0 ||
+            !bindings.emplace(binding.node_id, binding.port_id, binding.slot_id).second)
+            return false;
+    std::set<std::pair<std::string, uint64_t>> slots;
+    for (const auto& slot : document.variadic_slots)
+        if (slot.node_id.empty() || slot.group_id == 0 || slot.slot_id == 0 ||
+            !slots.emplace(slot.node_id, slot.slot_id).second)
+            return false;
     return true;
 }
 
@@ -191,7 +204,8 @@ foundation::ResultValue<std::vector<std::byte>> encode_pipeline_asset(const Pipe
         return {foundation::invalid_argument("Pipeline asset document identity is invalid"), {}};
     if (document.pipeline_nodes.size() > kMaxCount || document.feature_nodes.size() > kMaxCount ||
         document.pass_nodes.size() > kMaxCount || document.resources.size() > kMaxCount ||
-        document.edges.size() > kMaxCount || document.present_connections.size() > kMaxCount)
+        document.edges.size() > kMaxCount || document.input_bindings.size() > kMaxCount ||
+        document.variadic_slots.size() > kMaxCount || document.present_connections.size() > kMaxCount)
         return {foundation::invalid_argument("Pipeline asset document is too large"), {}};
     for (const auto& source : document.present_connections)
         if (source.empty())
@@ -201,6 +215,9 @@ foundation::ResultValue<std::vector<std::byte>> encode_pipeline_asset(const Pipe
                                              static_cast<std::byte>('G'), static_cast<std::byte>('P')});
     writer.value(kVersion);
     writer.value(document.schema_version);
+    writer.value(document.graph_version);
+    writer.value(document.draft_revision);
+    writer.value(document.layout_revision);
     writer.string(document.asset_uuid);
     writer.string(document.name);
     writer.value(static_cast<uint32_t>(document.module_requirements.size()));
@@ -256,9 +273,38 @@ foundation::ResultValue<std::vector<std::byte>> encode_pipeline_asset(const Pipe
         writer.value(static_cast<uint8_t>(edge.kind));
         writer.string(edge.source.node_id);
         writer.id(edge.source.port_id);
+        writer.id(edge.source.slot_id);
         writer.string(edge.destination.node_id);
         writer.id(edge.destination.port_id);
+        writer.id(edge.destination.slot_id);
         writer.value(edge.binding_id);
+    }
+    writer.value(static_cast<uint32_t>(document.input_bindings.size()));
+    for (const auto& binding : document.input_bindings) {
+        writer.string(binding.node_id);
+        writer.id(binding.port_id);
+        writer.id(binding.slot_id);
+        writer.value(static_cast<uint8_t>(binding.source));
+        writer.value(static_cast<uint8_t>(binding.status));
+        writer.value(static_cast<uint32_t>(binding.edge_ids.size()));
+        for (const auto& edge_id : binding.edge_ids)
+            writer.string(edge_id);
+        writer.string(binding.asset.uuid);
+        writer.string(binding.product_id);
+        writer.string(binding.target_variant);
+        writer.value(binding.content_revision);
+        writer.value(binding.default_id);
+        writer.value(binding.default_revision);
+        write_parameters(writer, {{binding.port_id, binding.literal}});
+        writer.string(binding.context_key);
+    }
+    writer.value(static_cast<uint32_t>(document.variadic_slots.size()));
+    for (const auto& slot : document.variadic_slots) {
+        writer.string(slot.node_id);
+        writer.id(slot.group_id);
+        writer.id(slot.slot_id);
+        writer.value(slot.order);
+        write_parameters(writer, slot.parameters);
     }
     writer.value(static_cast<uint32_t>(document.present_connections.size()));
     for (const auto& source : document.present_connections)
@@ -277,10 +323,13 @@ foundation::ResultValue<PipelineDocument> decode_pipeline_asset(std::span<const 
     }
     uint32_t version{}, schema{};
     if (magic != std::array<char, 4>{'A', 'E', 'G', 'P'} || !reader.value(version) ||
-        (version != 1 && version != kVersion) || !reader.value(schema) || schema == 0)
+        (version < 1 || version > kVersion) || !reader.value(schema) || schema == 0)
         return {foundation::invalid_argument("Pipeline asset header is invalid"), {}};
     PipelineDocument document;
     document.schema_version = schema;
+    if (version >= 3 && (!reader.value(document.graph_version) || !reader.value(document.draft_revision) ||
+                         !reader.value(document.layout_revision)))
+        return {foundation::invalid_argument("Pipeline asset graph revisions are invalid"), {}};
     if (!reader.string(document.asset_uuid) || !reader.string(document.name))
         return {foundation::invalid_argument("Pipeline asset identity is invalid"), {}};
     auto count = [&](uint32_t& output) { return reader.value(output) && output <= kMaxCount; };
@@ -383,14 +432,58 @@ foundation::ResultValue<PipelineDocument> decode_pipeline_asset(std::span<const 
         DocumentEdge edge;
         uint8_t kind{};
         if (!reader.string(edge.edge_id) || !reader.value(kind) || kind > 3 || !reader.string(edge.source.node_id) ||
-            !reader.value(edge.source.port_id) || !reader.string(edge.destination.node_id) ||
-            !reader.value(edge.destination.port_id) || !reader.value(edge.binding_id))
+            !reader.value(edge.source.port_id) || (version >= 3 && !reader.value(edge.source.slot_id)) ||
+            !reader.string(edge.destination.node_id) || !reader.value(edge.destination.port_id) ||
+            (version >= 3 && !reader.value(edge.destination.slot_id)) || !reader.value(edge.binding_id))
             return {foundation::invalid_argument("Pipeline asset edge is invalid"), {}};
         edge.kind = static_cast<DocumentEdgeKind>(kind);
         if (edge.kind != DocumentEdgeKind::kOrdering &&
             (edge.source.port_id == 0 || edge.destination.port_id == 0 || edge.binding_id == 0))
             return {foundation::invalid_argument("Pipeline asset data edge binding is invalid"), {}};
         document.edges.push_back(std::move(edge));
+    }
+    if (version >= 3) {
+        if (!count(size))
+            return {foundation::invalid_argument("Pipeline asset input binding count is invalid"), {}};
+        for (uint32_t i = 0; i < size; ++i) {
+            InputBindingDocument binding;
+            uint8_t source{}, status{};
+            uint32_t edge_count{};
+            if (!reader.string(binding.node_id) || !reader.id(binding.port_id) || !reader.value(binding.slot_id) ||
+                !reader.value(source) || source > static_cast<uint8_t>(InputSourceKind::kNone) ||
+                !reader.value(status) || status > static_cast<uint8_t>(InputBindingStatus::kCancelled) ||
+                !reader.value(edge_count) || edge_count > kMaxCount)
+                return {foundation::invalid_argument("Pipeline asset input binding is invalid"), {}};
+            binding.source = static_cast<InputSourceKind>(source);
+            binding.status = static_cast<InputBindingStatus>(status);
+            binding.edge_ids.reserve(edge_count);
+            for (uint32_t edge_index = 0; edge_index < edge_count; ++edge_index) {
+                std::string edge_id;
+                if (!reader.string(edge_id) || edge_id.empty())
+                    return {foundation::invalid_argument("Pipeline asset input edge is invalid"), {}};
+                binding.edge_ids.push_back(std::move(edge_id));
+            }
+            if (!reader.string(binding.asset.uuid) || !reader.string(binding.product_id) ||
+                !reader.string(binding.target_variant) || !reader.value(binding.content_revision) ||
+                !reader.value(binding.default_id) || !reader.value(binding.default_revision))
+                return {foundation::invalid_argument("Pipeline asset input source is invalid"), {}};
+            ParameterBlock literal;
+            if (!read_parameters(reader, literal) || literal.size() != 1)
+                return {foundation::invalid_argument("Pipeline asset input literal is invalid"), {}};
+            binding.literal = literal.begin()->second;
+            if (!reader.string(binding.context_key))
+                return {foundation::invalid_argument("Pipeline asset input context is invalid"), {}};
+            document.input_bindings.push_back(std::move(binding));
+        }
+        if (!count(size))
+            return {foundation::invalid_argument("Pipeline asset variadic slot count is invalid"), {}};
+        for (uint32_t i = 0; i < size; ++i) {
+            VariadicInputSlotDocument slot;
+            if (!reader.string(slot.node_id) || !reader.id(slot.group_id) || !reader.id(slot.slot_id) ||
+                !reader.value(slot.order) || !read_parameters(reader, slot.parameters))
+                return {foundation::invalid_argument("Pipeline asset variadic slot is invalid"), {}};
+            document.variadic_slots.push_back(std::move(slot));
+        }
     }
     if (version >= 2) {
         if (!count(size))

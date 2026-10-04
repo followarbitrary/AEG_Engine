@@ -144,7 +144,9 @@ EditorPreferencePanel::EditorPreferencePanel(EditorPreferenceModel& model, IEdit
                                              EditorImGuiHost* preview_host) noexcept
     : model_(&model), actions_(&actions), preview_host_(preview_host) {}
 
-void EditorPreferencePanel::build_ui() {
+void EditorPreferencePanel::build_ui() { build_ui(EditorPanelBuildContext{}); }
+
+void EditorPreferencePanel::build_ui(const EditorPanelBuildContext& context) {
     if (model_ == nullptr || actions_ == nullptr)
         return;
 
@@ -231,7 +233,12 @@ void EditorPreferencePanel::build_ui() {
                                               ImGuiWindowFlags_NoScrollWithMouse;
     constexpr ImGuiChildFlags padded = ImGuiChildFlags_AlwaysUseWindowPadding;
     ImGui::PushFont(font(20), font(20)->LegacySize);
+    if (context.native_window)
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                            ImVec2{kEditorWindowContentPadding, kEditorWindowContentPadding});
     if (ImGui::Begin("Preferences", nullptr, fixed_window)) {
+        if (context.native_window)
+            draw_editor_window_chrome("Preferences", {}, context.window_actions);
         const auto& state = model_->state();
         const bool compact_footer = viewport->WorkSize.x < 560 * unit;
         const float footer_height = compact_footer ? control_height * 2 + 40 : control_height + 24;
@@ -576,6 +583,8 @@ void EditorPreferencePanel::build_ui() {
         ImGui::PopStyleVar(3);
     }
     ImGui::End();
+    if (context.native_window)
+        ImGui::PopStyleVar();
     ImGui::PopFont();
 }
 }  // namespace aeg::editor

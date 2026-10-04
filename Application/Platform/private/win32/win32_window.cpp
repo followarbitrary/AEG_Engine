@@ -402,6 +402,25 @@ LRESULT Win32Window::handle_message(UINT message, WPARAM w_param, LPARAM l_param
                 return 0;
             }
             return DefWindowProcW(hwnd_, message, w_param, l_param);
+        case WM_GETMINMAXINFO:
+            if (!desc_.client_decorated && l_param != 0) {
+                // Borderless editor windows still use WS_THICKFRAME for
+                // resizing, but their maximized bounds must follow the
+                // monitor work area rather than the full monitor rectangle.
+                // This preserves the Windows taskbar and avoids the default
+                // frame compensation extending the client area past it.
+                const HMONITOR monitor = MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST);
+                MONITORINFO monitor_info{};
+                monitor_info.cbSize = sizeof(monitor_info);
+                if (monitor != nullptr && GetMonitorInfoW(monitor, &monitor_info) != FALSE) {
+                    auto* limits = reinterpret_cast<MINMAXINFO*>(l_param);
+                    const RECT& work = monitor_info.rcWork;
+                    limits->ptMaxPosition = POINT{work.left, work.top};
+                    limits->ptMaxSize = POINT{work.right - work.left, work.bottom - work.top};
+                    return 0;
+                }
+            }
+            return DefWindowProcW(hwnd_, message, w_param, l_param);
         case WM_NCHITTEST:
             if (!desc_.client_decorated) {
                 POINT point{GET_X_LPARAM(l_param), GET_Y_LPARAM(l_param)};
@@ -409,23 +428,36 @@ LRESULT Win32Window::handle_message(UINT message, WPARAM w_param, LPARAM l_param
                 RECT client{};
                 GetClientRect(hwnd_, &client);
                 constexpr LONG resize_border = 7;
-                constexpr LONG title_height = 30;
+                constexpr LONG title_height = 32;
                 // Inline Aeg Chrome owns the close control in the upper-right
                 // client area. Keep that rectangle out of the native resize
                 // hit-test so its ImGui button receives the complete click
                 // region, including the pixels adjacent to the top/right edge.
                 const LONG close_left = client.right - 36;
-                const LONG close_right = client.right - 6;
-                const LONG close_top = 3;
-                const LONG close_bottom = 27;
+                const LONG close_right = client.right;
+                const LONG close_top = 0;
+                const LONG close_bottom = title_height;
                 if (point.x >= close_left && point.x < close_right && point.y >= close_top && point.y < close_bottom) {
+                    return HTCLIENT;
+                }
+                // The complete three-button cluster is client-owned. Keep it
+                // out of the top/right resize strips so every control remains
+                // clickable when it touches the native border.
+                const LONG controls_left = client.right - 108;
+                if (point.x >= controls_left && point.x < client.right && point.y >= 0 && point.y < title_height) {
+                    return HTCLIENT;
+                }
+                // A maximized editor window has no resize affordance at all.
+                // Return a client hit before evaluating the border strips so
+                // the native frame cannot restore-and-resize it from an edge.
+                if (state_.maximized) {
                     return HTCLIENT;
                 }
                 // The workspace selector, status, and client controls are real
                 // ImGui controls, not a draggable caption region. Reserve the
                 // right-side control cluster even for compact native panels.
-                const LONG draggable_title_width = std::max<LONG>(0, client.right - 140);
-                if (desc_.resizable && !state_.maximized) {
+                const LONG draggable_title_width = std::max<LONG>(0, client.right - 108);
+                if (desc_.resizable) {
                     const bool left = point.x < resize_border;
                     const bool right = point.x >= client.right - resize_border;
                     const bool top = point.y < resize_border;
@@ -447,9 +479,35 @@ LRESULT Win32Window::handle_message(UINT message, WPARAM w_param, LPARAM l_param
                     if (bottom)
                         return HTBOTTOM;
                 }
+                // A maximized borderless window must remain stationary. Keep
+                // the title area client-owned so a drag cannot invoke the
+                // operating system's restore-and-move behavior. Double-click
+                // is handled below and still toggles the maximized state.
                 if (point.y >= 0 && point.y < title_height && point.x < draggable_title_width)
                     return HTCAPTION;
                 return HTCLIENT;
+            }
+            return DefWindowProcW(hwnd_, message, w_param, l_param);
+        case WM_NCLBUTTONDBLCLK:
+            if (!desc_.client_decorated && !state_.minimized && static_cast<UINT>(w_param) == HTCAPTION) {
+                // The window owns its title bar instead of using the native
+                // frame, so toggle explicitly on a caption double-click.
+                static_cast<void>(set_maximized(!state_.maximized));
+                return 0;
+            }
+            return DefWindowProcW(hwnd_, message, w_param, l_param);
+        case WM_LBUTTONDBLCLK:
+            if (!desc_.client_decorated && !state_.minimized) {
+                POINT point{GET_X_LPARAM(l_param), GET_Y_LPARAM(l_param)};
+                constexpr LONG title_height = 32;
+                constexpr LONG control_reserve = 108;
+                RECT client{};
+                GetClientRect(hwnd_, &client);
+                if (point.y >= 0 && point.y < title_height && point.x >= 0 &&
+                    point.x < client.right - control_reserve) {
+                    static_cast<void>(set_maximized(!state_.maximized));
+                    return 0;
+                }
             }
             return DefWindowProcW(hwnd_, message, w_param, l_param);
         case WM_SETCURSOR:

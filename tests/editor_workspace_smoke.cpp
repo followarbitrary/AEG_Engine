@@ -5,7 +5,11 @@
 #include <imgui.h>
 #include <imgui_internal.h>
 
+#include <algorithm>
 #include <cassert>
+#include <cmath>
+#include <cstdio>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -34,6 +38,51 @@ private:
     uint32_t& build_count_;
     const char* title_;
 };
+
+// Inspect actual glyph geometry rather than repeating the rail's layout
+// calculation. Shape vertices use the atlas's white pixel in these frames.
+bool selected_rail_label_fits(const ImGuiWindow& rail, std::size_t letter_count, bool wrapped, bool ellipsized,
+                              float minimum_text_width = 0.0f) {
+    const ImU32 selected_color = IM_COL32(115, 230, 195, 255);
+    const ImVec2 white_uv = rail.DrawList->_Data->TexUvWhitePixel;
+    ImVec2 text_min{std::numeric_limits<float>::max(), std::numeric_limits<float>::max()};
+    ImVec2 text_max{std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest()};
+    ImRect marker = ImRect(text_min, text_max);
+    std::size_t glyph_vertices = 0;
+    for (const ImDrawVert& vertex : rail.DrawList->VtxBuffer) {
+        if (vertex.col != selected_color)
+            continue;
+        if (vertex.uv.x == white_uv.x && vertex.uv.y == white_uv.y) {
+            if (vertex.pos.x >= rail.WorkRect.Max.x - 6.0f)
+                marker.Add(vertex.pos);
+            continue;
+        }
+        text_min.x = std::min(text_min.x, vertex.pos.x);
+        text_min.y = std::min(text_min.y, vertex.pos.y);
+        text_max.x = std::max(text_max.x, vertex.pos.x);
+        text_max.y = std::max(text_max.y, vertex.pos.y);
+        ++glyph_vertices;
+    }
+    const float text_height = text_max.y - text_min.y;
+    const float text_width = text_max.x - text_min.x;
+    const bool glyph_count_ok = ellipsized ? glyph_vertices > 0 && glyph_vertices < letter_count * 4
+                                           : glyph_vertices == letter_count * 4;
+    const bool fits = glyph_count_ok && !marker.IsInverted() &&
+                      text_min.x >= rail.InnerClipRect.Min.x + 2.0f &&
+                      text_max.x <= marker.Min.x - 4.0f &&
+                      text_width + 5.0f >= minimum_text_width &&
+                      text_min.y >= marker.Min.y - 4.0f && text_max.y <= marker.Max.y + 4.0f &&
+                      (wrapped ? text_height > ImGui::GetFontSize() : text_height <= ImGui::GetFontSize()) &&
+                      text_height <= 2.0f * ImGui::GetTextLineHeight();
+    if (!fits)
+        std::fprintf(stderr,
+                     "Rail label clipped or overlapped: font %.0f, glyphs %zu/%zu, text (%.0f,%.0f)-(%.0f,%.0f), "
+                     "marker (%.0f,%.0f)-(%.0f,%.0f), wrapped %d, ellipsized %d, width %.1f/%.1f, font %.1f, height %.1f\n",
+                     ImGui::GetFontSize(), glyph_vertices / 4, letter_count, text_min.x, text_min.y,
+                     text_max.x, text_max.y, marker.Min.x, marker.Min.y, marker.Max.x, marker.Max.y, wrapped,
+                     ellipsized, text_width, minimum_text_width, ImGui::GetFontSize(), text_height);
+    return fits;
+}
 }  // namespace
 
 int main() {
@@ -165,12 +214,79 @@ int main() {
             assert(panel->Pos.x >= rail->Pos.x + rail->Size.x);
             assert(hierarchy && hierarchy->Pos.x >= rail->Pos.x + rail->Size.x);
             assert(rail->Size.x >= ImGui::CalcTextSize("Settings").x + 16.0f);
+            const float expected_width = std::max(96.0f, ImGui::CalcTextSize("ABCDEFGHIJKL").x + 4.0f);
+            if (std::abs(rail->Size.x - expected_width) > 1.0f) {
+                std::fprintf(stderr, "Rail width %.0f does not match the 12-letter width %.0f\n", rail->Size.x,
+                             expected_width);
+                return 1;
+            }
             const auto* status = ImGui::FindWindowByName("##EditorStatusBar");
             assert(status && panel->Pos.y + panel->Size.y <= status->Pos.y + 1.0f);
             assert(ImGui::GetCurrentContext()->ColorStack.Size == 0);
             assert(host.end_frame());
         }
     }
+    // CamelCase labels are rendered as words. They stay on one line with a
+    // visible separator when possible; otherwise they wrap before ellipsis.
+    const bool textured_lines = ImGui::GetStyle().AntiAliasedLinesUseTex;
+    ImGui::GetStyle().AntiAliasedLinesUseTex = false;
+    for (const float font_size : {13.0f, 18.0f, 28.0f}) {
+        for (const auto* label : {"FlowGraph", "Scene"}) {
+            ImGui::ActivateItemByID(ImGui::FindWindowByName("##EditorRail")->GetID(label));
+            for (int frame = 0; frame < 3; ++frame) {
+                assert(host.begin_frame(frame_desc));
+                ImGui::PushFont(ImGui::GetFont(), font_size);
+                assert(workspace.build_ui());
+                const auto* status = ImGui::FindWindowByName("##EditorStatusBar");
+                assert(status != nullptr);
+                // The status bar must leave a full text line inside its
+                // content rectangle; otherwise descenders are clipped at the
+                // bottom edge, especially when the editor font is enlarged.
+                assert(status->WorkRect.Max.y - status->WorkRect.Min.y >= ImGui::GetTextLineHeight());
+                bool label_fits = true;
+                if (frame == 2) {
+                    const auto* rail = ImGui::FindWindowByName("##EditorRail");
+                    assert(rail != nullptr);
+                    const bool is_flow_graph = std::string(label) == "FlowGraph";
+                    label_fits = selected_rail_label_fits(
+                        *rail, std::string(label).size(), false, false,
+                        is_flow_graph ? ImGui::CalcTextSize("Flow Graph").x : 0.0f);
+                    const float expected_width = std::max(96.0f, ImGui::CalcTextSize("ABCDEFGHIJKL").x + 4.0f);
+                    assert(std::abs(rail->Size.x - expected_width) <= 1.0f);
+                }
+                ImGui::PopFont();
+                assert(host.end_frame());
+                if (frame == 2 && !label_fits)
+                    return 1;
+            }
+        }
+    }
+    ImGui::GetStyle().AntiAliasedLinesUseTex = textured_lines;
+    // A user-narrowed rail must wrap words without cutting a single word in
+    // half, keep the selection marker clear, and reserve the same dock space.
+    workspace.set_navigation_width(64.0f);
+    for (const auto* label : {"FlowGraph", "Settings"}) {
+        if (std::string(label) == "Settings")
+            workspace.set_preferences_open(true);
+        else
+            ImGui::ActivateItemByID(ImGui::FindWindowByName("##EditorRail")->GetID(label));
+        for (int frame = 0; frame < 3; ++frame) {
+            assert(host.begin_frame(frame_desc));
+            assert(workspace.build_ui());
+            if (frame == 2) {
+                const auto* rail = ImGui::FindWindowByName("##EditorRail");
+                const auto* hierarchy = ImGui::FindWindowByName("Hierarchy");
+                assert(rail && std::abs(rail->Size.x - 64.0f) < 1.0f);
+                assert(hierarchy && hierarchy->Pos.x >= rail->Pos.x + rail->Size.x);
+                assert(selected_rail_label_fits(*rail, std::string(label).size(),
+                                                std::string(label) == "FlowGraph",
+                                                std::string(label) == "Settings"));
+            }
+            assert(host.end_frame());
+        }
+    }
+    workspace.set_preferences_open(false);
+    workspace.set_navigation_width(0.0f);
     ImGui::ActivateItemByID(ImGui::FindWindowByName("##EditorRail")->GetID("Settings"));
     for (int frame = 0; frame < 3; ++frame) {
         assert(host.begin_frame(frame_desc));
@@ -196,9 +312,9 @@ int main() {
     assert(action_failure_reported);
     fail_preferences_action = false;
     uint32_t bottom_build_count = 0;
-    for (const auto* title : {"Pipeline", "Assets"}) {
+    for (const auto* title : {"FlowGraph", "Assets"}) {
         assert(workspace.register_panel(
-            aeg::editor::EditorPanelDescriptor{std::string(title) == "Pipeline" ? "pipeline" : "assets", title,
+            aeg::editor::EditorPanelDescriptor{std::string(title) == "FlowGraph" ? "flowgraph" : "assets", title,
                                                aeg::editor::EditorDockRegion::kBottom, true, true, true},
             std::make_unique<TestPanel>(bottom_build_count, title)));
     }
@@ -207,7 +323,7 @@ int main() {
         assert(workspace.build_ui());
         assert(host.end_frame());
     }
-    for (const auto* title : {"Pipeline", "Assets", "Pipeline"}) {
+    for (const auto* title : {"FlowGraph", "Assets", "FlowGraph"}) {
         ImGui::ActivateItemByID(ImGui::FindWindowByName("##EditorRail")->GetID(title));
         for (int frame = 0; frame < 3; ++frame) {
             assert(host.begin_frame(frame_desc));

@@ -125,6 +125,7 @@ struct EditorImGuiHost::Impl final {
         std::unique_ptr<EditorPanel> panel{};
         bool visible{true};
         bool native{false};
+        bool native_size_pending{false};
     };
 
     /** @brief Dear ImGui context owned by this host. */
@@ -797,7 +798,8 @@ foundation::Result EditorImGuiHost::build_panels() {
         explicit TraversalScope(bool& value) : active(value) { active = true; }
         ~TraversalScope() { active = false; }
     } traversal(impl_->building_panels);
-    for (const Impl::PanelSlot& slot : impl_->panels) {
+    for (std::size_t panel_index = 0; panel_index < impl_->panels.size(); ++panel_index) {
+        Impl::PanelSlot& slot = impl_->panels[panel_index];
         if (slot.panel != nullptr && slot.visible) {
             ImGuiWindowClass panel_window_class{};
             panel_window_class.DockNodeFlagsOverrideSet = ImGuiDockNodeFlags_AutoHideTabBar;
@@ -806,10 +808,36 @@ foundation::Result EditorImGuiHost::build_panels() {
             ImGui::SetNextWindowClass(&panel_window_class);
             if (slot.native)
                 ImGui::SetNextWindowDockID(0, ImGuiCond_Always);
+            if (slot.native && slot.native_size_pending) {
+                // A detached panel can otherwise inherit the small rectangle
+                // it occupied in the dock tree. Seed a generous authoring
+                // viewport once; the user can resize it afterwards.
+                const ImGuiViewport* main_viewport = ImGui::GetMainViewport();
+                if (main_viewport != nullptr) {
+                    const ImVec2 center = main_viewport->GetCenter();
+                    ImGui::SetNextWindowPos(ImVec2{center.x - 840.0f, center.y - 472.5f}, ImGuiCond_Always);
+                }
+                ImGui::SetNextWindowSize(ImVec2{1680.0f, 945.0f}, ImGuiCond_Always);
+                slot.native_size_pending = false;
+            }
             ImGuiErrorRecoveryState checkpoint{};
             ImGui::ErrorRecoveryStoreState(&checkpoint);
             const auto result = guard_editor_operation([&] {
-                slot.panel->build_ui();
+                EditorPanelBuildContext context{};
+                const EditorPanelId panel_id{static_cast<uint32_t>(panel_index), slot.generation};
+                context.native_window = slot.native || impl_->desc.native_window;
+                if (context.native_window) {
+                    context.window_actions.minimize = [this, panel_id] {
+                        return request_current_window_action(0, panel_id);
+                    };
+                    context.window_actions.maximize = [this, panel_id] {
+                        return request_current_window_action(1, panel_id);
+                    };
+                    context.window_actions.close = [this, panel_id] {
+                        return request_current_window_action(2, panel_id);
+                    };
+                }
+                slot.panel->build_ui(context);
                 return foundation::Result::success();
             });
             const auto recovery = guard_editor_operation([&] {
@@ -824,6 +852,49 @@ foundation::Result EditorImGuiHost::build_panels() {
         }
     }
     return foundation::Result::success();
+}
+
+foundation::Result EditorImGuiHost::request_current_window_action(uint8_t action, EditorPanelId panel) noexcept {
+    if (impl_ == nullptr || !impl_->initialized || !impl_->frame_active || impl_->platform_bridge.window_system == nullptr) {
+        return foundation::invalid_state("The editor window is unavailable");
+    }
+    try {
+        ImGuiViewport* viewport = ImGui::GetWindowViewport();
+        const platform::WindowId window = viewport_window_id(impl_->platform_bridge, viewport);
+        if (!window.is_valid()) {
+            return foundation::invalid_state("The current ImGui window has no native window");
+        }
+        const auto window_result = impl_->platform_bridge.window_system->find_window(window);
+        if (!window_result) {
+            return window_result.result;
+        }
+        const std::shared_ptr<platform::IWindow>& native_window = window_result.value;
+        switch (action) {
+            case 0:
+                return native_window->set_minimized(true);
+            case 1:
+                return native_window->set_maximized(!native_window->state().maximized);
+            case 2: {
+                const foundation::Result close_result = native_window->request_close();
+                if (!close_result)
+                    return close_result;
+                if (panel.index < impl_->panels.size()) {
+                    Impl::PanelSlot& slot = impl_->panels[panel.index];
+                    if (slot.generation == panel.generation && slot.panel != nullptr)
+                        slot.visible = false;
+                }
+                if (viewport != nullptr && viewport != ImGui::GetMainViewport())
+                    viewport->PlatformRequestClose = true;
+                return close_result;
+            }
+            default:
+                return foundation::invalid_argument("Unknown editor window action");
+        }
+    } catch (const std::exception& exception) {
+        return foundation::unknown_exception(exception);
+    } catch (...) {
+        return foundation::Result::failure(foundation::ResultCode::kUnknown, "Editor window control failed");
+    }
 }
 
 foundation::Result EditorImGuiHost::end_frame() {
@@ -1000,8 +1071,15 @@ foundation::Result EditorImGuiHost::set_panel_native(EditorPanelId panel, bool n
     if (slot.panel == nullptr || slot.generation != panel.generation) {
         return foundation::not_found("Editor panel identity is stale");
     }
-    slot.native = native;
+    if (slot.native != native) {
+        slot.native = native;
+        slot.native_size_pending = native;
+    }
     return foundation::Result::success();
+}
+
+bool EditorImGuiHost::viewports_enabled() const noexcept {
+    return impl_ != nullptr && impl_->initialized && impl_->platform_bridge.viewports_enabled;
 }
 
 bool EditorImGuiHost::is_initialized() const noexcept {

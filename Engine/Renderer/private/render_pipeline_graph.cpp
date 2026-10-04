@@ -108,6 +108,18 @@ inline constexpr RenderResourceId kLightClusters{"Renderer.LightClusters"};
     return target;
 }
 
+[[nodiscard]] const pipeline::FeatureInstanceConfiguration* authored_feature_configuration(
+    const RenderGraphBuilder& builder) {
+    const auto configuration = builder.configuration();
+    if (!configuration)
+        return nullptr;
+    const auto found = std::find_if(configuration->features.begin(), configuration->features.end(),
+                                    [&](const auto& feature) {
+                                        return feature.instance == builder.feature_instance_id();
+                                    });
+    return found == configuration->features.end() ? nullptr : &*found;
+}
+
 [[nodiscard]] ResultValue<RenderGraphTexture> create_lighting_target(RenderGraphBuilder& builder,
                                                                      rhi::Extent3D extent) {
     return builder.create_texture(
@@ -117,11 +129,13 @@ inline constexpr RenderResourceId kLightClusters{"Renderer.LightClusters"};
 }
 
 [[nodiscard]] Result add_empty_culling_pass(RenderGraphBuilder& builder, const RenderFeatureContext& context,
-                                            std::function<Result(pipeline::RenderPassBuilder&)> setup) {
+                                            std::function<Result(pipeline::RenderPassBuilder&)> setup,
+                                            pipeline::RenderPassInstanceId authored_instance = {}) {
     // An empty scene has no shaded pixels and needs no light-list dispatch.
     const auto pass =
         detail::add_builtin_render_pass(builder, context, kLightCullingPassTypeId, std::move(setup),
-                                        [](pipeline::RenderPassExecutionContext&) { return Result::success(); });
+                                        [](pipeline::RenderPassExecutionContext&) { return Result::success(); },
+                                        authored_instance);
     return pass ? Result::success() : pass.result;
 }
 
@@ -180,13 +194,6 @@ inline constexpr RenderResourceId kLightClusters{"Renderer.LightClusters"};
     const auto shadow_resource = prepare_shadow_resources(builder, context, shadow_view.value);
     if (!shadow_resource)
         return shadow_resource.result;
-    if (const auto result = build_shadow_render_graph(builder, context, shadow_view.value, shadow.value); !result)
-        return result;
-    if (const Result result =
-            build_gbuffer_render_graph(builder, context, albedo.value, normal.value, material.value, depth.value);
-        !result) {
-        return result;
-    }
     RenderDeferredLightingResource deferred{};
     RenderLightingResource lighting{};
     const bool has_geometry = !context.scene_snapshot->instances.empty();
@@ -211,94 +218,142 @@ inline constexpr RenderResourceId kLightClusters{"Renderer.LightClusters"};
         }
         lighting = frame_lighting.value;
     }
-    const auto lighting_pass = detail::add_builtin_render_pass(
-        builder, context, kDeferredLightingPassTypeId,
-        [albedo = albedo.value, normal = normal.value, material = material.value, shadow = shadow.value,
-         depth = depth.value, color = lighting_color.value, lighting, has_geometry,
-         shadow_resource = shadow_resource.value](pipeline::RenderPassBuilder& pass) {
-            for (const RenderGraphTexture input : {albedo, normal, material, shadow, depth}) {
-                if (const Result result = pass.read(input, ResourceUsage::kSampledRead, PipelineStage::kFragmentShader,
-                                                    ShaderStage::kFragment);
-                    !result) {
-                    return result;
-                }
-            }
-            if (has_geometry) {
-                if (shadow_resource.graph_buffer.is_valid()) {
-                    if (const auto result = pass.read(shadow_resource.graph_buffer, ResourceUsage::kUniformRead,
-                                                      PipelineStage::kFragmentShader, ShaderStage::kFragment);
+    const auto add_lighting_pass = [&](pipeline::RenderPassInstanceId authored_instance = {}) -> Result {
+        const auto lighting_pass = detail::add_builtin_render_pass(
+            builder, context, kDeferredLightingPassTypeId,
+            [albedo = albedo.value, normal = normal.value, material = material.value, shadow = shadow.value,
+             depth = depth.value, color = lighting_color.value, lighting, has_geometry,
+             shadow_resource = shadow_resource.value](pipeline::RenderPassBuilder& pass) {
+                for (const RenderGraphTexture input : {albedo, normal, material, shadow, depth}) {
+                    if (const Result result = pass.read(input, ResourceUsage::kSampledRead,
+                                                        PipelineStage::kFragmentShader, ShaderStage::kFragment);
                         !result)
                         return result;
                 }
-                if (const auto result = pass.read(lighting.lighting_resource, ResourceUsage::kUniformRead,
-                                                  PipelineStage::kFragmentShader, ShaderStage::kFragment,
-                                                  {lighting.lighting_offset, lighting.lighting_size});
-                    !result)
-                    return result;
-            }
-            return pass.use_color_attachment(color, rhi::LoadOp::kClear, rhi::StoreOp::kStore, {},
-                                             ResourceUsage::kColorAttachmentWrite);
-        },
-        [albedo = albedo.value, normal = normal.value, depth = depth.value, deferred, lighting, extent, has_geometry,
-         shadow = shadow.value,
-         shadow_resource = shadow_resource.value](pipeline::RenderPassExecutionContext& execution) -> Result {
-            rhi::BindingSetHandle inputs{};
-            if (has_geometry) {
-                const auto albedo_view = execution.texture_view(albedo);
-                if (!albedo_view)
-                    return albedo_view.result;
-                const auto normal_view = execution.texture_view(normal);
-                if (!normal_view)
-                    return normal_view.result;
-                const auto depth_view =
-                    execution.texture_view(depth, rhi::TextureViewKind::kSampled, {rhi::Aspect::kDepth, 0, 1, 0, 1});
-                if (!depth_view)
-                    return depth_view.result;
-                const auto light_buffer = execution.buffer(lighting.lighting_resource);
-                if (!light_buffer)
-                    return light_buffer.result;
-                RenderDeferredLightingInputs bindings{
-                    albedo_view.value,
-                    normal_view.value,
-                    depth_view.value,
-                    {light_buffer.value, lighting.lighting_offset, lighting.lighting_size}};
-                if (shadow_resource.graph_buffer.is_valid()) {
-                    const auto shadow_view = execution.texture_view(shadow, rhi::TextureViewKind::kSampled,
-                                                                    {rhi::Aspect::kDepth, 0, 1, 0, 1});
-                    const auto buffer = execution.buffer(shadow_resource.graph_buffer);
-                    if (!shadow_view || !buffer)
-                        return !shadow_view ? shadow_view.result : buffer.result;
-                    bindings.shadow_map = shadow_view.value;
-                    bindings.shadow_constants = {buffer.value, 0, sizeof(RenderShadowConstants)};
+                if (has_geometry) {
+                    if (shadow_resource.graph_buffer.is_valid()) {
+                        if (const auto result = pass.read(shadow_resource.graph_buffer, ResourceUsage::kUniformRead,
+                                                          PipelineStage::kFragmentShader, ShaderStage::kFragment);
+                            !result)
+                            return result;
+                    }
+                    if (const auto result = pass.read(lighting.lighting_resource, ResourceUsage::kUniformRead,
+                                                      PipelineStage::kFragmentShader, ShaderStage::kFragment,
+                                                      {lighting.lighting_offset, lighting.lighting_size});
+                        !result)
+                        return result;
                 }
-                const auto prepared = deferred.prepare_inputs(bindings);
-                if (!prepared)
-                    return prepared.result;
-                if (!prepared.value.is_valid())
-                    return invalid_state("deferred lighting input binding is invalid");
-                inputs = prepared.value;
-            }
-            if (const auto result = execution.begin_rendering(); !result)
-                return result;
-            const auto draw = [&]() -> Result {
-                if (!has_geometry)
-                    return Result::success();
-                if (const auto result = execution.set_viewport({0, 0, float(extent.width), float(extent.height), 0, 1});
+                return pass.use_color_attachment(color, rhi::LoadOp::kClear, rhi::StoreOp::kStore, {},
+                                                 ResourceUsage::kColorAttachmentWrite);
+            },
+             [albedo = albedo.value, normal = normal.value, depth = depth.value, deferred, lighting, extent,
+             has_geometry, shadow = shadow.value,
+             shadow_resource = shadow_resource.value](pipeline::RenderPassExecutionContext& execution) -> Result {
+                rhi::BindingSetHandle inputs{};
+                if (has_geometry) {
+                    const auto albedo_view = execution.texture_view(albedo);
+                    if (!albedo_view)
+                        return albedo_view.result;
+                    const auto normal_view = execution.texture_view(normal);
+                    if (!normal_view)
+                        return normal_view.result;
+                    const auto depth_view = execution.texture_view(
+                        depth, rhi::TextureViewKind::kSampled, {rhi::Aspect::kDepth, 0, 1, 0, 1});
+                    if (!depth_view)
+                        return depth_view.result;
+                    const auto light_buffer = execution.buffer(lighting.lighting_resource);
+                    if (!light_buffer)
+                        return light_buffer.result;
+                    RenderDeferredLightingInputs bindings{
+                        albedo_view.value,
+                        normal_view.value,
+                        depth_view.value,
+                        {light_buffer.value, lighting.lighting_offset, lighting.lighting_size}};
+                    if (shadow_resource.graph_buffer.is_valid()) {
+                        const auto shadow_view = execution.texture_view(
+                            shadow, rhi::TextureViewKind::kSampled, {rhi::Aspect::kDepth, 0, 1, 0, 1});
+                        const auto buffer = execution.buffer(shadow_resource.graph_buffer);
+                        if (!shadow_view || !buffer)
+                            return !shadow_view ? shadow_view.result : buffer.result;
+                        bindings.shadow_map = shadow_view.value;
+                        bindings.shadow_constants = {buffer.value, 0, sizeof(RenderShadowConstants)};
+                    }
+                    const auto prepared = deferred.prepare_inputs(bindings);
+                    if (!prepared)
+                        return prepared.result;
+                    if (!prepared.value.is_valid())
+                        return invalid_state("deferred lighting input binding is invalid");
+                    inputs = prepared.value;
+                }
+                if (const auto result = execution.begin_rendering(); !result)
+                    return result;
+                const auto draw = [&]() -> Result {
+                    if (!has_geometry)
+                        return Result::success();
+                    if (const auto result = execution.set_viewport(
+                            {0, 0, float(extent.width), float(extent.height), 0, 1});
+                        !result)
+                        return result;
+                    if (const auto result = execution.set_scissor({0, 0, extent.width, extent.height}); !result)
+                        return result;
+                    if (const auto result = execution.bind_pipeline(deferred.pipeline); !result)
+                        return result;
+                    if (const auto result = execution.bind_binding_set(0, inputs); !result)
+                        return result;
+                    return execution.draw({3, 1, 0, 0});
+                }();
+                const auto end = execution.end_rendering();
+                return draw ? end : draw;
+             },
+             authored_instance);
+        return lighting_pass ? Result::success() : lighting_pass.result;
+    };
+
+    if (const auto* authored = authored_feature_configuration(builder); authored != nullptr) {
+        bool has_final_output = false;
+        for (const auto& pass : authored->passes) {
+            if (!pass.enabled)
+                continue;
+            if (pass.type == kShadowPassTypeId) {
+                if (const auto result = build_shadow_render_graph(builder, context, shadow_view.value, shadow.value,
+                                                                  pass.instance);
                     !result)
                     return result;
-                if (const auto result = execution.set_scissor({0, 0, extent.width, extent.height}); !result)
+            } else if (pass.type == kGBufferPassTypeId) {
+                if (const auto result =
+                        build_gbuffer_render_graph(builder, context, albedo.value, normal.value, material.value,
+                                                   depth.value, pass.instance);
+                    !result)
                     return result;
-                if (const auto result = execution.bind_pipeline(deferred.pipeline); !result)
+            } else if (pass.type == kDeferredLightingPassTypeId) {
+                if (const auto result = add_lighting_pass(pass.instance); !result)
                     return result;
-                if (const auto result = execution.bind_binding_set(0, inputs); !result)
+            } else if (pass.type == kSkyboxPostProcessPassTypeId) {
+                if (const auto result = build_post_process_render_graph(
+                        builder, context, lighting_color.value, depth.value, color.value,
+                        builder.state_output().is_valid() ? ResourceUsage::kSampledRead
+                                                          : context.scene_snapshot->view.color_target_final_usage,
+                        pass.instance);
+                    !result)
                     return result;
-                return execution.draw({3, 1, 0, 0});
-            }();
-            const auto end = execution.end_rendering();
-            return draw ? end : draw;
-        });
-    if (!lighting_pass)
-        return lighting_pass.result;
+                has_final_output = true;
+            } else {
+                return invalid_argument("Deferred renderer pass type is not supported by its authored adapter");
+            }
+        }
+        return has_final_output ? Result::success()
+                                : invalid_argument("Deferred renderer graph has no final output pass");
+    }
+
+    if (const auto result = build_shadow_render_graph(builder, context, shadow_view.value, shadow.value); !result)
+        return result;
+    if (const Result result =
+            build_gbuffer_render_graph(builder, context, albedo.value, normal.value, material.value, depth.value);
+        !result) {
+        return result;
+    }
+    if (const Result result = add_lighting_pass(); !result)
+        return result;
     return build_post_process_render_graph(builder, context, lighting_color.value, depth.value, color.value,
                                            builder.state_output().is_valid()
                                                ? ResourceUsage::kSampledRead
@@ -355,6 +410,67 @@ inline constexpr RenderResourceId kLightClusters{"Renderer.LightClusters"};
     const auto clusters = builder.create_buffer(kLightClusters, cluster_desc);
     if (!clusters) {
         return clusters.result;
+    }
+
+    if (const auto* authored = authored_feature_configuration(builder); authored != nullptr) {
+        bool has_final_output = false;
+        for (const auto& pass : authored->passes) {
+            if (!pass.enabled)
+                continue;
+            if (pass.type == kShadowPassTypeId) {
+                if (const auto result = build_shadow_render_graph(builder, context, shadow_view.value, shadow.value,
+                                                                  pass.instance);
+                    !result)
+                    return result;
+            } else if (pass.type == kZPrepassPassTypeId) {
+                if (const auto result = build_depth_render_graph(builder, context, context.scene_snapshot->view,
+                                                                 depth.value, "Renderer.ZPrepassPass", {},
+                                                                 pass.instance);
+                    !result)
+                    return result;
+            } else if (pass.type == kLightCullingPassTypeId) {
+                if (has_geometry) {
+                    if (const auto result = build_light_culling_render_graph(builder, context, depth.value,
+                                                                               clusters.value, light_culling,
+                                                                               pass.instance);
+                        !result)
+                        return result;
+                } else if (const Result result = add_empty_culling_pass(
+                               builder, context,
+                               [clusters = clusters.value, depth = depth.value](pipeline::RenderPassBuilder& pass) {
+                                   pass.set_side_effects();
+                                   if (const auto result = pass.read(depth, ResourceUsage::kSampledRead,
+                                                                     PipelineStage::kCompute, ShaderStage::kCompute);
+                                       !result)
+                                       return result;
+                                    return pass.write(clusters, ResourceUsage::kStorageWrite, PipelineStage::kCompute,
+                                                      ShaderStage::kCompute);
+                                },
+                                pass.instance);
+                           !result) {
+                    return result;
+                }
+            } else if (pass.type == kForwardOpaquePassTypeId) {
+                if (const Result result = build_opaque_render_graph(
+                        builder, context, true, shadow.value, clusters.value, nullptr,
+                         has_geometry ? &light_culling : nullptr, lighting_color.value, pass.instance);
+                    !result)
+                    return result;
+            } else if (pass.type == kSkyboxPostProcessPassTypeId) {
+                if (const auto result = build_post_process_render_graph(
+                        builder, context, lighting_color.value, depth.value, color.value,
+                        builder.state_output().is_valid() ? ResourceUsage::kSampledRead
+                                                          : context.scene_snapshot->view.color_target_final_usage,
+                        pass.instance);
+                    !result)
+                    return result;
+                has_final_output = true;
+            } else {
+                return invalid_argument("Forward renderer pass type is not supported by its authored adapter");
+            }
+        }
+        return has_final_output ? Result::success()
+                                : invalid_argument("Forward renderer graph has no final output pass");
     }
 
     if (const auto result = build_shadow_render_graph(builder, context, shadow_view.value, shadow.value); !result)

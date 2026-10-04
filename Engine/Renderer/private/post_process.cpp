@@ -144,7 +144,8 @@ foundation::ResultValue<RenderPostProcessResource> PostProcessResources::for_fra
 
 foundation::Result build_post_process_render_graph(
     pipeline::RenderGraphBuilder& builder, const RenderFeatureContext& context, pipeline::RenderGraphTexture color,
-    pipeline::RenderGraphTexture depth, pipeline::RenderGraphTexture output, rhi::ResourceUsage final_usage) {
+    pipeline::RenderGraphTexture depth, pipeline::RenderGraphTexture output, rhi::ResourceUsage final_usage,
+    pipeline::RenderPassInstanceId authored_instance) {
     using namespace foundation;
     if (!builder.is_runtime() || !context.is_valid() || render_feature_context(builder) != &context ||
         !context.resource_resolver || !color.is_valid() || !depth.is_valid() || !output.is_valid() || color == output)
@@ -201,7 +202,8 @@ foundation::Result build_post_process_render_graph(
             }();
             const auto ended = command.end_rendering();
             return drawn ? ended : drawn;
-        });
+        },
+        authored_instance);
     return pass ? Result::success() : pass.result;
 }
 }  // namespace aeg::renderer

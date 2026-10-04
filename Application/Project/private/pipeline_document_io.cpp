@@ -121,8 +121,10 @@ uint64_t read_u64(const toml::value& value) {
 
 bool known_root_key(std::string_view key) {
     static constexpr std::string_view kEys[] = {
-        "schema_version", "asset_uuid", "name",  "module_requirements", "pipeline_nodes", "feature_nodes",
-        "pass_nodes",     "resources",  "edges", "present_connections", "layouts",        "extensions"};
+        "schema_version", "graph_version", "draft_revision", "layout_revision", "asset_uuid", "name",
+        "module_requirements", "pipeline_nodes", "feature_nodes",
+        "pass_nodes",     "resources",  "edges", "input_bindings", "variadic_slots", "present_connections",
+        "layouts",        "extensions"};
     for (const auto known : kEys)
         if (key == known)
             return true;
@@ -158,6 +160,9 @@ foundation::ResultValue<PipelineDocument> load_pipeline_document(const std::file
         const toml::value root = toml::parse(file);
         PipelineDocument document;
         document.schema_version = static_cast<uint32_t>(toml::find<int64_t>(root, "schema_version"));
+        document.graph_version = root.contains("graph_version") ? read_u64(root.at("graph_version")) : 1;
+        document.draft_revision = root.contains("draft_revision") ? read_u64(root.at("draft_revision")) : 1;
+        document.layout_revision = root.contains("layout_revision") ? read_u64(root.at("layout_revision")) : 1;
         document.asset_uuid = toml::find<std::string>(root, "asset_uuid");
         document.name = toml::find<std::string>(root, "name");
         if (root.contains("module_requirements"))
@@ -234,10 +239,60 @@ foundation::ResultValue<PipelineDocument> load_pipeline_document(const std::file
                 DocumentEdge edge;
                 edge.edge_id = item.at("edge_id").as_string();
                 edge.kind = static_cast<DocumentEdgeKind>(item.at("kind").as_integer());
-                edge.source = {item.at("source_node").as_string(), read_u64(item.at("source_port"))};
-                edge.destination = {item.at("destination_node").as_string(), read_u64(item.at("destination_port"))};
+                edge.source = {item.at("source_node").as_string(), read_u64(item.at("source_port")),
+                               item.contains("source_slot") ? read_u64(item.at("source_slot")) : 0};
+                edge.destination = {item.at("destination_node").as_string(), read_u64(item.at("destination_port")),
+                                    item.contains("destination_slot") ? read_u64(item.at("destination_slot")) : 0};
                 edge.binding_id = read_u64(item.at("binding_id"));
                 document.edges.push_back(std::move(edge));
+            }
+        if (root.contains("input_bindings"))
+            for (const auto& value : root.at("input_bindings").as_array()) {
+                const auto& item = value.as_table();
+                InputBindingDocument binding;
+                binding.node_id = item.at("node_id").as_string();
+                binding.port_id = read_u64(item.at("port_id"));
+                binding.slot_id = item.contains("slot_id") ? read_u64(item.at("slot_id")) : 0;
+                binding.source = static_cast<InputSourceKind>(item.at("source").as_integer());
+                binding.status = item.contains("status")
+                                     ? static_cast<InputBindingStatus>(item.at("status").as_integer())
+                                     : InputBindingStatus::kUnset;
+                if (item.contains("edge_ids") && item.at("edge_ids").is_array())
+                    for (const auto& edge_id : item.at("edge_ids").as_array())
+                        binding.edge_ids.push_back(edge_id.as_string());
+                if (item.contains("asset_uuid"))
+                    binding.asset.uuid = item.at("asset_uuid").as_string();
+                if (item.contains("product_id"))
+                    binding.product_id = item.at("product_id").as_string();
+                if (item.contains("target_variant"))
+                    binding.target_variant = item.at("target_variant").as_string();
+                if (item.contains("content_revision"))
+                    binding.content_revision = read_u64(item.at("content_revision"));
+                if (item.contains("default_id"))
+                    binding.default_id = read_u64(item.at("default_id"));
+                if (item.contains("default_revision"))
+                    binding.default_revision = read_u64(item.at("default_revision"));
+                if (item.contains("context_key"))
+                    binding.context_key = item.at("context_key").as_string();
+                if (item.contains("literal")) {
+                    toml::value wrapper(toml::table{});
+                    wrapper["parameters"] = item.at("literal");
+                    const auto literal = decode_parameters(wrapper);
+                    if (!literal.empty())
+                        binding.literal = literal.begin()->second;
+                }
+                document.input_bindings.push_back(std::move(binding));
+            }
+        if (root.contains("variadic_slots"))
+            for (const auto& value : root.at("variadic_slots").as_array()) {
+                const auto& item = value.as_table();
+                VariadicInputSlotDocument slot;
+                slot.node_id = item.at("node_id").as_string();
+                slot.group_id = read_u64(item.at("group_id"));
+                slot.slot_id = read_u64(item.at("slot_id"));
+                slot.order = static_cast<uint32_t>(item.at("order").as_integer());
+                slot.parameters = decode_parameters(value);
+                document.variadic_slots.push_back(std::move(slot));
             }
         if (root.contains("present_connections"))
             for (const auto& value : root.at("present_connections").as_array())
@@ -281,6 +336,9 @@ foundation::Result save_pipeline_document(const std::filesystem::path& file, con
     try {
         toml::value root(toml::table{});
         root["schema_version"] = static_cast<int64_t>(document.schema_version);
+        root["graph_version"] = encode_u64(document.graph_version);
+        root["draft_revision"] = encode_u64(document.draft_revision);
+        root["layout_revision"] = encode_u64(document.layout_revision);
         root["asset_uuid"] = document.asset_uuid;
         root["name"] = document.name;
         toml::array modules;
@@ -334,12 +392,48 @@ foundation::Result save_pipeline_document(const std::filesystem::path& file, con
             item["kind"] = static_cast<int64_t>(edge.kind);
             item["source_node"] = edge.source.node_id;
             item["source_port"] = encode_u64(edge.source.port_id);
+            item["source_slot"] = encode_u64(edge.source.slot_id);
             item["destination_node"] = edge.destination.node_id;
             item["destination_port"] = encode_u64(edge.destination.port_id);
+            item["destination_slot"] = encode_u64(edge.destination.slot_id);
             item["binding_id"] = encode_u64(edge.binding_id);
             edges.emplace_back(std::move(item));
         }
         root["edges"] = std::move(edges);
+        toml::array input_bindings;
+        for (const auto& binding : document.input_bindings) {
+            toml::table item;
+            item["node_id"] = binding.node_id;
+            item["port_id"] = encode_u64(binding.port_id);
+            item["slot_id"] = encode_u64(binding.slot_id);
+            item["source"] = static_cast<int64_t>(binding.source);
+            item["status"] = static_cast<int64_t>(binding.status);
+            toml::array edge_ids;
+            for (const auto& edge_id : binding.edge_ids)
+                edge_ids.emplace_back(edge_id);
+            item["edge_ids"] = std::move(edge_ids);
+            item["asset_uuid"] = binding.asset.uuid;
+            item["product_id"] = binding.product_id;
+            item["target_variant"] = binding.target_variant;
+            item["content_revision"] = encode_u64(binding.content_revision);
+            item["default_id"] = encode_u64(binding.default_id);
+            item["default_revision"] = encode_u64(binding.default_revision);
+            item["literal"] = encode_parameters({{binding.port_id, binding.literal}});
+            item["context_key"] = binding.context_key;
+            input_bindings.emplace_back(std::move(item));
+        }
+        root["input_bindings"] = std::move(input_bindings);
+        toml::array variadic_slots;
+        for (const auto& slot : document.variadic_slots) {
+            toml::table item;
+            item["node_id"] = slot.node_id;
+            item["group_id"] = encode_u64(slot.group_id);
+            item["slot_id"] = encode_u64(slot.slot_id);
+            item["order"] = static_cast<int64_t>(slot.order);
+            item["parameters"] = encode_parameters(slot.parameters);
+            variadic_slots.emplace_back(std::move(item));
+        }
+        root["variadic_slots"] = std::move(variadic_slots);
         toml::array present_connections;
         for (const auto& source_node : document.present_connections)
             present_connections.emplace_back(source_node);
@@ -382,6 +476,21 @@ foundation::Result save_pipeline_document(const std::filesystem::path& file, con
         if (!output)
             return foundation::Result::failure(foundation::ResultCode::kUnknown, "Cannot write Pipeline document");
         std::error_code error;
+        const auto verified = load_pipeline_document(temporary);
+        if (!verified || document_semantic_digest(verified.value) != document_semantic_digest(document)) {
+            std::filesystem::remove(temporary, error);
+            return foundation::Result::failure(foundation::ResultCode::kUnknown,
+                                               "Pipeline document integrity verification failed");
+        }
+        const auto backup = file.string() + ".bak";
+        if (std::filesystem::exists(file, error)) {
+            std::filesystem::copy_file(file, backup, std::filesystem::copy_options::overwrite_existing, error);
+            if (error) {
+                std::filesystem::remove(temporary, error);
+                return foundation::Result::failure(foundation::ResultCode::kUnknown,
+                                                   "Cannot create Pipeline document backup");
+            }
+        }
 #if defined(_WIN32)
         if (!MoveFileExW(std::filesystem::path(temporary).c_str(), file.c_str(),
                          MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {

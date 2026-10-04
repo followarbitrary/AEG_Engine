@@ -125,7 +125,8 @@ public:
         pipeline::RenderGraphBuilder& builder, bool preserve_depth, pipeline::RenderGraphTexture shadow_map = {},
         pipeline::RenderGraphBuffer light_clusters = {}, const RenderShadowResource* shadow_resource = nullptr,
         const RenderLightCullingResource* light_culling = nullptr,
-        pipeline::RenderGraphTexture color_override = {}) const {
+        pipeline::RenderGraphTexture color_override = {},
+        pipeline::RenderPassInstanceId authored_instance = {}) const {
         const RenderFeatureContext* context = render_feature_context(builder);
         if (context == nullptr || !context->is_valid()) {
             return invalid_state("opaque render feature requires a valid renderer context");
@@ -134,7 +135,7 @@ public:
                                          pipeline::RenderPassExecuteFunction execute) {
             if (color_override.is_valid())
                 return detail::add_builtin_render_pass(builder, *context, kForwardOpaquePassTypeId, std::move(setup),
-                                                       std::move(execute));
+                                                       std::move(execute), authored_instance);
             return builder.add_graphics_pass(name, std::move(setup), std::move(execute));
         };
         if (!context->scene_snapshot->instances.empty() && context->resource_resolver == nullptr) {
@@ -635,7 +636,8 @@ struct GBufferPassData final {
 
 [[nodiscard]] foundation::Result build_gbuffer_impl(
     pipeline::RenderGraphBuilder& builder, const RenderFeatureContext& context, pipeline::RenderGraphTexture albedo,
-    pipeline::RenderGraphTexture normal, pipeline::RenderGraphTexture material, pipeline::RenderGraphTexture depth) {
+    pipeline::RenderGraphTexture normal, pipeline::RenderGraphTexture material, pipeline::RenderGraphTexture depth,
+    pipeline::RenderPassInstanceId authored_instance) {
     if (!builder.is_runtime() || builder.scope() != pipeline::PipelineScope::kFrame) {
         return invalid_state("GBuffer render graph requires a frame runtime builder");
     }
@@ -772,7 +774,7 @@ struct GBufferPassData final {
             return pass_builder.use_depth_stencil_attachment(
                 pass_data->depth, rhi::LoadOp::kClear, rhi::StoreOp::kStore, 1.0f, 0, rhi::ResourceUsage::kSampledRead);
         },
-        [pass_data](pipeline::RenderPassExecutionContext& execution) {
+         [pass_data](pipeline::RenderPassExecutionContext& execution) {
             if (const auto result = execution.begin_rendering(); !result)
                 return result;
             if (const auto result = execution.set_viewport({0.0f, 0.0f, static_cast<float>(pass_data->extent.width),
@@ -806,7 +808,8 @@ struct GBufferPassData final {
                     return end_rendering_after_failure(execution, result);
             }
             return execution.end_rendering();
-        });
+        },
+        authored_instance);
     return pass ? foundation::Result::success() : pass.result;
 }
 }  // namespace
@@ -831,7 +834,8 @@ foundation::Result build_opaque_render_graph(pipeline::RenderGraphBuilder& build
                                              pipeline::RenderGraphBuffer light_clusters,
                                              const RenderShadowResource* shadow_resource,
                                              const RenderLightCullingResource* light_culling,
-                                             pipeline::RenderGraphTexture color_override) {
+                                             pipeline::RenderGraphTexture color_override,
+                                             pipeline::RenderPassInstanceId authored_instance) {
     if (!context.is_valid()) {
         return invalid_state("opaque render graph helper requires a valid renderer context");
     }
@@ -844,7 +848,7 @@ foundation::Result build_opaque_render_graph(pipeline::RenderGraphBuilder& build
     // snapshot while reusing the draw path for a variant pipeline.
     OpaqueRenderFeature feature;
     return feature.build_render_graph_with_options(builder, preserve_depth, shadow_map, light_clusters, shadow_resource,
-                                                   light_culling, color_override);
+                                                   light_culling, color_override, authored_instance);
 }
 
 foundation::Result build_gbuffer_render_graph(pipeline::RenderGraphBuilder& builder,
@@ -852,13 +856,16 @@ foundation::Result build_gbuffer_render_graph(pipeline::RenderGraphBuilder& buil
                                               pipeline::RenderGraphTexture albedo_target,
                                               pipeline::RenderGraphTexture normal_target,
                                               pipeline::RenderGraphTexture material_target,
-                                              pipeline::RenderGraphTexture depth_target) {
-    return build_gbuffer_impl(builder, context, albedo_target, normal_target, material_target, depth_target);
+                                               pipeline::RenderGraphTexture depth_target,
+                                               pipeline::RenderPassInstanceId authored_instance) {
+    return build_gbuffer_impl(builder, context, albedo_target, normal_target, material_target, depth_target,
+                              authored_instance);
 }
 
 foundation::Result build_depth_render_graph(pipeline::RenderGraphBuilder& builder, const RenderFeatureContext& context,
                                             const RenderView& view, pipeline::RenderGraphTexture depth_target,
-                                            std::string_view pass_name, std::span<const RenderInstance> instances) {
+                                             std::string_view pass_name, std::span<const RenderInstance> instances,
+                                             pipeline::RenderPassInstanceId authored_instance) {
     if (!builder.is_runtime() || builder.scope() != pipeline::PipelineScope::kFrame || !context.is_valid() ||
         render_feature_context(builder) != &context || !view.is_valid() ||
         view.world != context.scene_snapshot->world || !depth_target.is_valid() || pass_name.empty()) {
@@ -925,7 +932,8 @@ foundation::Result build_depth_render_graph(pipeline::RenderGraphBuilder& builde
                                     pipeline::RenderPassExecuteFunction execute) {
         const pipeline::RenderPassTypeId type(pass_name);
         if (type == kZPrepassPassTypeId || type == kShadowPassTypeId)
-            return detail::add_builtin_render_pass(builder, context, type, std::move(setup), std::move(execute));
+            return detail::add_builtin_render_pass(builder, context, type, std::move(setup), std::move(execute),
+                                                   authored_instance);
         return builder.add_graphics_pass(pass_name, std::move(setup), std::move(execute));
     };
     const auto pass = add_depth_pass(

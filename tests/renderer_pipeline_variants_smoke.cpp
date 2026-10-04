@@ -3,6 +3,7 @@
  * @brief Verifies the public deferred/forward renderer registration seams.
  */
 #include <initializer_list>
+#include <iostream>
 #include <renderer.hpp>
 #include <renderer_variants.hpp>
 
@@ -94,6 +95,32 @@ int main() {
                                           aeg::pipeline::StageId("Renderer.DeferredRenderPipeline.SkyboxPostProcess"),
                                           aeg::pipeline::StageId("Renderer.DeferredRenderPipeline.BeforePresent")})) {
         return 7;
+    }
+
+    // The built-in renderer is an editable authored template. A configuration
+    // with a reduced Pass set must still compile its pipeline contribution;
+    // runtime graph validation will report missing inputs/final output later.
+    auto edited_deferred = std::make_shared<aeg::pipeline::PipelineInstanceConfiguration>();
+    edited_deferred->instance = aeg::pipeline::PipelineInstanceId("Renderer.DeferredSmoke");
+    edited_deferred->pipeline = aeg::renderer::kDeferredRenderPipelineId;
+    edited_deferred->scope = aeg::pipeline::PipelineScope::kFrame;
+    aeg::pipeline::FeatureInstanceConfiguration edited_feature;
+    edited_feature.instance = aeg::pipeline::FeatureInstanceId("EditedDeferredFeature");
+    edited_feature.feature = aeg::renderer::kDeferredRenderFeatureId;
+    edited_feature.point =
+        aeg::pipeline::FeaturePointId("Renderer.DeferredRenderPipeline.BeforePresent");
+    edited_feature.expand_authored_passes = true;
+    edited_feature.passes.push_back({.type = aeg::renderer::kShadowPassTypeId,
+                                     .instance = aeg::pipeline::RenderPassInstanceId("EditedShadow"),
+                                     .source = "EditedShadow"});
+    edited_deferred->features.push_back(std::move(edited_feature));
+    if (const auto set_result = deferred_host.set_configuration(edited_deferred); !set_result) {
+        std::cerr << "edited deferred configuration: " << set_result.message << '\n';
+        return 20;
+    }
+    if (const auto edited_result = deferred_host.rebuild(registry); !edited_result) {
+        std::cerr << "edited deferred rebuild: " << edited_result.message << '\n';
+        return 20;
     }
 
     aeg::pipeline::PipelineScopeHost forward_host(aeg::pipeline::PipelineScope::kFrame,

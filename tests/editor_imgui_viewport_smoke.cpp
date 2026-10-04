@@ -43,6 +43,11 @@ public:
         return {aeg::foundation::Result::success(), aeg::platform::WindowMetrics{{1280, 720}, 1.0f, 1.0f}};
     }
 
+    [[nodiscard]] aeg::foundation::ResultValue<aeg::platform::DisplayWorkArea> query_display_work_area(
+        aeg::platform::WindowId) const override {
+        return {aeg::foundation::Result::success(), aeg::platform::DisplayWorkArea{{0, 0}, {2560, 1392}}};
+    }
+
     std::string clipboard_text{};
 };
 
@@ -162,9 +167,28 @@ public:
         close_hovered = ImGui::IsItemHovered();
         ImGui::SetCursorPos(ImVec2(12.0f, 40.0f));
         ImGui::TextUnformatted("Viewport bridge");
+        if (show_combo) {
+            ImGui::SetCursorPos(ImVec2(60.0f, 160.0f));
+            combo_position = ImGui::GetCursorScreenPos();
+            ImGui::SetNextItemWidth(330.0f);
+            combo_visible = ImGui::BeginCombo("##Graph", "Pipeline");
+            if (combo_visible) {
+                popup_position = ImGui::GetWindowPos();
+                ImGui::Selectable("Pipeline");
+                ImGui::Selectable("Feature / DeferredFeature");
+                if (close_combo)
+                    ImGui::CloseCurrentPopup();
+                ImGui::EndCombo();
+            }
+        }
         ImGui::End();
     }
     ImVec2 position{};
+    ImVec2 combo_position{};
+    ImVec2 popup_position{};
+    bool show_combo{false};
+    bool close_combo{false};
+    bool combo_visible{false};
     bool close_hovered{false};
     int close_clicks{0};
 };
@@ -277,6 +301,49 @@ int main() {
         run_frame();
         assert(floating_panel->close_clicks == expected_clicks);
     }
+
+    // A detached Graph combo must stay anchored when maximizing/restoring
+    // while the main editor remains offset from the monitor's screen origin.
+    aeg::platform::WindowDesc main_desc{};
+    main_desc.position = {240, 120};
+    main_desc.extent = {1280, 720};
+    window_system.windows.push_back(std::make_shared<FakeWindow>(main_window, main_desc));
+    floating_panel->show_combo = true;
+    for (const bool maximized : {false, true, false}) {
+        assert(window_system.windows.front()->set_position(maximized ? aeg::platform::WindowPosition{0, 0}
+                                                                    : aeg::platform::WindowPosition{760, 400}));
+        assert(window_system.windows.front()->set_extent(maximized ? aeg::platform::WindowExtent{2560, 1392}
+                                                                  : aeg::platform::WindowExtent{480, 320}));
+        aeg::platform::WindowEvent resized{};
+        resized.window = floating_window;
+        resized.type = aeg::platform::WindowEventType::kWindowResized;
+        resized.extent = window_system.windows.front()->state().extent;
+        assert(host.submit_event(resized));
+        event.mouse_x = 370.0f;
+        event.mouse_y = 170.0f;
+        assert(host.submit_event(event));
+        run_frame();
+        run_frame();
+        aeg::platform::WindowEvent click{};
+        click.window = floating_window;
+        click.type = aeg::platform::WindowEventType::kMouseButton;
+        click.mouse_button = aeg::platform::MouseButton::kLeft;
+        click.mouse_button_down = true;
+        assert(host.submit_event(click));
+        run_frame();
+        click.mouse_button_down = false;
+        assert(host.submit_event(click));
+        run_frame();
+        run_frame(); // Allow the popup to measure its contents before checking placement.
+        assert(floating_panel->combo_visible);
+        assert(floating_panel->popup_position.x == floating_panel->combo_position.x);
+        assert(floating_panel->popup_position.y > floating_panel->combo_position.y);
+        floating_panel->close_combo = true;
+        run_frame();
+        floating_panel->close_combo = false;
+        run_frame();
+    }
+    floating_panel->show_combo = false;
 
     // Native client resizes must be forwarded to Dear ImGui so the platform
     // viewport refreshes its draw-data extent before the next frame.

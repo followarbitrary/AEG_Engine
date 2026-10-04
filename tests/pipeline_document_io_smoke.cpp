@@ -30,9 +30,20 @@ int main() {
     // Stable renderer port/binding IDs use all 64 bits, including values above INT64_MAX.
     fixture.document.edges.push_back({.edge_id = "high-bit-resource-binding",
                                       .kind = pipeline::DocumentEdgeKind::kRenderResource,
-                                      .source = {"scene_color", 0xffffffffffffffffull},
-                                      .destination = {"pass", 0x8000000000000001ull},
+                                      .source = {"scene_color", 0xffffffffffffffffull, 17},
+                                      .destination = {"pass", 0x8000000000000001ull, 19},
                                       .binding_id = 0x8000000000000000ull});
+    fixture.document.input_bindings.push_back({.node_id = "feature",
+                                               .port_id = 1001,
+                                               .slot_id = 17,
+                                               .source = pipeline::InputSourceKind::kAsset,
+                                               .asset = pipeline::AssetReference{"00000000-0000-0000-0000-000000000123"},
+                                               .product_id = "albedo",
+                                               .target_variant = "desktop",
+                                               .content_revision = 8,
+                                               .status = pipeline::InputBindingStatus::kBound});
+    fixture.document.variadic_slots.push_back(
+        {.node_id = "feature", .group_id = 700, .slot_id = 17, .order = 2, .parameters = {{42, uint64_t{9}}}});
 
     const auto root = std::filesystem::temp_directory_path() / "aeg_pipeline_document_io_smoke";
     std::error_code error;
@@ -41,12 +52,23 @@ int main() {
     const auto file = root / "CustomForward.aegpipe";
     if (!application::project::save_pipeline_document(file, fixture.document))
         return 1;
+    if (!application::project::save_pipeline_document(file, fixture.document) ||
+        !std::filesystem::exists(file.string() + ".bak"))
+        return 1;
     const auto loaded = application::project::load_pipeline_document(file);
     if (!loaded ||
         pipeline::document_semantic_digest(loaded.value) != pipeline::document_semantic_digest(fixture.document))
         return 2;
+    const auto high_bit_edge = std::find_if(loaded.value.edges.begin(), loaded.value.edges.end(),
+                                           [](const auto& edge) { return edge.edge_id == "high-bit-resource-binding"; });
     if (loaded.value.resources.size() != 1 || loaded.value.extensions.size() != 1 ||
-        loaded.value.present_connections != std::vector<std::string>{"pass"})
+        loaded.value.present_connections != std::vector<std::string>{"pass"} ||
+        loaded.value.input_bindings.size() != 1 || loaded.value.variadic_slots.size() != 1 ||
+        high_bit_edge == loaded.value.edges.end() || high_bit_edge->source.slot_id != 17 ||
+        high_bit_edge->destination.slot_id != 19 ||
+        loaded.value.input_bindings.front().asset.uuid != "00000000-0000-0000-0000-000000000123" ||
+        loaded.value.input_bindings.front().content_revision != 8 ||
+        loaded.value.variadic_slots.front().parameters.at(42) != pipeline::ParameterValue{uint64_t{9}})
         return 3;
     if (!std::holds_alternative<uint64_t>(loaded.value.resources.front().parameters.at(9001)) ||
         std::get<uint64_t>(loaded.value.resources.front().parameters.at(9001)) != 0xffffffffffffffffull)
@@ -67,6 +89,15 @@ int main() {
         std::none_of(unknown.value.extensions.begin(), unknown.value.extensions.end(),
                      [](const auto& extension) { return extension.owner_node == "@root:unknown_extension"; }))
         return 5;
+
+    auto layout_only = loaded.value;
+    layout_only.layouts.push_back({"feature", 100.0, 200.0, false});
+    if (pipeline::document_semantic_digest(layout_only) != pipeline::document_semantic_digest(loaded.value))
+        return 7;
+    auto semantic_change = loaded.value;
+    semantic_change.input_bindings.front().content_revision++;
+    if (pipeline::document_semantic_digest(semantic_change) == pipeline::document_semantic_digest(loaded.value))
+        return 8;
 
     std::ofstream(file, std::ios::trunc) << "schema_version = 0\nasset_uuid = \"x\"\nname = \"bad\"\n";
     if (application::project::load_pipeline_document(file))

@@ -326,12 +326,19 @@ add_library(aeg_editor_composition_model STATIC
     Application/Editor/private/composition/editor_composition_storage.cpp
     Application/Editor/private/composition/editor_composition_operations.cpp
     Application/Editor/private/composition/editor_composition_preview.cpp
+    Application/Editor/private/composition/editor_custom_node_workflow.cpp
+    Application/Editor/private/composition/editor_node_definition.cpp
+    Application/Editor/private/composition/editor_node_contract_storage.cpp
+    Application/Editor/private/composition/editor_node_definition_service.cpp
 )
 target_compile_features(aeg_editor_composition_model PUBLIC cxx_std_20)
 target_include_directories(aeg_editor_composition_model
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private/composition
+           ${CMAKE_CURRENT_SOURCE_DIR}/Application/EditorFramework/public
            ${CMAKE_CURRENT_SOURCE_DIR}/Application/Tooling/public
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Pipeline/public)
+target_include_directories(aeg_editor_composition_model PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/nlohmann/json/include)
 target_link_libraries(aeg_editor_composition_model PUBLIC aeg_application_project aeg_pipeline aeg_engine)
 if (MSVC)
     target_compile_options(aeg_editor_composition_model PRIVATE /W4 /permissive-)
@@ -354,6 +361,48 @@ add_executable(aeg_editor_composition_operations_smoke tests/editor_composition_
 target_link_libraries(aeg_editor_composition_operations_smoke PRIVATE aeg_editor_composition_model)
 add_executable(aeg_editor_composition_preview_smoke tests/editor_composition_preview_smoke.cpp)
 target_link_libraries(aeg_editor_composition_preview_smoke PRIVATE aeg_editor_composition_model)
+add_executable(aeg_editor_custom_node_workflow_smoke tests/editor_custom_node_workflow_smoke.cpp)
+target_link_libraries(aeg_editor_custom_node_workflow_smoke PRIVATE aeg_editor_composition_model)
+add_executable(aeg_editor_node_definition_model_smoke tests/editor_node_definition_model_smoke.cpp)
+target_link_libraries(aeg_editor_node_definition_model_smoke PRIVATE aeg_editor_composition_model)
+add_executable(aeg_editor_node_contract_storage_smoke
+    tests/editor_node_contract_storage_smoke.cpp
+    Application/Editor/private/editor_project_pipeline_authoring.cpp)
+target_link_libraries(aeg_editor_node_contract_storage_smoke PRIVATE aeg_editor_composition_model)
+target_include_directories(aeg_editor_node_contract_storage_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private)
+add_executable(aeg_editor_node_definition_generation_smoke tests/editor_node_definition_generation_smoke.cpp)
+target_link_libraries(aeg_editor_node_definition_generation_smoke PRIVATE aeg_editor_composition_model)
+add_executable(aeg_editor_node_definition_service_smoke tests/editor_node_definition_service_smoke.cpp)
+target_link_libraries(aeg_editor_node_definition_service_smoke PRIVATE aeg_editor_composition_model)
+add_executable(aeg_editor_node_definition_end_to_end_smoke
+    tests/editor_node_definition_end_to_end_smoke.cpp
+    Application/Editor/private/editor_project_pipeline_authoring.cpp)
+target_link_libraries(aeg_editor_node_definition_end_to_end_smoke PRIVATE aeg_editor_composition_model)
+target_include_directories(aeg_editor_node_definition_end_to_end_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private)
+set(AEG_FLOWGRAPH_TEST_ROOT ${CMAKE_CURRENT_BINARY_DIR}/generated/flowgraph-nodes)
+set(AEG_FLOWGRAPH_TEST_SOURCE ${AEG_FLOWGRAPH_TEST_ROOT}/Source/FlowGraph)
+set(AEG_FLOWGRAPH_GENERATED_SOURCES)
+set(AEG_FLOWGRAPH_GENERATED_FILES)
+foreach(AEG_FLOWGRAPH_TEST_NODE EditorPipelineNode EditorFeatureNode EditorPassNode)
+    list(APPEND AEG_FLOWGRAPH_GENERATED_SOURCES
+        ${AEG_FLOWGRAPH_TEST_SOURCE}/${AEG_FLOWGRAPH_TEST_NODE}.flowgraph.cpp
+        ${AEG_FLOWGRAPH_TEST_SOURCE}/${AEG_FLOWGRAPH_TEST_NODE}.flowgraph.registration.cpp)
+    list(APPEND AEG_FLOWGRAPH_GENERATED_FILES
+        ${AEG_FLOWGRAPH_TEST_SOURCE}/${AEG_FLOWGRAPH_TEST_NODE}.flowgraph.hpp
+        ${AEG_FLOWGRAPH_TEST_SOURCE}/${AEG_FLOWGRAPH_TEST_NODE}.flowgraph.cpp
+        ${AEG_FLOWGRAPH_TEST_SOURCE}/${AEG_FLOWGRAPH_TEST_NODE}.flowgraph.registration.cpp
+        ${AEG_FLOWGRAPH_TEST_SOURCE}/${AEG_FLOWGRAPH_TEST_NODE}.flowgraph.contract.json)
+endforeach()
+add_custom_command(OUTPUT ${AEG_FLOWGRAPH_GENERATED_FILES}
+    COMMAND $<TARGET_FILE:aeg_editor_custom_node_workflow_smoke> --generate ${AEG_FLOWGRAPH_TEST_ROOT}
+    DEPENDS aeg_editor_custom_node_workflow_smoke
+    VERBATIM)
+add_executable(aeg_generated_flowgraph_nodes_smoke
+    tests/generated_flowgraph_nodes_smoke.cpp ${AEG_FLOWGRAPH_GENERATED_SOURCES})
+target_include_directories(aeg_generated_flowgraph_nodes_smoke PRIVATE ${AEG_FLOWGRAPH_TEST_SOURCE})
+target_link_libraries(aeg_generated_flowgraph_nodes_smoke PRIVATE aeg_module)
 if (MSVC)
     target_compile_options(aeg_editor_composition_history_smoke PRIVATE /W4 /permissive-)
     target_compile_options(aeg_editor_composition_palette_smoke PRIVATE /W4 /permissive-)
@@ -362,6 +411,12 @@ if (MSVC)
     target_compile_options(aeg_editor_composition_storage_smoke PRIVATE /W4 /permissive-)
     target_compile_options(aeg_editor_composition_operations_smoke PRIVATE /W4 /permissive-)
     target_compile_options(aeg_editor_composition_preview_smoke PRIVATE /W4 /permissive-)
+    target_compile_options(aeg_editor_custom_node_workflow_smoke PRIVATE /W4 /permissive-)
+    target_compile_options(aeg_editor_node_definition_model_smoke PRIVATE /W4 /permissive-)
+    target_compile_options(aeg_editor_node_contract_storage_smoke PRIVATE /W4 /permissive-)
+    target_compile_options(aeg_editor_node_definition_generation_smoke PRIVATE /W4 /permissive-)
+    target_compile_options(aeg_editor_node_definition_service_smoke PRIVATE /W4 /permissive-)
+    target_compile_options(aeg_editor_node_definition_end_to_end_smoke PRIVATE /W4 /permissive-)
 else()
     target_compile_options(aeg_editor_composition_history_smoke PRIVATE -Wall -Wextra -Wpedantic)
     target_compile_options(aeg_editor_composition_palette_smoke PRIVATE -Wall -Wextra -Wpedantic)
@@ -370,6 +425,12 @@ else()
     target_compile_options(aeg_editor_composition_storage_smoke PRIVATE -Wall -Wextra -Wpedantic)
     target_compile_options(aeg_editor_composition_operations_smoke PRIVATE -Wall -Wextra -Wpedantic)
     target_compile_options(aeg_editor_composition_preview_smoke PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(aeg_editor_custom_node_workflow_smoke PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(aeg_editor_node_definition_model_smoke PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(aeg_editor_node_contract_storage_smoke PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(aeg_editor_node_definition_generation_smoke PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(aeg_editor_node_definition_service_smoke PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(aeg_editor_node_definition_end_to_end_smoke PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 endif()
 
@@ -683,6 +744,18 @@ target_include_directories(aeg_editor_framework
 target_link_libraries(aeg_editor_framework PUBLIC aeg_foundation aeg_platform aeg_input)
 target_link_libraries(aeg_editor_framework PUBLIC aeg_imgui_core aeg_imgui_freetype)
 
+if (AEG_BUILD_EDITOR AND TARGET aeg_editor_composition_model)
+    target_sources(aeg_editor_composition_model PRIVATE
+        Application/Editor/private/composition/editor_flowgraph_panel.cpp)
+    target_include_directories(aeg_editor_composition_model PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/ImGui)
+    target_link_libraries(aeg_editor_composition_model PUBLIC aeg_imgui_core)
+    if (AEG_BUILD_TESTS)
+        add_executable(aeg_editor_flowgraph_history_ui_smoke tests/editor_flowgraph_history_ui_smoke.cpp)
+        target_link_libraries(aeg_editor_flowgraph_history_ui_smoke PRIVATE aeg_editor_composition_model)
+    endif()
+endif()
+
 if (MSVC)
     target_compile_options(aeg_editor_framework PRIVATE /W4 /permissive-)
 else()
@@ -935,6 +1008,7 @@ add_library(aeg_pipeline STATIC
     Engine/Pipeline/public/pipeline_builder_backend.hpp
     Engine/Pipeline/private/pipeline.cpp
     Engine/Pipeline/private/pipeline_authoring.cpp
+    Engine/Pipeline/private/flowgraph_input.cpp
     Engine/Pipeline/private/render_pass.cpp
     Engine/Pipeline/private/pipeline_document.cpp
 )
@@ -1002,6 +1076,14 @@ add_executable(aeg_pipeline_authoring_catalog_smoke
 target_link_libraries(aeg_pipeline_authoring_catalog_smoke PRIVATE aeg_pipeline)
 if (WIN32)
     target_compile_definitions(aeg_pipeline_authoring_catalog_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
+add_executable(aeg_flowgraph_input_contract_smoke
+    tests/flowgraph_input_contract_smoke.cpp
+)
+target_link_libraries(aeg_flowgraph_input_contract_smoke PRIVATE aeg_pipeline)
+if (WIN32)
+    target_compile_definitions(aeg_flowgraph_input_contract_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
 add_executable(aeg_module_authoring_smoke
@@ -2044,9 +2126,12 @@ if (AEG_BUILD_TESTS)
     add_executable(aeg_editor_project_pipeline_authoring_smoke
         tests/editor_project_pipeline_authoring_smoke.cpp
         Application/Editor/private/editor_project_pipeline_authoring.cpp
+        Application/Editor/private/composition/editor_node_definition.cpp
+        Application/Editor/private/composition/editor_node_contract_storage.cpp
     )
     target_include_directories(aeg_editor_project_pipeline_authoring_smoke PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/nlohmann/json/include
     )
     target_link_libraries(aeg_editor_project_pipeline_authoring_smoke PRIVATE
         aeg_foundation
@@ -2081,6 +2166,7 @@ endif() # AEG_BUILD_TESTS
         aeg_resource
         aeg_editor_assets
         aeg_application_project
+        aeg_editor_composition_model
         aeg_module
         aeg_rhi
         aeg_core_shaders
@@ -2484,6 +2570,7 @@ if (BUILD_TESTING AND AEG_BUILD_TESTS)
     add_test(NAME aeg_pipeline_smoke COMMAND aeg_pipeline_smoke)
     add_test(NAME aeg_pipeline_extension_smoke COMMAND aeg_pipeline_extension_smoke)
     add_test(NAME aeg_pipeline_authoring_catalog_smoke COMMAND aeg_pipeline_authoring_catalog_smoke)
+    add_test(NAME aeg_flowgraph_input_contract_smoke COMMAND aeg_flowgraph_input_contract_smoke)
     add_test(NAME aeg_module_authoring_smoke COMMAND aeg_module_authoring_smoke)
     add_test(NAME aeg_pipeline_document_validation_smoke COMMAND aeg_pipeline_document_validation_smoke)
     add_test(NAME aeg_pipeline_asset_codec_smoke COMMAND aeg_pipeline_asset_codec_smoke)
@@ -2509,6 +2596,16 @@ if (BUILD_TESTING AND AEG_BUILD_TESTS)
         add_test(NAME aeg_editor_composition_storage_smoke COMMAND aeg_editor_composition_storage_smoke)
         add_test(NAME aeg_editor_composition_operations_smoke COMMAND aeg_editor_composition_operations_smoke)
         add_test(NAME aeg_editor_composition_preview_smoke COMMAND aeg_editor_composition_preview_smoke)
+        add_test(NAME aeg_editor_custom_node_workflow_smoke COMMAND aeg_editor_custom_node_workflow_smoke)
+        add_test(NAME aeg_editor_node_definition_model_smoke COMMAND aeg_editor_node_definition_model_smoke)
+        add_test(NAME aeg_editor_node_contract_storage_smoke COMMAND aeg_editor_node_contract_storage_smoke)
+        add_test(NAME aeg_editor_node_definition_generation_smoke COMMAND aeg_editor_node_definition_generation_smoke)
+        add_test(NAME aeg_editor_node_definition_service_smoke COMMAND aeg_editor_node_definition_service_smoke)
+        add_test(NAME aeg_editor_node_definition_end_to_end_smoke COMMAND aeg_editor_node_definition_end_to_end_smoke)
+        if (TARGET aeg_editor_flowgraph_history_ui_smoke)
+            add_test(NAME aeg_editor_flowgraph_history_ui_smoke COMMAND aeg_editor_flowgraph_history_ui_smoke)
+        endif()
+        add_test(NAME aeg_generated_flowgraph_nodes_smoke COMMAND aeg_generated_flowgraph_nodes_smoke)
     endif()
     add_test(NAME aeg_world_scope_smoke COMMAND aeg_world_scope_smoke)
     add_test(NAME aeg_world_serialization_smoke COMMAND aeg_world_serialization_smoke)

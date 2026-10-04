@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 #include <renderer_variants.hpp>
 
 namespace aeg::test {
@@ -33,6 +34,25 @@ inline pipeline::PipelineDocument renderer_document(const pipeline::TypeCatalog&
                  .ownership = OwnershipPolicy::kGraphOwned,
                  .resource_constraints = resource.constraints});
         document.edges.insert(document.edges.end(), defaults.default_edges.begin(), defaults.default_edges.end());
+    }
+    // Resource input edges are data bindings, not just visual ordering hints.
+    // Populate the explicit Edge bindings required by the FlowGraph input
+    // contract so this fixture represents the same authored document that the
+    // editor produces.
+    for (const auto& edge : document.edges) {
+        if (edge.kind != DocumentEdgeKind::kRenderResource)
+            continue;
+        const auto resource_destination = std::find_if(
+            document.resources.begin(), document.resources.end(),
+            [&](const auto& resource) { return resource.node_id == edge.destination.node_id; });
+        if (resource_destination == document.resources.end())
+            continue;
+        document.input_bindings.push_back({.node_id = edge.destination.node_id,
+                                           .port_id = edge.destination.port_id,
+                                           .slot_id = edge.destination.slot_id,
+                                           .source = InputSourceKind::kEdge,
+                                           .edge_ids = {edge.edge_id},
+                                           .status = InputBindingStatus::kBound});
     }
     document.present_connections = {"SkyboxPostProcess"};
     return document;

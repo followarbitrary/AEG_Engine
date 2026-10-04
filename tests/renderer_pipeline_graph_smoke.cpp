@@ -6,12 +6,14 @@
 #include <iostream>
 #include <memory>
 #include <opaque_render_feature.hpp>
+#include <pipeline_configuration.hpp>
 #include <post_process.hpp>
 #include <render_feature_runtime.hpp>
 #include <render_graph.hpp>
 #include <renderer.hpp>
 #include <renderer_variants.hpp>
 #include <rhi.hpp>
+#include <string>
 
 #ifndef AEG_POST_PROCESS_SHADER_PACKAGE_PATH
 #define AEG_POST_PROCESS_SHADER_PACKAGE_PATH ""
@@ -94,9 +96,62 @@ struct EmptySceneResolver final : aeg::renderer::RenderResourceResolver {
 
 [[nodiscard]] bool build_variant(aeg::rhi::Device& device, PipelineRegistry& registry,
                                  aeg::pipeline::PipelineId pipeline_id, RenderResourceId color_id,
-                                 RenderResourceId depth_id, uint32_t expected_passes) {
+                                 RenderResourceId depth_id, uint32_t expected_passes,
+                                 bool authored = false) {
     PipelineScopeHost host(PipelineScope::kFrame, aeg::pipeline::PipelineInstanceId("Renderer.GraphSmoke"));
-    if (!host.bind_pipeline(pipeline_id) || !host.rebuild(registry)) {
+    if (!host.bind_pipeline(pipeline_id)) {
+        return false;
+    }
+    std::shared_ptr<aeg::pipeline::PipelineInstanceConfiguration> configuration;
+    if (authored) {
+        configuration = std::make_shared<aeg::pipeline::PipelineInstanceConfiguration>();
+        configuration->instance = host.instance_id();
+        configuration->pipeline = pipeline_id;
+        configuration->scope = PipelineScope::kFrame;
+
+        const bool deferred = pipeline_id == aeg::renderer::kDeferredRenderPipelineId;
+        const auto feature = deferred ? aeg::renderer::kDeferredRenderFeatureId
+                                      : aeg::renderer::kForwardRenderFeatureId;
+        const auto point = aeg::pipeline::FeaturePointId(
+            deferred ? "Renderer.DeferredRenderPipeline.BeforePresent"
+                     : "Renderer.ForwardRenderPipeline.BeforePresent");
+        aeg::pipeline::FeatureInstanceConfiguration feature_configuration;
+        feature_configuration.instance = aeg::pipeline::FeatureInstanceId("Renderer.GraphSmoke.AuthoredFeature");
+        feature_configuration.feature = feature;
+        feature_configuration.point = point;
+        feature_configuration.expand_authored_passes = true;
+
+        // Deliberately reorder independent producers. The graph adapter must
+        // preserve this authored collection and use instance IDs to resolve
+        // each built-in implementation in the authored collection.
+        const std::array<aeg::pipeline::RenderPassTypeId, 5> order = deferred
+            ? std::array<aeg::pipeline::RenderPassTypeId, 5>{
+                  aeg::renderer::kGBufferPassTypeId, aeg::renderer::kShadowPassTypeId,
+                  aeg::renderer::kDeferredLightingPassTypeId, aeg::renderer::kSkyboxPostProcessPassTypeId,
+                  aeg::pipeline::RenderPassTypeId{}}
+            : std::array<aeg::pipeline::RenderPassTypeId, 5>{
+                  aeg::renderer::kZPrepassPassTypeId, aeg::renderer::kShadowPassTypeId,
+                  aeg::renderer::kLightCullingPassTypeId, aeg::renderer::kForwardOpaquePassTypeId,
+                  aeg::renderer::kSkyboxPostProcessPassTypeId};
+        const size_t count = deferred ? 4u : 5u;
+        const auto instance_prefix = deferred ? "Deferred" : "Forward";
+        for (size_t index = 0; index < count; ++index) {
+            const auto type = order[index];
+            feature_configuration.passes.push_back({
+                .type = type,
+                .instance = aeg::pipeline::RenderPassInstanceId(
+                    std::string("Renderer.GraphSmoke.") + instance_prefix + "." + std::to_string(index)),
+                .queue = type == aeg::renderer::kLightCullingPassTypeId ? aeg::rhi::QueueClass::kCompute
+                                                                         : aeg::rhi::QueueClass::kGraphics,
+                .enabled = true,
+            });
+        }
+        configuration->features.push_back(std::move(feature_configuration));
+        if (!host.set_configuration(configuration)) {
+            return false;
+        }
+    }
+    if (!host.rebuild(registry)) {
         return false;
     }
     const PipelinePlanHandle plan = host.active_plan_snapshot();
@@ -186,8 +241,8 @@ struct EmptySceneResolver final : aeg::renderer::RenderResourceResolver {
     }
     const RenderSceneSnapshot snapshot = make_snapshot(color_id, depth_id);
     const RenderFeatureContext feature_context{&snapshot, &resolver, nullptr, &passes};
-    const aeg::render_graph::RenderGraphFeatureRuntimeDesc desc{
-        {}, bindings, nullptr, &feature_context, {},
+    aeg::render_graph::RenderGraphFeatureRuntimeDesc desc{
+        {}, bindings, nullptr, &feature_context, {}, configuration,
     };
     // Missing registry/types must abort the feature transaction without leaving partial passes/resources.
     aeg::pipeline::RenderPassRegistry empty_passes;
@@ -307,11 +362,11 @@ int main() {
         return 2;
     }
     if (!build_variant(*device.value, registry, aeg::renderer::kDeferredRenderPipelineId,
-                       RenderResourceId("Renderer.SceneColor"), RenderResourceId("Renderer.SceneDepth"), 4)) {
+                       RenderResourceId("Renderer.SceneColor"), RenderResourceId("Renderer.SceneDepth"), 4, true)) {
         return 3;
     }
     if (!build_variant(*device.value, registry, aeg::renderer::kForwardRenderPipelineId,
-                       RenderResourceId("Renderer.SceneColor"), RenderResourceId("Renderer.SceneDepth"), 5)) {
+                       RenderResourceId("Renderer.SceneColor"), RenderResourceId("Renderer.SceneDepth"), 5, true)) {
         return 4;
     }
 

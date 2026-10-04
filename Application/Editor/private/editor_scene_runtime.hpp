@@ -146,6 +146,8 @@ public:
     /** Authored project Pipeline documents, available before the game module has been built. */
     [[nodiscard]] std::span<const EditorProjectPipelineDocument> authored_pipeline_documents() const noexcept;
     [[nodiscard]] const pipeline::TypeCatalog& authored_pipeline_catalog() const noexcept;
+    [[nodiscard]] std::span<const NodeContractFile> authored_pipeline_drafts() const noexcept;
+    [[nodiscard]] std::span<const EditorProjectPipelineConflict> authored_pipeline_conflicts() const noexcept;
     /** Persists one authored node's optional connection to the editor-owned Present consumer. */
     [[nodiscard]] foundation::Result set_authored_present_connection(const std::filesystem::path& document_path,
                                                                      std::string_view source_node, bool connected);

@@ -64,9 +64,15 @@ struct PipelineDocument final {
     std::vector<PassNodeDocument> pass_nodes{};
     std::vector<ResourceNodeDocument> resources{};
     std::vector<DocumentEdge> edges{};
+    std::vector<InputBindingDocument> input_bindings{};
+    std::vector<VariadicInputSlotDocument> variadic_slots{};
     /** Editor display-consumer links targeting the mandatory Present terminal. */
     std::vector<std::string> present_connections{};
     std::vector<DocumentNodeLayout> layouts{};
     std::vector<OpaqueAuthoringRecord> extensions{};
+    /** Published semantic graph version; draft/layout revisions are editor-only counters. */
+    uint64_t graph_version{1};
+    uint64_t draft_revision{1};
+    uint64_t layout_revision{1};
 };
 }  // namespace aeg::pipeline

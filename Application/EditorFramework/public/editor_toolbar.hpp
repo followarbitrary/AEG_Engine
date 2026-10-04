@@ -6,11 +6,12 @@ namespace aeg::editor {
 enum class ToolbarIcon { None, Play, Pause, Stop };
 inline float toolbar_height() { return std::max(32.0f, ImGui::GetFontSize() + 16.0f); }
 inline bool toolbar_button(const char* label, const char* description, ToolbarIcon icon = ToolbarIcon::None,
-                           bool active = false, bool dropdown = false) {
+                           bool active = false, bool dropdown = false, float width_override = 0.0f) {
     const ImVec2 text = ImGui::CalcTextSize(label);
     const float h = toolbar_height();
     const float icon_space = icon == ToolbarIcon::None ? 0.0f : 22.0f;
-    const ImVec2 size{24.0f + text.x + icon_space + (dropdown ? 20.0f : 0.0f), h};
+    const float content_width = 24.0f + text.x + icon_space + (dropdown ? 20.0f : 0.0f);
+    const ImVec2 size{std::max(content_width, width_override), h};
     const ImVec2 p = ImGui::GetCursorScreenPos();
     ImGui::PushID(label);
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 5.0f);

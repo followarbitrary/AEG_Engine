@@ -39,6 +39,44 @@ struct ParameterDescriptor final {
 enum class PortDirection : uint8_t { kInput, kOutput };
 enum class PortValueKind : uint8_t { kArtifact, kRenderResource, kRenderState, kBuffer, kTexture };
 enum class ResourceClass : uint8_t { kNone, kBuffer, kTexture };
+/** @brief Authoring sources that can satisfy one named input. */
+enum class InputSourceKind : uint8_t {
+    kUnset = 0,
+    kEdge = 1,
+    kAsset = 2,
+    kLiteral = 3,
+    kDefault = 4,
+    kContext = 5,
+    kNone = 6,
+};
+using InputSourceMask = uint32_t;
+[[nodiscard]] constexpr InputSourceMask input_source_mask(InputSourceKind source) noexcept {
+    return source >= InputSourceKind::kEdge && source <= InputSourceKind::kContext
+               ? 1u << (static_cast<uint8_t>(source) - 1u)
+               : 0u;
+}
+inline constexpr InputSourceMask kAllInputSources =
+    input_source_mask(InputSourceKind::kEdge) | input_source_mask(InputSourceKind::kAsset) |
+    input_source_mask(InputSourceKind::kLiteral) | input_source_mask(InputSourceKind::kDefault) |
+    input_source_mask(InputSourceKind::kContext);
+enum class InputPresenceRequirement : uint8_t { kOptional, kRequired };
+enum class InputBindingStatus : uint8_t { kUnset, kBound, kPending, kReady, kInvalid, kCancelled };
+struct InputDefaultDescriptor final {
+    uint64_t id{};
+    uint64_t revision{};
+    ParameterValue value{false};
+};
+/** @brief Explicit source and presence rules, independent of legacy edge counts. */
+struct InputPortContract final {
+    InputSourceMask allowed_sources{input_source_mask(InputSourceKind::kEdge)};
+    InputPresenceRequirement presence{InputPresenceRequirement::kRequired};
+    uint32_t min_edges{};
+    uint32_t max_edges{1};
+    uint64_t variadic_group_id{};
+    std::optional<ParameterDescriptor> literal_schema{};
+    std::optional<InputDefaultDescriptor> default_value{};
+    std::vector<std::string> context_keys{};
+};
 // capability_mask uses the matching RHI BufferCapability/TextureCapability bits;
 // usage_mask uses 1 << ResourceUsage. Zero sample_count means unspecified.
 struct ResourceConstraints final {
@@ -61,6 +99,17 @@ struct PortDescriptor final {
     uint32_t max_connections{1};
     uint64_t binding_id{};
     ResourceConstraints resource_constraints{};
+    // Absent on legacy contracts; explicitly migrated before FlowGraph editing.
+    std::optional<InputPortContract> input{};
+};
+struct VariadicInputDescriptor final {
+    uint64_t id{};
+    std::string name{};
+    uint64_t member_port_id{};
+    uint32_t min_slots{};
+    uint32_t max_slots{1};
+    bool ordered{true};
+    bool empty_is_valid{};
 };
 struct AuthoringStage final {
     StageId id{};
@@ -128,6 +177,7 @@ enum class DocumentEdgeKind : uint8_t { kArtifact, kOrdering, kRenderResource, k
 struct DocumentEndpoint final {
     std::string node_id{};
     uint64_t port_id{};
+    uint64_t slot_id{};
 };
 struct DocumentEdge final {
     std::string edge_id{};
@@ -137,6 +187,30 @@ struct DocumentEdge final {
     uint64_t binding_id{};
 };
 using DefaultEdge = DocumentEdge;
+/** @brief Explicit authoring source for one fixed port or variadic slot. */
+struct InputBindingDocument final {
+    std::string node_id{};
+    uint64_t port_id{};
+    uint64_t slot_id{};
+    InputSourceKind source{InputSourceKind::kUnset};
+    std::vector<std::string> edge_ids{};
+    AssetReference asset{};
+    std::string product_id{};
+    std::string target_variant{};
+    uint64_t content_revision{};
+    uint64_t default_id{};
+    uint64_t default_revision{};
+    ParameterValue literal{false};
+    std::string context_key{};
+    InputBindingStatus status{InputBindingStatus::kUnset};
+};
+struct VariadicInputSlotDocument final {
+    std::string node_id{};
+    uint64_t group_id{};
+    uint64_t slot_id{};
+    uint32_t order{};
+    ParameterBlock parameters{};
+};
 struct PipelineAuthoringDeclaration final {
     std::vector<AuthoringStage> stages{};
     std::vector<AuthoringFeaturePoint> feature_points{};
@@ -152,6 +226,11 @@ struct FeatureAuthoringDeclaration final {
     std::vector<DefaultResourceNode> default_resources{};
     std::vector<DefaultEdge> default_edges{};
     std::vector<RenderPassTypeId> allowed_pass_types{};
+    /**
+     * When true, the authored Pass collection is authoritative. It may add,
+     * remove, disable, or reorder allowed Pass types; the owning Feature still
+     * validates each Pass's execution contract.
+     */
     bool allow_add_passes{false};
 };
 // Queue masks use 1 << rhi::QueueClass; zero leaves queue selection unspecified.
@@ -171,6 +250,7 @@ struct TypeCatalogEntry final {
     PipelineScopeMask scopes{};
     std::vector<ParameterDescriptor> parameters{};
     std::vector<PortDescriptor> ports{};
+    std::vector<VariadicInputDescriptor> variadic_inputs{};
     AuthoringDeclaration declaration{PipelineAuthoringDeclaration{}};
 };
 }  // namespace aeg::pipeline

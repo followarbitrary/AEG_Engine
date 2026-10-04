@@ -5,6 +5,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string_view>
 #include <vector>
@@ -88,6 +89,8 @@ public:
     [[nodiscard]] foundation::Result set_panel_visible(EditorPanelId panel, bool visible);
     /** @brief Requests an independent Dear ImGui platform viewport for one panel. */
     [[nodiscard]] foundation::Result set_panel_native(EditorPanelId panel, bool native);
+    /** @brief Returns whether this host can create independent platform viewports. */
+    [[nodiscard]] bool viewports_enabled() const noexcept;
 
     [[nodiscard]] bool is_initialized() const noexcept;
     [[nodiscard]] bool is_frame_active() const noexcept;
@@ -96,6 +99,8 @@ public:
     [[nodiscard]] const void* draw_data() const noexcept;
 
 private:
+    [[nodiscard]] foundation::Result request_current_window_action(uint8_t action, EditorPanelId panel) noexcept;
+
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

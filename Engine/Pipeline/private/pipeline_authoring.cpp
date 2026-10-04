@@ -5,6 +5,7 @@
 #include <cmath>
 #include <set>
 #include <tuple>
+#include <unordered_map>
 #include <unordered_set>
 namespace aeg::pipeline {
 namespace {
@@ -125,11 +126,61 @@ foundation::Result validate_ports(std::span<const PortDescriptor> ports) {
     std::unordered_set<std::string> names;
     for (const auto& port : ports) {
         if (!port.id || port.name.empty() || !port.schema_id || !port.schema_version || !port.binding_id ||
-            (port.required && port.min_connections == 0) || !valid_port_kind(port.value_kind) ||
+            !valid_port_kind(port.value_kind) ||
             static_cast<uint8_t>(port.direction) > static_cast<uint8_t>(PortDirection::kOutput) ||
             port.min_connections > port.max_connections || !ids.insert(port.id).second ||
             !names.insert(port.name).second || !valid_resource_constraints(port.resource_constraints))
             return foundation::invalid_argument("invalid port descriptor");
+        if (port.direction == PortDirection::kOutput && port.input)
+            return foundation::invalid_argument("output port carries input-only contract");
+        if (!port.input && port.required && port.min_connections == 0)
+            return foundation::invalid_argument("legacy required port needs a minimum connection");
+        if (port.input) {
+            const auto& input = *port.input;
+            if (!input.allowed_sources || (input.allowed_sources & ~kAllInputSources) ||
+                static_cast<uint8_t>(input.presence) > static_cast<uint8_t>(InputPresenceRequirement::kRequired) ||
+                input.min_edges > input.max_edges || input.max_edges > 1)
+                return foundation::invalid_argument("invalid input source contract");
+            if ((input.allowed_sources & input_source_mask(InputSourceKind::kEdge)) == 0 && input.min_edges != 0)
+                return foundation::invalid_argument("input without Edge source cannot require edges");
+            if (input.literal_schema) {
+                if (input.literal_schema->id != port.id)
+                    return foundation::invalid_argument("input literal schema does not identify its port");
+                if (auto result = validate_parameters(std::span(&*input.literal_schema, 1)); !result)
+                    return result;
+            }
+            if (input.allowed_sources & input_source_mask(InputSourceKind::kLiteral)) {
+                if (!input.literal_schema || port.resource_constraints.resource_class != ResourceClass::kNone)
+                    return foundation::invalid_argument("Literal source requires a value schema and a value port");
+            }
+            if (input.allowed_sources & input_source_mask(InputSourceKind::kAsset)) {
+                if (port.resource_constraints.resource_class == ResourceClass::kNone)
+                    return foundation::invalid_argument("Asset source requires a resource port");
+            }
+            if (input.default_value) {
+                if (!input.default_value->id || !input.default_value->revision ||
+                    !finite_value(input.default_value->value))
+                    return foundation::invalid_argument("invalid versioned input default");
+                if (input.literal_schema &&
+                    !validate_parameter_block({{port.id, input.default_value->value}},
+                                               std::span(&*input.literal_schema, 1)))
+                    return foundation::invalid_argument("input default does not match its value schema");
+                if (port.resource_constraints.resource_class != ResourceClass::kNone) {
+                    const auto* reference = std::get_if<AssetReference>(&input.default_value->value);
+                    if (!reference || !valid_asset_reference(*reference))
+                        return foundation::invalid_argument("resource default requires a stable AssetId");
+                }
+            }
+            if ((input.allowed_sources & input_source_mask(InputSourceKind::kDefault)) && !input.default_value)
+                return foundation::invalid_argument("Default source requires a versioned contract default");
+            std::unordered_set<std::string> context_keys;
+            for (const auto& key : input.context_keys)
+                if (key.empty() || !context_keys.insert(key).second)
+                    return foundation::invalid_argument("invalid Context source key");
+            if ((input.allowed_sources & input_source_mask(InputSourceKind::kContext)) &&
+                input.context_keys.empty())
+                return foundation::invalid_argument("Context source requires declared keys");
+        }
         const auto resource_class = port.resource_constraints.resource_class;
         const bool consistent = [&] {
             switch (port.value_kind) {
@@ -147,6 +198,30 @@ foundation::Result validate_ports(std::span<const PortDescriptor> ports) {
         }();
         if (!consistent)
             return foundation::invalid_argument("port value kind and resource class disagree");
+    }
+    return foundation::Result::success();
+}
+
+foundation::Result validate_variadic_inputs(const TypeCatalogEntry& entry) {
+    std::unordered_map<uint64_t, const PortDescriptor*> ports;
+    for (const auto& port : entry.ports)
+        ports.emplace(port.id, &port);
+    std::unordered_set<uint64_t> groups;
+    for (const auto& group : entry.variadic_inputs) {
+        if (!group.id || group.name.empty() || !group.member_port_id || !group.max_slots ||
+            group.min_slots > group.max_slots || !groups.insert(group.id).second)
+            return foundation::invalid_argument("invalid variadic input group");
+        const auto port = ports.find(group.member_port_id);
+        if (port == ports.end() || port->second->direction != PortDirection::kInput ||
+            !port->second->input || port->second->input->variadic_group_id != group.id ||
+            (group.empty_is_valid && group.min_slots != 0))
+            return foundation::invalid_argument("variadic group does not match its member port");
+    }
+    for (const auto& port : entry.ports) {
+        if (!port.input || !port.input->variadic_group_id)
+            continue;
+        if (!groups.contains(port.input->variadic_group_id))
+            return foundation::invalid_argument("port references unknown variadic input group");
     }
     return foundation::Result::success();
 }
@@ -402,9 +477,14 @@ foundation::Result validate_entry(const TypeCatalogEntry& entry) {
         return result;
     if (auto result = validate_ports(entry.ports); !result)
         return result;
+    if (auto result = validate_variadic_inputs(entry); !result)
+        return result;
     return validate_declaration(entry);
 }
 }  // namespace
+foundation::Result validate_type_catalog_entry(const TypeCatalogEntry& entry) {
+    return validate_entry(entry);
+}
 foundation::Result TypeCatalog::add(const TypeCatalogEntry& entry) {
     if (auto result = validate_entry(entry); !result)
         return result;
@@ -414,6 +494,22 @@ foundation::Result TypeCatalog::add(const TypeCatalogEntry& entry) {
         if (key.kind == entry.key.kind && existing.name == entry.name)
             return foundation::invalid_argument("catalog type name is already registered");
     entries_by_key_.emplace(entry.key, entry);
+    snapshot_dirty_ = true;
+    return foundation::Result::success();
+}
+foundation::Result TypeCatalog::replace(AuthoringTypeKey key, const TypeCatalogEntry& entry) {
+    if (key != entry.key)
+        return foundation::invalid_argument("catalog replacement key does not match entry key");
+    if (auto result = validate_entry(entry); !result)
+        return result;
+    const auto existing = entries_by_key_.find(key);
+    if (existing == entries_by_key_.end())
+        return foundation::not_found("catalog replacement key is not registered");
+    for (const auto& [other_key, other] : entries_by_key_) {
+        if (other_key != key && other_key.kind == entry.key.kind && other.name == entry.name)
+            return foundation::invalid_argument("catalog type name is already registered");
+    }
+    existing->second = entry;
     snapshot_dirty_ = true;
     return foundation::Result::success();
 }

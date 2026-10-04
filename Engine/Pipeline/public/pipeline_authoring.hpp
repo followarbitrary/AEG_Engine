@@ -9,6 +9,7 @@
 #include "pipeline.hpp"
 #include "pipeline_configuration.hpp"
 #include "pipeline_document.hpp"
+#include "pipeline_execution.hpp"
 #include "render_pass.hpp"
 namespace aeg::pipeline {
 template <class T>
@@ -23,6 +24,8 @@ concept SupportedGameFeature = SupportedSingleDomainFeature<std::remove_cvref_t<
 class TypeCatalog final {
 public:
     [[nodiscard]] foundation::Result add(const TypeCatalogEntry& entry);
+    /** Replace one registered entry after validating the replacement contract. */
+    [[nodiscard]] foundation::Result replace(AuthoringTypeKey key, const TypeCatalogEntry& entry);
     [[nodiscard]] const TypeCatalogEntry* find(AuthoringTypeKey key) const noexcept;
     /** Borrowed ordered contiguous snapshot; invalidated by the next successful add. */
     [[nodiscard]] std::span<const TypeCatalogEntry> entries() const;
@@ -33,6 +36,8 @@ private:
     mutable std::vector<TypeCatalogEntry> entries_snapshot_{};
     mutable bool snapshot_dirty_{true};
 };
+/** @brief Shared validator for one authored type contract. */
+[[nodiscard]] foundation::Result validate_type_catalog_entry(const TypeCatalogEntry& entry);
 [[nodiscard]] foundation::Result validate_parameter_block(const ParameterBlock& values,
                                                           std::span<const ParameterDescriptor> schema);
 struct DocumentDiagnostic final {
@@ -42,12 +47,26 @@ struct DocumentDiagnostic final {
     std::string edge_id{};
     uint64_t port_id{};
     uint64_t parameter_id{};
+    uint64_t slot_id{};
 };
+/** @brief Checks explicit sources and slots without executing nodes or resolving devices. */
+[[nodiscard]] std::vector<DocumentDiagnostic> validate_flowgraph_inputs(const PipelineDocument&, const TypeCatalog&);
+/** Converts legacy ordering-only edges when a unique typed data-port pair exists. */
+[[nodiscard]] foundation::ResultValue<PipelineDocument> migrate_legacy_ordering_edges(const PipelineDocument&,
+                                                                                       const TypeCatalog&);
 [[nodiscard]] std::vector<DocumentDiagnostic> validate_pipeline_document(const PipelineDocument&, const TypeCatalog&);
 [[nodiscard]] std::string document_semantic_digest(const PipelineDocument&);
 struct PreparedPipelineDocument final {
+    struct DataDependency final {
+        std::string source_node{};
+        std::string destination_node{};
+        std::vector<std::string> edge_ids{};
+    };
     std::vector<std::shared_ptr<const PipelineInstanceConfiguration>> configurations{};
     std::vector<DocumentEdge> composition_edges{};
+    /** Every ordinary data edge is also an execution dependency. */
+    std::vector<DataDependency> data_dependencies{};
+    std::string graph_version{};
     std::map<std::string, std::string> source_map{};
     std::string semantic_digest{};
 };

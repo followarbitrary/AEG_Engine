@@ -36,6 +36,8 @@ struct EditorImGuiDesc final {
     platform::IWindowSystem* window_system{nullptr};
     /** @brief Enables docking platform viewports when a window system is available. */
     bool enable_viewports{false};
+    /** @brief Marks this host as the client area of an independent native window. */
+    bool native_window{false};
     /** @brief Borrowed font catalog copied while the ImGui host initializes. */
     const EditorFontCatalog* font_catalog{nullptr};
     /** @brief Stable key of the initial font selected from the catalog. */

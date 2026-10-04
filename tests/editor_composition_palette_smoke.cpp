@@ -8,7 +8,12 @@ int main() {
     aeg::tests::EditorCompositionFixture fixture;
     using namespace aeg::application;
     const auto top = build_composition_palette(fixture.document, fixture.catalog, {});
-    if (!top || top.value.size() != 1U || top.value.front().type.kind != aeg::pipeline::AuthoringTypeKind::kPipeline)
+    if (!top || std::none_of(top.value.begin(), top.value.end(), [](const auto& entry) {
+            return entry.type.kind == aeg::pipeline::AuthoringTypeKind::kPipeline;
+        }) ||
+        std::any_of(top.value.begin(), top.value.end(), [](const auto& entry) {
+            return entry.type.kind == aeg::pipeline::AuthoringTypeKind::kFeature;
+        }))
         return 1;
     const auto features =
         build_composition_palette(fixture.document, fixture.catalog, {EditorGraphKind::kFeature, "pipeline", {}, {}});
@@ -30,6 +35,21 @@ int main() {
     }
     if (!located)
         return 4;
+    {
+        auto resource_document = fixture.document;
+        resource_document.resources.push_back({.node_id = "feature/SceneTexture",
+                                                .resource_id = aeg::pipeline::RenderResourceId("Game.SceneTexture"),
+                                                .type = aeg::pipeline::ArtifactTypeId("Pipeline.DefaultTexture")});
+        resource_document.edges.push_back({.edge_id = "scene-texture",
+                                           .kind = aeg::pipeline::DocumentEdgeKind::kRenderResource,
+                                           .source = {"pass", 11},
+                                           .destination = {"feature/SceneTexture", 77}});
+        const auto target = resolve_composition_diagnostic(
+            resource_document,
+            {.code = "resource.binding", .message = "resource binding", .node_id = "feature/SceneTexture"});
+        if (!target || target.value.node_id != "pass" || target.value.graph.kind != EditorGraphKind::kPass)
+            return 5;
+    }
     std::cout << "Editor composition palette smoke passed\n";
     return 0;
 }

@@ -9,6 +9,7 @@
 #include <string_view>
 
 #include "pipeline.hpp"
+#include "pipeline_configuration.hpp"
 #include "result.hpp"
 
 namespace aeg::renderer {
@@ -44,7 +45,7 @@ inline constexpr pipeline::FeatureId kOpaqueRenderFeatureId{"Renderer.OpaqueRend
     pipeline::RenderGraphBuilder& builder, const RenderFeatureContext& context, bool preserve_depth = false,
     pipeline::RenderGraphTexture shadow_map = {}, pipeline::RenderGraphBuffer light_clusters = {},
     const RenderShadowResource* shadow_resource = nullptr, const RenderLightCullingResource* light_culling = nullptr,
-    pipeline::RenderGraphTexture color_override = {});
+    pipeline::RenderGraphTexture color_override = {}, pipeline::RenderPassInstanceId authored_instance = {});
 
 /** @brief Builds an indexed geometry pass that writes the three deferred targets. */
 [[nodiscard]] foundation::Result build_gbuffer_render_graph(pipeline::RenderGraphBuilder& builder,
@@ -52,12 +53,14 @@ inline constexpr pipeline::FeatureId kOpaqueRenderFeatureId{"Renderer.OpaqueRend
                                                             pipeline::RenderGraphTexture albedo_target,
                                                             pipeline::RenderGraphTexture normal_target,
                                                             pipeline::RenderGraphTexture material_target,
-                                                            pipeline::RenderGraphTexture depth_target);
+                                                            pipeline::RenderGraphTexture depth_target,
+                                                            pipeline::RenderPassInstanceId authored_instance = {});
 
 /** @brief Builds a depth-only indexed geometry pass for shadow/Z-prepass stages. */
 [[nodiscard]] foundation::Result build_depth_render_graph(pipeline::RenderGraphBuilder& builder,
                                                           const RenderFeatureContext& context, const RenderView& view,
                                                           pipeline::RenderGraphTexture depth_target,
                                                           std::string_view pass_name = "Renderer.DepthPass",
-                                                          std::span<const RenderInstance> instances = {});
+                                                          std::span<const RenderInstance> instances = {},
+                                                          pipeline::RenderPassInstanceId authored_instance = {});
 }  // namespace aeg::renderer

@@ -1,6 +1,7 @@
 /** @file shadow_rendering.hpp @brief Directional shadow view and graph contracts. */
 #pragma once
 
+#include "pipeline_configuration.hpp"
 #include "renderer.hpp"
 
 namespace aeg::render_graph {
@@ -50,5 +51,6 @@ private:
 [[nodiscard]] foundation::Result build_shadow_render_graph(pipeline::RenderGraphBuilder& builder,
                                                            const RenderFeatureContext& context,
                                                            const RenderShadowView& shadow,
-                                                           pipeline::RenderGraphTexture depth_target);
+                                                           pipeline::RenderGraphTexture depth_target,
+                                                           pipeline::RenderPassInstanceId authored_instance = {});
 }  // namespace aeg::renderer

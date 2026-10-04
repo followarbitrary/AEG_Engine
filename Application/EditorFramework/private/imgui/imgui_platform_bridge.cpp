@@ -211,6 +211,19 @@ void update_monitors(ImGuiPlatformBridgeContext& context) noexcept {
         monitor.WorkSize = monitor.MainSize;
         monitor.DpiScale = metrics.framebuffer_scale_x;
 
+        // WindowMetrics describes the client area, not the monitor. Using
+        // that rectangle as the popup boundary shifts detached-window
+        // combos when they maximize to the left of the main editor window.
+        // Keep popup placement in desktop coordinates and off the taskbar.
+        const auto work_area_result = context.services->query_display_work_area(context.window);
+        if (work_area_result && work_area_result.value.is_valid()) {
+            const platform::DisplayWorkArea& work_area = work_area_result.value;
+            monitor.MainPos = monitor.WorkPos =
+                ImVec2(static_cast<float>(work_area.position.x), static_cast<float>(work_area.position.y));
+            monitor.MainSize = monitor.WorkSize =
+                ImVec2(static_cast<float>(work_area.extent.width), static_cast<float>(work_area.extent.height));
+        }
+
         ImGuiPlatformIO& platform_io = ImGui::GetPlatformIO();
         if (platform_io.Monitors.Size == 0) {
             platform_io.Monitors.push_back(monitor);

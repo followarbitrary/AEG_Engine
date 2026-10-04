@@ -3,6 +3,7 @@
 
 #include <filesystem>
 
+#include "pipeline_configuration.hpp"
 #include "renderer.hpp"
 
 namespace aeg::rhi {
@@ -39,5 +40,6 @@ private:
 /** @brief Samples HDR scene color and depth, then writes the view's final output. */
 [[nodiscard]] foundation::Result build_post_process_render_graph(
     pipeline::RenderGraphBuilder& builder, const RenderFeatureContext& context, pipeline::RenderGraphTexture hdr_color,
-    pipeline::RenderGraphTexture depth, pipeline::RenderGraphTexture output, rhi::ResourceUsage final_usage);
+    pipeline::RenderGraphTexture depth, pipeline::RenderGraphTexture output, rhi::ResourceUsage final_usage,
+    pipeline::RenderPassInstanceId authored_instance = {});
 }  // namespace aeg::renderer

@@ -215,7 +215,8 @@ foundation::Result build_light_culling_render_graph(pipeline::RenderGraphBuilder
                                                     const RenderFeatureContext& context,
                                                     pipeline::RenderGraphTexture depth,
                                                     pipeline::RenderGraphBuffer clusters,
-                                                    RenderLightCullingResource& resource) {
+                                                     RenderLightCullingResource& resource,
+                                                     pipeline::RenderPassInstanceId authored_instance) {
     using namespace foundation;
     if (!builder.is_runtime() || !context.is_valid() || render_feature_context(builder) != &context ||
         !depth.is_valid() || !clusters.is_valid() || !resource.pipeline.is_valid() || !resource.prepare_compute ||
@@ -263,7 +264,8 @@ foundation::Result build_light_culling_render_graph(pipeline::RenderGraphBuilder
             if (const auto r = command.bind_binding_set(0, set.value); !r)
                 return r;
             return command.dispatch({resource.tile_count_x, resource.tile_count_y, 1});
-        });
+        },
+        authored_instance);
     return pass ? Result::success() : pass.result;
 }
 }  // namespace aeg::renderer

@@ -34,6 +34,9 @@ struct EditorDiagnosticTarget final {
 [[nodiscard]] foundation::ResultValue<std::vector<EditorPaletteEntry>> build_composition_palette(
     const pipeline::PipelineDocument&, const pipeline::TypeCatalog&, const EditorGraphAddress&);
 
+/** Creates a valid authoring-only contract with no implementation or ports. */
+[[nodiscard]] pipeline::TypeCatalogEntry make_empty_custom_type(pipeline::AuthoringTypeKind, std::string_view name);
+
 [[nodiscard]] foundation::ResultValue<EditorDiagnosticTarget> resolve_composition_diagnostic(
     const pipeline::PipelineDocument&, const pipeline::DocumentDiagnostic&);
 

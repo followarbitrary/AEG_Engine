@@ -12,6 +12,7 @@
 #include <memory>
 #include <new>
 #include <span>
+#include <string_view>
 #include <utility>
 
 #include "editor_error.hpp"
@@ -19,36 +20,165 @@
 
 namespace aeg::editor {
 namespace {
+constexpr float editor_rail_window_padding_x = 4.0f;
+constexpr float editor_rail_marker_width = 2.0f;
+constexpr float editor_rail_marker_inset = 2.0f;
+constexpr float editor_rail_marker_gap = 6.0f;
+constexpr float editor_rail_marker_gutter =
+    editor_rail_marker_width + editor_rail_marker_inset + editor_rail_marker_gap;
+constexpr std::string_view editor_rail_width_reference = "ABCDEFGHIJKL";
+
 float editor_rail_width() {
-    return std::max(64.0f, ImGui::CalcTextSize("Settings").x + 16.0f);
+    return std::max(96.0f, ImGui::CalcTextSize(editor_rail_width_reference.data(),
+                                               editor_rail_width_reference.data() + editor_rail_width_reference.size())
+                               .x + 4.0f);
 }
-constexpr float editor_status_height = 28.0f;
-constexpr float workspace_brand_height = 30.0f;
-constexpr float workspace_navigation_height = 30.0f;
-constexpr float workspace_command_height =
-    EditorWorkspace::chrome_height() - workspace_brand_height - workspace_navigation_height;
+float editor_status_height() {
+    // The status row is compact at the default font size, but it must always
+    // leave a complete text line between its explicit vertical paddings.
+    return std::max(28.0f, ImGui::GetTextLineHeight() + 8.0f);
+}
+float workspace_navigation_height() { return std::max(30.0f, ImGui::GetFontSize() + 10.0f); }
+float workspace_command_height() { return std::max(44.0f, toolbar_height() + 12.0f); }
+
+struct editor_rail_label_lines final {
+    std::string_view first;
+    std::string_view second;
+    bool separated{false};
+    bool wrapped_lines{false};
+    bool first_ellipsized{false};
+    bool second_ellipsized{false};
+
+    [[nodiscard]] bool wrapped() const noexcept { return wrapped_lines; }
+};
+
+struct editor_rail_word_pair final {
+    std::string_view first;
+    std::string_view second;
+
+    [[nodiscard]] bool valid() const noexcept { return !first.empty() && !second.empty(); }
+};
+
+editor_rail_word_pair editor_rail_split_words(std::string_view text) {
+    const auto is_lower = [](char value) noexcept {
+        return value >= 'a' && value <= 'z';
+    };
+    const auto is_upper = [](char value) noexcept {
+        return value >= 'A' && value <= 'Z';
+    };
+
+    std::size_t split = text.find_first_of(" _-");
+    if (split == std::string_view::npos) {
+        for (std::size_t index = 1; index < text.size(); ++index) {
+            const char previous = text[index - 1];
+            const char current = text[index];
+            const bool lower_to_upper = is_lower(previous) && is_upper(current);
+            const bool acronym_to_word = is_upper(previous) && is_upper(current) && index + 1 < text.size() &&
+                                         is_lower(text[index + 1]);
+            if (lower_to_upper || acronym_to_word) {
+                split = index;
+                break;
+            }
+        }
+    }
+    if (split == std::string_view::npos || split == 0 || split + 1 >= text.size())
+        return {};
+
+    std::size_t second_start = split;
+    while (second_start < text.size() && (text[second_start] == ' ' || text[second_start] == '_' ||
+                                          text[second_start] == '-'))
+        ++second_start;
+    if (second_start >= text.size())
+        return {};
+    return {text.substr(0, split), text.substr(second_start)};
+}
+
+editor_rail_label_lines editor_rail_label_layout(const char* label, float available_width) {
+    const std::string_view text(label);
+    const editor_rail_word_pair words = editor_rail_split_words(text);
+    if (!words.valid()) {
+        if (ImGui::CalcTextSize(text.data(), text.data() + text.size()).x <= available_width)
+            return {text, {}};
+        return {text, {}, false, false, true, false};
+    }
+
+    const float separator_width = ImGui::CalcTextSize(" ").x;
+    const float first_width = ImGui::CalcTextSize(words.first.data(), words.first.data() + words.first.size()).x;
+    const float second_width = ImGui::CalcTextSize(words.second.data(), words.second.data() + words.second.size()).x;
+    if (first_width + separator_width + second_width <= available_width)
+        return {words.first, words.second, true, false, false, false};
+
+    return {words.first, words.second, false, true, first_width > available_width, second_width > available_width};
+}
+
+void draw_editor_rail_label(ImDrawList* draw, const editor_rail_label_lines& lines, const ImVec2& center,
+                            float top, float available_width, ImU32 color) {
+    const auto draw_line = [draw, color](std::string_view line, float center_x, float y, float width,
+                                         bool ellipsized) {
+        if (line.empty())
+            return;
+        if (ellipsized) {
+            const ImVec2 min{center_x - width * 0.5f, y};
+            const ImVec2 max{center_x + width * 0.5f, y + ImGui::GetTextLineHeight()};
+            ImGui::PushStyleColor(ImGuiCol_Text, color);
+            ImGui::RenderTextEllipsis(draw, min, max, max.x, line.data(), line.data() + line.size(), nullptr);
+            ImGui::PopStyleColor();
+            return;
+        }
+        const ImVec2 line_size = ImGui::CalcTextSize(line.data(), line.data() + line.size());
+        draw->AddText(ImVec2{center_x - line_size.x * 0.5f, y}, color, line.data(), line.data() + line.size());
+    };
+    if (lines.wrapped()) {
+        draw_line(lines.first, center.x, top, available_width, lines.first_ellipsized);
+        draw_line(lines.second, center.x, top + ImGui::GetTextLineHeight(), available_width, lines.second_ellipsized);
+    } else if (lines.separated) {
+        const float first_width = ImGui::CalcTextSize(lines.first.data(), lines.first.data() + lines.first.size()).x;
+        const float second_width = ImGui::CalcTextSize(lines.second.data(), lines.second.data() + lines.second.size()).x;
+        const float separator_width = ImGui::CalcTextSize(" ").x;
+        const float left = center.x - (first_width + separator_width + second_width) * 0.5f;
+        draw_line(lines.first, left + first_width * 0.5f, top, first_width, false);
+        draw_line(lines.second, left + first_width + separator_width + second_width * 0.5f, top, second_width, false);
+    } else {
+        draw_line(lines.first, center.x, top, available_width, lines.first_ellipsized);
+    }
+}
+
 bool editor_rail_button(const char* label, bool active) {
     const ImVec2 pos = ImGui::GetCursorScreenPos();
-    const ImVec2 size{ImGui::GetContentRegionAvail().x, 64.0f};
+    const float available_width = std::max(0.0f, ImGui::GetContentRegionAvail().x - editor_rail_marker_gutter);
+    const editor_rail_label_lines label_lines = editor_rail_label_layout(label, available_width);
+    const float line_height = ImGui::GetTextLineHeight();
+    const float button_height = label_lines.wrapped() ? std::max(64.0f, 38.0f + 2.0f * line_height)
+                                                      : std::max(64.0f, 47.0f + line_height);
+    const ImVec2 size{ImGui::GetContentRegionAvail().x, button_height};
     const bool pressed = ImGui::InvisibleButton(label, size);
     auto* draw = ImGui::GetWindowDrawList();
     const ImU32 color = active ? IM_COL32(115, 230, 195, 255) : IM_COL32(144, 165, 176, 255);
     if (active || ImGui::IsItemHovered())
         draw->AddRectFilled(pos, ImVec2{pos.x + size.x, pos.y + size.y},
                             active ? IM_COL32(18, 51, 47, 255) : IM_COL32(16, 35, 44, 255), 4.0f);
-    if (active)
-        draw->AddLine(pos, ImVec2{pos.x, pos.y + size.y}, color, 2.0f);
-    const ImVec2 center{pos.x + size.x * 0.5f, pos.y + 22.0f};
-    if (std::string_view(label) == "Pipeline") {
-        for (int i = 0; i < 3; ++i)
-            draw->AddRect(ImVec2{center.x - 8.0f + i * 6, center.y + 6.0f - (i + 1) * 5},
-                          ImVec2{center.x - 4.0f + i * 6, center.y + 7.0f}, color, 0, 0, 1.3f);
-    } else if (std::string_view(label) == "Settings") {
+    if (active) {
+        // The marker has its own gutter so it can never share pixels with a
+        // label, including when the UI font is scaled up.
+        const float marker_right = pos.x + size.x - editor_rail_marker_inset;
+        draw->AddRectFilled(ImVec2{marker_right - editor_rail_marker_width, pos.y + 4.0f},
+                            ImVec2{marker_right, pos.y + size.y - 4.0f}, color);
+    }
+    const float label_area_width = std::max(0.0f, size.x - editor_rail_marker_gutter);
+    const bool wrapped = label_lines.wrapped();
+    const ImVec2 center{pos.x + label_area_width * 0.5f, pos.y + (wrapped ? 17.0f : 22.0f)};
+    if (std::string_view(label) == "Settings") {
         draw->AddCircle(center, 8.0f, color, 8, 1.5f);
         draw->AddCircle(center, 3.0f, color, 12, 1.5f);
     } else if (std::string_view(label) == "Assets") {
         draw->AddRect(ImVec2{center.x - 9, center.y - 5}, ImVec2{center.x + 9, center.y + 7}, color, 2, 0, 1.5f);
         draw->AddLine(ImVec2{center.x - 8, center.y - 8}, ImVec2{center.x - 1, center.y - 8}, color, 1.5f);
+    } else if (std::string_view(label) == "FlowGraph") {
+        draw->AddLine(ImVec2{center.x - 7, center.y - 3}, ImVec2{center.x + 3, center.y - 7}, color, 1.5f);
+        draw->AddLine(ImVec2{center.x - 7, center.y - 3}, ImVec2{center.x + 3, center.y + 6}, color, 1.5f);
+        draw->AddCircleFilled(ImVec2{center.x - 8, center.y - 3}, 3.0f, color);
+        draw->AddCircleFilled(ImVec2{center.x + 5, center.y - 8}, 3.0f, color);
+        draw->AddCircleFilled(ImVec2{center.x + 5, center.y + 7}, 3.0f, color);
     } else {
         draw->AddQuad(ImVec2{center.x, center.y - 9}, ImVec2{center.x + 8, center.y - 4},
                       ImVec2{center.x, center.y + 1}, ImVec2{center.x - 8, center.y - 4}, color, 1.5f);
@@ -57,7 +187,13 @@ bool editor_rail_button(const char* label, bool active) {
         draw->AddLine(ImVec2{center.x - 8, center.y + 5}, ImVec2{center.x, center.y + 10}, color, 1.5f);
         draw->AddLine(ImVec2{center.x + 8, center.y + 5}, ImVec2{center.x, center.y + 10}, color, 1.5f);
     }
-    draw->AddText(ImVec2{center.x - ImGui::CalcTextSize(label).x * 0.5f, pos.y + 43}, color, label);
+    draw_editor_rail_label(draw, label_lines, center, pos.y + (wrapped ? 34.0f : 43.0f), label_area_width, color);
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+        if (std::string_view(label) == "FlowGraph")
+            ImGui::SetTooltip("Open Flow Graph");
+        else
+            ImGui::SetTooltip("Open %s", label);
+    }
     return pressed;
 }
 [[nodiscard]] ImGuiID dock_node_for_region(EditorDockRegion region, ImGuiID center, ImGuiID left, ImGuiID right,
@@ -264,6 +400,9 @@ foundation::Result EditorWorkspace::invoke_view_action(std::string_view action_k
     if (action == nullptr) {
         return foundation::not_found("Editor workspace View action key is not registered");
     }
+    if (action->enabled && !action->enabled()) {
+        return foundation::invalid_state("Editor workspace action is currently unavailable");
+    }
     ImGuiContext* context = ImGui::GetCurrentContext();
     const bool has_frame = context != nullptr && context->WithinFrameScope;
     ImGuiWindow* owner_window = has_frame ? context->CurrentWindow : nullptr;
@@ -318,32 +457,21 @@ foundation::Result EditorWorkspace::build_ui() {
         // The editor's top chrome is intentionally split into three rows.  Keeping
         // commands out of the native menu bar prevents the old one-line layout
         // from collapsing the editor hierarchy on wide displays.
-        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2{12.0f, 6.0f});
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2{10.0f, 5.0f});
         if (ImGui::BeginMainMenuBar()) {
             ImGui::TextColored(ImVec4{0.18f, 0.93f, 0.86f, 1.0f}, "AEG");
-            ImGui::SameLine(0.0f, 12.0f);
-            ImGui::TextDisabled("|");
-            ImGui::SameLine(0.0f, 12.0f);
-            ImGui::TextUnformatted("AEG Engine  —  Editor");
-            const char* status_text = playing_ ? "Playing" : "Ready";
+            if (ImGui::GetWindowWidth() > ImGui::CalcTextSize("AEG Engine — Editor").x + 340.0f) {
+                ImGui::SameLine(0.0f, 10.0f);
+                ImGui::TextDisabled("|");
+                ImGui::SameLine(0.0f, 10.0f);
+                ImGui::TextUnformatted("AEG Engine  —  Editor");
+            }
+            const char* status_text = paused_ ? "Paused" : playing_ ? "Playing" : "Ready";
             const float ready_width = ImGui::CalcTextSize(status_text).x + 18.0f;
-            const float workspace_width = ImGui::CalcTextSize("Workspace").x + 8.0f + 112.0f + 16.0f + ready_width +
+            const float workspace_width = ImGui::CalcTextSize("Game Workspace").x + 16.0f + ready_width +
                                           EditorWorkspace::title_control_width();
             ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(), ImGui::GetWindowWidth() - workspace_width));
-            ImGui::TextDisabled("Workspace");
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(112.0f);
-            constexpr const char* workspace_modes[]{"Game", "Editor"};
-            workspace_mode_ = std::clamp(workspace_mode_, 0, 1);
-            if (ImGui::BeginCombo("##WorkspaceMode", workspace_modes[workspace_mode_])) {
-                for (int mode = 0; mode < 2; ++mode) {
-                    if (ImGui::Selectable(workspace_modes[mode], workspace_mode_ == mode))
-                        workspace_mode_ = mode;
-                    if (workspace_mode_ == mode)
-                        ImGui::SetItemDefaultFocus();
-                }
-                ImGui::EndCombo();
-            }
+            ImGui::TextDisabled("Game Workspace");
             ImGui::SameLine(0.0f, 16.0f);
             const ImVec2 status_position = ImGui::GetCursorScreenPos();
             const float status_height = ImGui::GetFrameHeight();
@@ -357,7 +485,8 @@ foundation::Result EditorWorkspace::build_ui() {
                                         status_position.y + (status_height - ImGui::GetTextLineHeight()) * 0.5f},
                                  ImGui::GetColorU32(status_color), status_text);
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
-                ImGui::SetTooltip("%s", playing_ ? "The game runtime is active." : "The editor is ready.");
+                ImGui::SetTooltip("%s", paused_ ? "The game runtime is paused."
+                                                 : playing_ ? "The game runtime is active." : "The editor is ready.");
             }
             ImGui::SameLine(0.0f, 8.0f);
             const auto title_control = [&](const char* id, int kind,
@@ -370,7 +499,7 @@ foundation::Result EditorWorkspace::build_ui() {
                 const ImU32 background = hovered ? (kind == 2 ? IM_COL32(190, 52, 56, 255) : IM_COL32(22, 62, 70, 255))
                                                  : IM_COL32(3, 24, 30, 255);
                 const ImU32 foreground = IM_COL32(174, 207, 211, 255);
-                draw->AddRectFilled(position, ImVec2{position.x + size.x, position.y + size.y}, background);
+                draw->AddRectFilled(position, ImVec2{position.x + size.x, position.y + size.y}, background, 3.0f);
                 const ImVec2 center{position.x + size.x * 0.5f, position.y + size.y * 0.5f};
                 if (kind == 0)
                     draw->AddLine(ImVec2{center.x - 5.0f, center.y}, ImVec2{center.x + 5.0f, center.y}, foreground,
@@ -408,9 +537,9 @@ foundation::Result EditorWorkspace::build_ui() {
             const ImVec2 chrome_size = chrome_viewport->Size;
             const float brand_height = std::max(0.0f, chrome_viewport->WorkPos.y - chrome_viewport->Pos.y);
             ImGui::SetNextWindowPos(ImVec2{chrome_pos.x, chrome_pos.y + brand_height});
-            ImGui::SetNextWindowSize(ImVec2{chrome_size.x, workspace_navigation_height});
+            ImGui::SetNextWindowSize(ImVec2{chrome_size.x, workspace_navigation_height()});
             ImGui::SetNextWindowViewport(chrome_viewport->ID);
-            ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4{0.018f, 0.075f, 0.095f, 1.0f});
+            ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4{0.025f, 0.062f, 0.080f, 1.0f});
             ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2{12.0f, 3.0f});
             ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
             ImGui::PushStyleVar(ImGuiStyleVar_WindowMinSize, ImVec2{0.0f, 0.0f});
@@ -435,9 +564,13 @@ foundation::Result EditorWorkspace::build_ui() {
                             if (state == nullptr)
                                 continue;
                             bool visible = state->visible;
+                            const std::string panel_title = entry.descriptor.title == "FlowGraph" ||
+                                                                    entry.descriptor.title == "Flow Graph###FlowGraph"
+                                                                ? "Flow Graph"
+                                                                : entry.descriptor.title;
                             if (!entry.descriptor.closable)
                                 ImGui::BeginDisabled();
-                            if (ImGui::MenuItem(entry.descriptor.title.c_str(), nullptr, &visible) &&
+                            if (ImGui::MenuItem(panel_title.c_str(), nullptr, &visible) &&
                                 entry.descriptor.closable) {
                                 if (const foundation::Result result = set_panel_visible(entry.descriptor.key, visible);
                                     !result && action_result)
@@ -446,7 +579,7 @@ foundation::Result EditorWorkspace::build_ui() {
                             if (!entry.descriptor.closable)
                                 ImGui::EndDisabled();
                             if (entry.descriptor.closable &&
-                                ImGui::BeginMenu((entry.descriptor.title + " Window").c_str())) {
+                                ImGui::BeginMenu((panel_title + " Window").c_str())) {
                                 const bool docked =
                                     panel_presentation(entry.descriptor.key) == PanelPresentation::kDockWindow;
                                 if (ImGui::MenuItem("Dock Window", nullptr, docked) && !docked) {
@@ -465,107 +598,108 @@ foundation::Result EditorWorkspace::build_ui() {
                             }
                         }
                         for (const EditorWorkspaceActionDescriptor& action : view_actions_) {
-                            if (action.show_in_view_menu && ImGui::MenuItem(action.title.c_str()))
-                                invoke_action(action.key);
+                            // Panel entries and actions share the Window menu. Keep the
+                            // visible title human-readable while giving every action a
+                            // stable, key-scoped ImGui ID; otherwise an action named
+                            // "FlowGraph" collides with the FlowGraph panel entry.
+                            const std::string action_label = action.title + "##view_action_" + action.key;
+                            if (action.show_in_view_menu) {
+                                const bool enabled = !action.enabled || action.enabled();
+                                ImGui::BeginDisabled(!enabled);
+                                if (ImGui::MenuItem(action_label.c_str()))
+                                    invoke_action(action.key);
+                                ImGui::EndDisabled();
+                            }
                         }
                         ImGui::EndMenu();
                     }
                     ImGui::EndMenuBar();
                 }
             }
+            const ImVec2 navigation_origin = ImGui::GetWindowPos();
+            const ImVec2 navigation_size = ImGui::GetWindowSize();
+            ImGui::GetWindowDrawList()->AddLine(
+                ImVec2{navigation_origin.x, navigation_origin.y + navigation_size.y - 1.0f},
+                ImVec2{navigation_origin.x + navigation_size.x, navigation_origin.y + navigation_size.y - 1.0f},
+                IM_COL32(18, 59, 68, 255));
             ImGui::End();
             ImGui::PopStyleVar(3);
             ImGui::PopStyleColor();
 
-            ImGui::SetNextWindowPos(ImVec2{chrome_pos.x, chrome_pos.y + brand_height + workspace_navigation_height});
-            ImGui::SetNextWindowSize(ImVec2{chrome_size.x, workspace_command_height});
+            ImGui::SetNextWindowPos(ImVec2{chrome_pos.x, chrome_pos.y + brand_height + workspace_navigation_height()});
+            ImGui::SetNextWindowSize(ImVec2{chrome_size.x, workspace_command_height()});
             ImGui::SetNextWindowViewport(chrome_viewport->ID);
-            ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4{0.016f, 0.09f, 0.115f, 1.0f});
-            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2{14.0f, 0.0f});
+            ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4{0.020f, 0.082f, 0.102f, 1.0f});
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2{12.0f, 0.0f});
             ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
             if (ImGui::Begin("##WorkspaceCommands", nullptr,
                              ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoMove |
                                  ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus)) {
                 const ImVec2 command_origin = ImGui::GetWindowPos();
                 ImGui::SetCursorScreenPos(
-                    ImVec2{command_origin.x + 14.0f,
-                           command_origin.y + std::max(0.0f, (workspace_command_height - toolbar_height()) * 0.5f)});
+                    ImVec2{command_origin.x + 12.0f,
+                           command_origin.y + std::max(0.0f, (workspace_command_height() - toolbar_height()) * 0.5f)});
                 ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2{9.0f, 5.0f});
-                const auto command = [&](const char* label, std::string_view action,
-                                         ToolbarIcon icon = ToolbarIcon::None, bool emphasized = false) {
-                    if (toolbar_button(label, label, icon, emphasized) && find_view_action(action))
-                        invoke_action(action);
+                const auto available = [&](std::string_view key) {
+                    const auto* action = find_view_action(key);
+                    return action && (!action->enabled || action->enabled());
                 };
-                command("Save", "save_scene");
+                const auto command = [&](const char* label, std::string_view action, const char* hint,
+                                         ToolbarIcon icon = ToolbarIcon::None, bool emphasized = false,
+                                         float width_override = 0.0f) {
+                    ImGui::BeginDisabled(!available(action));
+                    if (toolbar_button(label, hint, icon, emphasized, false, width_override))
+                        invoke_action(action);
+                    ImGui::EndDisabled();
+                };
+                const float spacing = ImGui::GetStyle().ItemSpacing.x;
+                const char* run_label = playing_ ? (paused_ ? "Resume" : "Pause") : "Play";
+                const auto button_width = [](const char* label, bool icon) {
+                    return ImGui::CalcTextSize(label).x + 24.0f + (icon ? 22.0f : 0.0f);
+                };
+                const float run_button_width = std::max({button_width("Play", true), button_width("Pause", true),
+                                                         button_width("Resume", true)});
+                const float core_width = button_width("Save", false) + run_button_width +
+                                         button_width("Stop", true) + 32.0f + spacing * 4.0f + 16.0f;
+                const float history_width = button_width("Undo", false) + button_width("Redo", false) + spacing * 2.0f;
+                const bool show_history = ImGui::GetContentRegionAvail().x >= core_width + history_width;
+                command("Save", "save_scene", "Save the current scene (Ctrl+S)");
+                if (show_history) {
+                    ImGui::SameLine();
+                    command("Undo", "undo", "Undo the last scene edit (Ctrl+Z)");
+                    ImGui::SameLine();
+                    command("Redo", "redo", "Redo the last scene edit (Ctrl+Y)");
+                }
+                ImGui::SameLine(0.0f, 16.0f);
+                command(run_label, playing_ && !paused_ ? "pause" : "play",
+                        playing_ && !paused_ ? "Pause the game preview" : "Start or resume the game preview",
+                        playing_ && !paused_ ? ToolbarIcon::Pause : ToolbarIcon::Play, true, run_button_width);
                 ImGui::SameLine();
-                ImGui::BeginDisabled(find_view_action("undo") == nullptr);
-                command("Undo", "undo");
-                ImGui::EndDisabled();
-                ImGui::SameLine();
-                ImGui::BeginDisabled(find_view_action("redo") == nullptr);
-                command("Redo", "redo");
-                ImGui::EndDisabled();
-                ImGui::SameLine();
-                ImGui::BeginDisabled();
-                toolbar_button("Auto-Layout", "Available in the Pipeline editor.");
-                ImGui::EndDisabled();
-                ImGui::SameLine();
-                ImGui::BeginDisabled();
-                toolbar_button("Validate", "Available in the Pipeline editor.");
-                ImGui::EndDisabled();
-                ImGui::SameLine();
-                ImGui::BeginDisabled();
-                toolbar_button("Preview", "Available in the Pipeline editor.", ToolbarIcon::Play);
-                ImGui::EndDisabled();
+                command("Stop", "stop", "Stop preview and restore the editing scene", ToolbarIcon::Stop);
 
-                const ImGuiStyle& style = ImGui::GetStyle();
-                constexpr float platform_combo_width = 132.0f;
-                constexpr float config_combo_width = 118.0f;
-                constexpr float more_button_width = 32.0f;
                 const bool has_refresh_action = find_view_action("refresh_assets") != nullptr;
                 const bool has_rebuild_action = find_view_action("rebuild_pipeline") != nullptr;
-                const bool has_more_actions = has_refresh_action || has_rebuild_action;
-                const float command_right_width = ImGui::CalcTextSize("Platform").x + style.ItemSpacing.x +
-                                                  platform_combo_width + 18.0f + ImGui::CalcTextSize("Config").x +
-                                                  style.ItemSpacing.x + config_combo_width +
-                                                  (has_more_actions ? 14.0f + more_button_width : 0.0f);
-                ImGui::SameLine();
-                ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX() + 20.0f,
-                                              ImGui::GetWindowContentRegionMax().x - command_right_width));
-                ImGui::TextDisabled("Platform");
-                ImGui::SameLine();
-                ImGui::SetNextItemWidth(platform_combo_width);
-                if (ImGui::BeginCombo("##WorkspacePlatform", "PC (Vulkan)")) {
-                    ImGui::Selectable("PC (Vulkan)", true);
-                    ImGui::Selectable("PC (DX12)", false);
-                    ImGui::EndCombo();
-                }
-                ImGui::SameLine(0.0f, 18.0f);
-                ImGui::TextDisabled("Config");
-                ImGui::SameLine();
-                ImGui::SetNextItemWidth(config_combo_width);
-                if (ImGui::BeginCombo("##WorkspaceConfig", "Editor")) {
-                    ImGui::Selectable("Editor", true);
-                    ImGui::Selectable("Deferred", false);
-                    ImGui::EndCombo();
-                }
-                if (has_more_actions) {
-                    ImGui::SameLine(0.0f, 14.0f);
-                    const ImVec2 more_size{more_button_width, toolbar_height()};
-                    const bool more_pressed = ImGui::Button("...", more_size);
-                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
-                        ImGui::SetTooltip("Project and pipeline actions");
-                    if (more_pressed)
-                        ImGui::OpenPopup("WorkspaceMore");
-                    if (ImGui::BeginPopup("WorkspaceMore")) {
-                        if (has_refresh_action && ImGui::MenuItem("Refresh Project Assets")) {
-                            invoke_action("refresh_assets");
-                        }
-                        if (has_rebuild_action && ImGui::MenuItem("Rebuild Editor Pipeline")) {
-                            invoke_action("rebuild_pipeline");
-                        }
-                        ImGui::EndPopup();
+                ImGui::SameLine(0.0f, 10.0f);
+                if (ImGui::Button("...##WorkspaceMore", ImVec2{32.0f, toolbar_height()}))
+                    ImGui::OpenPopup("WorkspaceMore");
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+                    ImGui::SetTooltip("More editor actions");
+                if (ImGui::BeginPopup("WorkspaceMore")) {
+                    if (!show_history) {
+                        if (ImGui::MenuItem("Undo", "Ctrl+Z", false, available("undo"))) invoke_action("undo");
+                        if (ImGui::MenuItem("Redo", "Ctrl+Y", false, available("redo"))) invoke_action("redo");
+                        ImGui::Separator();
                     }
+                    if (has_refresh_action && ImGui::MenuItem("Refresh Project Assets", "F5", false,
+                                                              available("refresh_assets")))
+                        invoke_action("refresh_assets");
+                    if (has_rebuild_action && ImGui::MenuItem("Rebuild Editor Pipeline", nullptr, false,
+                                                              available("rebuild_pipeline")))
+                        invoke_action("rebuild_pipeline");
+                    ImGui::Separator();
+                    if (ImGui::MenuItem("Reset Panel Layout")) dockspace_initialized_ = false;
+                    if (ImGui::MenuItem("Reset Navigation Width")) navigation_width_ = 0.0f;
+                    ImGui::EndPopup();
                 }
                 ImGui::PopStyleVar();
             }
@@ -582,25 +716,45 @@ foundation::Result EditorWorkspace::build_ui() {
 
         const ImGuiViewport* main_viewport = ImGui::GetMainViewport();
         if (main_viewport != nullptr) {
-            const float remaining_chrome_height = workspace_navigation_height + workspace_command_height;
+            const float rail_width = navigation_width_ > 0.0f ? navigation_width_ : editor_rail_width();
+            const float remaining_chrome_height = workspace_navigation_height() + workspace_command_height();
             const ImVec2 workspace_pos{main_viewport->WorkPos.x, main_viewport->WorkPos.y + remaining_chrome_height};
             ImGui::SetNextWindowPos(workspace_pos);
             ImGui::SetNextWindowSize(
-                ImVec2{editor_rail_width(),
-                       std::max(0.0f, main_viewport->WorkSize.y - remaining_chrome_height - editor_status_height)});
+                ImVec2{rail_width,
+                       std::max(0.0f, main_viewport->WorkSize.y - remaining_chrome_height - editor_status_height())});
             ImGui::SetNextWindowViewport(main_viewport->ID);
             constexpr ImGuiWindowFlags rail_flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoDocking |
                                                     ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove |
                                                     ImGuiWindowFlags_NoBringToFrontOnFocus;
-            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2{4.0f, 8.0f});
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                                ImVec2{editor_rail_window_padding_x, 8.0f});
             if (ImGui::Begin("##EditorRail", nullptr, rail_flags)) {
                 ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2{4.0f, 8.0f});
-                const auto rail_button = [this](const char* label, const char* panel_key) {
+                const auto rail_button = [this, &action_result](const char* label, const char* panel_key) {
                     const bool active = !preferences_open_ && active_rail_ == label;
                     if (active)
                         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4{0.07f, 0.25f, 0.22f, 1.0f});
                     if (editor_rail_button(label, active)) {
-                        active_rail_ = label;
+                        if (std::string_view{label} == "FlowGraph") {
+                            // The FlowGraph is a heavyweight authoring surface. Keep the
+                            // main editor layout intact and promote it to a native viewport
+                            // only when the host supports multi-viewport windows. Headless
+                            // ImGui tests retain the docked fallback deterministically.
+                            const PanelPresentation presentation = imgui_host_->viewports_enabled()
+                                                                       ? PanelPresentation::kNativeWindow
+                                                                       : PanelPresentation::kDockWindow;
+                            if (const foundation::Result result =
+                                    set_panel_presentation(panel_key, presentation);
+                                !result) {
+                                if (action_result)
+                                    action_result = result;
+                            } else {
+                                active_rail_ = label;
+                            }
+                        } else {
+                            active_rail_ = label;
+                        }
                         static_cast<void>(set_panel_visible(panel_key, true));
                         pending_panel_focus_ = panel_key;
                     }
@@ -608,7 +762,7 @@ foundation::Result EditorWorkspace::build_ui() {
                         ImGui::PopStyleColor();
                 };
                 rail_button("Scene", "scene_viewport");
-                rail_button("Pipeline", "pipeline");
+                rail_button("FlowGraph", "flowgraph");
                 rail_button("Assets", "assets");
                 const bool settings_active = preferences_open_;
                 if (settings_active)
@@ -624,6 +778,45 @@ foundation::Result EditorWorkspace::build_ui() {
             }
             ImGui::End();
             ImGui::PopStyleVar();
+
+            // The navigation rail is deliberately outside the dock tree, so a
+            // small independent handle keeps its width user-adjustable without
+            // letting the dock builder fight the drag operation.
+            const float rail_height =
+                std::max(0.0f, main_viewport->WorkSize.y - remaining_chrome_height - editor_status_height());
+            ImGui::SetNextWindowPos(ImVec2{workspace_pos.x + rail_width - 3.0f, workspace_pos.y});
+            ImGui::SetNextWindowSize(ImVec2{6.0f, rail_height});
+            ImGui::SetNextWindowViewport(main_viewport->ID);
+            constexpr ImGuiWindowFlags rail_resize_flags =
+                ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoSavedSettings |
+                ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNav |
+                ImGuiWindowFlags_NoFocusOnAppearing;
+            ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4{0.0f, 0.0f, 0.0f, 0.0f});
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2{0.0f, 0.0f});
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowMinSize, ImVec2{0.0f, 0.0f});
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+            if (ImGui::Begin("##EditorRailResize", nullptr, rail_resize_flags)) {
+                const bool handle_hovered_or_active = ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
+                ImGui::InvisibleButton("##ResizeHandle", ImVec2{6.0f, rail_height});
+                if (ImGui::IsItemHovered() || ImGui::IsItemActive())
+                    ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+                if (ImGui::IsItemActive()) {
+                    navigation_width_ = std::clamp(ImGui::GetMousePos().x - workspace_pos.x, 64.0f, 260.0f);
+                }
+                if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+                    navigation_width_ = 0.0f;
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+                    ImGui::SetTooltip("Drag to resize; double-click to restore automatic width");
+                if (handle_hovered_or_active || ImGui::IsItemActive()) {
+                    ImGui::GetWindowDrawList()->AddRectFilled(
+                        ImVec2{ImGui::GetWindowPos().x + 2.0f, workspace_pos.y},
+                        ImVec2{ImGui::GetWindowPos().x + 4.0f, workspace_pos.y + rail_height},
+                        IM_COL32(83, 186, 171, ImGui::IsItemActive() ? 230 : 120));
+                }
+            }
+            ImGui::End();
+            ImGui::PopStyleVar(3);
+            ImGui::PopStyleColor();
         }
 
         if (const foundation::Result result = initialize_dockspace(); !result) {
@@ -641,22 +834,38 @@ foundation::Result EditorWorkspace::build_ui() {
         }
         const ImGuiViewport* viewport = ImGui::GetMainViewport();
         if (viewport != nullptr && viewport->WorkSize.x > 0.0f && viewport->WorkSize.y > 30.0f) {
-            ImGui::SetNextWindowPos(ImVec2{viewport->WorkPos.x, viewport->WorkPos.y + viewport->WorkSize.y - 28.0f});
-            ImGui::SetNextWindowSize(ImVec2{viewport->WorkSize.x, 28.0f});
+            const float status_height = editor_status_height();
+            ImGui::SetNextWindowPos(
+                ImVec2{viewport->WorkPos.x, viewport->WorkPos.y + viewport->WorkSize.y - status_height});
+            ImGui::SetNextWindowSize(ImVec2{viewport->WorkSize.x, status_height});
             ImGui::SetNextWindowViewport(viewport->ID);
             constexpr ImGuiWindowFlags status_flags =
                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoSavedSettings |
                 ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoMove;
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2{12.0f, 4.0f});
             if (ImGui::Begin("##EditorStatusBar", nullptr, status_flags)) {
                 ImGui::TextDisabled("AEG Engine / Editor");
-                ImGui::SameLine();
-                ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(), ImGui::GetWindowWidth() - 360.0f));
                 const float fps = ImGui::GetIO().Framerate;
+                const float backend_width = ImGui::CalcTextSize("PC / Vulkan").x + 12.0f;
+                const float metrics_width = ImGui::CalcTextSize("Frame 000.0 ms  |  000 FPS  |  Game Draw Calls 000000").x;
+                const bool show_backend = ImGui::GetWindowWidth() >= backend_width + metrics_width + 180.0f;
+                ImGui::SameLine();
+                if (show_backend) {
+                    ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(),
+                                                  ImGui::GetWindowWidth() - backend_width - metrics_width - 28.0f));
+                    ImGui::AlignTextToFramePadding();
+                    ImGui::TextDisabled("PC / Vulkan");
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+                        ImGui::SetTooltip("Current editor rendering backend");
+                    ImGui::SameLine(0.0f, 16.0f);
+                }
+                ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(), ImGui::GetWindowWidth() - metrics_width - 12.0f));
                 ImGui::TextDisabled("Frame %.1f ms  |  %.0f FPS  |  Game Draw Calls %u",
                                     fps > 0.0f ? 1000.0f / fps : 0.0f, fps,
                                     static_cast<unsigned int>(game_draw_calls_));
             }
             ImGui::End();
+            ImGui::PopStyleVar();
         }
         return action_result;
     });
@@ -746,10 +955,12 @@ foundation::Result EditorWorkspace::initialize_dockspace() {
     }
     // The rail is outside the dock tree. Empty dock leaves are collapsed by ImGui,
     // so reserve its space in the host rectangle instead of an empty split node.
-    const float remaining_chrome_height = workspace_navigation_height + workspace_command_height;
-    const ImVec2 dock_pos{viewport->WorkPos.x + editor_rail_width(), viewport->WorkPos.y + remaining_chrome_height};
-    const ImVec2 dock_size{std::max(1.0f, viewport->WorkSize.x - editor_rail_width()),
-                           std::max(1.0f, viewport->WorkSize.y - remaining_chrome_height - editor_status_height)};
+    const float remaining_chrome_height = workspace_navigation_height() + workspace_command_height();
+    const auto* rail = ImGui::FindWindowByName("##EditorRail");
+    const float rail_width = rail ? rail->Size.x : editor_rail_width();
+    const ImVec2 dock_pos{viewport->WorkPos.x + rail_width, viewport->WorkPos.y + remaining_chrome_height};
+    const ImVec2 dock_size{std::max(1.0f, viewport->WorkSize.x - rail_width),
+                           std::max(1.0f, viewport->WorkSize.y - remaining_chrome_height - editor_status_height())};
     ImGui::SetNextWindowPos(dock_pos);
     ImGui::SetNextWindowSize(dock_size);
     ImGui::SetNextWindowViewport(viewport->ID);
@@ -778,16 +989,21 @@ foundation::Result EditorWorkspace::initialize_dockspace() {
 
     ImGuiID left_node = 0;
     ImGuiID remaining_node = 0;
-    const float hierarchy_width = std::clamp(dock_size.x * 0.095f, 180.0f, 240.0f);
+    // Keep a readable side-panel budget while reserving a center canvas even at
+    // compact window sizes. Fixed side minima can otherwise consume the whole host.
+    const float center_minimum = std::min(760.0f, std::max(126.0f, dock_size.x * 0.42f));
+    const float side_budget = std::max(0.0f, dock_size.x - center_minimum);
+    const float hierarchy_width = std::min(std::clamp(dock_size.x * 0.11f, 210.0f, 270.0f), side_budget * 0.43f);
     ImGui::DockBuilderSplitNode(dockspace_id, ImGuiDir_Left, hierarchy_width / dock_size.x, &left_node,
                                 &remaining_node);
     ImGuiID right_node = 0;
-    const float inspector_width = std::clamp(dock_size.x * 0.13f, 280.0f, 340.0f);
+    const float inspector_budget = std::max(0.0f, side_budget - hierarchy_width);
+    const float inspector_width = std::min(std::clamp(dock_size.x * 0.16f, 310.0f, 380.0f), inspector_budget);
     ImGui::DockBuilderSplitNode(remaining_node, ImGuiDir_Right,
                                 inspector_width / std::max(1.0f, dock_size.x - hierarchy_width), &right_node,
                                 &remaining_node);
     ImGuiID bottom_node = 0;
-    ImGui::DockBuilderSplitNode(remaining_node, ImGuiDir_Down, 0.28f, &bottom_node, &remaining_node);
+    ImGui::DockBuilderSplitNode(remaining_node, ImGuiDir_Down, 0.30f, &bottom_node, &remaining_node);
 
     for (const PanelEntry& entry : panels_) {
         const EditorPanelLayoutState* state = layout_->find_panel(entry.descriptor.key);

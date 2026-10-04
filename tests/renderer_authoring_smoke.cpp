@@ -23,7 +23,7 @@ int main() {
     }
     const auto* declaration = std::get_if<aeg::pipeline::FeatureAuthoringDeclaration>(&forward_feature->declaration);
     if (declaration == nullptr || declaration->allowed_pass_types.size() != 5u ||
-        declaration->default_resources.size() != 5u) {
+        declaration->default_resources.size() != 5u || !declaration->allow_add_passes) {
         return 4;
     }
     aeg::pipeline::TypeCatalogEntry collision = *deferred;
@@ -46,24 +46,40 @@ int main() {
         if (!diagnostics.empty())
             return 8;
         auto prepared = aeg::pipeline::prepare_pipeline_document(document, catalog, pipelines, passes);
-        if (!prepared)
+        if (!prepared || prepared.value.data_dependencies.empty())
             return 9;
         auto reversed = document;
         std::reverse(reversed.pass_nodes.begin(), reversed.pass_nodes.end());
+        if (aeg::pipeline::document_semantic_digest(reversed) ==
+            aeg::pipeline::document_semantic_digest(document))
+            return 23;
         auto ordered = aeg::pipeline::prepare_pipeline_document(reversed, catalog, pipelines, passes);
         if (!ordered ||
             ordered.value.configurations.front()->features.front().passes.front().source !=
-                document.pass_nodes.front().node_id ||
-            ordered.value.configurations.front()->features.front().passes[1].ordered_after.empty())
+                document.pass_nodes[1].node_id ||
+            !std::any_of(ordered.value.configurations.front()->features.front().passes.begin() + 1,
+                         ordered.value.configurations.front()->features.front().passes.end(),
+                         [](const auto& pass) { return !pass.ordered_after.empty(); })) {
             return 20;
-        auto virtual_defaults = document;
-        virtual_defaults.pass_nodes.clear();
-        virtual_defaults.edges.clear();
-        virtual_defaults.present_connections = {document.feature_nodes.front().node_id};
-        auto materialized = aeg::pipeline::prepare_pipeline_document(virtual_defaults, catalog, pipelines, passes);
-        if (!materialized ||
-            materialized.value.configurations.front()->features.front().passes.size() != document.pass_nodes.size() ||
-            materialized.value.configurations.front()->features.front().passes.front().resource_bindings.empty())
+        }
+        auto legacy_ordered = reversed;
+        legacy_ordered.edges.push_back({"legacy-pass-order", aeg::pipeline::DocumentEdgeKind::kOrdering,
+                                        {document.pass_nodes[0].node_id, 0, 0},
+                                        {document.pass_nodes[1].node_id, 0, 0}, 0});
+        auto migrated_order = aeg::pipeline::prepare_pipeline_document(legacy_ordered, catalog, pipelines, passes);
+        if (!migrated_order ||
+            migrated_order.value.configurations.front()->features.front().passes.front().source !=
+                document.pass_nodes[1].node_id)
+            return 22;
+        auto explicitly_empty = document;
+        explicitly_empty.pass_nodes.clear();
+        explicitly_empty.edges.clear();
+        explicitly_empty.input_bindings.clear();
+        explicitly_empty.present_connections = {document.feature_nodes.front().node_id};
+        auto empty_materialized =
+            aeg::pipeline::prepare_pipeline_document(explicitly_empty, catalog, pipelines, passes);
+        if (!empty_materialized ||
+            !empty_materialized.value.configurations.front()->features.front().passes.empty())
             return 21;
         auto configuration = prepared.value.configurations.front();
         aeg::pipeline::PipelineScopeHost host(aeg::pipeline::PipelineScope::kFrame, configuration->instance);

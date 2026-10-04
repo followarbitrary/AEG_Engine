@@ -111,28 +111,50 @@ public:
     }
 
 protected:
+    [[nodiscard]] bool handles_authored_render_passes_for_part(pipeline::FeatureInstanceId,
+                                                                pipeline::FeaturePartId part) const noexcept override {
+        return !part.is_valid();
+    }
+
     foundation::Result setup(pipeline::RenderGraphBuilder& builder) const override {
         if (builder.pipeline_id() != pipeline_id(variant_) || builder.scope() != pipeline::PipelineScope::kFrame ||
             builder.feature_point() != pipeline::FeaturePointId(stage_name(variant_, "BeforePresent")))
             return foundation::invalid_argument("renderer feature requires its own BeforePresent frame anchor");
+        // The built-in graph is an editable template, so the authored pass
+        // collection may be shorter, longer, or reordered.  Keep the
+        // renderer's resource/program contract strict: every authored type
+        // must belong to this variant and its queue/parameter/binding shape
+        // must remain compatible with the engine-owned implementation.  The
+        // graph adapter validates missing prerequisites and final output when
+        // it consumes the current pass collection.
         if (const auto configuration = builder.configuration()) {
-            const pipeline::FeatureInstanceConfiguration* authored = nullptr;
-            for (const auto& feature : configuration->features)
-                if (feature.instance == builder.feature_instance_id())
+            const auto* authored = static_cast<const pipeline::FeatureInstanceConfiguration*>(nullptr);
+            for (const auto& feature : configuration->features) {
+                if (feature.instance == builder.feature_instance_id()) {
                     authored = &feature;
-            if (authored == nullptr || authored->passes.size() != pass_indices(variant_).size())
-                return foundation::unsupported("built-in renderer requires its complete default pass topology");
-            for (size_t i = 0; i < authored->passes.size(); ++i) {
-                const auto index = pass_indices(variant_)[i];
-                const auto& pass = authored->passes[i];
-                const auto queue = index == 5 ? rhi::QueueClass::kCompute : rhi::QueueClass::kGraphics;
-                const bool rebound_resource =
-                    std::any_of(pass.resource_bindings.begin(), pass.resource_bindings.end(),
-                                [](const auto& binding) { return binding.first != binding.second; });
-                if (pass.type != pipeline::RenderPassTypeId(kPassNames[index]) || !pass.enabled ||
-                    pass.queue != queue || !pass.parameters.empty() || rebound_resource)
-                    return foundation::unsupported(
-                        "built-in renderer pass topology, parameters or resource rebinding is unsupported");
+                    break;
+                }
+            }
+            if (authored != nullptr) {
+                for (const auto& pass : authored->passes) {
+                    bool supported_type = false;
+                    rhi::QueueClass expected_queue = rhi::QueueClass::kGraphics;
+                    for (const size_t index : pass_indices(variant_)) {
+                        if (pass.type == pipeline::RenderPassTypeId(kPassNames[index])) {
+                            supported_type = true;
+                            expected_queue = index == 5 ? rhi::QueueClass::kCompute : rhi::QueueClass::kGraphics;
+                            break;
+                        }
+                    }
+                    if (!supported_type)
+                        return foundation::unsupported("renderer feature contains an unsupported authored pass type");
+                    const bool rebound_resource = std::any_of(
+                        pass.resource_bindings.begin(), pass.resource_bindings.end(),
+                        [](const auto& binding) { return binding.first != binding.second; });
+                    if (pass.queue != expected_queue || !pass.parameters.empty() || rebound_resource)
+                        return foundation::unsupported(
+                            "built-in renderer pass parameters, queue or resource rebinding are unsupported");
+                }
             }
         }
         const auto stage = builder.add_stage({.id = pipeline::StageId(feature_name(variant_)),

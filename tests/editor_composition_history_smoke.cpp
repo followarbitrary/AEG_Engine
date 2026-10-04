@@ -38,6 +38,15 @@ int main() {
     aeg::pipeline::TypeCatalog empty_catalog;
     if (!editor.replace_catalog(std::move(empty_catalog)) || editor.diagnostics().empty())
         return 9;
+    auto persisted = fixture.document;
+    persisted.pipeline_nodes.push_back({"custom-pipeline", aeg::pipeline::PipelineId("Game.Custom.Pipeline"),
+                                        {1, 0, 0}, aeg::pipeline::PipelineScope::kFrame, "Renderer", {}});
+    persisted.extensions.push_back({"@flowgraph:empty-type", aeg::pipeline::OpaqueAuthoringEncoding::kToml,
+                                    "AEG_FLOWGRAPH_EMPTY 1 0 \"Game.Custom.Pipeline\" 0"});
+    aeg::application::EditorCompositionDocument restored(persisted, fixture.catalog);
+    if (restored.catalog().find({aeg::pipeline::AuthoringTypeKind::kPipeline,
+                                 aeg::pipeline::PipelineId("Game.Custom.Pipeline").value()}) == nullptr)
+        return 10;
     std::cout << "Editor composition history smoke passed\n";
     return 0;
 }

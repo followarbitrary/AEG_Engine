@@ -143,6 +143,14 @@ int main() {
     }
     if (preview.state().active_revision != 7)
         return 3;
+    auto invalid_document = std::make_shared<pipeline::PipelineDocument>(fixture.document);
+    invalid_document->pipeline_nodes.front().type = pipeline::PipelineId("Missing.Pipeline");
+    const auto rejected = preview.request(std::shared_ptr<const pipeline::PipelineDocument>(invalid_document),
+                                          fixture.catalog, 8,
+                                          std::span<const engine::PipelineHostBinding>(&binding, 1));
+    if (rejected || runtime.has_pending() || !preview.state().stale || preview.state().active_revision != 7 ||
+        preview.apply_at_frame_boundary().code != foundation::ResultCode::kInvalidState)
+        return 31;
     if (const auto result = host.bind_pipeline(pipeline::PipelineId("Game.EditorPipeline")); !result) {
         std::cerr << "bind failed: " << result.message << "\n";
         return 4;

@@ -10,6 +10,7 @@
 #include "pipeline_authoring.hpp"
 #include "pipeline_document.hpp"
 #include "result.hpp"
+#include "composition/editor_node_contract_storage.hpp"
 
 namespace aeg::application {
 
@@ -20,9 +21,21 @@ struct EditorProjectPipelineDocument final {
     foundation::Result load_result{};
 };
 
+struct EditorProjectPipelineConflict final {
+    pipeline::AuthoringTypeKey key{};
+    NodeDefinitionDraft draft{};
+    pipeline::TypeCatalogEntry compiled{};
+    std::string message{};
+};
+
 struct EditorProjectPipelineAuthoring final {
     pipeline::TypeCatalog catalog{};
     std::vector<EditorProjectPipelineDocument> documents{};
+    std::vector<NodeContractFile> contracts{};
+    /** Non-generated editor drafts kept available for the definition editor. */
+    std::vector<NodeContractFile> drafts{};
+    std::vector<EditorProjectPipelineConflict> conflicts{};
+    std::vector<std::string> contract_diagnostics{};
 };
 
 /** Loads source module metadata and authored .aegpipe files without loading a game DLL. */

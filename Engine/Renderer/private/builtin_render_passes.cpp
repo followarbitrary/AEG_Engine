@@ -81,7 +81,8 @@ private:
 namespace detail {
 foundation::ResultValue<pipeline::RenderGraphPass> add_builtin_render_pass(
     pipeline::RenderGraphBuilder& builder, const RenderFeatureContext& context, pipeline::RenderPassTypeId type,
-    pipeline::RenderPassSetupFunction setup, pipeline::RenderPassExecuteFunction execute) {
+    pipeline::RenderPassSetupFunction setup, pipeline::RenderPassExecuteFunction execute,
+    pipeline::RenderPassInstanceId authored_instance) {
     if (!builder.is_runtime() || render_feature_context(builder) != &context || !context.render_passes)
         return {foundation::invalid_state("built-in renderer pass requires its host RenderPassRegistry"), {}};
     bool known = false;
@@ -99,10 +100,14 @@ foundation::ResultValue<pipeline::RenderGraphPass> add_builtin_render_pass(
             if (feature.instance != builder.feature_instance_id())
                 continue;
             for (const auto& pass : feature.passes) {
-                if (pass.type != type)
+                const bool matches_instance = authored_instance.is_valid() && pass.instance == authored_instance;
+                if ((!authored_instance.is_valid() && pass.type != type) ||
+                    (authored_instance.is_valid() && !matches_instance))
                     continue;
                 if (found)
-                    return {foundation::invalid_argument("built-in renderer pass is duplicated"), {}};
+                    return {foundation::invalid_argument("built-in renderer pass instance is duplicated"), {}};
+                if (pass.type != type)
+                    return {foundation::invalid_argument("built-in renderer pass instance type does not match"), {}};
                 configuration->type = pass.type;
                 configuration->instance = pass.instance;
                 configuration->queue = pass.queue;

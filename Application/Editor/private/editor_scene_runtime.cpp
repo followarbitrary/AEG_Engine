@@ -1407,6 +1407,16 @@ const pipeline::TypeCatalog& EditorSceneRuntime::authored_pipeline_catalog() con
     return impl_ == nullptr ? kEmptyCatalog : impl_->project_pipeline_authoring.catalog;
 }
 
+std::span<const NodeContractFile> EditorSceneRuntime::authored_pipeline_drafts() const noexcept {
+    return impl_ == nullptr ? std::span<const NodeContractFile>{}
+                            : std::span<const NodeContractFile>{impl_->project_pipeline_authoring.drafts};
+}
+
+std::span<const EditorProjectPipelineConflict> EditorSceneRuntime::authored_pipeline_conflicts() const noexcept {
+    return impl_ == nullptr ? std::span<const EditorProjectPipelineConflict>{}
+                            : std::span<const EditorProjectPipelineConflict>{impl_->project_pipeline_authoring.conflicts};
+}
+
 foundation::Result EditorSceneRuntime::set_authored_present_connection(const std::filesystem::path& document_path,
                                                                        std::string_view source_node, bool connected) {
     if (impl_ == nullptr || !impl_->initialized)

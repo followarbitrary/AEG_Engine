@@ -33,5 +33,6 @@ private:
                                                                   const RenderFeatureContext& context,
                                                                   pipeline::RenderGraphTexture depth,
                                                                   pipeline::RenderGraphBuffer clusters,
-                                                                  RenderLightCullingResource& resource);
+                                                                  RenderLightCullingResource& resource,
+                                                                  pipeline::RenderPassInstanceId authored_instance = {});
 }  // namespace aeg::renderer

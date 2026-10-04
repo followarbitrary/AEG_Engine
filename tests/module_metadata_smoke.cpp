@@ -59,9 +59,40 @@ int main() {
     entry.display_name = "Custom Pipeline";
     entry.domains = 1u << static_cast<uint32_t>(pipeline::FeatureDomain::kRender);
     entry.scopes = 1u << static_cast<uint32_t>(pipeline::PipelineScope::kWorld);
+    entry.ports.push_back({.id = 101,
+                           .name = "Exposure",
+                           .direction = pipeline::PortDirection::kInput,
+                           .value_kind = pipeline::PortValueKind::kArtifact,
+                           .schema_id = 1,
+                           .binding_id = 101,
+                           .input = pipeline::InputPortContract{
+                               .allowed_sources = pipeline::input_source_mask(pipeline::InputSourceKind::kLiteral) |
+                                                   pipeline::input_source_mask(pipeline::InputSourceKind::kDefault),
+                               .presence = pipeline::InputPresenceRequirement::kOptional,
+                               .variadic_group_id = 700,
+                               .literal_schema = pipeline::ParameterDescriptor{.id = 101,
+                                                                                .name = "Exposure",
+                                                                                .display_name = "Exposure",
+                                                                                .kind = pipeline::ParameterKind::kFloat64,
+                                                                                .default_value = 1.0,
+                                                                                .minimum = 0.0,
+                                                                                .maximum = 4.0},
+                               .default_value = pipeline::InputDefaultDescriptor{.id = 7,
+                                                                                  .revision = 3,
+                                                                                  .value = 1.0}}});
+    entry.variadic_inputs.push_back({.id = 700,
+                                     .name = "Layers",
+                                     .member_port_id = 101,
+                                     .min_slots = 0,
+                                     .max_slots = 4,
+                                     .ordered = true,
+                                     .empty_is_valid = true});
     entry.declaration = pipeline::PipelineAuthoringDeclaration{};
-    if (!metadata.catalog.add(entry))
+    const auto add_entry = metadata.catalog.add(entry);
+    if (!add_entry) {
+        std::cerr << add_entry.message << '\n';
         return 2;
+    }
 
     const auto contract = module::module_contract_sha256(metadata);
     if (!contract || contract.value.size() != 64u)
@@ -71,7 +102,10 @@ int main() {
     if (!encoded || encoded.value.find("18446744073709551614") == std::string::npos)
         return 4;
     const auto decoded = module::decode_module_metadata(encoded.value);
-    if (!decoded || decoded.value.module.name != metadata.module.name || decoded.value.catalog.entries().size() != 1u)
+    const auto* decoded_entry = decoded ? decoded.value.catalog.find(entry.key) : nullptr;
+    if (!decoded || decoded.value.module.name != metadata.module.name || decoded.value.catalog.entries().size() != 1u ||
+        decoded_entry == nullptr || !decoded_entry->ports.front().input || decoded_entry->variadic_inputs.size() != 1u ||
+        decoded_entry->ports.front().input->default_value->revision != 3u)
         return 5;
     const auto content_hash = module::module_content_sha256("abc");
     if (!content_hash || content_hash.value != "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")

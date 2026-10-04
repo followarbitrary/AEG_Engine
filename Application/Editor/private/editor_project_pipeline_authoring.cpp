@@ -5,6 +5,7 @@
 #include "editor_project_pipeline_authoring.hpp"
 
 #include <algorithm>
+#include <fstream>
 #include <system_error>
 
 #include "module_bundle.hpp"
@@ -13,6 +14,24 @@
 
 namespace aeg::application {
 namespace {
+
+std::vector<std::filesystem::path> flowgraph_contract_paths(const std::filesystem::path& project_root) {
+    std::vector<std::filesystem::path> paths;
+    const auto directory = project_root / "Source" / "FlowGraph";
+    std::error_code error;
+    if (!std::filesystem::exists(directory, error) || error)
+        return paths;
+    for (std::filesystem::recursive_directory_iterator iterator{
+             directory, std::filesystem::directory_options::skip_permission_denied, error};
+         !error && iterator != std::filesystem::recursive_directory_iterator{}; iterator.increment(error)) {
+        if (iterator->is_regular_file(error) && !error &&
+            (iterator->path().filename().string().ends_with(".flowgraph.contract.json") ||
+             iterator->path().filename().string().ends_with(".flowgraph.draft.json")))
+            paths.push_back(iterator->path());
+    }
+    std::sort(paths.begin(), paths.end());
+    return paths;
+}
 
 [[nodiscard]] bool has_metadata_extension(const std::filesystem::path& path) {
     const std::string name = path.filename().string();
@@ -68,6 +87,34 @@ foundation::ResultValue<EditorProjectPipelineAuthoring> load_editor_project_pipe
             if (const foundation::Result added = result.catalog.add(entry); !added)
                 return {added, {}};
         }
+    }
+
+    // Editor contracts are an overlay for types that do not yet exist in
+    // compiled metadata. When both sources describe the same stable identity,
+    // retain the compiled entry and expose an explicit conflict for the UI.
+    for (const auto& path : flowgraph_contract_paths(project_root)) {
+        const auto contract = read_editor_node_contract(path);
+        if (!contract) {
+            result.contract_diagnostics.push_back(path.string() + ": " + contract.result.message);
+            continue;
+        }
+        if (!contract.value.draft.generated)
+            result.drafts.push_back(contract.value);
+        else
+            result.contracts.push_back(contract.value);
+        const auto* compiled = result.catalog.find(contract.value.draft.entry.key);
+        if (compiled) {
+            result.conflicts.push_back({contract.value.draft.entry.key, contract.value.draft, *compiled,
+                                        "editor draft conflicts with compiled contract"});
+            continue;
+        }
+        // A draft is an editor recovery artifact. It must remain visible in
+        // `drafts`, but it cannot become the runtime catalog authority until
+        // Save & Generate Stub installs a generated contract.
+        if (!contract.value.draft.generated)
+            continue;
+        if (const auto added = result.catalog.add(contract.value.draft.entry); !added)
+            result.contract_diagnostics.push_back(path.string() + ": " + added.message);
     }
 
     const auto pipeline_files = files_with_extension(assets_directory, ".aegpipe");

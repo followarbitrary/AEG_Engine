@@ -20,6 +20,7 @@ foundation::Result EditorCompositionPreviewController::request(
         return foundation::invalid_state("Preview services are unavailable");
     const auto prepared = pipeline::prepare_pipeline_document(*document, catalog, *registry_, *render_pass_registry_);
     if (!prepared) {
+        runtime_->discard_pending();
         state_.draft_revision = revision;
         state_.rebuilding = false;
         state_.stale = true;
@@ -27,6 +28,7 @@ foundation::Result EditorCompositionPreviewController::request(
         return prepared.result;
     }
     if (const auto result = runtime_->stage(prepared.value, bindings); !result) {
+        runtime_->discard_pending();
         state_.draft_revision = revision;
         state_.rebuilding = false;
         state_.stale = true;
@@ -44,6 +46,8 @@ foundation::Result EditorCompositionPreviewController::request(
 foundation::Result EditorCompositionPreviewController::apply_at_frame_boundary() {
     if (!runtime_)
         return foundation::invalid_state("Preview services are unavailable");
+    if (state_.stale && !state_.rebuilding)
+        return foundation::invalid_state("the latest FlowGraph draft is stale; repair it before applying");
     if (const auto result = runtime_->apply_pending(true); !result)
         return result;
     if (state_.rebuilding) {

@@ -265,8 +265,63 @@ foundation::ResultValue<pipeline::ResourceConstraints> constraints_value(const J
         result.formats = value.at("formats").get<std::vector<std::string>>();
     return {foundation::Result::success(), std::move(result)};
 }
+Json input_contract_json(const pipeline::InputPortContract& value) {
+    Json result{{"allowed_sources", value.allowed_sources},
+                {"presence", static_cast<uint8_t>(value.presence)},
+                {"min_edges", value.min_edges},
+                {"max_edges", value.max_edges},
+                {"variadic_group_id", std::to_string(value.variadic_group_id)},
+                {"context_keys", value.context_keys}};
+    if (value.literal_schema)
+        result["literal_schema"] = parameter_descriptor_json(*value.literal_schema);
+    if (value.default_value)
+        result["default_value"] = Json{{"id", std::to_string(value.default_value->id)},
+                                         {"revision", std::to_string(value.default_value->revision)},
+                                         {"value", parameter_json(value.default_value->value)}};
+    return result;
+}
+foundation::ResultValue<pipeline::InputPortContract> input_contract_value(const Json& value) {
+    pipeline::InputPortContract result{};
+    const auto allowed = u32_value<uint32_t>(value, "allowed_sources");
+    const auto presence = u32_value<uint32_t>(value, "presence");
+    const auto min = u32_value<uint32_t>(value, "min_edges");
+    const auto max = u32_value<uint32_t>(value, "max_edges");
+    const auto group = u64_value(value, "variadic_group_id");
+    if (!allowed || !presence || !min || !max || !group ||
+        allowed.value & ~pipeline::kAllInputSources ||
+        presence.value > static_cast<uint32_t>(pipeline::InputPresenceRequirement::kRequired))
+        return {invalid("input contract"), {}};
+    result.allowed_sources = allowed.value;
+    result.presence = static_cast<pipeline::InputPresenceRequirement>(presence.value);
+    result.min_edges = min.value;
+    result.max_edges = max.value;
+    result.variadic_group_id = group.value;
+    if (value.contains("context_keys")) {
+        if (!value.at("context_keys").is_array())
+            return {invalid("context_keys"), {}};
+        result.context_keys = value.at("context_keys").get<std::vector<std::string>>();
+    }
+    if (value.contains("literal_schema")) {
+        const auto schema = parameter_descriptor_value(value.at("literal_schema"));
+        if (!schema)
+            return {schema.result, {}};
+        result.literal_schema = schema.value;
+    }
+    if (value.contains("default_value")) {
+        const auto& item = value.at("default_value");
+        const auto id = u64_value(item, "id");
+        const auto revision = u64_value(item, "revision");
+        if (!id || !revision || !item.contains("value"))
+            return {invalid("input default"), {}};
+        const auto parsed = parameter_value(item.at("value"));
+        if (!parsed)
+            return {parsed.result, {}};
+        result.default_value = pipeline::InputDefaultDescriptor{id.value, revision.value, parsed.value};
+    }
+    return {foundation::Result::success(), std::move(result)};
+}
 Json port_json(const pipeline::PortDescriptor& value) {
-    return Json{{"id", std::to_string(value.id)},
+    Json result{{"id", std::to_string(value.id)},
                 {"name", value.name},
                 {"direction", static_cast<uint8_t>(value.direction)},
                 {"value_kind", static_cast<uint8_t>(value.value_kind)},
@@ -277,6 +332,9 @@ Json port_json(const pipeline::PortDescriptor& value) {
                 {"max_connections", value.max_connections},
                 {"binding_id", std::to_string(value.binding_id)},
                 {"resource_constraints", constraints_json(value.resource_constraints)}};
+    if (value.input)
+        result["input"] = input_contract_json(*value.input);
+    return result;
 }
 foundation::ResultValue<pipeline::PortDescriptor> port_value(const Json& value) {
     pipeline::PortDescriptor result{};
@@ -308,7 +366,37 @@ foundation::ResultValue<pipeline::PortDescriptor> port_value(const Json& value) 
     result.max_connections = max.value;
     result.binding_id = binding.value;
     result.resource_constraints = constraints.value;
+    if (value.contains("input")) {
+        const auto input = input_contract_value(value.at("input"));
+        if (!input)
+            return {input.result, {}};
+        result.input = input.value;
+    }
     return {foundation::Result::success(), std::move(result)};
+}
+
+Json variadic_input_json(const pipeline::VariadicInputDescriptor& value) {
+    return Json{{"id", std::to_string(value.id)},
+                {"name", value.name},
+                {"member_port_id", std::to_string(value.member_port_id)},
+                {"min_slots", value.min_slots},
+                {"max_slots", value.max_slots},
+                {"ordered", value.ordered},
+                {"empty_is_valid", value.empty_is_valid}};
+}
+foundation::ResultValue<pipeline::VariadicInputDescriptor> variadic_input_value(const Json& value) {
+    const auto id = u64_value(value, "id");
+    const auto name = string_value(value, "name");
+    const auto member = u64_value(value, "member_port_id");
+    const auto min = u32_value<uint32_t>(value, "min_slots");
+    const auto max = u32_value<uint32_t>(value, "max_slots");
+    const auto ordered = bool_value(value, "ordered");
+    const auto empty = bool_value(value, "empty_is_valid");
+    if (!id || !name || !member || !min || !max || !ordered || !empty)
+        return {invalid("variadic input"), {}};
+    return {foundation::Result::success(), pipeline::VariadicInputDescriptor{id.value, name.value, member.value,
+                                                                              min.value, max.value, ordered.value,
+                                                                              empty.value}};
 }
 
 Json stage_json(const pipeline::AuthoringStage& value) {
@@ -651,6 +739,7 @@ Json catalog_entry_json(const pipeline::TypeCatalogEntry& value) {
                 {"scopes", std::to_string(value.scopes)},
                 {"parameters", Json::array()},
                 {"ports", Json::array()},
+                {"variadic_inputs", Json::array()},
                 {"declaration", declaration_json(value.declaration)}};
     std::vector<const pipeline::ParameterDescriptor*> parameters;
     for (const auto& item : value.parameters)
@@ -664,6 +753,13 @@ Json catalog_entry_json(const pipeline::TypeCatalogEntry& value) {
     std::sort(ports.begin(), ports.end(), [](auto left, auto right) { return left->id < right->id; });
     for (const auto* item : ports)
         result["ports"].push_back(port_json(*item));
+    std::vector<const pipeline::VariadicInputDescriptor*> variadic_inputs;
+    for (const auto& item : value.variadic_inputs)
+        variadic_inputs.push_back(&item);
+    std::sort(variadic_inputs.begin(), variadic_inputs.end(),
+              [](auto left, auto right) { return left->id < right->id; });
+    for (const auto* item : variadic_inputs)
+        result["variadic_inputs"].push_back(variadic_input_json(*item));
     return result;
 }
 foundation::ResultValue<pipeline::TypeCatalogEntry> catalog_entry_value(const Json& value) {
@@ -697,6 +793,16 @@ foundation::ResultValue<pipeline::TypeCatalogEntry> catalog_entry_value(const Js
         if (!parsed)
             return {parsed.result, {}};
         result.ports.push_back(parsed.value);
+    }
+    if (value.contains("variadic_inputs")) {
+        if (!value.at("variadic_inputs").is_array())
+            return {invalid("variadic_inputs"), {}};
+        for (const auto& item : value.at("variadic_inputs")) {
+            const auto parsed = variadic_input_value(item);
+            if (!parsed)
+                return {parsed.result, {}};
+            result.variadic_inputs.push_back(parsed.value);
+        }
     }
     auto declaration = declaration_value(value.at("declaration"));
     if (!declaration)
