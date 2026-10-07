@@ -1,0 +1,16 @@
+AEG Engine
+Copyright 2026 AEG Engine contributors
+
+AEG Engine is licensed under the Apache License, Version 2.0.
+See LICENSE for the full license text.
+
+Third-party code and fonts retain their own copyright notices and licenses.
+See ThirdParty/README.md and the license files in each component's directory.
+
+FreeType attribution
+--------------------
+Portions of this software are copyright (C) 2024 The FreeType Project
+(www.freetype.org). All rights reserved.
+This software is based in part on the work of the FreeType Team.
+AEG Engine uses FreeType under the FreeType License (FTL).
+See ThirdParty/freetype/docs/FTL.TXT.

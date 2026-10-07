@@ -80,3 +80,17 @@ Logo 与品牌资源位于 [`Assets/Branding`](Assets/Branding/)。
 ```powershell
 ctest --test-dir build -C Debug --output-on-failure -R "^aeg_game_project_runtime$"
 ```
+
+## 开源协议
+
+Copyright 2026 AEG Engine contributors.
+
+本仓库原创代码、文档与示例采用 [Apache License 2.0](LICENSE)，允许商业使用、修改和
+闭源分发，并包含贡献者对其贡献所涉及的必要专利的授权。使用本引擎开发的独立游戏与
+应用可以采用自己的许可证。
+
+分发本项目或衍生作品时，应附带协议全文、保留适用的版权和 [NOTICE](NOTICE) 声明，
+并在修改过的文件中标明修改。完整条款以 [LICENSE](LICENSE) 为准。
+
+第三方代码和字体保留各自的许可证，详见 [第三方依赖与许可说明](ThirdParty/README.md)。
+本项目使用 FreeType 的 FTL 授权选项，相关致谢见 [NOTICE](NOTICE)。
