@@ -4,6 +4,11 @@
 
 # AEG Engine
 
+> [!WARNING]
+> **项目已废弃，不再继续开发。**
+>
+> 停止开发的原因：整体逻辑杂乱，代码臃肿、繁杂。仓库及以下文档仅保留作历史参考。
+
 AEG Engine 是一个使用 C++20 构建的模块化游戏引擎与编辑器项目。它以明确的生命周期、显式依赖和
 后端无关的系统边界组织 World、Scene、ECS、FeatureGraph、RenderGraph、RHI、资源与编辑器能力。
 
