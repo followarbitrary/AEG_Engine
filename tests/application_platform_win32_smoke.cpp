@@ -2,6 +2,7 @@
  * @file application_platform_win32_smoke.cpp
  * @brief Verifies the Application-owned Win32 window adapter.
  */
+#include <array>
 #include <cstdio>
 #include <filesystem>
 #include <limits>
@@ -257,6 +258,45 @@ int main() {
     }
     if (!window->focus() || !window->state().focused) {
         return 16;
+    }
+    // A minimized surface has no drawable extent. Preserve zero in both the
+    // native state sync and resize event so Runtime can suspend swapchain work.
+    if (!system->poll_events([](const aeg::platform::WindowEvent&) {})) {
+        return 45;
+    }
+    if (!window->set_minimized(true)) {
+        return 46;
+    }
+    bool minimized_resize_seen = false;
+    aeg::platform::WindowExtent minimized_extent{};
+    const auto minimized_events = system->poll_events([&](const aeg::platform::WindowEvent& event) {
+        if (event.window == window->id() && event.type == aeg::platform::WindowEventType::kWindowResized) {
+            minimized_resize_seen = true;
+            minimized_extent = event.extent;
+        }
+    });
+    if (!minimized_events || !window->state().minimized ||
+        window->state().extent != aeg::platform::WindowExtent{0, 0} || !minimized_resize_seen ||
+        minimized_extent != aeg::platform::WindowExtent{0, 0}) {
+        std::fprintf(stderr, "minimized drawable extent must be zero: state=%ux%u event=%ux%u seen=%d\n",
+            window->state().extent.width, window->state().extent.height,
+            minimized_extent.width, minimized_extent.height, minimized_resize_seen);
+        return 47;
+    }
+    if (!window->set_minimized(false) || window->state().minimized ||
+        window->state().extent != aeg::platform::WindowExtent{360, 240}) {
+        return 48;
+    }
+    bool restored_resize_seen = false;
+    aeg::platform::WindowExtent restored_extent{};
+    const auto restored_events = system->poll_events([&](const aeg::platform::WindowEvent& event) {
+        if (event.window == window->id() && event.type == aeg::platform::WindowEventType::kWindowResized) {
+            restored_resize_seen = true;
+            restored_extent = event.extent;
+        }
+    });
+    if (!restored_events || !restored_resize_seen || restored_extent != window->state().extent) {
+        return 49;
     }
     if (!window->set_visible(false) || window->state().visible) {
         return 17;

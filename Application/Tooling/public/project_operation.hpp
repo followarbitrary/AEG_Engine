@@ -3,10 +3,13 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
-#include "pipeline_authoring.hpp"
+#include "project_diagnostic.hpp"
 #include "result.hpp"
+#include "module_bundle.hpp"
+#include "feature_graph.hpp"
 
 namespace aeg::tooling {
 
@@ -19,23 +22,38 @@ struct ProjectOperationRequest final {
     std::string configuration{"Debug"};
     std::string target{};
     ProjectOperation operation{ProjectOperation::kBuildAndCook};
-    // Cook inputs are explicit so the operation service can publish the same
-    // verified module/package pair used by runtime boot.  Empty values retain
-    // the legacy build-only orchestration behavior for older callers.
+    // Cook inputs select the verified module/package pair used by runtime boot.
+    // Cook and BuildAndCook require an explicit module manifest.
     std::filesystem::path module_manifest{};
     std::filesystem::path output_directory{};
+    /** Empty selects the system CMake executable; relative paths are project-root-relative. */
+    std::filesystem::path cmake_executable{};
+};
+
+/** Owning observations copied from the actual operation Runtime on its owner thread. */
+struct ProjectOperationFeatureExecution final {
+    feature::FeatureNodeProvenance source{};
+    feature::RuntimeGeneration generation{};
+    uint64_t definition_digest{0};
+    std::vector<feature::SideEffectContract> side_effects{};
+    feature::ProcessInstance process{};
+    feature::InvocationSnapshot invocation{};
 };
 
 struct ProjectOperationStatus final {
     ProjectOperationState state{ProjectOperationState::kRunning};
     foundation::Result result{};
-    std::vector<pipeline::DocumentDiagnostic> diagnostics{};
-    // Ordered names of LogicFeatures that completed in the operation Pipeline.
+    std::vector<ProjectDiagnostic> diagnostics{};
+    // Ordered names of Logic Process Features that completed in the operation.
     // This is progress evidence for the Editor and never carries execution
     // handles or implementation pointers.
-    std::vector<std::string> pipeline_stages{};
+    std::vector<std::string> feature_stages{};
     std::filesystem::path module_manifest{};
     std::filesystem::path game_manifest{};
+    module::ModuleDescriptor feature_module{};
+    std::vector<ProjectOperationFeatureExecution> feature_executions{};
+    /** Cancellation requests may precede retirement; true only after operation work has finished. */
+    bool execution_complete{false};
 };
 
 class ProjectOperationService final {
@@ -47,7 +65,16 @@ public:
 
     [[nodiscard]] foundation::ResultValue<uint64_t> start(const ProjectOperationRequest& request);
     [[nodiscard]] foundation::ResultValue<ProjectOperationStatus> poll(uint64_t operation_id);
+    /** Waits for worker retirement and returns the final owning operation facts. */
+    [[nodiscard]] foundation::ResultValue<ProjectOperationStatus> wait(uint64_t operation_id);
     [[nodiscard]] foundation::Result cancel(uint64_t operation_id);
+    /** Validates an explicit manifest against this project and configuration.
+     * Relative manifests are project-root-relative; absolute custom build paths
+     * are allowed. Returns owning verified facts; does not load or activate code.
+     */
+    [[nodiscard]] static foundation::ResultValue<module::ModuleBundle> select_module(
+        const std::filesystem::path& project_file, const std::filesystem::path& module_manifest,
+        std::string_view configuration);
 
 private:
     struct Impl;

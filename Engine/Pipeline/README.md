@@ -1,75 +1,52 @@
 # Pipeline
 
-## 目录职责
+`Pipeline` 保留 Engine 内部的技术投影编译与阶段观测实现。游戏作者使用 `Engine/Feature`
+的 FeatureDefinition、类型化 StateDelta 和 `.aegfeature` FeatureGraph。
 
-`Pipeline` 是 AEG 的领域导向执行框架，负责描述和编译 Pipeline、Feature、Stage、
-Task、Artifact 及其依赖，并负责在声明的 ExecutionDomain 上调度运行时节点。
+所有 Pipeline 头均位于 `private/`，没有公开头或兼容 shim。`pipeline.hpp` 与
+`pipeline_types.hpp` 提供技术 Definition、Stage、Artifact、Registry、ScopeHost 和编译输入。
+逻辑资源句柄复用 RenderGraph 的实际 `render_graph_types.hpp` 定义；Pipeline 内部别名
+不提供另一套公开句柄。`render_pass.hpp`、`render_program.hpp` 及其 Registry 和程序
+绑定契约同样仅供 Engine 内部使用。
 
-## 当前实现
+`PipelineRegistry::register_pipeline()` 接收拥有字符串与记录的 `PipelineDefinition`，
+完整重放 Stage、Artifact、访问绑定、ordering 和 exposure 验证后才入表。编译直接读取
+该不可变 Definition，保留 scope/capability、Phase、Artifact 版本与可见性校验，生成
+一 Stage 一节点的依赖、拓扑顺序及批次；编译失败不发布部分计划。
 
-- `public/pipeline_types.hpp`：公共 ID、枚举、描述符、Plan 和数据模型。
-- `public/pipeline.hpp`：Builder、Feature、Registry、Compiler、Scheduler 和 Scope Host。
-- `private/pipeline.cpp`：定义收集、拓扑编译、Artifact Runtime 和执行器编排。
+`PipelinePlan::definition_owner` 保留注册表中的实际 Definition。ScopeHost 继续管理
+active、pending、retired 计划，支持帧内 pin、安全边界切换与退休；外部 plan 引用、
+Artifact 合同及尚未结束的 Writer 仍约束替换。Registry 注销不使已持有的 Definition
+或计划失效。Artifact 的值、共享不可变快照、发布、跨 scope 桥和执行 lease 继续保留。
+WorldScope 的旧 Pipeline 注入已删除，World 快照使用其私有技术 Artifact 桥。
 
-## Feature 扩展入口
+`PipelineScheduler` 只按编译批次遍历或筛选 Phase；`PipelineExecutionContext` 提供
+本次成功调用的只读节点索引，失败后索引为空。业务执行由真正的 FeatureRuntime
+承担；技术 Stage 不分发业务 callback。执行域与时间策略是技术计划元数据，业务
+并发、worker lane 和取消行为由 Feature/Concurrency 提供。
 
-`PipelineFeature` 用于 Registry 的类型擦除和生命周期管理。业务 Feature 的推荐扩展入口是
-`LogicFeature`、`PhysicsFeature`、`RenderFeature`、`AudioFeature`、`StreamFeature` 或
-`CompositeFeature<Parts...>`。这是 AEG Domain-Oriented Pipeline Architecture 的开发
-约定：当前不会通过构造令牌、模板约束或 Registry 的运行时 RTTI 检查强制禁止直接继承
-`PipelineFeature`。直接派生在 C++ 层面合法，但会绕过领域基类固定的 Builder 能力边界和
-领域元数据；是否遵守该约定由开发人员负责。
+旧结构作者链已物理删除：`PipelineFeatureDeclaration`、FeaturePoint、Feature/Part/
+Point 身份、`register_feature` / `find_feature_*` / `bind_feature` / `unbind_feature`、
+贡献展开与 `feature_owners` 均不再存在。`pipeline_configuration.hpp` 及其中的 Pipeline/
+Feature/RenderPass instance 配置、ScopeHost 配置入口和编译配置链已删除。
+`PipelineDescriptor` 不再携带旧绑定使用的 domains；五域业务合同仍属于 `Engine/Feature`。
+此前的 Pipeline/RenderFeature 虚执行层、factory/build/collect、raw Task callback、旧模块
+声明 backend、FlowGraph DTO、composer 和 state input/output/layer 通道也已删除。
 
-`CompositeFeature` 采用成员组合。Part 按开发约定应选择一个领域基类，不作为独立顶层
-Feature 注册，也不嵌套另一个 `CompositeFeature`。这些规则只用于设计评审、Editor 元数据
-审查和运行时诊断，不增加额外的代码 trait、构造令牌或 Registry 硬性拒绝；组合实现由游戏
-项目自行维护，避免把口头领域约束误写成引擎核心的类型限制。
+私有 native `RenderGraphBuilder` 使用独立的 `RenderGraphBuildFlags`：
+`kMayCreateResources`、`kMayCreateGraphicsPass`、`kMayCreateComputePass`、
+`kMayCreateCopyPass`、`kMayUseDedicatedQueue`、`kMayWriteFinalOutput`。这些六位权限
+控制真实资源与 Pass 操作，不再来自 FeaturePoint；Snapshot 发布仍由技术 Artifact 合同校验。
+`RenderGraphBuildContext` 只包含 `flags` 与借用的 `context_data`，Builder 提供
+`build_flags()`、`context_data()`、`allows()` 和 `is_runtime()`，不携带旧作者身份或实例配置。
 
-## 依赖边界
+NativeGraphBuildSession 与 committed Feature 投影继续复用同一资源/Pass backend、
+事务和命令录制路径。Renderer 的业务工作来自实际提交的 RenderIntent 与 RenderWorkItem；
+ImGui 使用固定私有 overlay adapter。内部 `RenderPassRegistry`、native setup/execute、
+`RenderPassConfiguration` 与 `NativePassSequence` 仍服务真实技术执行，后两者不属于已删除
+的旧实例配置链。native 排序使用实际注册的 Pass handle；`retain_execution_owner`
+保活实际解析的 Pass 和配置，直到 Graph 提交的 GPU 帧退休。
 
-Pipeline 可以使用 Foundation、Concurrency 和通用 RHI 数据模型，但不应依赖具体
-Vulkan/D3D12 类型。`PipelineScheduler` 通过 Concurrency 的 `ExecutorRegistry` 映射
-执行域；RenderGraph 通过受控的 Feature/Runtime 接口接入 Pipeline，不应让 Pipeline
-直接持有 RenderGraph 的私有实现。
-# Authoring contracts
-
-游戏代码中的 Pipeline、Feature 和 RenderPass 必须继承对应的 Pipeline 专有基类，并通过
-`TypeCatalog` 提供 Editor 所需的稳定类型、参数、端口和声明元数据。`.aegpipe` 文档只保存
-稳定 ID、参数、连接和布局，不保存函数地址、编译索引或 GPU Handle。
-
-`RenderPassRegistry` 负责把自定义 Pass 适配到现有 `RenderGraphBuilder`；Pass 回调只能通过
-`RenderPassBuilder` 与 `RenderPassExecutionContext` 访问图资源，并按稳定 `RenderResourceId`
-解析当前图中的句柄。CompositeFeature 会按 render Part 过滤和展开 authored Pass；ordering edge
-通过显式 Graph 依赖保留。
-
-Render Pass 需要 Shader 或其他 GPU 程序时，声明阶段使用
-`RenderPassBuilder::declare_render_program()`，执行阶段使用
-`RenderPassExecutionContext::bind_render_program()`。两者只传递稳定的
-`RenderProgramRequest`、参数块和逻辑资源绑定；程序提供器返回的
-`PreparedRenderProgram::owner` 负责把模块代码和帧内资源保活，Pass 本身不接触 Device、
-原生命令对象或 Vulkan 创建函数。
-
-模块声明可使用 `PipelineBuilderBackendAdapter` 转发到当前 `PipelineBuilder`。适配器只在
-声明回调期间借用 Builder；模块不得保存适配器、句柄或资源绑定供异步回调使用，跨阶段数据
-必须通过已发布的不可变 Pipeline 配置传递。
-
-在 Pass 的 `.cpp` 中使用 `REGISTER_RENDER_PASS(MyPass)` 完成静态注册。宏参数应为当前
-命名空间中的类型名；注册发生在 `main()` 前，运行时通过 `global_render_pass_registry()`
-按稳定 `RenderPassTypeId` 查找。
-
-# Pipeline、Feature 与 RenderPass
-
-Pipeline 定义执行骨架：Stage、Artifact、FeaturePoint 和固定依赖交给 Compiler/Scheduler 形成 Plan。Feature 是绑定到 FeaturePoint 的领域能力；RenderFeature 可以拥有多个 RenderPass，Pass 只负责当前 Graph 中的一步资源声明和受限命令录制。
-
-作者文档保存 Pipeline、Feature、Pass、资源节点和稳定连接。准备阶段把 Pass 收入
-`FeatureInstanceConfiguration::passes`，资源边只保存稳定 `RenderResourceId`，ordering edge 会转为
-Pass 间的显式 Graph 依赖。声明中的默认 Feature/Pass 也会在准备阶段物化；Graph handle 和 RHI
-handle 不会写回文档。
-
-`FeatureAuthoringDeclaration::allow_add_passes` 是作者 Pass 的唯一声明开关。准备阶段会把它复制到
-`FeatureInstanceConfiguration::expand_authored_passes`，RenderGraph 据此展开配置中的 Pass；旧的
-`uses_authored_render_passes*()` 虚函数仍用于兼容没有文档配置的代码路径。Feature Part 的
-`part_index` 必须等于声明数组中的位置，保证作者 Pass、CompositeFeature 和运行时 Part 使用同一身份。
-文档中的 ordering edge 只能连接两个 RenderPass 节点，并且必须属于同一个 Feature 和 Render Part。
-
-一个 Feature 可以拥有零个、一个或多个 Pass。Pass 不单独绑定 FeaturePoint，也不创建自己的调度器；跨领域能力使用 `CompositeFeature` 组合领域 Part。
+Pipeline 使用 Foundation、Feature、RenderGraph 中性值和通用 RHI 数据，不持有
+RenderGraph 私有实现或具体 Vulkan/D3D12 类型。AssetReference、ParameterBlock 和
+ParameterValue 直接使用 Foundation `parameter_value.hpp`。

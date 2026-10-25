@@ -2,22 +2,27 @@
 #include <filesystem>
 #include <string_view>
 
-#include "game_module.hpp"
+#include "feature_catalog.hpp"
+#include "module_descriptor.hpp"
 namespace aeg::module {
+inline constexpr uint32_t kModuleMetadataSchemaVersion = 3;
+inline constexpr uint32_t kModuleSdkContractMajor = 3;
+inline constexpr uint32_t kModuleSdkContractMinor = 0;
+
 struct ModuleMetadata final {
-    uint32_t schema_version{1};
-    ModuleDescriptor descriptor{};
-    // `module` is the B7 spelling. `descriptor` remains as a source-compatible
-    // alias for the first metadata implementation; codecs keep both in sync.
+    uint32_t schema_version{kModuleMetadataSchemaVersion};
     ModuleDescriptor module{};
-    pipeline::TypeCatalog catalog{};
+    // Exported Feature contracts used by tooling/catalog discovery.  Contract
+    // metadata includes port, side-effect, scope, clock and composition schema;
+    // executable callbacks remain module-owned and are never serialized.
+    feature::FeatureCatalog feature_catalog{};
     std::string build_id{};
     std::string target{};
     std::string configuration{};
     std::string contract_digest{};
-    uint32_t abi_major{1};
+    uint32_t abi_major{2};
     uint32_t abi_minor{0};
-    uint32_t sdk_contract_major{1};
+    uint32_t sdk_contract_major{kModuleSdkContractMajor};
     uint32_t sdk_contract_minor{0};
 };
 struct ModuleBundle final {

@@ -7,6 +7,7 @@
 #include "asset_package.hpp"
 #include "cooked_asset.hpp"
 #include "runtime_asset_resolver.hpp"
+#include "runtime_asset_upload_host.hpp"
 
 namespace {
 template <typename T>
@@ -15,7 +16,7 @@ void append(std::vector<std::byte>& bytes, T value) {
     bytes.insert(bytes.end(), first, first + sizeof(value));
 }
 
-void append_uuid(std::vector<std::byte>& bytes, aeg::asset::AssetId id) {
+void append_uuid(std::vector<std::byte>& bytes, aeg::foundation::AssetId id) {
     for (const uint8_t value : id.value.bytes)
         append(bytes, value);
 }
@@ -29,12 +30,12 @@ bool require(bool condition, const char* message) {
 
 int main() {
     using namespace aeg;
-    const auto material_id = asset::AssetId::parse("80112233-4455-6677-8899-aabbccddeeff");
-    const auto texture_id = asset::AssetId::parse("81112233-4455-6677-8899-aabbccddeeff");
-    const auto shader_id = asset::AssetId::parse("82112233-4455-6677-8899-aabbccddeeff");
-    const auto missing_shader_id = asset::AssetId::parse("83112233-4455-6677-8899-aabbccddeeff");
-    const auto wrong_binding_id = asset::AssetId::parse("84112233-4455-6677-8899-aabbccddeeff");
-    const auto default_material_id = asset::AssetId::parse("85112233-4455-6677-8899-aabbccddeeff");
+    const auto material_id = foundation::AssetId::parse("80112233-4455-6677-8899-aabbccddeeff");
+    const auto texture_id = foundation::AssetId::parse("81112233-4455-6677-8899-aabbccddeeff");
+    const auto shader_id = foundation::AssetId::parse("82112233-4455-6677-8899-aabbccddeeff");
+    const auto missing_shader_id = foundation::AssetId::parse("83112233-4455-6677-8899-aabbccddeeff");
+    const auto wrong_binding_id = foundation::AssetId::parse("84112233-4455-6677-8899-aabbccddeeff");
+    const auto default_material_id = foundation::AssetId::parse("85112233-4455-6677-8899-aabbccddeeff");
     if (!require(material_id && texture_id && shader_id && missing_shader_id && wrong_binding_id && default_material_id,
                  "material contract fixture IDs are invalid"))
         return 1;
@@ -94,26 +95,26 @@ int main() {
     std::memcpy(texture_bytes.data() + 8u, &four, sizeof(four));
 
     const auto cooked_material =
-        asset::encode_cooked_asset({material_id.value, asset::AssetKind::kMaterial, 1, {}, material_bytes});
+        asset::encode_cooked_asset({material_id.value, foundation::AssetKind::kMaterial, 1, {}, material_bytes});
     const auto cooked_missing_shader =
-        asset::encode_cooked_asset({missing_shader_id.value, asset::AssetKind::kMaterial, 1, {}, missing_shader_bytes});
+        asset::encode_cooked_asset({missing_shader_id.value, foundation::AssetKind::kMaterial, 1, {}, missing_shader_bytes});
     const auto cooked_wrong_binding =
-        asset::encode_cooked_asset({wrong_binding_id.value, asset::AssetKind::kMaterial, 1, {}, wrong_binding_bytes});
+        asset::encode_cooked_asset({wrong_binding_id.value, foundation::AssetKind::kMaterial, 1, {}, wrong_binding_bytes});
     const auto cooked_default_material = asset::encode_cooked_asset(
-        {default_material_id.value, asset::AssetKind::kMaterial, 1, {}, default_material_bytes});
+        {default_material_id.value, foundation::AssetKind::kMaterial, 1, {}, default_material_bytes});
     const auto cooked_texture =
-        asset::encode_cooked_asset({texture_id.value, asset::AssetKind::kTexture, 1, {}, std::move(texture_bytes)});
+        asset::encode_cooked_asset({texture_id.value, foundation::AssetKind::kTexture, 1, {}, std::move(texture_bytes)});
     if (!require(cooked_material && cooked_missing_shader && cooked_wrong_binding && cooked_default_material &&
                      cooked_texture,
                  "material contract fixture cook failed"))
         return 2;
 
     const std::vector<tooling::AssetPackageEntry> entries{
-        {material_id.value, asset::AssetKind::kMaterial, 1, cooked_material.value},
-        {missing_shader_id.value, asset::AssetKind::kMaterial, 1, cooked_missing_shader.value},
-        {wrong_binding_id.value, asset::AssetKind::kMaterial, 1, cooked_wrong_binding.value},
-        {default_material_id.value, asset::AssetKind::kMaterial, 1, cooked_default_material.value},
-        {texture_id.value, asset::AssetKind::kTexture, 1, cooked_texture.value},
+        {material_id.value, foundation::AssetKind::kMaterial, 1, cooked_material.value},
+        {missing_shader_id.value, foundation::AssetKind::kMaterial, 1, cooked_missing_shader.value},
+        {wrong_binding_id.value, foundation::AssetKind::kMaterial, 1, cooked_wrong_binding.value},
+        {default_material_id.value, foundation::AssetKind::kMaterial, 1, cooked_default_material.value},
+        {texture_id.value, foundation::AssetKind::kTexture, 1, cooked_texture.value},
     };
     const auto path = std::filesystem::temp_directory_path() / "aeg_runtime_material_contract.aegbin";
     if (!require(static_cast<bool>(tooling::AssetPackageWriter{}.write(path, entries)),
@@ -160,7 +161,27 @@ int main() {
                  "mismatching host material shader contract was not rejected"))
         return 9;
     upload_context.material_shader = shader_id.value;
+    upload_context.material_contract_epoch = 0;
     resolver.set_upload_context(upload_context);
+    const auto invalid_contract_epoch = resolver.resolve_material(default_bound.value);
+    if (!require(!invalid_contract_epoch && invalid_contract_epoch.result.code == foundation::ResultCode::kInvalidArgument &&
+                     invalid_contract_epoch.result.message.find("contract epoch") != std::string::npos,
+                 "zero material contract epoch was not rejected"))
+        return 10;
+    upload_context.material_contract_epoch = 1;
+    resolver.set_upload_context(upload_context);
+    const auto missing_shader_contract = resolver.resolve_material(default_bound.value);
+    if (!require(!missing_shader_contract && missing_shader_contract.result.code == foundation::ResultCode::kNotReady &&
+                     missing_shader_contract.result.message.find("shader layout contract") != std::string::npos,
+                 "missing host material shader layout contract was not reported as not-ready"))
+        return 10;
+    upload_context.material_shader_contract = {
+        renderer::kRenderMaterialShaderContractVersion, 0x1234u};
+    resolver.set_upload_context(upload_context);
+    const auto missing_shader_layout = resolver.resolve_material(default_bound.value);
+    if (!require(!missing_shader_layout && missing_shader_layout.result.code == foundation::ResultCode::kNotReady,
+                 "host material shader layout pointer was not required"))
+        return 10;
     const auto matching_host_shader = resolver.resolve_material(default_bound.value);
     if (!require(!matching_host_shader && matching_host_shader.result.code == foundation::ResultCode::kNotReady,
                  "matching host material shader contract did not reach the GPU readiness guard"))

@@ -5,7 +5,6 @@
 
 #include "asset_package_reader.hpp"
 #include "ecs.hpp"
-#include "pipeline.hpp"
 #include "reflection.hpp"
 #include "runtime_asset_resolver.hpp"
 #include "scene_asset.hpp"
@@ -45,10 +44,11 @@ struct RuntimeSceneLoadResult final {
 
 class RuntimeSceneLoader final {
 public:
+    /** Resolves the same stable entity UUID used by Scene relocations and explicit World command routes. */
+    [[nodiscard]] static scene::SceneEntityId scene_entity_id(foundation::Uuid uuid) noexcept;
     [[nodiscard]] static foundation::ResultValue<RuntimeSceneLoadResult> load_startup_scene(
-        const asset::AssetPackageReader& package, asset::AssetId startup_scene, pipeline::PipelineRegistry& pipelines,
-        reflection::TypeRegistry& reflection_registry, const world::WorldScopeDesc& scope_desc = {},
-        RuntimeAssetResolver* resolver = nullptr);
+        const asset::AssetPackageReader& package, foundation::AssetId startup_scene,
+        reflection::TypeRegistry& reflection_registry, RuntimeAssetResolver* resolver = nullptr);
 };
 
 }  // namespace aeg::application::runtime

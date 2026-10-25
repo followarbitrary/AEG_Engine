@@ -1,8 +1,0 @@
-version = 1
-source_uuid = "00000000-0000-4000-8000-000000000011"
-importer = "aeg.pipeline"
-
-[[products]]
-uuid = "00000000-0000-0000-0000-000000000101"
-kind = "pipeline"
-key = "Default"

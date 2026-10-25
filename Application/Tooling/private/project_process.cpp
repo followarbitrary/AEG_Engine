@@ -2,6 +2,8 @@
 
 #include <system_error>
 
+#include "concurrency.hpp"
+
 #if defined(_WIN32)
 #include <windows.h>
 #else
@@ -119,7 +121,9 @@ foundation::ResultValue<ProjectProcessResult> run_project_process(const ProjectP
                         {}};
             break;
         }
-        usleep(50000);
+        const foundation::Result delay = concurrency::sleep_for(50'000'000ull);
+        if (!delay)
+            return {delay, {}};
     }
     return {foundation::Result::success(), {WIFEXITED(status) ? WEXITSTATUS(status) : -1, cancelled}};
 #endif

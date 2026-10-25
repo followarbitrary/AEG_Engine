@@ -13,16 +13,16 @@ std::atomic<uint64_t> next_owner_cookie{1};
     switch (kind) {
         case ModuleContextKind::kModule:
             return "module";
-        case ModuleContextKind::kPipeline:
-            return "pipeline";
-        case ModuleContextKind::kFeature:
-            return "feature";
-        case ModuleContextKind::kTask:
-            return "task";
+        case ModuleContextKind::kFeatureDefinition:
+            return "feature definition";
+        case ModuleContextKind::kFeatureInstance:
+            return "feature instance";
+        case ModuleContextKind::kProcess:
+            return "process";
         case ModuleContextKind::kRenderGraph:
             return "render graph";
-        case ModuleContextKind::kRenderPass:
-            return "render pass";
+        case ModuleContextKind::kRenderWorkItem:
+            return "render work item";
         case ModuleContextKind::kReflection:
             return "reflection";
     }

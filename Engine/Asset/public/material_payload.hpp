@@ -11,19 +11,19 @@
 #include <vector>
 
 #include "asset_identity.hpp"
-#include "pipeline_authoring_types.hpp"
+#include "parameter_value.hpp"
 
 namespace aeg::asset {
 struct MaterialTextureBinding final {
     uint64_t binding_id{};
-    AssetId texture{};
+    foundation::AssetId texture{};
 };
 
 struct MaterialPayload final {
     uint32_t schema_version{1};
-    AssetId shader{};
+    foundation::AssetId shader{};
     std::vector<MaterialTextureBinding> textures{};
-    pipeline::ParameterBlock parameters{};
+    foundation::ParameterBlock parameters{};
 };
 
 [[nodiscard]] foundation::ResultValue<std::vector<std::byte>> encode_material_payload(const MaterialPayload& payload);

@@ -3,6 +3,7 @@
 #include <iostream>
 
 #include "mesh_payload.hpp"
+#include "runtime_mesh_vertex.hpp"
 
 int main() {
     std::vector<std::byte> payload(16 + 32 + 12, std::byte{0});

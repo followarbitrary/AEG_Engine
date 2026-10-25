@@ -14,6 +14,10 @@
 #include "asset_metadata.hpp"
 
 namespace aeg::tooling {
+/** @brief Replaces a selector file atomically after a complete bundle is staged. */
+[[nodiscard]] foundation::Result replace_file_atomically(const std::filesystem::path& source,
+                                                         const std::filesystem::path& destination);
+
 /** @brief One complete FlatBuffers product awaiting cache publication. */
 struct CookedArtifact final {
     AssetId id{};

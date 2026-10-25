@@ -10,6 +10,7 @@
 #include "font_payload.hpp"
 #include "material_payload.hpp"
 #include "mesh_payload.hpp"
+#include "runtime_mesh_vertex.hpp"
 #include "texture_payload.hpp"
 
 namespace aeg::application::runtime {
@@ -62,17 +63,17 @@ public:
         : package_(std::move(package)) {}
 
     [[nodiscard]] foundation::Result mount(asset::AssetPackageReader package) noexcept;
-    [[nodiscard]] foundation::ResultValue<RuntimeMeshAsset> load_mesh(asset::AssetId id);
-    [[nodiscard]] foundation::ResultValue<RuntimeMaterialAsset> load_material(asset::AssetId id);
-    [[nodiscard]] foundation::ResultValue<RuntimeTextureAsset> load_texture(asset::AssetId id);
-    [[nodiscard]] foundation::ResultValue<RuntimeFontAsset> load_font(asset::AssetId id);
-    [[nodiscard]] foundation::Result retry(asset::AssetId id, asset::AssetKind kind) noexcept;
+    [[nodiscard]] foundation::ResultValue<RuntimeMeshAsset> load_mesh(foundation::AssetId id);
+    [[nodiscard]] foundation::ResultValue<RuntimeMaterialAsset> load_material(foundation::AssetId id);
+    [[nodiscard]] foundation::ResultValue<RuntimeTextureAsset> load_texture(foundation::AssetId id);
+    [[nodiscard]] foundation::ResultValue<RuntimeFontAsset> load_font(foundation::AssetId id);
+    [[nodiscard]] foundation::Result retry(foundation::AssetId id, foundation::AssetKind kind) noexcept;
     [[nodiscard]] std::size_t entry_count() const noexcept { return entries_.size(); }
 
 private:
     struct Key final {
-        asset::AssetId id{};
-        asset::AssetKind kind{asset::AssetKind::kMesh};
+        foundation::AssetId id{};
+        foundation::AssetKind kind{foundation::AssetKind::kMesh};
         auto operator==(const Key&) const -> bool = default;
     };
     struct KeyHash final {
@@ -89,8 +90,8 @@ private:
         asset::FontPayload font{};
     };
 
-    [[nodiscard]] foundation::ResultValue<Entry*> begin(asset::AssetId id, asset::AssetKind kind);
-    [[nodiscard]] uint64_t handle_value(asset::AssetId id, asset::AssetKind kind) noexcept;
+    [[nodiscard]] foundation::ResultValue<Entry*> begin(foundation::AssetId id, foundation::AssetKind kind);
+    [[nodiscard]] uint64_t handle_value(foundation::AssetId id, foundation::AssetKind kind) noexcept;
 
     std::shared_ptr<asset::AssetPackageReader> package_{};
     std::unordered_map<Key, Entry, KeyHash> entries_{};

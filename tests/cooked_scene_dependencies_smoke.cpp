@@ -8,8 +8,8 @@
 #include "texture_payload.hpp"
 
 namespace {
-using aeg::asset::AssetId;
-using aeg::asset::AssetKind;
+using aeg::foundation::AssetId;
+using aeg::foundation::AssetKind;
 
 AssetId id(std::string_view text) {
     const auto parsed = AssetId::parse(text);

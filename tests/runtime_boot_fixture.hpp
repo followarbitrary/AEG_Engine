@@ -12,10 +12,10 @@
 namespace runtime_test {
 struct Fixture {
     std::filesystem::path root;
-    aeg::module::ModuleDefinition definition{};
+    aeg::module::FeatureModuleDefinition definition{};
     aeg::application::runtime::RuntimeBuildIdentity identity{"task1", "windows-x64-vulkan", "Debug"};
 };
-inline bool prepare(Fixture& f) {
+inline bool prepare(Fixture& f, const aeg::scene::SceneAsset* authored_scene = nullptr) {
     using namespace aeg;
     namespace fs = std::filesystem;
     f.root = fs::temp_directory_path() / "aeg_runtime_task1_fixture";
@@ -31,7 +31,7 @@ inline bool prepare(Fixture& f) {
     cooked_scene.schema_version = 1;
     scene::SceneAsset document(scene::SceneAssetId{0x4000, 0x8000000000000001ull}, "RuntimeFixture", 1);
     serialization::BinaryWriter archive;
-    if (!scene::SceneSerializer::serialize(document, archive))
+    if (!scene::SceneSerializer::serialize(authored_scene ? *authored_scene : document, archive))
         return false;
     asset::ScenePayload payload{};
     payload.serialized_scene.assign(reinterpret_cast<const std::byte*>(archive.data().data()),
@@ -47,7 +47,7 @@ inline bool prepare(Fixture& f) {
                                                                        cooked_scene.schema_version, envelope.value}}))
         return false;
     std::ofstream(f.root / "game.manifest") << "package = \"game.aegbin\"\n";
-    f.definition.descriptor.id = pipeline::ModuleId{"Task1.GameModule"};
+    f.definition.descriptor.id = module::ModuleId{"Task1.GameModule"};
     f.definition.descriptor.name = "Task1.GameModule";
     return true;
 }

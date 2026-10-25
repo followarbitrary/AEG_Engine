@@ -308,12 +308,14 @@ int main() {
     view_desc.camera_entity = camera_entity.value;
     view_desc.view_id = 1;
     view_desc.output_extent = {1280, 720};
+    view_desc.shadow_extent = {320, 180};
     view_desc.visibility_mask = 0x00000003u;
     const auto view = aeg::engine::components::make_render_view(snapshot.value, view_desc);
     if (!require(view, "Runtime camera entity could not create a RenderView") ||
         !require(view.value.id == aeg::renderer::make_render_view_id(target_handle.value, 1) &&
                      view.value.world == target_handle.value && view.value.view_id == 1 &&
                      view.value.output_extent == aeg::renderer::RenderExtent{1280, 720} &&
+                     view.value.shadow_extent == aeg::renderer::RenderExtent{320, 180} &&
                      aeg::math::nearly_equal(view.value.camera.position, render_camera.value.position) &&
                      view.value.visibility_mask == view_desc.visibility_mask,
                  "Runtime component RenderView does not preserve its stable contract")) {

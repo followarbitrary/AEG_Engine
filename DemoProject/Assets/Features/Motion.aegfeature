@@ -1,0 +1,19 @@
+edges = []
+layout_revision = 1
+schema_version = 1
+draft_revision = 1
+graph_version = 1
+asset_uuid = "00000000-0000-4000-8000-000000000130"
+module_requirements = []
+process_subgraphs = []
+input_bindings = []
+variadic_slots = []
+extensions = []
+contract_digest = "16605880809940863371"
+
+[[nodes]]
+node_id = 8687060656354179064
+definition_id = "15852580244013579762"
+version = [1, 0, 0]
+owner_path = [6676448459379529708]
+parameters = []

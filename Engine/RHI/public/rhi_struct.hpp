@@ -1210,6 +1210,8 @@ namespace aeg::rhi {
         DeviceFeatureMask supported_features{DeviceFeature::kNone};
         bool supports_swapchain{false};
         uint64_t max_uniform_buffer_bytes{0};
+        /** Maximum byte range of one storage-buffer descriptor; zero means unavailable. */
+        uint64_t max_storage_buffer_bytes{0};
         uint32_t max_inline_constant_bytes{0};
     };
 } // namespace aeg::rhi

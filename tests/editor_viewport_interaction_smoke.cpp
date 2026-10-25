@@ -2,6 +2,7 @@
  * @file editor_viewport_interaction_smoke.cpp
  * @brief Verifies CPU viewport picking and editor-owned Transform transactions.
  */
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
@@ -9,14 +10,14 @@
 #include <iostream>
 #include <limits>
 #include <memory>
-#include <optional>
 #include <span>
 #include <vector>
 
 #include "Components/component_ids.hpp"
 #include "Components/render_components.hpp"
 #include "editor_scene_runtime.hpp"
-#include "render_state_flow.hpp"
+#include "composition/editor_render_graph_inspection.hpp"
+#include "renderer_feature_profiles.hpp"
 #include "rhi.hpp"
 
 namespace {
@@ -42,6 +43,45 @@ bool same_transform(const aeg::engine::components::Transform& left, const aeg::e
     return aeg::math::nearly_equal(left.translation, right.translation, 1.0e-4f) &&
            aeg::math::nearly_equal(left.rotation, right.rotation, 1.0e-4f) &&
            aeg::math::nearly_equal(left.scale, right.scale, 1.0e-4f);
+}
+
+bool preview_has_execution_source(const aeg::application::EditorSceneRuntime& runtime,
+                                  aeg::feature::RuntimeGeneration expected = {}) {
+    using namespace aeg;
+    const auto execution = runtime.inspect_renderer_feature_execution();
+    const auto captured = runtime.inspect_render_graph();
+    if (!require(execution && captured && execution.value.generation.is_valid() &&
+                 (!expected.is_valid() || execution.value.generation == expected) &&
+                 execution.value.provenance.size() == 1 && execution.value.plans.size() == 1 &&
+                 captured.value->plan.revision != 0,
+                 "viewport Preview has no real Feature ExecutionPlan/RenderGraph source")) return false;
+    const auto& origin = execution.value.provenance.front();
+    if (!require(origin.runtime.definition_id == feature::FeatureDefinitionId{"Renderer.Scene.Opaque"} &&
+                 origin.runtime.owner_module == feature::ModuleIdentity{"com.aeg.renderer"} &&
+                 origin.runtime.node_id.is_valid() && origin.runtime.instance_id.is_valid() &&
+                 origin.authored_node_id == feature::FeatureNodeId{"Renderer.Scene.Root"} &&
+                 std::ranges::find(execution.value.plans.front().instances, origin.runtime.instance_id) !=
+                     execution.value.plans.front().instances.end(),
+                 "viewport Preview ExecutionPlan lost actual Definition/Node/Instance/module attribution")) return false;
+    const auto source = std::ranges::find_if(captured.value->sources, [&](const auto& value) {
+        return value.asset_uuid == execution.value.asset_uuid && value.generation == execution.value.generation;
+    });
+    if (!require(source != captured.value->sources.end() && source->provenance.size() == 1 &&
+                 source->provenance.front().runtime.instance_id == origin.runtime.instance_id,
+                 "viewport RenderGraph does not retain its actual Preview publication")) return false;
+    bool drew = false;
+    for (const auto& pass : captured.value->plan.pass_plans) {
+        if (!pass.live || !pass.feature_work) continue;
+        const auto& work = *pass.feature_work;
+        if (!require(work.feature_definition_id == origin.runtime.definition_id &&
+                     work.owner_module == origin.runtime.owner_module && work.node_id == origin.runtime.node_id &&
+                     work.instance_id == origin.runtime.instance_id && work.frame_index == captured.value->frame_index &&
+                     work.operation_index == 0 && work.invocation.invocation_id.is_valid() &&
+                     work.invocation.generation == execution.value.generation,
+                     "viewport business Scene draw lost real invocation/frame/Feature provenance")) return false;
+        drew = true;
+    }
+    return require(drew && runtime.draw_call_count() != 0, "viewport Preview has no actual Feature Scene draw");
 }
 
 bool scale_drag_follows_visible_axis(aeg::application::EditorSceneRuntime& runtime) {
@@ -72,7 +112,7 @@ bool scale_drag_follows_visible_axis(aeg::application::EditorSceneRuntime& runti
         if (!require(
                 runtime.queue_component_update(camera_id, transform_type, std::as_bytes(std::span{&camera_pose, 1})),
                 "scale direction camera update failed") ||
-            !require(runtime.render_frame(frame++), "scale direction camera frame failed"))
+            !require(runtime.render_frame(frame++, 1.0 / 60.0), "scale direction camera frame failed"))
             return false;
         for (const auto axis : {ViewportGizmoAxis::kZ, ViewportGizmoAxis::kX, ViewportGizmoAxis::kY}) {
             const auto projection = runtime.selected_gizmo_projection(320, 240);
@@ -96,7 +136,7 @@ bool scale_drag_follows_visible_axis(aeg::application::EditorSceneRuntime& runti
                 if (!require(runtime.begin_transform_edit(ViewportGizmoMode::kScale, axis, tip, 320, 240),
                              "scale direction begin failed") ||
                     !require(runtime.update_transform_edit(end, 320, 240), "scale direction update failed") ||
-                    !require(runtime.render_frame(frame++), "scale direction preview frame failed"))
+                    !require(runtime.render_frame(frame++, 1.0 / 60.0), "scale direction preview frame failed"))
                     return false;
                 const auto* edited = static_cast<const Transform*>(runtime.component_value(mesh_id, transform_type));
                 if (!require(edited != nullptr, "scale direction edited Transform is missing"))
@@ -115,7 +155,7 @@ bool scale_drag_follows_visible_axis(aeg::application::EditorSceneRuntime& runti
                 unchanged.scale[index] = initial.scale[index];
                 if (!require(same_transform(unchanged, initial), "axis scale changed another Transform component") ||
                     !require(runtime.cancel_transform_edit(), "scale direction cancel failed") ||
-                    !require(runtime.render_frame(frame++), "scale direction cancel frame failed"))
+                    !require(runtime.render_frame(frame++, 1.0 / 60.0), "scale direction cancel frame failed"))
                     return false;
                 const auto* cancelled = static_cast<const Transform*>(runtime.component_value(mesh_id, transform_type));
                 if (!require(cancelled && same_transform(*cancelled, initial),
@@ -127,7 +167,7 @@ bool scale_drag_follows_visible_axis(aeg::application::EditorSceneRuntime& runti
     return require(
                runtime.queue_component_update(camera_id, transform_type, std::as_bytes(std::span{&original_camera, 1})),
                "scale direction camera restore failed") &&
-           require(runtime.render_frame(frame), "scale direction restore frame failed");
+           require(runtime.render_frame(frame, 1.0 / 60.0), "scale direction restore frame failed");
 }
 }  // namespace
 
@@ -148,7 +188,7 @@ int main() {
     aeg::application::EditorSceneRuntime runtime;
     if (!require(runtime.initialize(*device), "viewport interaction smoke initialization failed") ||
         !require(runtime.request_viewport_extent(96, 64), "viewport interaction smoke extent request failed") ||
-        !require(runtime.render_frame(0), "viewport interaction smoke initial frame failed")) {
+        !require(runtime.render_frame(0, 1.0 / 60.0), "viewport interaction smoke initial frame failed")) {
         return 2;
     }
 
@@ -212,7 +252,7 @@ int main() {
     zoomed_right.translation.z = 1.9f;
     if (!require(runtime.queue_component_update(right->id, transform_type, std::as_bytes(std::span{&zoomed_right, 1})),
                  "viewport interaction smoke could not move right mesh toward camera") ||
-        !require(runtime.render_frame(1), "viewport interaction smoke zoomed frame failed") ||
+        !require(runtime.render_frame(1, 1.0 / 60.0), "viewport interaction smoke zoomed frame failed") ||
         !require(runtime.select(left->id), "viewport interaction smoke could not select left mesh after zoom")) {
         return 10;
     }
@@ -247,7 +287,7 @@ int main() {
                                                96, 64),
                  "viewport interaction smoke update translate failed") ||
         !require(runtime.commit_transform_edit(), "viewport interaction smoke commit translate failed") ||
-        !require(runtime.render_frame(2), "viewport interaction smoke committed frame failed")) {
+        !require(runtime.render_frame(2, 1.0 / 60.0), "viewport interaction smoke committed frame failed")) {
         return 14;
     }
     const auto* translated =
@@ -270,7 +310,7 @@ int main() {
                 {after_translate_projection.value.z_axis.x + 10.0f, after_translate_projection.value.z_axis.y}, 96, 64),
             "viewport interaction smoke update rotate failed") ||
         !require(runtime.cancel_transform_edit(), "viewport interaction smoke cancel rotate failed") ||
-        !require(runtime.render_frame(3), "viewport interaction smoke cancelled frame failed")) {
+        !require(runtime.render_frame(3, 1.0 / 60.0), "viewport interaction smoke cancelled frame failed")) {
         return 16;
     }
     const auto* cancelled =
@@ -299,7 +339,7 @@ int main() {
     if (!require(reopened_transform != nullptr && same_transform(*reopened_transform, committed_copy),
                  "viewport interaction smoke Transform did not round-trip through Save/Load") ||
         !require(runtime.play(), "viewport interaction smoke Play failed") ||
-        !require(runtime.render_frame(3), "viewport interaction smoke Play frame failed") ||
+        !require(runtime.render_frame(3, 1.0 / 60.0), "viewport interaction smoke Play frame failed") ||
         !require(runtime.stop(), "viewport interaction smoke Stop failed")) {
         std::filesystem::remove(scene_path, remove_error);
         return 14;
@@ -319,14 +359,14 @@ int main() {
         if (!require(runtime.select(entity->id), "visibility selection failed") ||
             !require(runtime.queue_component_update(entity->id, mesh_type, std::as_bytes(std::span{&mesh, 1})),
                      "visibility update failed") ||
-            !require(runtime.render_frame(10), "visibility frame failed"))
+            !require(runtime.render_frame(10, 1.0 / 60.0), "visibility frame failed"))
             return 20;
         const auto hidden_gizmo = runtime.selected_gizmo_projection(96, 64);
         if (!require(hidden_gizmo && !hidden_gizmo.value.valid, "hidden entity still exposes a gizmo"))
             return 21;
     }
     if (!require(runtime.request_viewport_readback(), "empty viewport readback request failed") ||
-        !require(runtime.render_frame(11), "empty viewport frame failed"))
+        !require(runtime.render_frame(11, 1.0 / 60.0), "empty viewport frame failed"))
         return 22;
     const auto pixels = runtime.read_viewport_pixels();
     if (!require(pixels, "empty viewport readback failed"))
@@ -345,7 +385,7 @@ int main() {
             runtime.queue_component_update(restore_entity->id, mesh_type, std::as_bytes(std::span{&restored_mesh, 1})),
             "restore visibility failed") ||
         !require(runtime.request_viewport_readback(), "restore readback request failed") ||
-        !require(runtime.render_frame(12), "restore frame failed"))
+        !require(runtime.render_frame(12, 1.0 / 60.0), "restore frame failed"))
         return 25;
     const auto restored_gizmo = runtime.selected_gizmo_projection(96, 64);
     const auto restored_pixels = runtime.read_viewport_pixels();
@@ -358,110 +398,71 @@ int main() {
     if (!require(has_geometry, "restoring visibility did not restore rendered geometry"))
         return 27;
 
-    const auto snapshots = runtime.pipeline_snapshots();
-    const auto renderer_plan = std::find_if(snapshots.begin(), snapshots.end(),
-                                            [](const auto& snapshot) { return snapshot.first == "Game / Renderer"; });
-    if (!require(renderer_plan != snapshots.end() && renderer_plan->second != nullptr,
-                 "renderer pipeline snapshot is unavailable for state-link test"))
-        return 28;
-    const auto& plan = *renderer_plan->second;
-    std::vector<uint8_t> state_writers(plan.feature_contributions.size(), 0);
-    for (std::size_t contribution_index = 0; contribution_index < plan.feature_contributions.size();
-         ++contribution_index) {
-        const auto& contribution = plan.feature_contributions[contribution_index];
-        if (contribution.domain != aeg::pipeline::FeatureDomain::kRender)
-            continue;
-        for (const auto& implementation : plan.feature_implementations) {
-            if (implementation.feature_instance == contribution.feature_instance && implementation.implementation &&
-                implementation.implementation->uses_render_state_output()) {
-                state_writers[contribution_index] = 1;
-                break;
-            }
-        }
+    if (!preview_has_execution_source(runtime)) return 28;
+    const auto source = runtime.inspect_renderer_feature_execution();
+    const auto preset = aeg::renderer::scene_render_profile_graph(aeg::renderer::SceneRenderProfile::kOpaque);
+    if (!require(source && preset, "actual Renderer Feature preset is unavailable")) return 29;
+    const auto initial_generation = source.value.generation;
+    std::vector<aeg::feature::FeatureGraphDocument> invalid_graphs(4, preset.value);
+    invalid_graphs[0].nodes.front().definition_id = aeg::feature::FeatureDefinitionId{"Game.Logic.Foreign"};
+    invalid_graphs[1].nodes.front().definition_version.major += 1;
+    invalid_graphs[2].contract_digest ^= 1;
+    const auto node = preset.value.nodes.front().node_id;
+    invalid_graphs[3].edges.push_back({node, aeg::feature::PortId{"Out"}, node, aeg::feature::PortId{"In"},
+        aeg::feature::EdgeKind::kData, aeg::renderer::kSceneRenderProfileClock,
+        aeg::renderer::kSceneRenderProfileClock, 1, 1, 0});
+    uint64_t feature_frame = 13;
+    for (const auto& invalid : invalid_graphs) {
+        const auto rejected = runtime.publish_renderer_feature_graph(invalid);
+        const auto retained = runtime.inspect_renderer_feature_execution();
+        if (!require(!rejected && rejected.code == aeg::foundation::ResultCode::kInvalidArgument &&
+                     retained && retained.value.generation == initial_generation &&
+                     retained.value.asset_uuid == source.value.asset_uuid &&
+                     retained.value.graph_version == source.value.graph_version,
+                     "invalid Preview Feature publication changed the last-good source") ||
+            !require(runtime.request_viewport_readback(), "rejected Feature readback request failed") ||
+            !require(runtime.render_frame(feature_frame++, 1.0 / 60.0), "rejected Feature continuation frame failed") ||
+            !preview_has_execution_source(runtime, initial_generation)) return 31;
+        const auto retained_pixels = runtime.read_viewport_pixels();
+        if (!require(retained_pixels && retained_pixels.value == restored_pixels.value,
+                     "rejected Preview Feature publication changed actual last-good pixels")) return 32;
     }
-    // State Links are limited to RenderFeature/Present endpoints.  Non-render
-    // scheduler stages must never appear as a seemingly valid graph pin.
-    std::optional<uint32_t> non_render_node;
-    std::optional<uint32_t> present_node;
-    for (uint32_t node_index = 0; node_index < plan.nodes.size(); ++node_index) {
-        if (plan.nodes[node_index].phase == aeg::pipeline::EnginePhase::kPresent) {
-            present_node = node_index;
-        }
-        bool is_render_feature = false;
-        for (std::size_t contribution_index = 0; contribution_index < plan.feature_contributions.size();
-             ++contribution_index) {
-            const auto& contribution = plan.feature_contributions[contribution_index];
-            if (contribution.domain != aeg::pipeline::FeatureDomain::kRender ||
-                plan.nodes[node_index].definition_stage_index < contribution.first_stage_index ||
-                plan.nodes[node_index].definition_stage_index >=
-                    contribution.first_stage_index + contribution.stage_count) {
-                continue;
-            }
-            is_render_feature = true;
-            break;
-        }
-        if (!is_render_feature && plan.nodes[node_index].phase != aeg::pipeline::EnginePhase::kPresent)
-            non_render_node = node_index;
-    }
-    if (!require(non_render_node && present_node,
-                 "renderer pipeline has no non-Render/Present pair for State Link validation"))
-        return 29;
-    const auto invalid_state_link = runtime.add_render_state_link(*non_render_node, *present_node);
-    if (!require(!invalid_state_link && invalid_state_link.code == aeg::foundation::ResultCode::kInvalidArgument,
-                 "non-Render stage was allowed to create a State Link"))
-        return 30;
-    std::optional<aeg::render_graph::RenderStateLinkOverride> removed_link;
-    for (const auto& edge : plan.dependencies) {
-        const std::array<aeg::render_graph::RenderStateLinkOverride, 1> override{
-            {{edge.source_node, edge.destination_node, false}}};
-        const auto detached = aeg::render_graph::build_render_state_flow(plan, override);
-        bool writer_reaches_present = false;
-        for (std::size_t index = 0; index < state_writers.size(); ++index) {
-            writer_reaches_present |= state_writers[index] != 0 && detached.contributions[index].reaches_present;
-        }
-        if (!writer_reaches_present) {
-            removed_link = override.front();
-            break;
-        }
-    }
-    if (!require(removed_link.has_value(), "renderer pipeline has no detachable State Link"))
-        return 31;
-    if (!require(runtime.remove_render_state_link(removed_link->source_node, removed_link->destination_node),
-                 "removing compiled State Link failed") ||
-        !require(runtime.request_viewport_readback(), "detached State Link readback request failed") ||
-        !require(runtime.render_frame(13), "detached State Link frame failed"))
-        return 32;
-    const auto detached_pixels = runtime.read_viewport_pixels();
-    if (!require(detached_pixels, "detached State Link readback failed"))
-        return 33;
-    for (std::size_t i = 0; i + 3 < detached_pixels.value.size(); i += 4) {
-        if (!require(std::to_integer<int>(detached_pixels.value[i]) < 10 &&
-                         std::to_integer<int>(detached_pixels.value[i + 1]) < 10 &&
-                         std::to_integer<int>(detached_pixels.value[i + 2]) < 10,
-                     "detached State Link retained rendered geometry"))
-            return 34;
-    }
-    if (!require(runtime.add_render_state_link(removed_link->source_node, removed_link->destination_node),
-                 "reconnecting compiled State Link failed") ||
-        !require(runtime.request_viewport_readback(), "reconnected State Link readback request failed") ||
-        !require(runtime.render_frame(14), "reconnected State Link frame failed"))
-        return 35;
+    auto empty = preset.value;
+    empty.graph_version += 1;
+    empty.nodes.clear();
+    if (!require(runtime.publish_renderer_feature_graph(empty), "empty Preview Feature publication failed") ||
+        !require(runtime.request_viewport_readback(), "empty Feature readback request failed") ||
+        !require(runtime.render_frame(feature_frame++, 1.0 / 60.0), "empty Feature frame failed")) return 33;
+    const auto empty_source = runtime.inspect_renderer_feature_execution();
+    const auto empty_graph = runtime.inspect_render_graph();
+    const auto empty_pixels = runtime.read_viewport_pixels();
+    if (!require(empty_source && empty_source.value.generation != initial_generation &&
+                 empty_source.value.plans.empty() && empty_source.value.provenance.empty() &&
+                 empty_graph && std::ranges::none_of(empty_graph.value->plan.pass_plans,
+                     [](const auto& pass) { return pass.feature_work.has_value(); }) &&
+                 runtime.draw_call_count() == 0 &&
+                 empty_pixels && empty_pixels.value == restored_pixels.value,
+                 "empty Feature Preview performed hidden rendering or replayed retired business work")) return 34;
+    if (!require(runtime.restore_default_renderer_feature(), "actual default Feature Preview restore failed") ||
+        !require(runtime.request_viewport_readback(), "restored Feature readback request failed") ||
+        !require(runtime.render_frame(feature_frame++, 1.0 / 60.0), "restored Feature frame failed") ||
+        !preview_has_execution_source(runtime)) return 35;
+    const auto restored_source = runtime.inspect_renderer_feature_execution();
     const auto reconnected_pixels = runtime.read_viewport_pixels();
     bool reconnected_geometry = false;
-    if (!require(reconnected_pixels, "reconnected State Link readback failed"))
-        return 36;
-    for (std::size_t i = 0; i + 3 < reconnected_pixels.value.size(); i += 4) {
+    if (!require(restored_source && restored_source.value.generation != empty_source.value.generation &&
+                 restored_source.value.generation != initial_generation && !restored_source.value.plans.empty() &&
+                 reconnected_pixels && reconnected_pixels.value == restored_pixels.value,
+                 "default restore did not publish a new actual Opaque Feature source/pixels")) return 36;
+    for (std::size_t i = 0; i + 3 < reconnected_pixels.value.size(); i += 4)
         reconnected_geometry |= std::to_integer<int>(reconnected_pixels.value[i + 1]) > 40;
-    }
-    if (!require(reconnected_geometry, "reconnected State Link did not restore rendered geometry"))
-        return 37;
-    // State-composite descriptors sample RenderGraph-owned transient textures.
-    // Keep rendering beyond the frames-in-flight rotation to prove that no
-    // persistent descriptor retains an expired state texture.
+    if (!require(reconnected_geometry, "restored Opaque Feature did not restore rendered geometry")) return 37;
+    // Continue past the frames-in-flight rotation with fresh Scene bindings and actual Feature provenance.
     for (uint64_t frame = 15; frame < 21; ++frame) {
-        const auto continued_frame = runtime.render_frame(frame);
-        if (!require(continued_frame, continued_frame.message.empty() ? "state-link continuation frame failed"
-                                                                      : continued_frame.message.c_str())) {
+        const auto continued_frame = runtime.render_frame(frame, 1.0 / 60.0);
+        if (!require(continued_frame, continued_frame.message.empty() ? "Feature Preview continuation frame failed"
+                                                                      : continued_frame.message.c_str()) ||
+            !preview_has_execution_source(runtime, restored_source.value.generation)) {
             return 38;
         }
     }

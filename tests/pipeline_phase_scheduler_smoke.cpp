@@ -1,113 +1,144 @@
 /**
  * @file pipeline_phase_scheduler_smoke.cpp
- * @brief Exercises custom global Phases and all PipelineScheduler worker lanes.
+ * @brief Exercises custom global Phase ordering and stage-only execution traces.
  */
 #include <algorithm>
-#include <atomic>
+#include <array>
+#include <limits>
 #include <memory>
-#include <mutex>
 #include <pipeline.hpp>
-#include <thread>
+#include <string>
+#include <utility>
 #include <vector>
 
-namespace {
-struct TaskState final {
-    std::atomic<uint32_t> execution_count{0};
-    std::mutex mutex;
-    std::thread::id worker_thread{};
-};
+#include "../Engine/Pipeline/private/phase_registry_execution.hpp"
+#include "../Engine/Pipeline/private/pipeline_compiler_execution.hpp"
 
-[[nodiscard]] aeg::foundation::Result record_task(aeg::pipeline::PipelineTaskContext& context) {
-    auto* state = static_cast<TaskState*>(context.user_data());
-    if (state == nullptr) {
-        return aeg::foundation::Result::failure(aeg::foundation::ResultCode::kInvalidArgument,
-                                                "pipeline task state is null");
+namespace {
+aeg::foundation::Result declare_phases(aeg::pipeline::PipelineBuilder& builder) {
+    const auto io_stage = builder.add_stage({
+        aeg::pipeline::StageId("IoStage"),
+        aeg::pipeline::EnginePhase::kPreUpdate,
+        aeg::pipeline::ExecutionDomain::kMainThread,
+        aeg::pipeline::TimePolicy::kFrame,
+        true,
+        aeg::pipeline::PhaseId("IoPhase"),
+    });
+    const auto render_stage = builder.add_stage({
+        aeg::pipeline::StageId("RenderThreadStage"),
+        aeg::pipeline::EnginePhase::kPreUpdate,
+        aeg::pipeline::ExecutionDomain::kMainThread,
+        aeg::pipeline::TimePolicy::kFrame,
+        true,
+        aeg::pipeline::PhaseId("RenderThreadPhase"),
+    });
+    const auto gpu_stage = builder.add_stage({
+        aeg::pipeline::StageId("GpuStage"),
+        aeg::pipeline::EnginePhase::kPreUpdate,
+        aeg::pipeline::ExecutionDomain::kMainThread,
+        aeg::pipeline::TimePolicy::kFrame,
+        true,
+        aeg::pipeline::PhaseId("GpuPhase"),
+    });
+    if (!io_stage || !render_stage || !gpu_stage) {
+        return builder.status();
     }
-    state->execution_count.fetch_add(1, std::memory_order_relaxed);
-    {
-        std::lock_guard lock(state->mutex);
-        state->worker_thread = std::this_thread::get_id();
-    }
+
     return aeg::foundation::Result::success();
 }
 
-class PhasePipeline final : public aeg::pipeline::Pipeline {
-public:
-    PhasePipeline(TaskState& io_state, TaskState& render_state, TaskState& gpu_state)
-        : io_state_(io_state), render_state_(render_state), gpu_state_(gpu_state) {
-        descriptor_.id = aeg::pipeline::PipelineId("PhaseSchedulerSmoke");
-        descriptor_.name = "PhaseSchedulerSmoke";
-        descriptor_.category = aeg::pipeline::PipelineCategory::kCore;
+aeg::foundation::ResultValue<aeg::pipeline::PipelineDefinition> phase_definition() {
+    aeg::pipeline::PipelineBuilder builder(
+        aeg::pipeline::PipelineDescriptor{.id = aeg::pipeline::PipelineId("PhaseSchedulerSmoke"),
+                                          .name = std::string("PhaseSchedulerSmoke"),
+                                          .category = aeg::pipeline::PipelineCategory::kCore});
+    if (const auto result = declare_phases(builder); !result)
+        return {result, {}};
+    return builder.finish();
+}
+
+aeg::foundation::Result declare_invalid_phase(aeg::pipeline::PipelineBuilder& builder, bool invalid_compatibility) {
+    const auto stage = builder.add_stage({
+        .id = aeg::pipeline::StageId("InvalidPhaseStage"),
+        .phase = invalid_compatibility ? static_cast<aeg::pipeline::EnginePhase>(255)
+                                       : aeg::pipeline::EnginePhase::kPreUpdate,
+        .phase_id = invalid_compatibility ? aeg::pipeline::PhaseId{} : aeg::pipeline::PhaseId("MissingPhase"),
+    });
+    return stage ? aeg::foundation::Result::success() : builder.status();
+}
+
+aeg::foundation::ResultValue<aeg::pipeline::PipelineDefinition> invalid_phase_definition(bool invalid_compatibility) {
+    aeg::pipeline::PipelineBuilder builder(aeg::pipeline::PipelineDescriptor{
+        .id = aeg::pipeline::PipelineId("InvalidPhaseSchema"), .name = std::string("InvalidPhaseSchema")});
+    if (const auto result = declare_invalid_phase(builder, invalid_compatibility); !result)
+        return {result, {}};
+    return builder.finish();
+}
+
+bool visits_stage(const aeg::pipeline::PipelinePlan& plan, const aeg::pipeline::PipelineExecutionContext& context,
+                  aeg::pipeline::StageId stage, aeg::pipeline::PhaseId phase) {
+    const auto visited = context.visited_nodes();
+    return visited.size() == 1 && visited.front() < plan.nodes.size() && plan.nodes[visited.front()].stage == stage &&
+           plan.nodes[visited.front()].phase_id == phase;
+}
+
+bool invalid_phase_schema_is_rejected() {
+    using namespace aeg::pipeline;
+    using aeg::foundation::ResultCode;
+    PipelineRegistry registry;
+    const auto invalid_compatibility = invalid_phase_definition(true);
+    if (invalid_compatibility || invalid_compatibility.result.code != ResultCode::kInvalidArgument ||
+        invalid_compatibility.result.message.find("phase") == std::string::npos ||
+        registry.find_definition(PipelineId("InvalidPhaseSchema")))
+        return false;
+    auto malformed_value = invalid_phase_definition(false);
+    if (!malformed_value)
+        return false;
+    malformed_value.value.stages.front().descriptor.phase = static_cast<EnginePhase>(255);
+    malformed_value.value.stages.front().descriptor.phase_id = {};
+    const auto rejected_value = registry.register_pipeline(std::move(malformed_value.value));
+    if (rejected_value || rejected_value.code != ResultCode::kInvalidArgument ||
+        rejected_value.message.find("phase") == std::string::npos ||
+        registry.find_definition(PipelineId("InvalidPhaseSchema")))
+        return false;
+    auto missing_phase = invalid_phase_definition(false);
+    if (!missing_phase || !registry.register_pipeline(std::move(missing_phase.value)))
+        return false;
+    const auto invalid_custom = detail::PipelineCompilerExecution::compile({
+        .pipeline = PipelineId("InvalidPhaseSchema"),
+        .scope = PipelineScope::kEngine,
+        .registry = &registry,
+        .instance = PipelineInstanceId("InvalidPhaseInstance"),
+    });
+    return !invalid_custom && invalid_custom.result.code == ResultCode::kNotFound &&
+           invalid_custom.result.message.find("phase") != std::string::npos;
+}
+
+bool invalid_phase_declarations_preserve_registry(aeg::pipeline::PhaseRegistry& registry) {
+    using namespace aeg::pipeline;
+    using aeg::foundation::ResultCode;
+    const auto before = detail::PhaseRegistryExecution::snapshot(registry);
+    if (!before)
+        return false;
+    const PhaseDescriptor invalid[] = {
+        {{}, "InvalidId", to_phase_id(EnginePhase::kPreUpdate), PhaseOrderRelation::kAfter},
+        {PhaseId("SelfPhase"), "SelfPhase", PhaseId("SelfPhase"), PhaseOrderRelation::kAfter},
+        {PhaseId("InvalidRelation"), "InvalidRelation", to_phase_id(EnginePhase::kPreUpdate),
+         static_cast<PhaseOrderRelation>(255)},
+    };
+    for (const auto& descriptor : invalid) {
+        const auto result = registry.register_phase(descriptor);
+        const auto after = detail::PhaseRegistryExecution::snapshot(registry);
+        if (result || result.code != ResultCode::kInvalidArgument || !after ||
+            after.value.revision != before.value.revision || after.value.ordered_phases != before.value.ordered_phases)
+            return false;
     }
-
-    [[nodiscard]] const aeg::pipeline::PipelineDescriptor& descriptor() const noexcept override { return descriptor_; }
-
-    [[nodiscard]] aeg::foundation::Result build(aeg::pipeline::PipelineBuilder& builder) const override {
-        const auto io_stage = builder.add_stage({
-            aeg::pipeline::StageId("IoStage"),
-            aeg::pipeline::EnginePhase::kPreUpdate,
-            aeg::pipeline::ExecutionDomain::kIoWorker,
-            aeg::pipeline::TimePolicy::kFrame,
-            true,
-            aeg::pipeline::PhaseId("IoPhase"),
-        });
-        const auto render_stage = builder.add_stage({
-            aeg::pipeline::StageId("RenderThreadStage"),
-            aeg::pipeline::EnginePhase::kPreUpdate,
-            aeg::pipeline::ExecutionDomain::kRenderThread,
-            aeg::pipeline::TimePolicy::kFrame,
-            true,
-            aeg::pipeline::PhaseId("RenderThreadPhase"),
-        });
-        const auto gpu_stage = builder.add_stage({
-            aeg::pipeline::StageId("GpuStage"),
-            aeg::pipeline::EnginePhase::kPreUpdate,
-            aeg::pipeline::ExecutionDomain::kGpu,
-            aeg::pipeline::TimePolicy::kFrame,
-            true,
-            aeg::pipeline::PhaseId("GpuPhase"),
-        });
-        if (!io_stage || !render_stage || !gpu_stage) {
-            return builder.status();
-        }
-
-        const auto io_task = builder.add_task({
-            aeg::pipeline::TaskId("IoTask"),
-            aeg::pipeline::TaskFlags::kParallelSafe,
-            &record_task,
-            &io_state_,
-        });
-        const auto render_task = builder.add_task({
-            aeg::pipeline::TaskId("RenderThreadTask"),
-            aeg::pipeline::TaskFlags::kParallelSafe,
-            &record_task,
-            &render_state_,
-        });
-        const auto gpu_task = builder.add_task({
-            aeg::pipeline::TaskId("GpuTask"),
-            aeg::pipeline::TaskFlags::kParallelSafe,
-            &record_task,
-            &gpu_state_,
-        });
-        if (!io_task || !render_task || !gpu_task) {
-            return builder.status();
-        }
-
-        if (const auto result = builder.bind_task(io_task, io_stage); !result) {
-            return result;
-        }
-        if (const auto result = builder.bind_task(render_task, render_stage); !result) {
-            return result;
-        }
-        return builder.bind_task(gpu_task, gpu_stage);
-    }
-
-private:
-    aeg::pipeline::PipelineDescriptor descriptor_{};
-    TaskState& io_state_;
-    TaskState& render_state_;
-    TaskState& gpu_state_;
-};
+    const auto missing_anchor = registry.register_phase({PhaseId("MissingAnchorPhase"), "MissingAnchorPhase",
+                                                         PhaseId("MissingAnchor"), PhaseOrderRelation::kAfter});
+    const auto after = detail::PhaseRegistryExecution::snapshot(registry);
+    return !missing_anchor && missing_anchor.code == ResultCode::kNotFound && after &&
+           after.value.revision == before.value.revision && after.value.ordered_phases == before.value.ordered_phases;
+}
 }  // namespace
 
 int main() {
@@ -140,7 +171,7 @@ int main() {
         return 3;
     }
 
-    const auto phase_snapshot = registry.phase_registry().snapshot();
+    const auto phase_snapshot = aeg::pipeline::detail::PhaseRegistryExecution::snapshot(registry.phase_registry());
     if (!phase_snapshot) {
         return 4;
     }
@@ -158,16 +189,12 @@ int main() {
         return 5;
     }
 
-    TaskState io_state;
-    TaskState render_state;
-    TaskState gpu_state;
-    if (const auto result = registry.register_pipeline(
-            [&] { return std::make_unique<PhasePipeline>(io_state, render_state, gpu_state); });
-        !result) {
+    auto declaration = phase_definition();
+    if (!declaration || !registry.register_pipeline(std::move(declaration.value))) {
         return 6;
     }
 
-    const auto compiled = aeg::pipeline::PipelineCompiler{}.compile({
+    const auto compiled = aeg::pipeline::detail::PipelineCompilerExecution::compile({
         .pipeline = aeg::pipeline::PipelineId("PhaseSchedulerSmoke"),
         .scope = aeg::pipeline::PipelineScope::kEngine,
         .available_capabilities = 0,
@@ -178,80 +205,52 @@ int main() {
         return 7;
     }
 
-    aeg::pipeline::PipelineScheduler scheduler({1, 1, 1, 1});
-    if (scheduler.worker_count(aeg::pipeline::ExecutionDomain::kIoWorker) != 1 ||
-        scheduler.worker_count(aeg::pipeline::ExecutionDomain::kRenderThread) != 1 ||
-        scheduler.worker_count(aeg::pipeline::ExecutionDomain::kGpu) != 1) {
+    aeg::pipeline::PipelineScheduler scheduler;
+    if (compiled.value.nodes.size() != 3) {
         return 8;
     }
 
-    aeg::pipeline::PipelineExecutionContext context(nullptr, aeg::pipeline::PipelineScope::kEngine);
+    aeg::pipeline::PipelineExecutionContext context(aeg::pipeline::PipelineScope::kEngine);
     if (const auto result = scheduler.execute_phase(compiled.value, context, aeg::pipeline::PhaseId("IoPhase"));
-        !result || io_state.execution_count.load() != 1 || render_state.execution_count.load() != 0 ||
-        gpu_state.execution_count.load() != 0) {
+        !result || !visits_stage(compiled.value, context, aeg::pipeline::StageId("IoStage"),
+                                 aeg::pipeline::PhaseId("IoPhase"))) {
         return 9;
     }
     if (const auto result =
             scheduler.execute_phase(compiled.value, context, aeg::pipeline::PhaseId("RenderThreadPhase"));
-        !result || render_state.execution_count.load() != 1) {
+        !result || !visits_stage(compiled.value, context, aeg::pipeline::StageId("RenderThreadStage"),
+                                 aeg::pipeline::PhaseId("RenderThreadPhase"))) {
         return 10;
     }
     if (const auto result = scheduler.execute_phase(compiled.value, context, aeg::pipeline::PhaseId("GpuPhase"));
-        !result || gpu_state.execution_count.load() != 1) {
+        !result || !visits_stage(compiled.value, context, aeg::pipeline::StageId("GpuStage"),
+                                 aeg::pipeline::PhaseId("GpuPhase"))) {
         return 11;
     }
 
-    const std::thread::id main_thread = std::this_thread::get_id();
-    {
-        std::lock_guard lock(io_state.mutex);
-        if (io_state.worker_thread == main_thread) {
-            return 12;
-        }
-    }
-    {
-        std::lock_guard lock(render_state.mutex);
-        if (render_state.worker_thread == main_thread) {
-            return 13;
-        }
-    }
-    {
-        std::lock_guard lock(gpu_state.mutex);
-        if (gpu_state.worker_thread == main_thread) {
-            return 14;
-        }
-    }
-
-    aeg::concurrency::CancellationSource cancellation_source;
-    static_cast<void>(cancellation_source.cancel());
-    aeg::pipeline::PipelineExecutionContext cancelled_context(nullptr, aeg::pipeline::PipelineScope::kEngine);
-    if (const auto result = scheduler.execute_phase(compiled.value, cancelled_context,
-                                                    aeg::pipeline::PhaseId("IoPhase"), cancellation_source.token());
-        result.code != aeg::foundation::ResultCode::kCancelled || io_state.execution_count.load() != 1) {
-        return 15;
-    }
-
-    aeg::pipeline::PipelineScheduler replacement_scheduler({1, 1, 1, 1});
-    if (const auto result = replacement_scheduler.set_executor(
-            aeg::pipeline::ExecutionDomain::kIoWorker,
-            std::make_shared<aeg::concurrency::InlineExecutor>(aeg::concurrency::ExecutorDomain::kIoWorker));
-        !result || replacement_scheduler.worker_count(aeg::pipeline::ExecutionDomain::kIoWorker) != 0) {
-        return 16;
-    }
-    aeg::pipeline::PipelineExecutionContext replacement_context(nullptr, aeg::pipeline::PipelineScope::kEngine);
-    if (const auto result =
-            replacement_scheduler.execute_phase(compiled.value, replacement_context, aeg::pipeline::PhaseId("IoPhase"));
-        !result || io_state.execution_count.load() != 2) {
-        return 17;
-    }
-    {
-        std::lock_guard lock(io_state.mutex);
-        if (io_state.worker_thread != main_thread) {
-            return 18;
-        }
-    }
+    if (!scheduler.execute(compiled.value, context)) return 12;
+    const auto all_visited = context.visited_nodes();
+    const std::array expected{aeg::pipeline::StageId("IoStage"), aeg::pipeline::StageId("RenderThreadStage"),
+                              aeg::pipeline::StageId("GpuStage")};
+    if (all_visited.size() != expected.size()) return 13;
+    for (std::size_t index = 0; index < expected.size(); ++index)
+        if (all_visited[index] >= compiled.value.nodes.size() ||
+            compiled.value.nodes[all_visited[index]].stage != expected[index]) return 14;
+    if (!scheduler.execute_phase(compiled.value, context,
+                                 aeg::pipeline::to_phase_id(aeg::pipeline::EnginePhase::kInput)) ||
+        !context.visited_nodes().empty()) return 15;
+    if (!scheduler.execute_phase(compiled.value, context, aeg::pipeline::PhaseId("IoPhase"))) return 16;
+    if (scheduler.execute_phase(compiled.value, context, {}).code != aeg::foundation::ResultCode::kInvalidArgument ||
+        !context.visited_nodes().empty()) return 16;
+    auto malformed = compiled.value;
+    malformed.batches.back().node_indices.push_back(std::numeric_limits<uint32_t>::max());
+    if (scheduler.execute(malformed, context) || !context.visited_nodes().empty()) return 17;
+    if (!invalid_phase_schema_is_rejected() || !invalid_phase_declarations_preserve_registry(registry.phase_registry()))
+        return 18;
 
     if (const auto result = registry.phase_registry().unregister_phase(aeg::pipeline::PhaseId("IoPhase"));
-        result || result.code != aeg::foundation::ResultCode::kInvalidState) {
+        result || result.code != aeg::foundation::ResultCode::kInvalidState ||
+        aeg::pipeline::detail::PhaseRegistryExecution::revision(registry.phase_registry()) != phase_snapshot.value.revision) {
         return 19;
     }
     if (const auto result = registry.phase_registry().unregister_phase(aeg::pipeline::PhaseId("GpuPhase")); !result) {
@@ -264,5 +263,10 @@ int main() {
     if (const auto result = registry.phase_registry().unregister_phase(aeg::pipeline::PhaseId("IoPhase")); !result) {
         return 22;
     }
+    const auto retired = aeg::pipeline::detail::PhaseRegistryExecution::snapshot(registry.phase_registry());
+    if (!retired || retired.value.revision <= phase_snapshot.value.revision ||
+        registry.phase_registry().contains(aeg::pipeline::PhaseId("IoPhase")) ||
+        registry.phase_registry().contains(aeg::pipeline::PhaseId("RenderThreadPhase")) ||
+        registry.phase_registry().contains(aeg::pipeline::PhaseId("GpuPhase"))) return 23;
     return 0;
 }

@@ -2,7 +2,7 @@
  * @file pipeline.cpp
  * @brief Implements pipeline definition collection, compilation, and scheduling.
  */
-#include "../public/pipeline.hpp"
+#include "pipeline.hpp"
 
 #include <algorithm>
 #include <array>
@@ -11,6 +11,7 @@
 #include <exception>
 #include <functional>
 #include <mutex>
+#include <new>
 #include <numeric>
 #include <queue>
 #include <shared_mutex>
@@ -21,29 +22,451 @@
 #include <utility>
 #include <vector>
 
-#include "../public/pipeline_builder_backend.hpp"
-#include "../public/pipeline_configuration.hpp"
-#include "concurrency.hpp"
+#include "render_pass_builder_backend.hpp"
+#include "render_pass_execution_context_backend.hpp"
+#include "render_graph_builder_backend.hpp"
+#include "phase_registry_execution.hpp"
+#include "pipeline_compiler_execution.hpp"
+#include "pipeline_scope_host_execution.hpp"
 
 namespace aeg::pipeline {
-namespace {
-inline constexpr uint32_t kKnownTaskFlags =
-    static_cast<uint32_t>(TaskFlags::kParallelSafe) | static_cast<uint32_t>(TaskFlags::kOptional) |
-    static_cast<uint32_t>(TaskFlags::kSideEffect) | static_cast<uint32_t>(TaskFlags::kMustRun) |
-    static_cast<uint32_t>(TaskFlags::kMayBlock) | static_cast<uint32_t>(TaskFlags::kExportsCompletion);
 
+RenderPassBuilder::RenderPassBuilder(RenderPassBuilderBackend& backend, RenderGraphBuildFlags build_flags) noexcept
+    : backend_(&backend), build_flags_(build_flags) {}
+
+foundation::ResultValue<RenderGraphBuffer> RenderPassBuilder::find_buffer(RenderResourceId id) const {
+    return backend_ == nullptr ? foundation::ResultValue<RenderGraphBuffer>{render_graph_builder_invalid_state(), {}}
+                               : backend_->find_buffer(id);
+}
+
+foundation::ResultValue<RenderGraphTexture> RenderPassBuilder::find_texture(RenderResourceId id) const {
+    return backend_ == nullptr ? foundation::ResultValue<RenderGraphTexture>{render_graph_builder_invalid_state(), {}}
+                               : backend_->find_texture(id);
+}
+
+foundation::Result RenderPassBuilder::read(RenderGraphBuffer buffer, rhi::ResourceUsage usage,
+                                           rhi::PipelineStageMask pipeline_stages,
+                                           rhi::ShaderStageMask shader_stages, RenderGraphBufferRange range) {
+    return backend_ == nullptr ? render_graph_builder_invalid_state()
+                               : backend_->read_buffer(buffer, usage, pipeline_stages, shader_stages, range);
+}
+
+foundation::Result RenderPassBuilder::write(RenderGraphBuffer buffer, rhi::ResourceUsage usage,
+                                            rhi::PipelineStageMask pipeline_stages,
+                                            rhi::ShaderStageMask shader_stages, RenderGraphBufferRange range,
+                                            bool discard_contents) {
+    return backend_ == nullptr
+               ? render_graph_builder_invalid_state()
+               : backend_->write_buffer(buffer, usage, pipeline_stages, shader_stages, range, discard_contents);
+}
+
+foundation::Result RenderPassBuilder::read_write(RenderGraphBuffer buffer, rhi::ResourceUsage usage,
+                                                 rhi::PipelineStageMask pipeline_stages,
+                                                 rhi::ShaderStageMask shader_stages, RenderGraphBufferRange range) {
+    return backend_ == nullptr ? render_graph_builder_invalid_state()
+                               : backend_->read_write_buffer(buffer, usage, pipeline_stages, shader_stages, range);
+}
+
+foundation::Result RenderPassBuilder::read(RenderGraphTexture texture, rhi::ResourceUsage usage,
+                                           rhi::PipelineStageMask pipeline_stages,
+                                           rhi::ShaderStageMask shader_stages,
+                                           rhi::SubresourceRange subresources) {
+    if (usage == rhi::ResourceUsage::kPresent && !has_flag(build_flags_, RenderGraphBuildFlags::kMayWriteFinalOutput)) {
+        return render_graph_builder_permission_denied(RenderGraphBuildFlags::kMayWriteFinalOutput);
+    }
+    return backend_ == nullptr ? render_graph_builder_invalid_state()
+                               : backend_->read_texture(texture, usage, pipeline_stages, shader_stages, subresources);
+}
+
+foundation::Result RenderPassBuilder::write(RenderGraphTexture texture, rhi::ResourceUsage usage,
+                                            rhi::PipelineStageMask pipeline_stages,
+                                            rhi::ShaderStageMask shader_stages,
+                                            rhi::SubresourceRange subresources, bool discard_contents) {
+    if (usage == rhi::ResourceUsage::kPresent && !has_flag(build_flags_, RenderGraphBuildFlags::kMayWriteFinalOutput)) {
+        return render_graph_builder_permission_denied(RenderGraphBuildFlags::kMayWriteFinalOutput);
+    }
+    return backend_ == nullptr
+               ? render_graph_builder_invalid_state()
+               : backend_->write_texture(texture, usage, pipeline_stages, shader_stages, subresources,
+                                         discard_contents);
+}
+
+foundation::Result RenderPassBuilder::read_write(RenderGraphTexture texture, rhi::ResourceUsage usage,
+                                                 rhi::PipelineStageMask pipeline_stages,
+                                                 rhi::ShaderStageMask shader_stages,
+                                                 rhi::SubresourceRange subresources) {
+    if (usage == rhi::ResourceUsage::kPresent && !has_flag(build_flags_, RenderGraphBuildFlags::kMayWriteFinalOutput)) {
+        return render_graph_builder_permission_denied(RenderGraphBuildFlags::kMayWriteFinalOutput);
+    }
+    return backend_ == nullptr
+               ? render_graph_builder_invalid_state()
+               : backend_->read_write_texture(texture, usage, pipeline_stages, shader_stages, subresources);
+}
+
+foundation::Result RenderPassBuilder::use_color_attachment(RenderGraphTexture texture, rhi::LoadOp load_op,
+                                                           rhi::StoreOp store_op, rhi::ClearColorValue clear_color,
+                                                           rhi::ResourceUsage final_usage,
+                                                           rhi::SubresourceRange subresources) {
+    if (final_usage == rhi::ResourceUsage::kPresent &&
+        !has_flag(build_flags_, RenderGraphBuildFlags::kMayWriteFinalOutput)) {
+        return render_graph_builder_permission_denied(RenderGraphBuildFlags::kMayWriteFinalOutput);
+    }
+    return backend_ == nullptr
+               ? render_graph_builder_invalid_state()
+               : backend_->use_color_attachment(texture, load_op, store_op, clear_color, final_usage, subresources);
+}
+
+foundation::Result RenderPassBuilder::use_depth_stencil_attachment(
+    RenderGraphTexture texture, rhi::LoadOp depth_load_op, rhi::StoreOp depth_store_op, float clear_depth,
+    uint32_t clear_stencil, rhi::ResourceUsage final_usage, rhi::SubresourceRange subresources) {
+    if (final_usage == rhi::ResourceUsage::kPresent &&
+        !has_flag(build_flags_, RenderGraphBuildFlags::kMayWriteFinalOutput)) {
+        return render_graph_builder_permission_denied(RenderGraphBuildFlags::kMayWriteFinalOutput);
+    }
+    return backend_ == nullptr
+               ? render_graph_builder_invalid_state()
+               : backend_->use_depth_stencil_attachment(texture, depth_load_op, depth_store_op, clear_depth,
+                                                        clear_stencil, final_usage, subresources);
+}
+
+void RenderPassBuilder::set_side_effects(bool enabled) noexcept {
+    if (backend_ != nullptr) {
+        backend_->set_side_effects(enabled);
+    }
+}
+
+foundation::Result RenderPassBuilder::declare_render_program(const RenderProgramRequest& request,
+                                                             const RenderPassConfiguration& configuration) {
+    return backend_ == nullptr ? foundation::invalid_state("render-pass builder backend is not attached")
+                               : backend_->declare_render_program(request, configuration);
+}
+
+RenderPassExecutionContext::RenderPassExecutionContext(RenderPassExecutionContextBackend& backend) noexcept
+    : backend_(&backend) {}
+
+RenderGraphPass RenderPassExecutionContext::pass() const noexcept {
+    return backend_->pass();
+}
+
+foundation::ResultValue<RenderGraphBuffer> RenderPassExecutionContext::find_buffer(RenderResourceId id) const {
+    return backend_->find_buffer(id);
+}
+
+foundation::ResultValue<RenderGraphTexture> RenderPassExecutionContext::find_texture(RenderResourceId id) const {
+    return backend_->find_texture(id);
+}
+
+foundation::ResultValue<rhi::BufferHandle> RenderPassExecutionContext::buffer(RenderGraphBuffer buffer) const {
+    return backend_->buffer(buffer);
+}
+
+foundation::ResultValue<rhi::TextureHandle> RenderPassExecutionContext::texture(RenderGraphTexture texture) const {
+    return backend_->texture(texture);
+}
+
+foundation::ResultValue<rhi::BufferViewHandle> RenderPassExecutionContext::buffer_view(
+    RenderGraphBuffer buffer, rhi::BufferViewKind kind, uint64_t offset, uint64_t size, rhi::Format format,
+    uint32_t structure_stride) {
+    return backend_->buffer_view(buffer, kind, offset, size, format, structure_stride);
+}
+
+foundation::ResultValue<rhi::TextureViewHandle> RenderPassExecutionContext::texture_view(
+    RenderGraphTexture texture, rhi::TextureViewKind kind, rhi::SubresourceRange subresources, rhi::Format format,
+    rhi::TextureViewDimension dimension) {
+    return backend_->texture_view(texture, kind, subresources, format, dimension);
+}
+
+foundation::Result RenderPassExecutionContext::begin_rendering() {
+    return backend_->begin_rendering();
+}
+
+foundation::Result RenderPassExecutionContext::end_rendering() {
+    return backend_->end_rendering();
+}
+
+bool RenderPassExecutionContext::rendering_active() const noexcept {
+    return backend_->rendering_active();
+}
+
+bool RenderPassExecutionContext::rendering_started() const noexcept {
+    return backend_->rendering_started();
+}
+
+foundation::Result RenderPassExecutionContext::set_viewport(const rhi::Viewport& viewport) {
+    return backend_->set_viewport(viewport);
+}
+
+foundation::Result RenderPassExecutionContext::set_scissor(const rhi::ScissorRect& scissor) {
+    return backend_->set_scissor(scissor);
+}
+
+foundation::Result RenderPassExecutionContext::bind_pipeline(rhi::PipelineHandle pipeline) {
+    return backend_->bind_pipeline(pipeline);
+}
+
+foundation::Result RenderPassExecutionContext::bind_binding_set(uint32_t group, rhi::BindingSetHandle set,
+                                                                std::span<const uint32_t> dynamic_offsets) {
+    return backend_->bind_binding_set(group, set, dynamic_offsets);
+}
+
+foundation::Result RenderPassExecutionContext::set_inline_constants(uint32_t offset,
+                                                                     rhi::ShaderStageMask shader_stages,
+                                                                     std::span<const std::byte> data) {
+    return backend_->set_inline_constants(offset, shader_stages, data);
+}
+
+foundation::Result RenderPassExecutionContext::bind_vertex_buffer(uint32_t binding, rhi::BufferHandle buffer,
+                                                                   uint64_t offset) {
+    return backend_->bind_vertex_buffer(binding, buffer, offset);
+}
+
+foundation::Result RenderPassExecutionContext::bind_index_buffer(rhi::BufferHandle buffer, uint64_t offset,
+                                                                  rhi::IndexFormat format) {
+    return backend_->bind_index_buffer(buffer, offset, format);
+}
+
+foundation::Result RenderPassExecutionContext::draw(const rhi::DrawDesc& desc) {
+    return backend_->draw(desc);
+}
+
+foundation::Result RenderPassExecutionContext::draw_indexed(const rhi::DrawIndexedDesc& desc) {
+    return backend_->draw_indexed(desc);
+}
+
+foundation::Result RenderPassExecutionContext::dispatch(const rhi::DispatchDesc& desc) {
+    return backend_->dispatch(desc);
+}
+
+foundation::Result RenderPassExecutionContext::dispatch_indirect(const rhi::DispatchIndirectDesc& desc) {
+    return backend_->dispatch_indirect(desc);
+}
+
+foundation::Result RenderPassExecutionContext::copy_buffer(RenderGraphBuffer source, RenderGraphBuffer destination,
+                                                            uint64_t source_offset, uint64_t destination_offset,
+                                                            uint64_t size) {
+    return backend_->copy_buffer(source, destination, source_offset, destination_offset, size);
+}
+
+foundation::Result RenderPassExecutionContext::copy_buffer_to_texture(
+    RenderGraphBuffer source, uint64_t source_offset, uint32_t source_row_length, uint32_t source_image_height,
+    RenderGraphTexture destination, rhi::TextureSubresourceLayers destination_subresources,
+    rhi::Offset3D destination_offset, rhi::Extent3D extent) {
+    return backend_->copy_buffer_to_texture(source, source_offset, source_row_length, source_image_height, destination,
+                                             destination_subresources, destination_offset, extent);
+}
+
+foundation::Result RenderPassExecutionContext::copy_texture_to_buffer(
+    RenderGraphTexture source, rhi::TextureSubresourceLayers source_subresources, rhi::Offset3D source_offset,
+    rhi::Extent3D extent, RenderGraphBuffer destination, uint64_t destination_offset, uint32_t destination_row_length,
+    uint32_t destination_image_height) {
+    return backend_->copy_texture_to_buffer(source, source_subresources, source_offset, extent, destination,
+                                             destination_offset, destination_row_length, destination_image_height);
+}
+
+foundation::Result RenderPassExecutionContext::copy_texture(
+    RenderGraphTexture source, rhi::TextureSubresourceLayers source_subresources, rhi::Offset3D source_offset,
+    RenderGraphTexture destination, rhi::TextureSubresourceLayers destination_subresources,
+    rhi::Offset3D destination_offset, rhi::Extent3D extent) {
+    return backend_->copy_texture(source, source_subresources, source_offset, destination, destination_subresources,
+                                   destination_offset, extent);
+}
+
+foundation::Result RenderPassExecutionContext::clear_texture(RenderGraphTexture texture,
+                                                              rhi::SubresourceRange subresources,
+                                                              rhi::ClearColorValue color, float depth,
+                                                              uint32_t stencil) {
+    return backend_->clear_texture(texture, subresources, color, depth, stencil);
+}
+
+foundation::Result RenderPassExecutionContext::bind_render_program(const RenderProgramRequest& request,
+                                                                    const RenderPassConfiguration& configuration) {
+    return backend_ == nullptr ? foundation::invalid_state("render-pass execution backend is not attached")
+                               : backend_->bind_render_program(request, configuration);
+}
+
+foundation::ResultValue<RenderGraphBuffer> RenderGraphBuilder::create_buffer(
+    const rhi::BufferDesc& desc, RenderGraphResourceLifetime lifetime) {
+    return create_buffer({}, desc, lifetime);
+}
+
+foundation::ResultValue<RenderGraphBuffer> RenderGraphBuilder::create_buffer(
+    RenderResourceId id, const rhi::BufferDesc& desc, RenderGraphResourceLifetime lifetime) {
+    if (runtime_backend_ == nullptr) {
+        return {render_graph_builder_invalid_state(), {}};
+    }
+    if (!allows(RenderGraphBuildFlags::kMayCreateResources)) {
+        return {render_graph_builder_permission_denied(RenderGraphBuildFlags::kMayCreateResources), {}};
+    }
+    return runtime_backend_->create_buffer(id, desc, lifetime);
+}
+
+foundation::ResultValue<RenderGraphTexture> RenderGraphBuilder::create_texture(
+    const rhi::TextureDesc& desc, RenderGraphResourceLifetime lifetime) {
+    return create_texture({}, desc, lifetime);
+}
+
+foundation::ResultValue<RenderGraphTexture> RenderGraphBuilder::create_texture(
+    RenderResourceId id, const rhi::TextureDesc& desc, RenderGraphResourceLifetime lifetime) {
+    if (runtime_backend_ == nullptr) {
+        return {render_graph_builder_invalid_state(), {}};
+    }
+    if (!allows(RenderGraphBuildFlags::kMayCreateResources)) {
+        return {render_graph_builder_permission_denied(RenderGraphBuildFlags::kMayCreateResources), {}};
+    }
+    return runtime_backend_->create_texture(id, desc, lifetime);
+}
+
+foundation::ResultValue<RenderGraphBuffer> RenderGraphBuilder::import_buffer(
+    RenderResourceId id, rhi::BufferHandle buffer, const rhi::BufferDesc& desc,
+    const rhi::ResourceState& initial_state) {
+    if (runtime_backend_ == nullptr) {
+        return {render_graph_builder_invalid_state(), {}};
+    }
+    if (!allows(RenderGraphBuildFlags::kMayCreateResources)) {
+        return {render_graph_builder_permission_denied(RenderGraphBuildFlags::kMayCreateResources), {}};
+    }
+    return runtime_backend_->import_buffer(id, buffer, desc, initial_state);
+}
+
+foundation::ResultValue<RenderGraphTexture> RenderGraphBuilder::import_texture(
+    RenderResourceId id, rhi::TextureHandle texture, rhi::TextureViewHandle default_view, const rhi::TextureDesc& desc,
+    const rhi::ResourceState& initial_state) {
+    if (runtime_backend_ == nullptr) {
+        return {render_graph_builder_invalid_state(), {}};
+    }
+    if (!allows(RenderGraphBuildFlags::kMayCreateResources)) {
+        return {render_graph_builder_permission_denied(RenderGraphBuildFlags::kMayCreateResources), {}};
+    }
+    return runtime_backend_->import_texture(id, texture, default_view, desc, initial_state);
+}
+
+foundation::ResultValue<RenderGraphTexture> RenderGraphBuilder::import_swapchain_image(
+    RenderResourceId id, const rhi::FrameAcquireResult& acquired, const rhi::TextureDesc& desc,
+    const rhi::ResourceState& initial_state) {
+    if (runtime_backend_ == nullptr) {
+        return {render_graph_builder_invalid_state(), {}};
+    }
+    if (!allows(RenderGraphBuildFlags::kMayCreateResources)) {
+        return {render_graph_builder_permission_denied(RenderGraphBuildFlags::kMayCreateResources), {}};
+    }
+    return runtime_backend_->import_swapchain_image(id, acquired, desc, initial_state);
+}
+
+foundation::ResultValue<RenderGraphBuffer> RenderGraphBuilder::find_buffer(RenderResourceId id) const {
+    if (runtime_backend_ == nullptr) {
+        return {render_graph_builder_invalid_state(), {}};
+    }
+    return runtime_backend_->find_buffer(id);
+}
+
+foundation::ResultValue<RenderGraphTexture> RenderGraphBuilder::find_texture(RenderResourceId id) const {
+    if (runtime_backend_ == nullptr) {
+        return {render_graph_builder_invalid_state(), {}};
+    }
+    return runtime_backend_->find_texture(id);
+}
+
+foundation::Result RenderGraphBuilder::bind_buffer(RenderResourceId id, RenderGraphBuffer buffer) {
+    if (runtime_backend_ == nullptr) {
+        return render_graph_builder_invalid_state();
+    }
+    if (!allows(RenderGraphBuildFlags::kMayCreateResources)) {
+        return render_graph_builder_permission_denied(RenderGraphBuildFlags::kMayCreateResources);
+    }
+    return runtime_backend_->bind_buffer(id, buffer);
+}
+
+foundation::Result RenderGraphBuilder::bind_texture(RenderResourceId id, RenderGraphTexture texture) {
+    if (runtime_backend_ == nullptr) {
+        return render_graph_builder_invalid_state();
+    }
+    if (!allows(RenderGraphBuildFlags::kMayCreateResources)) {
+        return render_graph_builder_permission_denied(RenderGraphBuildFlags::kMayCreateResources);
+    }
+    return runtime_backend_->bind_texture(id, texture);
+}
+
+foundation::Result RenderGraphBuilder::export_buffer(RenderGraphBuffer buffer) {
+    if (runtime_backend_ == nullptr) {
+        return render_graph_builder_invalid_state();
+    }
+    if (!allows(RenderGraphBuildFlags::kMayWriteFinalOutput)) {
+        return render_graph_builder_permission_denied(RenderGraphBuildFlags::kMayWriteFinalOutput);
+    }
+    return runtime_backend_->export_buffer(buffer);
+}
+
+foundation::Result RenderGraphBuilder::export_texture(RenderGraphTexture texture) {
+    if (runtime_backend_ == nullptr) {
+        return render_graph_builder_invalid_state();
+    }
+    if (!allows(RenderGraphBuildFlags::kMayWriteFinalOutput)) {
+        return render_graph_builder_permission_denied(RenderGraphBuildFlags::kMayWriteFinalOutput);
+    }
+    return runtime_backend_->export_texture(texture);
+}
+
+foundation::ResultValue<RenderGraphPass> RenderGraphBuilder::add_pass(std::string_view name, RenderGraphPassType type,
+                                                                       rhi::QueueClass queue,
+                                                                       RenderPassSetupFunction setup,
+                                                                       RenderPassExecuteFunction execute) {
+    if (runtime_backend_ == nullptr) {
+        return {render_graph_builder_invalid_state(), {}};
+    }
+    RenderGraphBuildFlags required_flag = RenderGraphBuildFlags::kNone;
+    switch (type) {
+        case RenderGraphPassType::kGraphics:
+            required_flag = RenderGraphBuildFlags::kMayCreateGraphicsPass;
+            break;
+        case RenderGraphPassType::kCompute:
+            required_flag = RenderGraphBuildFlags::kMayCreateComputePass;
+            break;
+        case RenderGraphPassType::kCopy:
+            required_flag = RenderGraphBuildFlags::kMayCreateCopyPass;
+            break;
+    }
+    if (!allows(required_flag)) {
+        return {render_graph_builder_permission_denied(required_flag), {}};
+    }
+    if ((queue == rhi::QueueClass::kCompute || queue == rhi::QueueClass::kCopy) &&
+        !allows(RenderGraphBuildFlags::kMayUseDedicatedQueue)) {
+        return {render_graph_builder_permission_denied(RenderGraphBuildFlags::kMayUseDedicatedQueue), {}};
+    }
+    return runtime_backend_->add_pass(name, type, queue, std::move(setup), std::move(execute));
+}
+
+foundation::Result RenderGraphBuilder::add_dependency(RenderGraphPass source, RenderGraphPass destination) {
+    return runtime_backend_ == nullptr ? render_graph_builder_invalid_state()
+                                       : runtime_backend_->add_dependency(source, destination);
+}
+
+foundation::Result RenderGraphBuilder::remember_native_pass(RenderPassInstanceId instance, RenderGraphPass pass) {
+    if (!instance.is_valid() || !pass.is_valid()) return foundation::invalid_argument("native pass identity or handle is invalid");
+    try {
+        if (!native_passes_.emplace(instance, pass).second)
+            return foundation::invalid_argument("native pass instance is duplicated in this sequence");
+        return foundation::Result::success();
+    } catch (const std::bad_alloc&) {
+        return foundation::out_of_memory("native pass sequence allocation failed");
+    }
+}
+
+foundation::ResultValue<RenderGraphPass> RenderGraphBuilder::native_pass(RenderPassInstanceId instance) const {
+    if (!instance.is_valid()) return {foundation::invalid_argument("native pass instance is invalid"), {}};
+    const auto found = native_passes_.find(instance);
+    if (found == native_passes_.end()) return {foundation::not_found("native sequence pass is missing or disabled"), {}};
+    return {foundation::Result::success(), found->second};
+}
+
+foundation::Result RenderGraphBuilder::retain_execution_owner(std::shared_ptr<const void> owner) {
+    return runtime_backend_ ? runtime_backend_->retain_execution_owner(std::move(owner)) : render_graph_builder_invalid_state();
+}
+
+namespace {
 inline constexpr uint32_t kKnownAccessFlags =
     static_cast<uint32_t>(AccessFlags::kOptional) | static_cast<uint32_t>(AccessFlags::kPreserveContents) |
     static_cast<uint32_t>(AccessFlags::kDiscardContents) | static_cast<uint32_t>(AccessFlags::kExclusive) |
     static_cast<uint32_t>(AccessFlags::kDeterministicAppend);
-
-inline constexpr uint32_t kKnownFeaturePointFlags = static_cast<uint32_t>(FeaturePointFlags::kMayCreateArtifacts) |
-                                                    static_cast<uint32_t>(FeaturePointFlags::kMayCreateGraphicsPass) |
-                                                    static_cast<uint32_t>(FeaturePointFlags::kMayCreateComputePass) |
-                                                    static_cast<uint32_t>(FeaturePointFlags::kMayCreateCopyPass) |
-                                                    static_cast<uint32_t>(FeaturePointFlags::kMayUseDedicatedQueue) |
-                                                    static_cast<uint32_t>(FeaturePointFlags::kMayWriteFinalOutput) |
-                                                    static_cast<uint32_t>(FeaturePointFlags::kMayPublishSnapshot);
 
 std::string append_message(std::string prefix, const foundation::Result& result) {
     if (!result.message.empty()) {
@@ -61,39 +484,8 @@ std::string append_message(std::string prefix, const foundation::Result& result)
     return static_cast<uint8_t>(domain) <= static_cast<uint8_t>(ExecutionDomain::kGpu);
 }
 
-[[nodiscard]] concurrency::ExecutorDomain to_executor_domain(ExecutionDomain domain) noexcept {
-    switch (domain) {
-        case ExecutionDomain::kMainThread:
-            return concurrency::ExecutorDomain::kMainThread;
-        case ExecutionDomain::kCpuWorker:
-            return concurrency::ExecutorDomain::kCpuWorker;
-        case ExecutionDomain::kIoWorker:
-            return concurrency::ExecutorDomain::kIoWorker;
-        case ExecutionDomain::kRenderThread:
-            return concurrency::ExecutorDomain::kRenderThread;
-        case ExecutionDomain::kGpu:
-            return concurrency::ExecutorDomain::kGpu;
-    }
-    return concurrency::ExecutorDomain::kMainThread;
-}
-
 [[nodiscard]] bool is_valid_time_policy(TimePolicy policy) noexcept {
     return static_cast<uint8_t>(policy) <= static_cast<uint8_t>(TimePolicy::kShutdown);
-}
-
-[[nodiscard]] bool is_valid_feature_domain(FeatureDomain domain) noexcept {
-    return static_cast<uint8_t>(domain) <= static_cast<uint8_t>(FeatureDomain::kComposite);
-}
-
-[[nodiscard]] bool is_valid_feature_point_position(FeaturePointPosition position) noexcept {
-    return static_cast<uint8_t>(position) <= static_cast<uint8_t>(FeaturePointPosition::kAfter);
-}
-
-[[nodiscard]] FeatureDomainMask get_feature_domain_mask(const FeatureDescriptor& descriptor) noexcept {
-    if (descriptor.domain == FeatureDomain::kComposite) {
-        return descriptor.domain_mask;
-    }
-    return descriptor.domain_mask == 0 ? to_mask(descriptor.domain) : descriptor.domain_mask;
 }
 
 [[nodiscard]] bool is_valid_engine_phase(EnginePhase phase) noexcept {
@@ -146,12 +538,6 @@ std::string append_message(std::string prefix, const foundation::Result& result)
     });
 }
 
-[[nodiscard]] bool artifact_is_visible(const PipelinePlan& plan, const ArtifactDescriptor& artifact,
-                                       PipelineScope target_scope) noexcept {
-    return target_scope == artifact.owner_scope || (artifact.visible_to & to_mask(target_scope)) != 0 ||
-           artifact_is_exposed(plan, artifact.id, target_scope);
-}
-
 [[nodiscard]] const ArtifactDescriptor* find_plan_artifact(const PipelinePlan& plan, ArtifactId id) noexcept {
     for (const ArtifactDescriptor& artifact : plan.artifacts) {
         if (artifact.id == id) {
@@ -168,15 +554,6 @@ std::string append_message(std::string prefix, const foundation::Result& result)
     });
 }
 
-[[nodiscard]] const ArtifactBinding* find_node_binding(const PipelineNode& node, ArtifactId id) noexcept {
-    for (const ArtifactBinding& binding : node.artifact_bindings) {
-        if (binding.artifact == id) {
-            return &binding;
-        }
-    }
-    return nullptr;
-}
-
 [[nodiscard]] bool is_writer(ArtifactAccess access) noexcept {
     return access == ArtifactAccess::kWrite || access == ArtifactAccess::kReadWrite ||
            access == ArtifactAccess::kAppend || access == ArtifactAccess::kPublishSnapshot;
@@ -189,14 +566,6 @@ std::string append_message(std::string prefix, const foundation::Result& result)
 
 [[nodiscard]] bool is_append_writer(ArtifactAccess access) noexcept {
     return access == ArtifactAccess::kAppend;
-}
-
-[[nodiscard]] bool is_parallel_safe(const PipelineNode& node) noexcept {
-    if (node.synthetic || !node.stage_parallelizable || !has_flag(node.flags, TaskFlags::kParallelSafe) ||
-        has_flag(node.flags, TaskFlags::kSideEffect)) {
-        return false;
-    }
-    return node.execution_domain != ExecutionDomain::kMainThread;
 }
 
 using foundation::invalid_argument;
@@ -236,34 +605,6 @@ using PlanArtifactIndex = std::unordered_map<ArtifactId, const ArtifactDescripto
         }
     }
     return foundation::Result::success();
-}
-
-[[nodiscard]] foundation::Result execute_node(const PipelineNode& node, PipelineExecutionContext& context) {
-    if (node.synthetic || node.execute == nullptr) {
-        return foundation::Result::success();
-    }
-
-    PipelineTaskContext task_context(context, node);
-    try {
-        return node.execute(task_context);
-    } catch (const std::exception& exception) {
-        return foundation::Result::failure(foundation::ResultCode::kUnknown, exception.what());
-    } catch (...) {
-        return foundation::Result::failure(foundation::ResultCode::kUnknown,
-                                           "pipeline task threw an unknown exception");
-    }
-}
-
-[[nodiscard]] foundation::Result with_task_context(const PipelineNode& node, foundation::Result result) {
-    if (result) {
-        return result;
-    }
-
-    std::string message = "pipeline task failed";
-    if (node.task.is_valid()) {
-        message += " (id=" + std::to_string(node.task.value()) + ")";
-    }
-    return foundation::Result::failure(result.code, append_message(std::move(message), result));
 }
 
 }  // namespace
@@ -559,35 +900,37 @@ foundation::ResultValue<PhaseDescriptor> PhaseRegistry::find_phase(PhaseId id) c
 }
 
 foundation::ResultValue<std::vector<PhaseId>> PhaseRegistry::ordered_phases() const {
-    foundation::ResultValue<PhaseRegistrySnapshot> snapshot_result = snapshot();
+    foundation::ResultValue<PhaseRegistrySnapshot> snapshot_result =
+        detail::PhaseRegistryExecution::snapshot(*this);
     if (!snapshot_result) {
         return {snapshot_result.result, {}};
     }
     return {foundation::Result::success(), std::move(snapshot_result.value.ordered_phases)};
 }
 
-foundation::ResultValue<PhaseRegistrySnapshot> PhaseRegistry::snapshot() const {
-    if (impl_ == nullptr) {
+foundation::ResultValue<PhaseRegistrySnapshot> detail::PhaseRegistryExecution::snapshot(
+    const PhaseRegistry& registry) {
+    if (registry.impl_ == nullptr) {
         return {invalid_state("phase registry is not initialized"), {}};
     }
-    std::shared_lock lock(impl_->mutex);
-    const foundation::ResultValue<std::vector<PhaseId>> ordered = ordered_phases_locked();
+    std::shared_lock lock(registry.impl_->mutex);
+    const foundation::ResultValue<std::vector<PhaseId>> ordered = registry.ordered_phases_locked();
     if (!ordered) {
         return {ordered.result, {}};
     }
 
     PhaseRegistrySnapshot result{};
-    result.revision = impl_->revision;
+    result.revision = registry.impl_->revision;
     result.ordered_phases = std::move(ordered.value);
     return {foundation::Result::success(), std::move(result)};
 }
 
-uint64_t PhaseRegistry::revision() const noexcept {
-    if (impl_ == nullptr) {
+uint64_t detail::PhaseRegistryExecution::revision(const PhaseRegistry& registry) noexcept {
+    if (registry.impl_ == nullptr) {
         return 0;
     }
-    std::shared_lock lock(impl_->mutex);
-    return impl_->revision;
+    std::shared_lock lock(registry.impl_->mutex);
+    return registry.impl_->revision;
 }
 
 struct ArtifactRuntimeEntry final {
@@ -1285,8 +1628,7 @@ foundation::ResultValue<ArtifactView> ArtifactScopeBridge::read(ArtifactId id, A
     return {foundation::Result::success(), value};
 }
 
-foundation::Result PipelineExecutionContext::begin_plan(const PipelinePlan& plan,
-                                                        concurrency::CancellationToken cancellation) noexcept {
+foundation::Result PipelineExecutionContext::begin_plan(const PipelinePlan& plan) noexcept {
     if (active_plan_ != nullptr) {
         return invalid_state("pipeline execution context is already executing a plan");
     }
@@ -1297,155 +1639,14 @@ foundation::Result PipelineExecutionContext::begin_plan(const PipelinePlan& plan
         return invalid_state("pipeline plan scope does not match execution context scope");
     }
     active_plan_ = &plan;
-    cancellation_ = std::move(cancellation);
     return foundation::Result::success();
 }
 
 void PipelineExecutionContext::end_plan() noexcept {
     active_plan_ = nullptr;
-    cancellation_ = {};
-}
-
-foundation::ResultValue<ArtifactView> PipelineExecutionContext::read_artifact(const PipelineNode& node, ArtifactId id,
-                                                                              ArtifactTypeId expected_type,
-                                                                              uint32_t required_version) const {
-    if (active_plan_ == nullptr) {
-        return {invalid_state("artifact access is outside pipeline execution"), {}};
-    }
-    const ArtifactDescriptor* artifact = find_plan_artifact(*active_plan_, id);
-    if (artifact == nullptr) {
-        return {not_found("task references an undeclared artifact"), {}};
-    }
-    const ArtifactBinding* binding = find_node_binding(node, id);
-    if (binding == nullptr || !is_reader(binding->access)) {
-        return {unsupported("task has no declared read access to the artifact"), {}};
-    }
-    if (!can_scope_read(scope_, artifact->owner_scope) || !artifact_is_visible(*active_plan_, *artifact, scope_)) {
-        return {unsupported("artifact is not visible from the execution scope"), {}};
-    }
-    if (expected_type.is_valid() && expected_type != artifact->type) {
-        return {invalid_argument("artifact type does not match its contract"), {}};
-    }
-    if (required_version == 0) {
-        required_version = binding->required_version;
-    }
-    if (required_version != artifact->version) {
-        return {invalid_argument("artifact version does not match its contract"), {}};
-    }
-    if (!expected_type.is_valid()) {
-        expected_type = artifact->type;
-    }
-
-    if (artifact_registry_ != nullptr) {
-        const foundation::ResultValue<ArtifactView> value =
-            artifact_registry_->read(id, expected_type, required_version);
-        if (value || (value.result.code != foundation::ResultCode::kNotFound &&
-                      value.result.code != foundation::ResultCode::kNotReady)) {
-            return value;
-        }
-    }
-    if (scope_bridge_ != nullptr) {
-        if (scope_bridge_->target_scope() != scope_ || scope_bridge_->source_scope() != artifact->owner_scope) {
-            return {invalid_state("artifact scope bridge does not match the artifact contract"), {}};
-        }
-        return scope_bridge_->read(id, expected_type, required_version);
-    }
-    return {
-        foundation::Result::failure(foundation::ResultCode::kNotReady, "artifact has no runtime value or scope bridge"),
-        {}};
-}
-
-foundation::ResultValue<ArtifactWriter> PipelineExecutionContext::write_artifact(const PipelineNode& node,
-                                                                                 ArtifactId id,
-                                                                                 ArtifactTypeId expected_type,
-                                                                                 uint32_t required_version) {
-    if (active_plan_ == nullptr) {
-        return {invalid_state("artifact access is outside pipeline execution"), {}};
-    }
-    const ArtifactDescriptor* artifact = find_plan_artifact(*active_plan_, id);
-    if (artifact == nullptr) {
-        return {not_found("task references an undeclared artifact"), {}};
-    }
-    const ArtifactBinding* binding = find_node_binding(node, id);
-    if (binding == nullptr || !is_writer(binding->access)) {
-        return {unsupported("task has no declared write access to the artifact"), {}};
-    }
-    if (artifact->owner_scope != scope_) {
-        return {unsupported("only the artifact owner scope may write the artifact"), {}};
-    }
-    if (expected_type.is_valid() && expected_type != artifact->type) {
-        return {invalid_argument("artifact type does not match its contract"), {}};
-    }
-    if (required_version == 0) {
-        required_version = binding->required_version;
-    }
-    if (required_version != artifact->version) {
-        return {invalid_argument("artifact version does not match its contract"), {}};
-    }
-    if (artifact->storage == ArtifactStorage::kImmutableSnapshot ||
-        artifact->ownership == OwnershipPolicy::kSharedImmutable) {
-        return {unsupported("immutable artifact cannot be written through a writer lease"), {}};
-    }
-    if (artifact_registry_ == nullptr) {
-        return {invalid_state("pipeline execution has no artifact registry"), {}};
-    }
-    return artifact_registry_->write(id, expected_type.is_valid() ? expected_type : artifact->type, required_version);
-}
-
-foundation::Result PipelineExecutionContext::publish_artifact(const PipelineNode& node, ArtifactId id,
-                                                              ArtifactPayload payload) {
-    if (active_plan_ == nullptr) {
-        return invalid_state("artifact access is outside pipeline execution");
-    }
-    const ArtifactDescriptor* artifact = find_plan_artifact(*active_plan_, id);
-    if (artifact == nullptr) {
-        return not_found("task references an undeclared artifact");
-    }
-    const ArtifactBinding* binding = find_node_binding(node, id);
-    if (binding == nullptr || binding->access != ArtifactAccess::kPublishSnapshot) {
-        return unsupported("task has no declared snapshot publication access to the artifact");
-    }
-    if (artifact->storage != ArtifactStorage::kImmutableSnapshot) {
-        return unsupported("snapshot publication requires immutable snapshot storage");
-    }
-    if (artifact->owner_scope != scope_) {
-        return unsupported("only the artifact owner scope may publish the artifact");
-    }
-    if (artifact_registry_ == nullptr) {
-        return invalid_state("pipeline execution has no artifact registry");
-    }
-    return artifact_registry_->publish(id, std::move(payload));
-}
-
-foundation::ResultValue<ArtifactView> PipelineTaskContext::read_artifact(ArtifactId id, ArtifactTypeId expected_type,
-                                                                         uint32_t required_version) const {
-    return execution_context_.read_artifact(node_, id, expected_type, required_version);
-}
-
-foundation::ResultValue<ArtifactWriter> PipelineTaskContext::write_artifact(ArtifactId id, ArtifactTypeId expected_type,
-                                                                            uint32_t required_version) const {
-    return execution_context_.write_artifact(node_, id, expected_type, required_version);
-}
-
-foundation::Result PipelineTaskContext::publish_artifact(ArtifactId id, ArtifactPayload payload) const {
-    return execution_context_.publish_artifact(node_, id, std::move(payload));
 }
 
 PipelineBuilder::PipelineBuilder(const PipelineDescriptor& descriptor) : descriptor_(descriptor) {}
-
-PipelineBuilder::PipelineBuilder(PipelineBuilderBackend& backend, const PipelineDescriptor& descriptor)
-    : descriptor_(descriptor), declaration_backend_(&backend) {}
-
-PipelineBuilder::PipelineBuilder(const PipelineDefinition& definition)
-    : descriptor_(definition.descriptor),
-      stages_(definition.stages),
-      tasks_(definition.tasks),
-      artifacts_(definition.artifacts),
-      feature_points_(definition.feature_points),
-      feature_bindings_(definition.feature_bindings),
-      bindings_(definition.bindings),
-      orderings_(definition.orderings),
-      exposures_(definition.exposures) {}
 
 void PipelineBuilder::set_failure(foundation::ResultCode code, std::string message) {
     if (status_) {
@@ -1457,16 +1658,8 @@ bool PipelineBuilder::validate_stage(PipelineStageHandle stage) const noexcept {
     return stage.is_valid() && stage.generation == kBuilderGeneration && stage.index < stages_.size();
 }
 
-bool PipelineBuilder::validate_task(PipelineTaskHandle task) const noexcept {
-    return task.is_valid() && task.generation == kBuilderGeneration && task.index < tasks_.size();
-}
-
 bool PipelineBuilder::validate_artifact(PipelineArtifactHandle artifact) const noexcept {
     return artifact.is_valid() && artifact.generation == kBuilderGeneration && artifact.index < artifacts_.size();
-}
-
-bool PipelineBuilder::validate_feature_point(PipelineFeaturePointHandle point) const noexcept {
-    return point.is_valid() && point.generation == kBuilderGeneration && point.index < feature_points_.size();
 }
 
 uint32_t PipelineBuilder::find_stage(StageId id) const noexcept {
@@ -1487,19 +1680,7 @@ uint32_t PipelineBuilder::find_artifact(ArtifactId id) const noexcept {
     return kInvalidPipelineHandleIndex;
 }
 
-uint32_t PipelineBuilder::find_feature_point(FeaturePointId id) const noexcept {
-    for (uint32_t index = 0; index < feature_points_.size(); ++index) {
-        if (feature_points_[index].descriptor.id == id) {
-            return index;
-        }
-    }
-    return kInvalidPipelineHandleIndex;
-}
-
 PipelineStageHandle PipelineBuilder::add_stage(const StageDescriptor& descriptor) {
-    if (declaration_backend_ != nullptr) {
-        return declaration_backend_->add_stage(descriptor);
-    }
     if (!status_) {
         return {};
     }
@@ -1534,42 +1715,7 @@ PipelineStageHandle PipelineBuilder::add_stage(const StageDescriptor& descriptor
     return PipelineStageHandle{index, kBuilderGeneration};
 }
 
-PipelineTaskHandle PipelineBuilder::add_task(const TaskDescriptor& descriptor) {
-    if (declaration_backend_ != nullptr) {
-        return declaration_backend_->add_task(descriptor);
-    }
-    if (!status_) {
-        return {};
-    }
-    if (!descriptor.id.is_valid()) {
-        set_failure(foundation::ResultCode::kInvalidArgument, "task id is invalid");
-        return {};
-    }
-    if (descriptor.execute == nullptr) {
-        set_failure(foundation::ResultCode::kInvalidArgument, "task execution function is null");
-        return {};
-    }
-    if ((static_cast<uint32_t>(descriptor.flags) & ~kKnownTaskFlags) != 0) {
-        set_failure(foundation::ResultCode::kInvalidArgument, "task flags contain unknown bits");
-        return {};
-    }
-    for (const PipelineTaskRecord& task : tasks_) {
-        if (task.descriptor.id == descriptor.id) {
-            set_failure(foundation::ResultCode::kInvalidArgument,
-                        "duplicate task id=" + std::to_string(descriptor.id.value()));
-            return {};
-        }
-    }
-
-    const uint32_t index = static_cast<uint32_t>(tasks_.size());
-    tasks_.push_back(PipelineTaskRecord{descriptor, kInvalidPipelineHandleIndex});
-    return PipelineTaskHandle{index, kBuilderGeneration};
-}
-
 PipelineArtifactHandle PipelineBuilder::declare_artifact(const ArtifactDescriptor& descriptor) {
-    if (declaration_backend_ != nullptr) {
-        return declaration_backend_->declare_artifact(descriptor);
-    }
     if (!status_) {
         return {};
     }
@@ -1609,134 +1755,6 @@ PipelineArtifactHandle PipelineBuilder::declare_artifact(const ArtifactDescripto
     const uint32_t index = static_cast<uint32_t>(artifacts_.size());
     artifacts_.push_back(PipelineArtifactRecord{descriptor});
     return PipelineArtifactHandle{index, kBuilderGeneration};
-}
-
-PipelineFeaturePointHandle PipelineBuilder::add_feature_point(const FeaturePointDescriptor& descriptor) {
-    if (declaration_backend_ != nullptr) {
-        return declaration_backend_->add_feature_point(descriptor);
-    }
-    if (!status_) {
-        return {};
-    }
-    if (!descriptor.id.is_valid() || descriptor.name.empty()) {
-        set_failure(foundation::ResultCode::kInvalidArgument, "feature point id or name is invalid");
-        return {};
-    }
-    if (descriptor.pipeline.is_valid() && descriptor.pipeline != descriptor_.id) {
-        set_failure(foundation::ResultCode::kInvalidArgument, "feature point belongs to another pipeline");
-        return {};
-    }
-    if (!descriptor.anchor_stage.is_valid()) {
-        set_failure(foundation::ResultCode::kInvalidArgument, "feature point anchor stage is invalid");
-        return {};
-    }
-    const uint32_t anchor_stage_index = find_stage(descriptor.anchor_stage);
-    if (anchor_stage_index == kInvalidPipelineHandleIndex) {
-        set_failure(foundation::ResultCode::kNotFound, "feature point anchor stage is not declared");
-        return {};
-    }
-    if (!is_valid_feature_point_position(descriptor.position)) {
-        set_failure(foundation::ResultCode::kInvalidArgument, "feature point position is invalid");
-        return {};
-    }
-    if (descriptor.allowed_domains == 0 || (descriptor.allowed_domains & ~kAllFeatureDomains) != 0) {
-        set_failure(foundation::ResultCode::kInvalidArgument, "feature point domain mask is invalid");
-        return {};
-    }
-    if (descriptor.allowed_scopes == 0 || (descriptor.allowed_scopes & ~kAllPipelineScopes) != 0) {
-        set_failure(foundation::ResultCode::kInvalidArgument, "feature point scope mask is invalid");
-        return {};
-    }
-    if ((static_cast<uint32_t>(descriptor.flags) & ~kKnownFeaturePointFlags) != 0) {
-        set_failure(foundation::ResultCode::kInvalidArgument, "feature point flags contain unknown bits");
-        return {};
-    }
-    if (find_feature_point(descriptor.id) != kInvalidPipelineHandleIndex) {
-        set_failure(foundation::ResultCode::kInvalidArgument,
-                    "duplicate feature point id=" + std::to_string(descriptor.id.value()));
-        return {};
-    }
-
-    FeaturePointDescriptor normalized = descriptor;
-    normalized.pipeline = descriptor_.id;
-    const uint32_t index = static_cast<uint32_t>(feature_points_.size());
-    feature_points_.push_back(PipelineFeaturePointRecord{normalized, anchor_stage_index});
-    return PipelineFeaturePointHandle{index, kBuilderGeneration};
-}
-
-foundation::Result PipelineBuilder::bind_feature(const FeatureBindingDescriptor& binding) {
-    if (declaration_backend_ != nullptr) {
-        return declaration_backend_->bind_feature(binding);
-    }
-    if (!status_) {
-        return status_;
-    }
-    if (!binding.feature.is_valid() || !binding.point.is_valid()) {
-        set_failure(foundation::ResultCode::kInvalidArgument, "feature binding identity is invalid");
-        return status_;
-    }
-    if (binding.pipeline.is_valid() && binding.pipeline != descriptor_.id) {
-        set_failure(foundation::ResultCode::kInvalidArgument, "feature binding belongs to another pipeline");
-        return status_;
-    }
-    if (!is_valid_scope(binding.scope)) {
-        set_failure(foundation::ResultCode::kInvalidArgument, "feature binding scope is invalid");
-        return status_;
-    }
-    const uint32_t point_index = find_feature_point(binding.point);
-    if (point_index == kInvalidPipelineHandleIndex) {
-        set_failure(foundation::ResultCode::kNotFound, "feature binding references an undeclared feature point");
-        return status_;
-    }
-    const FeaturePointDescriptor& point = feature_points_[point_index].descriptor;
-    if ((point.allowed_scopes & to_mask(binding.scope)) == 0 ||
-        (descriptor_.supported_scopes & to_mask(binding.scope)) == 0) {
-        set_failure(foundation::ResultCode::kUnsupported,
-                    "feature binding scope is not supported by the pipeline or feature point");
-        return status_;
-    }
-
-    FeatureBindingDescriptor normalized = binding;
-    normalized.pipeline = descriptor_.id;
-    if (!normalized.instance.is_valid()) {
-        normalized.instance =
-            make_feature_instance_id(normalized.feature, normalized.pipeline, normalized.scope, normalized.point);
-    }
-    for (const PipelineFeatureBindingRecord& existing : feature_bindings_) {
-        const FeatureBindingDescriptor& candidate = existing.descriptor;
-        if (candidate.feature == normalized.feature && candidate.pipeline == normalized.pipeline &&
-            candidate.scope == normalized.scope && candidate.point == normalized.point) {
-            set_failure(foundation::ResultCode::kInvalidArgument, "feature is already bound to this feature point");
-            return status_;
-        }
-        if (candidate.instance == normalized.instance) {
-            set_failure(foundation::ResultCode::kInvalidArgument,
-                        "feature binding instance id collides with an existing binding");
-            return status_;
-        }
-    }
-    feature_bindings_.push_back(PipelineFeatureBindingRecord{normalized});
-    return foundation::Result::success();
-}
-
-foundation::Result PipelineBuilder::bind_task(PipelineTaskHandle task, PipelineStageHandle stage) {
-    if (declaration_backend_ != nullptr) {
-        return declaration_backend_->bind_task(task, stage);
-    }
-    if (!status_) {
-        return status_;
-    }
-    if (!validate_task(task) || !validate_stage(stage)) {
-        set_failure(foundation::ResultCode::kInvalidArgument, "task or stage handle is invalid");
-        return status_;
-    }
-    PipelineTaskRecord& task_record = tasks_[task.index];
-    if (task_record.stage_index != kInvalidPipelineHandleIndex) {
-        set_failure(foundation::ResultCode::kInvalidState, "task is already bound to a stage");
-        return status_;
-    }
-    task_record.stage_index = stage.index;
-    return foundation::Result::success();
 }
 
 foundation::Result PipelineBuilder::add_binding(PipelineStageHandle stage, const ArtifactBinding& binding,
@@ -1817,37 +1835,22 @@ foundation::Result PipelineBuilder::add_binding(PipelineStageHandle stage, const
 }
 
 foundation::Result PipelineBuilder::reads(PipelineStageHandle stage, const ArtifactBinding& binding) {
-    if (declaration_backend_ != nullptr) {
-        return declaration_backend_->reads(stage, binding);
-    }
     return add_binding(stage, binding, ArtifactAccess::kRead);
 }
 
 foundation::Result PipelineBuilder::writes(PipelineStageHandle stage, const ArtifactBinding& binding) {
-    if (declaration_backend_ != nullptr) {
-        return declaration_backend_->writes(stage, binding);
-    }
     return add_binding(stage, binding, ArtifactAccess::kWrite);
 }
 
 foundation::Result PipelineBuilder::reads_writes(PipelineStageHandle stage, const ArtifactBinding& binding) {
-    if (declaration_backend_ != nullptr) {
-        return declaration_backend_->reads_writes(stage, binding);
-    }
     return add_binding(stage, binding, ArtifactAccess::kReadWrite);
 }
 
 foundation::Result PipelineBuilder::publish_snapshot(PipelineStageHandle stage, const ArtifactBinding& binding) {
-    if (declaration_backend_ != nullptr) {
-        return declaration_backend_->publish_snapshot(stage, binding);
-    }
     return add_binding(stage, binding, ArtifactAccess::kPublishSnapshot);
 }
 
 foundation::Result PipelineBuilder::runs_before(PipelineStageHandle stage, StageId other) {
-    if (declaration_backend_ != nullptr) {
-        return declaration_backend_->runs_before(stage, other);
-    }
     if (!status_) {
         return status_;
     }
@@ -1864,9 +1867,6 @@ foundation::Result PipelineBuilder::runs_before(PipelineStageHandle stage, Stage
 }
 
 foundation::Result PipelineBuilder::runs_after(PipelineStageHandle stage, StageId other) {
-    if (declaration_backend_ != nullptr) {
-        return declaration_backend_->runs_after(stage, other);
-    }
     if (!status_) {
         return status_;
     }
@@ -1883,9 +1883,6 @@ foundation::Result PipelineBuilder::runs_after(PipelineStageHandle stage, StageI
 }
 
 foundation::Result PipelineBuilder::expose_artifact(ArtifactId artifact, PipelineScope target_scope) {
-    if (declaration_backend_ != nullptr) {
-        return declaration_backend_->expose_artifact(artifact, target_scope);
-    }
     if (!status_) {
         return status_;
     }
@@ -1913,9 +1910,6 @@ foundation::Result PipelineBuilder::expose_artifact(ArtifactId artifact, Pipelin
 }
 
 foundation::ResultValue<PipelineDefinition> PipelineBuilder::finish() {
-    if (declaration_backend_ != nullptr) {
-        return {invalid_state("forwarding pipeline builder cannot be finalized"), {}};
-    }
     if (finished_) {
         return {invalid_state("pipeline builder has already been finalized"), {}};
     }
@@ -1933,34 +1927,13 @@ foundation::ResultValue<PipelineDefinition> PipelineBuilder::finish() {
     if (descriptor_.supported_scopes == 0 || (descriptor_.supported_scopes & ~kAllPipelineScopes) != 0) {
         return {invalid_argument("pipeline supported scopes are invalid"), {}};
     }
-    if (descriptor_.domains != 0 && (descriptor_.domains & ~kAllFeatureDomains) != 0) {
-        return {invalid_argument("pipeline domain mask contains unknown bits"), {}};
-    }
     if (stages_.empty()) {
         return {invalid_argument("pipeline must declare at least one stage"), {}};
-    }
-    for (const PipelineTaskRecord& task : tasks_) {
-        if (task.stage_index == kInvalidPipelineHandleIndex) {
-            return {invalid_argument("every task must be bound to a stage"), {}};
-        }
     }
     for (const PipelineOrderingRecord& ordering : orderings_) {
         if (ordering.source_stage_index >= stages_.size() ||
             find_stage(ordering.target_stage) == kInvalidPipelineHandleIndex) {
             return {not_found("ordering relation references an undeclared stage"), {}};
-        }
-    }
-    for (const PipelineFeaturePointRecord& point : feature_points_) {
-        if (point.anchor_stage_index >= stages_.size() || point.descriptor.pipeline != descriptor_.id ||
-            find_stage(point.descriptor.anchor_stage) != point.anchor_stage_index) {
-            return {invalid_state("feature point contains an invalid anchor"), {}};
-        }
-    }
-    for (const PipelineFeatureBindingRecord& binding : feature_bindings_) {
-        if (binding.descriptor.pipeline != descriptor_.id ||
-            find_feature_point(binding.descriptor.point) == kInvalidPipelineHandleIndex ||
-            !binding.descriptor.instance.is_valid()) {
-            return {invalid_state("feature binding contains an invalid reference"), {}};
         }
     }
     for (const PipelineArtifactRecord& artifact : artifacts_) {
@@ -1999,280 +1972,48 @@ foundation::ResultValue<PipelineDefinition> PipelineBuilder::finish() {
     PipelineDefinition definition;
     definition.descriptor = descriptor_;
     definition.stages = std::move(stages_);
-    definition.tasks = std::move(tasks_);
     definition.artifacts = std::move(artifacts_);
-    definition.feature_points = std::move(feature_points_);
-    definition.feature_bindings = std::move(feature_bindings_);
     definition.bindings = std::move(bindings_);
     definition.orderings = std::move(orderings_);
     definition.exposures = std::move(exposures_);
     return {foundation::Result::success(), std::move(definition)};
 }
 
-namespace {
-const FeatureDescriptor& default_logic_feature_descriptor() {
-    static const FeatureDescriptor kDescriptor{
-        {}, "LogicFeature", FeatureDomain::kLogic, to_mask(FeatureDomain::kLogic), kAllPipelineScopes, {1, 0, 0}, {}};
-    return kDescriptor;
-}
-
-const FeatureDescriptor& default_physics_feature_descriptor() {
-    static const FeatureDescriptor kDescriptor{
-        {}, "PhysicsFeature", FeatureDomain::kPhysics, to_mask(FeatureDomain::kPhysics), kAllPipelineScopes, {1, 0, 0},
-        {}};
-    return kDescriptor;
-}
-
-const FeatureDescriptor& default_render_feature_descriptor() {
-    static const FeatureDescriptor kDescriptor{
-        {}, "RenderFeature", FeatureDomain::kRender, to_mask(FeatureDomain::kRender), kAllPipelineScopes, {1, 0, 0},
-        {}};
-    return kDescriptor;
-}
-
-const FeatureDescriptor& default_audio_feature_descriptor() {
-    static const FeatureDescriptor kDescriptor{
-        {}, "AudioFeature", FeatureDomain::kAudio, to_mask(FeatureDomain::kAudio), kAllPipelineScopes, {1, 0, 0}, {}};
-    return kDescriptor;
-}
-
-const FeatureDescriptor& default_stream_feature_descriptor() {
-    static const FeatureDescriptor kDescriptor{
-        {}, "StreamFeature", FeatureDomain::kStream, to_mask(FeatureDomain::kStream), kAllPipelineScopes, {1, 0, 0},
-        {}};
-    return kDescriptor;
-}
-}  // namespace
-
-foundation::Result FeatureBuildContext::reject(foundation::ResultCode code, std::string message) {
-    if (feature_backend_ != nullptr) {
-        return feature_backend_->reject(code, std::move(message));
+foundation::Result PipelineRegistry::register_pipeline(PipelineDefinition definition) {
+    try {
+        // Replay records through the actual builder validation. A caller can
+        // construct or edit aggregate records without ever using a builder.
+        PipelineBuilder builder(definition.descriptor);
+        for (const auto& stage : definition.stages)
+            if (!builder.add_stage(stage.descriptor)) return builder.status();
+        for (const auto& artifact : definition.artifacts)
+            if (!builder.declare_artifact(artifact.descriptor)) return builder.status();
+        for (const auto& binding : definition.bindings) {
+            if (binding.stage_index >= builder.stages_.size() || !is_valid_artifact_access(binding.binding.access))
+                return invalid_argument("artifact binding stage index or access is invalid");
+            if (const auto result = builder.add_binding(
+                    {binding.stage_index, PipelineBuilder::kBuilderGeneration}, binding.binding, binding.binding.access);
+                !result) return result;
+        }
+        for (const auto& ordering : definition.orderings) {
+            const PipelineStageHandle stage{ordering.source_stage_index, PipelineBuilder::kBuilderGeneration};
+            const auto result = ordering.source_runs_before ? builder.runs_before(stage, ordering.target_stage)
+                                                            : builder.runs_after(stage, ordering.target_stage);
+            if (!result) return result;
+        }
+        for (const auto& exposure : definition.exposures)
+            if (const auto result = builder.expose_artifact(exposure.artifact, exposure.target_scope); !result) return result;
+        auto validated = builder.finish();
+        if (!validated) return validated.result;
+        auto owner = std::make_shared<const PipelineDefinition>(std::move(validated.value));
+        const auto id = owner->descriptor.id;
+        std::unique_lock lock(mutex_);
+        if (registrations_.contains(id)) return invalid_state("pipeline is already registered");
+        registrations_.emplace(id, Registration{std::move(owner)});
+        return foundation::Result::success();
+    } catch (const std::bad_alloc&) {
+        return foundation::out_of_memory("pipeline definition registration allocation failed");
     }
-    if (builder_ == nullptr) {
-        return foundation::Result::failure(code, std::move(message));
-    }
-    builder_->set_failure(code, std::move(message));
-    return builder_->status();
-}
-
-uint32_t FeatureBuildContext::stage_count() const noexcept {
-    if (feature_backend_ != nullptr) {
-        return feature_backend_->stage_count();
-    }
-    return builder_ == nullptr ? 0 : static_cast<uint32_t>(builder_->stages_.size());
-}
-
-void FeatureBuildContext::on_stage_added(PipelineStageHandle stage) {
-    if (!stage) {
-        return;
-    }
-    if (feature_backend_ != nullptr) {
-        feature_backend_->on_stage_added(stage, feature_point_);
-        return;
-    }
-    if (builder_ == nullptr)
-        return;
-    switch (feature_point_.position) {
-        case FeaturePointPosition::kBefore:
-            static_cast<void>(builder_->runs_before(stage, feature_point_.anchor_stage));
-            break;
-        case FeaturePointPosition::kInside:
-        case FeaturePointPosition::kAfter:
-            static_cast<void>(builder_->runs_after(stage, feature_point_.anchor_stage));
-            break;
-    }
-}
-
-void FeatureBuildContext::record_contribution(FeatureDomain domain, uint32_t first_stage_index) {
-    const uint32_t count = stage_count();
-    if (first_stage_index > count) {
-        static_cast<void>(
-            reject(foundation::ResultCode::kInvalidState, "feature contribution starts after the current stage count"));
-        return;
-    }
-    if (feature_backend_ != nullptr) {
-        feature_backend_->record_contribution(domain, first_stage_index, count - first_stage_index);
-        return;
-    }
-    if (contribution_records_ == nullptr || builder_ == nullptr) {
-        return;
-    }
-    contribution_records_->push_back(PipelineFeatureContributionRecord{
-        feature_instance_id_,
-        feature_id_,
-        part_id_,
-        feature_point_.id,
-        domain,
-        first_stage_index,
-        static_cast<uint32_t>(builder_->stages_.size()) - first_stage_index,
-        feature_point_.position,
-        feature_point_.flags,
-    });
-}
-
-LogicGraphBuilder FeatureBuildContext::logic_builder() noexcept {
-    return LogicGraphBuilder(*this);
-}
-
-PhysicsGraphBuilder FeatureBuildContext::physics_builder() noexcept {
-    return PhysicsGraphBuilder(*this);
-}
-
-RenderGraphBuilder FeatureBuildContext::render_builder() noexcept {
-    return RenderGraphBuilder(*this);
-}
-
-AudioGraphBuilder FeatureBuildContext::audio_builder() noexcept {
-    return AudioGraphBuilder(*this);
-}
-
-StreamGraphBuilder FeatureBuildContext::stream_builder() noexcept {
-    return StreamGraphBuilder(*this);
-}
-
-FeatureDomain PipelineFeature::feature_domain() const noexcept {
-    return descriptor().domain;
-}
-
-FeatureDomainMask PipelineFeature::feature_domain_mask() const noexcept {
-    return get_feature_domain_mask(descriptor());
-}
-
-const FeatureDescriptor& LogicFeature::descriptor() const noexcept {
-    return default_logic_feature_descriptor();
-}
-
-foundation::Result LogicFeature::collect_contributions(FeatureBuildContext& context) const {
-    FeatureBuildContext domain_context = context.for_domain(kDomain);
-    if (!domain_context.domain_is_active(kDomain)) {
-        return foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
-                                           "logic feature is not allowed at this feature point");
-    }
-    LogicGraphBuilder builder = domain_context.logic_builder();
-    const uint32_t first_stage_index = domain_context.stage_count();
-    const foundation::Result result = setup(builder);
-    if (result) {
-        domain_context.record_contribution(kDomain, first_stage_index);
-    }
-    return result;
-}
-
-const FeatureDescriptor& PhysicsFeature::descriptor() const noexcept {
-    return default_physics_feature_descriptor();
-}
-
-foundation::Result PhysicsFeature::collect_contributions(FeatureBuildContext& context) const {
-    FeatureBuildContext domain_context = context.for_domain(kDomain);
-    if (!domain_context.domain_is_active(kDomain)) {
-        return foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
-                                           "physics feature is not allowed at this feature point");
-    }
-    PhysicsGraphBuilder builder = domain_context.physics_builder();
-    const uint32_t first_stage_index = domain_context.stage_count();
-    const foundation::Result result = setup(builder);
-    if (result) {
-        domain_context.record_contribution(kDomain, first_stage_index);
-    }
-    return result;
-}
-
-const FeatureDescriptor& RenderFeature::descriptor() const noexcept {
-    return default_render_feature_descriptor();
-}
-
-foundation::Result RenderFeature::collect_contributions(FeatureBuildContext& context) const {
-    FeatureBuildContext domain_context = context.for_domain(kDomain);
-    if (!domain_context.domain_is_active(kDomain)) {
-        return foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
-                                           "render feature is not allowed at this feature point");
-    }
-    RenderGraphBuilder builder = domain_context.render_builder();
-    const uint32_t first_stage_index = domain_context.stage_count();
-    const foundation::Result result = setup(builder);
-    if (result) {
-        domain_context.record_contribution(kDomain, first_stage_index);
-    }
-    return result;
-}
-
-const FeatureDescriptor& AudioFeature::descriptor() const noexcept {
-    return default_audio_feature_descriptor();
-}
-
-foundation::Result AudioFeature::collect_contributions(FeatureBuildContext& context) const {
-    FeatureBuildContext domain_context = context.for_domain(kDomain);
-    if (!domain_context.domain_is_active(kDomain)) {
-        return foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
-                                           "audio feature is not allowed at this feature point");
-    }
-    AudioGraphBuilder builder = domain_context.audio_builder();
-    const uint32_t first_stage_index = domain_context.stage_count();
-    const foundation::Result result = setup(builder);
-    if (result) {
-        domain_context.record_contribution(kDomain, first_stage_index);
-    }
-    return result;
-}
-
-const FeatureDescriptor& StreamFeature::descriptor() const noexcept {
-    return default_stream_feature_descriptor();
-}
-
-foundation::Result StreamFeature::collect_contributions(FeatureBuildContext& context) const {
-    FeatureBuildContext domain_context = context.for_domain(kDomain);
-    if (!domain_context.domain_is_active(kDomain)) {
-        return foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
-                                           "stream feature is not allowed at this feature point");
-    }
-    StreamGraphBuilder builder = domain_context.stream_builder();
-    const uint32_t first_stage_index = domain_context.stage_count();
-    const foundation::Result result = setup(builder);
-    if (result) {
-        domain_context.record_contribution(kDomain, first_stage_index);
-    }
-    return result;
-}
-
-foundation::Result PipelineRegistry::register_pipeline(PipelineFactory factory) {
-    if (!factory) {
-        return invalid_argument("pipeline factory is empty");
-    }
-
-    std::unique_ptr<Pipeline> pipeline = factory();
-    if (!pipeline) {
-        return invalid_argument("pipeline factory returned null");
-    }
-
-    const PipelineDescriptor& descriptor = pipeline->descriptor();
-    const PipelineId pipeline_id = descriptor.id;
-    PipelineBuilder builder(descriptor);
-    const foundation::Result build_result = pipeline->build(builder);
-    if (!build_result) {
-        return foundation::Result::failure(build_result.code,
-                                           append_message("pipeline definition build failed", build_result));
-    }
-
-    foundation::ResultValue<PipelineDefinition> definition_result = builder.finish();
-    if (!definition_result) {
-        return foundation::Result::failure(
-            definition_result.result.code,
-            append_message("pipeline definition validation failed", definition_result.result));
-    }
-
-    if (!pipeline_id.is_valid()) {
-        return invalid_argument("pipeline id is invalid");
-    }
-
-    std::shared_ptr<Pipeline> implementation(std::move(pipeline));
-    std::shared_ptr<const PipelineDefinition> definition =
-        std::make_shared<const PipelineDefinition>(std::move(definition_result.value));
-
-    std::unique_lock lock(mutex_);
-    if (registrations_.find(pipeline_id) != registrations_.end()) {
-        return invalid_state("pipeline is already registered");
-    }
-    registrations_.emplace(pipeline_id, Registration{std::move(implementation), std::move(definition)});
-    return foundation::Result::success();
 }
 
 foundation::Result PipelineRegistry::unregister_pipeline(PipelineId id) {
@@ -2283,12 +2024,6 @@ foundation::Result PipelineRegistry::unregister_pipeline(PipelineId id) {
     const auto iterator = registrations_.find(id);
     if (iterator == registrations_.end()) {
         return not_found("pipeline is not registered");
-    }
-    for (const auto& [instance, binding] : feature_bindings_) {
-        static_cast<void>(instance);
-        if (binding.pipeline == id) {
-            return invalid_state("pipeline has active feature bindings");
-        }
     }
     registrations_.erase(iterator);
     return foundation::Result::success();
@@ -2303,196 +2038,6 @@ foundation::ResultValue<std::shared_ptr<const PipelineDefinition>> PipelineRegis
     return {foundation::Result::success(), registration.value.definition};
 }
 
-foundation::Result PipelineRegistry::register_feature(FeatureFactory factory) {
-    if (!factory) {
-        return invalid_argument("feature factory is empty");
-    }
-
-    std::unique_ptr<PipelineFeature> feature;
-    try {
-        feature = factory();
-    } catch (const std::exception& exception) {
-        return foundation::Result::failure(foundation::ResultCode::kUnknown,
-                                           std::string("feature factory threw: ") + exception.what());
-    } catch (...) {
-        return foundation::Result::failure(foundation::ResultCode::kUnknown,
-                                           "feature factory threw an unknown exception");
-    }
-    if (!feature) {
-        return invalid_argument("feature factory returned null");
-    }
-
-    FeatureDescriptor descriptor = feature->descriptor();
-    if (!descriptor.id.is_valid() || descriptor.name.empty()) {
-        return invalid_argument("feature id or name is invalid");
-    }
-    if (!descriptor.version.is_valid()) {
-        return invalid_argument("feature version is invalid");
-    }
-    if (!is_valid_feature_domain(descriptor.domain)) {
-        return invalid_argument("feature domain is invalid");
-    }
-    if (descriptor.supported_scopes == 0 || (descriptor.supported_scopes & ~kAllPipelineScopes) != 0) {
-        return invalid_argument("feature supported scopes are invalid");
-    }
-    const FeatureDomainMask implementation_mask = feature->feature_domain_mask();
-    const FeatureDomainMask expected_mask = feature->feature_domain() == FeatureDomain::kComposite
-                                                ? implementation_mask
-                                                : to_mask(feature->feature_domain());
-    if (feature->feature_domain() != descriptor.domain || expected_mask == 0 ||
-        (expected_mask & ~kAllFeatureDomains) != 0) {
-        return invalid_argument("feature domain metadata does not match its implementation");
-    }
-    if (descriptor.domain_mask == 0) {
-        descriptor.domain_mask = expected_mask;
-    }
-    if (descriptor.domain_mask != expected_mask) {
-        return invalid_argument("feature domain mask does not match its implementation");
-    }
-
-    std::shared_ptr<PipelineFeature> implementation(std::move(feature));
-    std::unique_lock lock(mutex_);
-    if (features_.find(descriptor.id) != features_.end()) {
-        return invalid_state("feature is already registered");
-    }
-    features_.emplace(descriptor.id, FeatureRegistration{std::move(implementation), descriptor});
-    return foundation::Result::success();
-}
-
-foundation::Result PipelineRegistry::unregister_feature(FeatureId id) {
-    if (!id.is_valid()) {
-        return invalid_argument("feature id is invalid");
-    }
-    std::unique_lock lock(mutex_);
-    const auto iterator = features_.find(id);
-    if (iterator == features_.end()) {
-        return not_found("feature is not registered");
-    }
-    for (const auto& [instance, binding] : feature_bindings_) {
-        static_cast<void>(instance);
-        if (binding.feature == id) {
-            return invalid_state("feature has active bindings");
-        }
-    }
-    for (const auto& [pipeline_id, registration] : registrations_) {
-        static_cast<void>(pipeline_id);
-        for (const PipelineFeatureBindingRecord& binding : registration.definition->feature_bindings) {
-            if (binding.descriptor.feature == id) {
-                return invalid_state("feature is referenced by a pipeline definition");
-            }
-        }
-    }
-    features_.erase(iterator);
-    return foundation::Result::success();
-}
-
-foundation::ResultValue<FeatureDescriptor> PipelineRegistry::find_feature_descriptor(FeatureId id) const {
-    const foundation::ResultValue<FeatureRegistration> registration = acquire_feature_registration(id);
-    if (!registration) {
-        return {registration.result, {}};
-    }
-    return {foundation::Result::success(), registration.value.descriptor};
-}
-
-foundation::ResultValue<std::shared_ptr<const PipelineFeature>> PipelineRegistry::find_feature(FeatureId id) const {
-    const foundation::ResultValue<FeatureRegistration> registration = acquire_feature_registration(id);
-    if (!registration) {
-        return {registration.result, {}};
-    }
-    return {foundation::Result::success(), std::shared_ptr<const PipelineFeature>(registration.value.implementation)};
-}
-
-foundation::Result PipelineRegistry::bind_feature(const FeatureBindingDescriptor& binding) {
-    if (!binding.feature.is_valid() || !binding.pipeline.is_valid() || !binding.point.is_valid()) {
-        return invalid_argument("feature binding identity is invalid");
-    }
-    if (!is_valid_scope(binding.scope)) {
-        return invalid_argument("feature binding scope is invalid");
-    }
-
-    std::unique_lock lock(mutex_);
-    const auto feature_iterator = features_.find(binding.feature);
-    if (feature_iterator == features_.end()) {
-        return not_found("feature is not registered");
-    }
-    const auto pipeline_iterator = registrations_.find(binding.pipeline);
-    if (pipeline_iterator == registrations_.end()) {
-        return not_found("feature binding pipeline is not registered");
-    }
-    const PipelineDefinition& definition = *pipeline_iterator->second.definition;
-    if ((definition.descriptor.supported_scopes & to_mask(binding.scope)) == 0 ||
-        (feature_iterator->second.descriptor.supported_scopes & to_mask(binding.scope)) == 0) {
-        return unsupported("feature binding scope is not supported");
-    }
-
-    const PipelineFeaturePointRecord* point = nullptr;
-    for (const PipelineFeaturePointRecord& candidate : definition.feature_points) {
-        if (candidate.descriptor.id == binding.point) {
-            point = &candidate;
-            break;
-        }
-    }
-    if (point == nullptr) {
-        return not_found("feature binding point is not declared by the pipeline");
-    }
-    if ((point->descriptor.allowed_scopes & to_mask(binding.scope)) == 0) {
-        return unsupported("feature binding scope is not allowed by the feature point");
-    }
-
-    const FeatureDomainMask binding_domains = get_feature_domain_mask(feature_iterator->second.descriptor);
-    if (binding_domains == 0 || (binding_domains & ~point->descriptor.allowed_domains) != 0) {
-        return unsupported("feature domain is not allowed by the feature point");
-    }
-    if (definition.descriptor.domains != 0 && (binding_domains & ~definition.descriptor.domains) != 0) {
-        return unsupported("feature domain is not enabled by the pipeline");
-    }
-    if (feature_iterator->second.descriptor.pipeline_affinity.is_valid() &&
-        feature_iterator->second.descriptor.pipeline_affinity != binding.pipeline) {
-        return unsupported("feature is bound to a different pipeline");
-    }
-
-    FeatureBindingDescriptor normalized = binding;
-    if (!normalized.instance.is_valid()) {
-        normalized.instance =
-            make_feature_instance_id(normalized.feature, normalized.pipeline, normalized.scope, normalized.point);
-    }
-    for (const auto& [instance, existing] : feature_bindings_) {
-        static_cast<void>(instance);
-        if (existing.feature == normalized.feature && existing.pipeline == normalized.pipeline &&
-            existing.scope == normalized.scope && existing.point == normalized.point) {
-            return invalid_state("feature is already bound to this feature point");
-        }
-        if (existing.instance == normalized.instance) {
-            return invalid_argument("feature binding instance id collides with an existing binding");
-        }
-    }
-    for (const PipelineFeatureBindingRecord& existing : definition.feature_bindings) {
-        const FeatureBindingDescriptor& candidate = existing.descriptor;
-        if (candidate.feature == normalized.feature && candidate.scope == normalized.scope &&
-            candidate.point == normalized.point) {
-            return invalid_state("feature is already bound by the pipeline definition");
-        }
-        if (candidate.instance == normalized.instance) {
-            return invalid_argument("feature binding instance id collides with a definition binding");
-        }
-    }
-    feature_bindings_.emplace(normalized.instance, normalized);
-    return foundation::Result::success();
-}
-
-foundation::Result PipelineRegistry::unbind_feature(FeatureInstanceId instance) {
-    if (!instance.is_valid()) {
-        return invalid_argument("feature binding instance id is invalid");
-    }
-    std::unique_lock lock(mutex_);
-    const auto iterator = feature_bindings_.find(instance);
-    if (iterator == feature_bindings_.end()) {
-        return not_found("feature binding is not registered");
-    }
-    feature_bindings_.erase(iterator);
-    return foundation::Result::success();
-}
-
 foundation::ResultValue<PipelineRegistry::Registration> PipelineRegistry::acquire_registration(PipelineId id) const {
     if (!id.is_valid()) {
         return {invalid_argument("pipeline id is invalid"), {}};
@@ -2505,39 +2050,7 @@ foundation::ResultValue<PipelineRegistry::Registration> PipelineRegistry::acquir
     return {foundation::Result::success(), iterator->second};
 }
 
-foundation::ResultValue<PipelineRegistry::FeatureRegistration> PipelineRegistry::acquire_feature_registration(
-    FeatureId id) const {
-    if (!id.is_valid()) {
-        return {invalid_argument("feature id is invalid"), {}};
-    }
-    std::shared_lock lock(mutex_);
-    const auto iterator = features_.find(id);
-    if (iterator == features_.end()) {
-        return {not_found("feature is not registered"), {}};
-    }
-    return {foundation::Result::success(), iterator->second};
-}
-
-foundation::ResultValue<std::vector<FeatureBindingDescriptor>> PipelineRegistry::acquire_feature_bindings(
-    PipelineId pipeline, PipelineScope scope) const {
-    if (!pipeline.is_valid()) {
-        return {invalid_argument("feature binding pipeline id is invalid"), {}};
-    }
-    if (!is_valid_scope(scope)) {
-        return {invalid_argument("feature binding scope is invalid"), {}};
-    }
-    std::vector<FeatureBindingDescriptor> result;
-    std::shared_lock lock(mutex_);
-    for (const auto& [instance, binding] : feature_bindings_) {
-        static_cast<void>(instance);
-        if (binding.pipeline == pipeline && binding.scope == scope) {
-            result.push_back(binding);
-        }
-    }
-    return {foundation::Result::success(), std::move(result)};
-}
-
-foundation::ResultValue<PipelinePlan> PipelineCompiler::compile(const PipelineCompileInput& input) const {
+foundation::ResultValue<PipelinePlan> detail::PipelineCompilerExecution::compile(const PipelineCompileInput& input) {
     if (input.registry == nullptr) {
         return {invalid_argument("pipeline compile registry is null"), {}};
     }
@@ -2568,194 +2081,10 @@ foundation::ResultValue<PipelinePlan> PipelineCompiler::compile(const PipelineCo
         return {unsupported("pipeline required capabilities are unavailable"), {}};
     }
 
-    PipelineBuilder contribution_builder(base_definition);
-    std::vector<PipelineFeatureContributionRecord> feature_contributions;
-    std::vector<PipelineFeatureImplementationRecord> feature_implementations;
-    std::vector<std::shared_ptr<const void>> feature_owners;
-    std::vector<FeatureBindingDescriptor> feature_bindings;
-    feature_bindings.reserve(base_definition.feature_bindings.size());
-    for (const PipelineFeatureBindingRecord& record : base_definition.feature_bindings) {
-        if (record.descriptor.scope == input.scope) {
-            feature_bindings.push_back(record.descriptor);
-        }
-    }
-    const foundation::ResultValue<std::vector<FeatureBindingDescriptor>> registered_bindings =
-        input.registry->acquire_feature_bindings(input.pipeline, input.scope);
-    if (!registered_bindings) {
-        return {registered_bindings.result, {}};
-    }
-    feature_bindings.insert(feature_bindings.end(), registered_bindings.value.begin(), registered_bindings.value.end());
-    if (input.configuration != nullptr) {
-        if (input.configuration->pipeline != input.pipeline || input.configuration->scope != input.scope ||
-            (input.configuration->instance.is_valid() && input.configuration->instance != input.instance)) {
-            return {invalid_argument("pipeline instance configuration does not match compile input"), {}};
-        }
-        // An authored instance replaces the default binding for the same feature/point.
-        // Keep unrelated host contributions, and retain default ordering priorities.
-        const auto default_bindings = feature_bindings;
-        std::erase_if(feature_bindings, [&](const FeatureBindingDescriptor& binding) {
-            return std::any_of(input.configuration->features.begin(), input.configuration->features.end(),
-                               [&](const FeatureInstanceConfiguration& feature) {
-                                   return feature.feature == binding.feature && feature.point == binding.point;
-                               });
-        });
-        for (const FeatureInstanceConfiguration& feature : input.configuration->features) {
-            if (!feature.instance.is_valid() || !feature.feature.is_valid() || !feature.point.is_valid()) {
-                return {invalid_argument("authored feature binding identity is invalid"), {}};
-            }
-            const auto default_binding = std::find_if(
-                default_bindings.begin(), default_bindings.end(), [&](const FeatureBindingDescriptor& binding) {
-                    return feature.feature == binding.feature && feature.point == binding.point;
-                });
-            feature_bindings.push_back(
-                {.feature = feature.feature,
-                 .pipeline = input.pipeline,
-                 .scope = input.scope,
-                 .point = feature.point,
-                 .priority = default_binding == default_bindings.end() ? 0 : default_binding->priority,
-                 .enabled = true,
-                 .instance = feature.instance});
-        }
-    }
-    std::sort(feature_bindings.begin(), feature_bindings.end(),
-              [](const FeatureBindingDescriptor& left, const FeatureBindingDescriptor& right) {
-                  if (left.point != right.point) {
-                      return left.point < right.point;
-                  }
-                  if (left.priority != right.priority) {
-                      return left.priority < right.priority;
-                  }
-                  if (left.feature != right.feature) {
-                      return left.feature < right.feature;
-                  }
-                  return left.instance < right.instance;
-              });
+    const PipelineDefinition& definition = base_definition;
 
-    struct FeatureExpansion {
-        FeatureBindingDescriptor binding{};
-        FeaturePointPosition position{FeaturePointPosition::kBefore};
-        std::vector<uint32_t> stage_indices{};
-    };
-    std::vector<FeatureExpansion> feature_expansions;
-    for (size_t binding_index = 0; binding_index < feature_bindings.size(); ++binding_index) {
-        const FeatureBindingDescriptor& binding = feature_bindings[binding_index];
-        if (!binding.enabled) {
-            continue;
-        }
-        for (size_t previous_index = 0; previous_index < binding_index; ++previous_index) {
-            const FeatureBindingDescriptor& previous = feature_bindings[previous_index];
-            if (previous.enabled && previous.feature == binding.feature && previous.pipeline == binding.pipeline &&
-                previous.scope == binding.scope && previous.point == binding.point) {
-                return {invalid_argument("feature is bound to the same feature point more than once"), {}};
-            }
-        }
-
-        const foundation::ResultValue<PipelineRegistry::FeatureRegistration> feature_registration =
-            input.registry->acquire_feature_registration(binding.feature);
-        if (!feature_registration) {
-            return {feature_registration.result, {}};
-        }
-        const FeatureDescriptor& feature_descriptor = feature_registration.value.descriptor;
-        if (feature_descriptor.pipeline_affinity.is_valid() && feature_descriptor.pipeline_affinity != input.pipeline) {
-            return {unsupported("feature is bound to a different pipeline"), {}};
-        }
-        const PipelineFeaturePointRecord* point = nullptr;
-        for (const PipelineFeaturePointRecord& candidate : base_definition.feature_points) {
-            if (candidate.descriptor.id == binding.point) {
-                point = &candidate;
-                break;
-            }
-        }
-        if (point == nullptr) {
-            return {not_found("feature binding point is not declared by the pipeline"), {}};
-        }
-        if ((feature_descriptor.supported_scopes & to_mask(input.scope)) == 0 ||
-            (point->descriptor.allowed_scopes & to_mask(input.scope)) == 0) {
-            return {unsupported("feature binding scope is not supported"), {}};
-        }
-        const FeatureDomainMask binding_domains = get_feature_domain_mask(feature_descriptor);
-        if (binding_domains == 0 || (binding_domains & ~point->descriptor.allowed_domains) != 0) {
-            return {unsupported("feature domain is not allowed by the feature point"), {}};
-        }
-        if (base_definition.descriptor.domains != 0 && (binding_domains & ~base_definition.descriptor.domains) != 0) {
-            return {unsupported("feature domain is not enabled by the pipeline"), {}};
-        }
-        if (!binding.instance.is_valid()) {
-            return {invalid_state("feature binding instance id is invalid"), {}};
-        }
-
-        const uint32_t first_stage_index = static_cast<uint32_t>(contribution_builder.stages_.size());
-        const size_t first_contribution_index = feature_contributions.size();
-        FeatureBuildContext context(
-            contribution_builder, input.scope, input.pipeline, binding.feature, binding.instance, {}, point->descriptor,
-            feature_registration.value.implementation->feature_domain(), &feature_contributions, input.configuration);
-        foundation::Result contribution_result;
-        try {
-            contribution_result = feature_registration.value.implementation->collect_contributions(context);
-        } catch (const std::exception& exception) {
-            contribution_result = foundation::Result::failure(foundation::ResultCode::kUnknown, exception.what());
-        } catch (...) {
-            contribution_result = foundation::Result::failure(foundation::ResultCode::kUnknown,
-                                                              "feature contribution threw an unknown exception");
-        }
-        if (!contribution_result) {
-            return {foundation::Result::failure(contribution_result.code,
-                                                append_message("feature contribution failed", contribution_result)),
-                    {}};
-        }
-        if (!contribution_builder.status()) {
-            return {contribution_builder.status(), {}};
-        }
-
-        const std::shared_ptr<const PipelineFeature> feature_implementation = feature_registration.value.implementation;
-        for (size_t contribution_index = first_contribution_index; contribution_index < feature_contributions.size();
-             ++contribution_index) {
-            const PipelineFeatureContributionRecord& contribution = feature_contributions[contribution_index];
-            feature_implementations.push_back(PipelineFeatureImplementationRecord{
-                contribution.feature_instance,
-                contribution.feature,
-                contribution.part,
-                feature_implementation,
-            });
-        }
-
-        FeatureExpansion expansion;
-        expansion.binding = binding;
-        expansion.position = point->descriptor.position;
-        for (uint32_t stage_index = first_stage_index; stage_index < contribution_builder.stages_.size();
-             ++stage_index) {
-            expansion.stage_indices.push_back(stage_index);
-        }
-        feature_expansions.push_back(std::move(expansion));
-        feature_owners.push_back(std::shared_ptr<const void>(feature_registration.value.implementation));
-    }
-
-    for (size_t left_index = 0; left_index < feature_expansions.size(); ++left_index) {
-        const FeatureExpansion& left = feature_expansions[left_index];
-        for (size_t right_index = left_index + 1; right_index < feature_expansions.size(); ++right_index) {
-            const FeatureExpansion& right = feature_expansions[right_index];
-            if (left.binding.point != right.binding.point || left.position != right.position) {
-                continue;
-            }
-            for (const uint32_t source_stage : left.stage_indices) {
-                for (const uint32_t destination_stage : right.stage_indices) {
-                    contribution_builder.orderings_.push_back(PipelineOrderingRecord{
-                        source_stage,
-                        contribution_builder.stages_[destination_stage].descriptor.id,
-                        true,
-                    });
-                }
-            }
-        }
-    }
-
-    foundation::ResultValue<PipelineDefinition> expanded_definition = contribution_builder.finish();
-    if (!expanded_definition) {
-        return {expanded_definition.result, {}};
-    }
-    const PipelineDefinition& definition = expanded_definition.value;
-
-    const foundation::ResultValue<PhaseRegistrySnapshot> phase_snapshot = phase_registry->snapshot();
+    const foundation::ResultValue<PhaseRegistrySnapshot> phase_snapshot =
+        detail::PhaseRegistryExecution::snapshot(*phase_registry);
     if (!phase_snapshot) {
         return {phase_snapshot.result, {}};
     }
@@ -2818,10 +2147,7 @@ foundation::ResultValue<PipelinePlan> PipelineCompiler::compile(const PipelineCo
     plan.definition_version = definition.descriptor.version;
     plan.scope = input.scope;
     plan.phase_revision = phase_snapshot.value.revision;
-    plan.definition_owner = std::shared_ptr<const void>(registration.value.implementation);
-    plan.feature_contributions = std::move(feature_contributions);
-    plan.feature_implementations = std::move(feature_implementations);
-    plan.feature_owners = std::move(feature_owners);
+    plan.definition_owner = registration.value.definition;
     plan.artifacts.reserve(definition.artifacts.size());
     for (const PipelineArtifactRecord& artifact : definition.artifacts) {
         plan.artifacts.push_back(artifact.descriptor);
@@ -2844,55 +2170,17 @@ foundation::ResultValue<PipelinePlan> PipelineCompiler::compile(const PipelineCo
     }
     for (const uint32_t original_stage_index : stage_order) {
         const StageDescriptor& stage = definition.stages[original_stage_index].descriptor;
-        std::vector<uint32_t> task_order;
-        for (uint32_t task_index = 0; task_index < definition.tasks.size(); ++task_index) {
-            if (definition.tasks[task_index].stage_index == original_stage_index) {
-                task_order.push_back(task_index);
-            }
-        }
-        std::sort(task_order.begin(), task_order.end(), [&](uint32_t left, uint32_t right) {
-            return definition.tasks[left].descriptor.id < definition.tasks[right].descriptor.id;
+        stage_nodes[original_stage_index].push_back(static_cast<uint32_t>(plan.nodes.size()));
+        plan.nodes.push_back(PipelineNode{
+            .stage = stage.id,
+            .phase = stage.phase,
+            .execution_domain = stage.execution_domain,
+            .time_policy = stage.time_policy,
+            .stage_parallelizable = stage.parallelizable,
+            .artifact_bindings = stage_bindings[original_stage_index],
+            .phase_id = resolved_stage_phases[original_stage_index],
+            .definition_stage_index = original_stage_index,
         });
-
-        if (task_order.empty()) {
-            stage_nodes[original_stage_index].push_back(static_cast<uint32_t>(plan.nodes.size()));
-            plan.nodes.push_back(PipelineNode{
-                {},
-                stage.id,
-                stage.phase,
-                stage.execution_domain,
-                stage.time_policy,
-                TaskFlags::kNone,
-                nullptr,
-                nullptr,
-                true,
-                stage.parallelizable,
-                stage_bindings[original_stage_index],
-                resolved_stage_phases[original_stage_index],
-                original_stage_index,
-            });
-            continue;
-        }
-
-        for (const uint32_t task_index : task_order) {
-            const TaskDescriptor& task = definition.tasks[task_index].descriptor;
-            stage_nodes[original_stage_index].push_back(static_cast<uint32_t>(plan.nodes.size()));
-            plan.nodes.push_back(PipelineNode{
-                task.id,
-                stage.id,
-                stage.phase,
-                stage.execution_domain,
-                stage.time_policy,
-                task.flags,
-                task.execute,
-                task.user_data,
-                false,
-                stage.parallelizable,
-                stage_bindings[original_stage_index],
-                resolved_stage_phases[original_stage_index],
-                original_stage_index,
-            });
-        }
     }
 
     std::unordered_map<uint64_t, uint32_t> dependency_indices;
@@ -3071,9 +2359,6 @@ foundation::ResultValue<PipelinePlan> PipelineCompiler::compile(const PipelineCo
 
         PipelineExecutionBatch batch;
         batch.node_indices = current_batch;
-        batch.parallelizable = std::all_of(current_batch.begin(), current_batch.end(), [&](uint32_t node_index) {
-            return is_parallel_safe(plan.nodes[node_index]);
-        });
         plan.topological_order.insert(plan.topological_order.end(), current_batch.begin(), current_batch.end());
         plan.batches.push_back(std::move(batch));
 
@@ -3090,7 +2375,7 @@ foundation::ResultValue<PipelinePlan> PipelineCompiler::compile(const PipelineCo
         return {invalid_argument("pipeline dependency graph contains a cycle"), {}};
     }
 
-    if (phase_registry->revision() != plan.phase_revision) {
+    if (detail::PhaseRegistryExecution::revision(*phase_registry) != plan.phase_revision) {
         return {foundation::Result::failure(foundation::ResultCode::kOutOfDate,
                                             "phase registry changed while compiling the pipeline"),
                 {}};
@@ -3101,266 +2386,74 @@ foundation::ResultValue<PipelinePlan> PipelineCompiler::compile(const PipelineCo
     return {foundation::Result::success(), std::move(plan)};
 }
 
-struct PipelineScheduler::Impl final {
-    explicit Impl(const PipelineSchedulerDesc& scheduler_desc)
-        : cpu_worker_executor(std::make_shared<concurrency::WorkerExecutor>(concurrency::WorkerExecutorDesc{
-              concurrency::ExecutorDomain::kCpuWorker, scheduler_desc.cpu_worker_count, false})),
-          io_worker_executor(std::make_shared<concurrency::WorkerExecutor>(concurrency::WorkerExecutorDesc{
-              concurrency::ExecutorDomain::kIoWorker, scheduler_desc.io_worker_count, false})),
-          render_thread_executor(std::make_shared<concurrency::WorkerExecutor>(concurrency::WorkerExecutorDesc{
-              concurrency::ExecutorDomain::kRenderThread, scheduler_desc.render_thread_worker_count, false})),
-          gpu_executor(std::make_shared<concurrency::WorkerExecutor>(concurrency::WorkerExecutorDesc{
-              concurrency::ExecutorDomain::kGpu, scheduler_desc.gpu_worker_count, false})) {
-        static_cast<void>(executor_registry.register_executor(cpu_worker_executor));
-        static_cast<void>(executor_registry.register_executor(io_worker_executor));
-        static_cast<void>(executor_registry.register_executor(render_thread_executor));
-        static_cast<void>(executor_registry.register_executor(gpu_executor));
-    }
-
-    std::shared_ptr<concurrency::WorkerExecutor> cpu_worker_executor;
-    std::shared_ptr<concurrency::WorkerExecutor> io_worker_executor;
-    std::shared_ptr<concurrency::WorkerExecutor> render_thread_executor;
-    std::shared_ptr<concurrency::WorkerExecutor> gpu_executor;
-    concurrency::ExecutorRegistry executor_registry;
-    mutable std::shared_mutex execution_gate;
-};
-
-PipelineScheduler::PipelineScheduler(uint32_t worker_count)
-    : PipelineScheduler(PipelineSchedulerDesc{worker_count, 1, 1, 1}) {}
-
-PipelineScheduler::PipelineScheduler(const PipelineSchedulerDesc& desc) : impl_(std::make_unique<Impl>(desc)) {}
-
-PipelineScheduler::~PipelineScheduler() = default;
-
-PipelineScheduler::PipelineScheduler(PipelineScheduler&&) noexcept = default;
-
-PipelineScheduler& PipelineScheduler::operator=(PipelineScheduler&&) noexcept = default;
-
-uint32_t PipelineScheduler::worker_count() const noexcept {
-    return worker_count(ExecutionDomain::kCpuWorker);
-}
-
-uint32_t PipelineScheduler::worker_count(ExecutionDomain domain) const noexcept {
-    if (impl_ == nullptr) {
-        return 0;
-    }
-    if (!is_valid_execution_domain(domain) || domain == ExecutionDomain::kMainThread) {
-        return 0;
-    }
-    const foundation::ResultValue<std::shared_ptr<concurrency::Executor>> executor =
-        impl_->executor_registry.find_executor(to_executor_domain(domain));
-    return executor ? executor.value->worker_count() : 0;
-}
-
-foundation::Result PipelineScheduler::set_executor(ExecutionDomain domain,
-                                                   std::shared_ptr<concurrency::Executor> executor) {
-    if (impl_ == nullptr) {
-        return invalid_state("pipeline scheduler is not initialized");
-    }
-    if (!is_valid_execution_domain(domain)) {
-        return invalid_argument("pipeline execution domain is invalid");
-    }
-    if (domain == ExecutionDomain::kMainThread) {
-        return unsupported("main-thread execution is owned by the caller thread");
-    }
-    if (executor == nullptr || executor->domain() != to_executor_domain(domain)) {
-        return invalid_argument("executor domain does not match pipeline execution domain");
-    }
-    return impl_->executor_registry.register_executor(std::move(executor), true);
-}
-
-foundation::ResultValue<std::shared_ptr<concurrency::Executor>> PipelineScheduler::find_executor(
-    ExecutionDomain domain) const {
-    if (impl_ == nullptr) {
-        return {invalid_state("pipeline scheduler is not initialized"), {}};
-    }
-    if (!is_valid_execution_domain(domain)) {
-        return {invalid_argument("pipeline execution domain is invalid"), {}};
-    }
-    return impl_->executor_registry.find_executor(to_executor_domain(domain));
-}
-
-foundation::Result PipelineScheduler::wait_idle(uint64_t timeout_nanoseconds) const {
-    if (impl_ == nullptr) {
-        return invalid_state("pipeline scheduler is not initialized");
-    }
-    std::unique_lock execution_lock(impl_->execution_gate);
-    return impl_->executor_registry.wait_idle(timeout_nanoseconds);
-}
-
-foundation::Result PipelineScheduler::execute(const PipelinePlan& plan, PipelineExecutionContext& context,
-                                              concurrency::CancellationToken cancellation) const {
-    return execute_internal(plan, context, nullptr, std::move(cancellation));
+foundation::Result PipelineScheduler::execute(const PipelinePlan& plan, PipelineExecutionContext& context) const {
+    return execute_internal(plan, context, nullptr);
 }
 
 foundation::Result PipelineScheduler::execute_phase(const PipelinePlan& plan, PipelineExecutionContext& context,
-                                                    PhaseId phase, concurrency::CancellationToken cancellation) const {
-    if (!phase.is_valid()) {
-        return invalid_argument("pipeline execution phase id is invalid");
-    }
-    return execute_internal(plan, context, &phase, std::move(cancellation));
+                                                    PhaseId phase) const {
+    return execute_internal(plan, context, &phase);
 }
 
 foundation::Result PipelineScheduler::execute_internal(const PipelinePlan& plan, PipelineExecutionContext& context,
-                                                       const PhaseId* phase,
-                                                       concurrency::CancellationToken cancellation) const {
-    if (impl_ == nullptr) {
-        return invalid_state("pipeline scheduler is not initialized");
+                                                       const PhaseId* phase) const {
+    context.visited_nodes_.clear();
+    if (phase != nullptr && !phase->is_valid()) {
+        return invalid_argument("pipeline execution phase id is invalid");
     }
-    if (plan.revision == 0 || !plan.pipeline.is_valid()) {
-        return invalid_state("pipeline plan is invalid");
-    }
-    if (plan.scope != context.scope()) {
-        return invalid_state("pipeline plan scope does not match execution context scope");
-    }
-
-    std::shared_lock execution_lock(impl_->execution_gate);
-    if (cancellation.is_cancellation_requested()) {
-        return foundation::Result::failure(foundation::ResultCode::kCancelled, "pipeline execution was cancelled");
-    }
-    if (const foundation::Result result = context.begin_plan(plan, std::move(cancellation)); !result) {
+    if (const foundation::Result result = context.begin_plan(plan); !result) {
         return result;
     }
     struct PlanExecutionGuard final {
         PipelineExecutionContext& context;
-
         ~PlanExecutionGuard() { context.end_plan(); }
     } plan_guard{context};
 
-    for (const PipelineExecutionBatch& batch : plan.batches) {
-        std::array<std::vector<uint32_t>, 5> domain_nodes;
-        for (std::vector<uint32_t>& nodes : domain_nodes) {
-            nodes.reserve(batch.node_indices.size());
+    try {
+        if (plan.topological_order.size() != plan.nodes.size()) {
+            return invalid_state("pipeline topological order does not cover its Stage nodes");
         }
-
-        for (const uint32_t node_index : batch.node_indices) {
-            if (node_index >= plan.nodes.size()) {
-                return invalid_state("pipeline batch references an invalid node");
-            }
-            const PipelineNode& node = plan.nodes[node_index];
-            const PhaseId node_phase = node.phase_id.is_valid() ? node.phase_id : to_phase_id(node.phase);
-            if (phase != nullptr && node_phase != *phase) {
-                continue;
-            }
-            switch (node.execution_domain) {
-                case ExecutionDomain::kMainThread:
-                    domain_nodes[static_cast<size_t>(ExecutionDomain::kMainThread)].push_back(node_index);
-                    break;
-                case ExecutionDomain::kCpuWorker:
-                    domain_nodes[static_cast<size_t>(ExecutionDomain::kCpuWorker)].push_back(node_index);
-                    break;
-                case ExecutionDomain::kIoWorker:
-                    domain_nodes[static_cast<size_t>(ExecutionDomain::kIoWorker)].push_back(node_index);
-                    break;
-                case ExecutionDomain::kRenderThread:
-                    domain_nodes[static_cast<size_t>(ExecutionDomain::kRenderThread)].push_back(node_index);
-                    break;
-                case ExecutionDomain::kGpu:
-                    domain_nodes[static_cast<size_t>(ExecutionDomain::kGpu)].push_back(node_index);
-                    break;
-                default:
-                    return invalid_argument("pipeline node execution domain is invalid");
-            }
-        }
-
-        const auto run_domain = [&](ExecutionDomain domain,
-                                    std::span<const uint32_t> node_indices) -> foundation::Result {
-            if (node_indices.empty()) {
-                return foundation::Result::success();
-            }
-            if (!is_valid_execution_domain(domain) || domain == ExecutionDomain::kMainThread) {
-                return invalid_argument("pipeline worker lane is invalid");
-            }
-            const concurrency::ExecutorDomain executor_domain = to_executor_domain(domain);
-
-            const foundation::ResultValue<std::shared_ptr<concurrency::Executor>> executor_result =
-                impl_->executor_registry.find_executor(executor_domain);
-            if (!executor_result) {
-                return executor_result.result;
-            }
-            concurrency::Executor& executor = *executor_result.value;
-
-            const auto make_task = [&](uint32_t node_index) {
-                concurrency::TaskDesc task{};
-                task.domain = executor_domain;
-                task.execute = [&plan, &context, node_index](const concurrency::TaskContext&) {
-                    foundation::Result result = execute_node(plan.nodes[node_index], context);
-                    if (!result) {
-                        return with_task_context(plan.nodes[node_index], std::move(result));
-                    }
-                    return result;
-                };
-                return task;
-            };
-
-            if (!batch.parallelizable) {
-                for (const uint32_t node_index : node_indices) {
-                    if (context.cancellation().is_cancellation_requested()) {
-                        return foundation::Result::failure(foundation::ResultCode::kCancelled,
-                                                           "pipeline execution was cancelled");
-                    }
-                    concurrency::TaskDesc task = make_task(node_index);
-                    task.cancellation = context.cancellation();
-                    foundation::ResultValue<concurrency::Completion> submitted = executor.submit(std::move(task));
-                    if (!submitted) {
-                        return submitted.result;
-                    }
-                    if (foundation::Result result = submitted.value.wait(); !result) {
-                        return result;
-                    }
+        std::vector<uint32_t> positions(plan.nodes.size(), kInvalidPipelineHandleIndex);
+        std::vector<uint32_t> visited_nodes;
+        visited_nodes.reserve(plan.nodes.size());
+        std::size_t ordered_index = 0;
+        for (const PipelineExecutionBatch& batch : plan.batches) {
+            for (const uint32_t node_index : batch.node_indices) {
+                if (node_index >= plan.nodes.size()) {
+                    return invalid_state("pipeline batch references an invalid Stage node");
                 }
-                return foundation::Result::success();
-            }
-
-            const concurrency::CancellationToken cancellation_token = context.cancellation();
-            concurrency::TaskGroup cancellable_group(cancellation_token);
-            for (const uint32_t node_index : node_indices) {
-                if (const foundation::ResultValue<concurrency::Completion> submitted =
-                        cancellable_group.submit(executor, make_task(node_index));
-                    !submitted) {
-                    static_cast<void>(cancellable_group.cancel());
-                    static_cast<void>(cancellable_group.wait());
-                    return submitted.result;
+                if (positions[node_index] != kInvalidPipelineHandleIndex ||
+                    ordered_index >= plan.topological_order.size() ||
+                    plan.topological_order[ordered_index] != node_index) {
+                    return invalid_state("pipeline Stage batches do not match its topological order");
+                }
+                positions[node_index] = static_cast<uint32_t>(ordered_index);
+                ++ordered_index;
+                const PipelineNode& node = plan.nodes[node_index];
+                if (!node.stage.is_valid() || !is_valid_engine_phase(node.phase) ||
+                    !is_valid_execution_domain(node.execution_domain) || !is_valid_time_policy(node.time_policy)) {
+                    return invalid_argument("pipeline Stage metadata is invalid");
+                }
+                const PhaseId node_phase = node.phase_id.is_valid() ? node.phase_id : to_phase_id(node.phase);
+                if (phase == nullptr || node_phase == *phase) {
+                    visited_nodes.push_back(node_index);
                 }
             }
-            return cancellable_group.wait();
-        };
-
-        const foundation::Result cpu_result =
-            run_domain(ExecutionDomain::kCpuWorker, domain_nodes[static_cast<size_t>(ExecutionDomain::kCpuWorker)]);
-        if (!cpu_result) {
-            return cpu_result;
         }
-        const foundation::Result io_result =
-            run_domain(ExecutionDomain::kIoWorker, domain_nodes[static_cast<size_t>(ExecutionDomain::kIoWorker)]);
-        if (!io_result) {
-            return io_result;
+        if (ordered_index != plan.nodes.size()) {
+            return invalid_state("pipeline Stage batches do not cover its nodes");
         }
-        const foundation::Result render_thread_result = run_domain(
-            ExecutionDomain::kRenderThread, domain_nodes[static_cast<size_t>(ExecutionDomain::kRenderThread)]);
-        if (!render_thread_result) {
-            return render_thread_result;
-        }
-        const foundation::Result gpu_result =
-            run_domain(ExecutionDomain::kGpu, domain_nodes[static_cast<size_t>(ExecutionDomain::kGpu)]);
-        if (!gpu_result) {
-            return gpu_result;
-        }
-
-        const std::vector<uint32_t>& main_thread_nodes =
-            domain_nodes[static_cast<size_t>(ExecutionDomain::kMainThread)];
-        for (const uint32_t node_index : main_thread_nodes) {
-            if (context.cancellation().is_cancellation_requested()) {
-                return foundation::Result::failure(foundation::ResultCode::kCancelled,
-                                                   "pipeline execution was cancelled");
-            }
-            foundation::Result result = execute_node(plan.nodes[node_index], context);
-            if (!result) {
-                return with_task_context(plan.nodes[node_index], std::move(result));
+        for (const PipelineDependency& dependency : plan.dependencies) {
+            if (dependency.source_node >= plan.nodes.size() || dependency.destination_node >= plan.nodes.size() ||
+                positions[dependency.source_node] >= positions[dependency.destination_node]) {
+                return invalid_state("pipeline Stage order does not satisfy its dependencies");
             }
         }
+        context.visited_nodes_.swap(visited_nodes);
+        return foundation::Result::success();
+    } catch (const std::bad_alloc&) {
+        return foundation::out_of_memory("pipeline Stage observation allocation failed");
     }
-    return foundation::Result::success();
 }
 
 foundation::Result PipelineScopeHost::bind_pipeline(PipelineId pipeline) {
@@ -3386,22 +2479,19 @@ foundation::Result PipelineScopeHost::bind_pipeline(PipelineId pipeline) {
 
 foundation::Result PipelineScopeHost::rebuild(const PipelineRegistry& registry, CapabilityMask available_capabilities) {
     PipelineId pipeline;
-    std::shared_ptr<const PipelineInstanceConfiguration> configuration;
     {
         std::shared_lock plan_lock(plan_mutex_);
         pipeline = pipeline_;
-        configuration = configuration_;
     }
     if (!pipeline.is_valid()) {
         return invalid_state("scope host has no bound pipeline");
     }
-    foundation::ResultValue<PipelinePlan> compiled = PipelineCompiler{}.compile({
+    foundation::ResultValue<PipelinePlan> compiled = detail::PipelineCompilerExecution::compile({
         .pipeline = pipeline,
         .scope = scope_,
         .available_capabilities = available_capabilities,
         .registry = &registry,
         .instance = instance_,
-        .configuration = configuration,
     });
     if (!compiled) {
         return compiled.result;
@@ -3415,7 +2505,7 @@ foundation::Result PipelineScopeHost::rebuild(const PipelineRegistry& registry, 
     }
 
     std::unique_lock plan_lock(plan_mutex_);
-    if (pipeline_ != pipeline || configuration_ != configuration) {
+    if (pipeline_ != pipeline) {
         return invalid_state("bound pipeline changed during pipeline rebuild");
     }
     if (active_) {
@@ -3437,100 +2527,6 @@ foundation::Result PipelineScopeHost::rebuild(const PipelineRegistry& registry, 
     }
     pending_plan_.reset();
     active_plan_ = std::move(plan);
-    return foundation::Result::success();
-}
-
-FeatureBuildContext FeatureBuildContext::from_backend(FeatureDeclarationBackend& backend,
-                                                      const FeatureBuildDescriptor& descriptor) noexcept {
-    FeatureBuildContext result(backend);
-    result.scope_ = descriptor.scope;
-    result.pipeline_id_ = descriptor.pipeline;
-    result.feature_id_ = descriptor.feature;
-    result.feature_instance_id_ = descriptor.instance;
-    result.part_id_ = descriptor.part;
-    result.feature_point_ = descriptor.point;
-    result.active_domain_ = descriptor.domain;
-    result.configuration_ = descriptor.configuration;
-    return result;
-}
-
-PipelineStageHandle FeatureBuildContext::add_stage(const StageDescriptor& descriptor) {
-    return feature_backend_ != nullptr
-               ? feature_backend_->add_stage(descriptor)
-               : (builder_ != nullptr ? builder_->add_stage(descriptor) : PipelineStageHandle{});
-}
-
-PipelineTaskHandle FeatureBuildContext::add_task(const TaskDescriptor& descriptor) {
-    return feature_backend_ != nullptr ? feature_backend_->add_task(descriptor)
-                                       : (builder_ != nullptr ? builder_->add_task(descriptor) : PipelineTaskHandle{});
-}
-
-PipelineArtifactHandle FeatureBuildContext::declare_artifact(const ArtifactDescriptor& descriptor) {
-    return feature_backend_ != nullptr
-               ? feature_backend_->declare_artifact(descriptor)
-               : (builder_ != nullptr ? builder_->declare_artifact(descriptor) : PipelineArtifactHandle{});
-}
-
-foundation::Result FeatureBuildContext::bind_task(PipelineTaskHandle task, PipelineStageHandle stage) {
-    return feature_backend_ != nullptr ? feature_backend_->bind_task(task, stage)
-                                       : (builder_ != nullptr ? builder_->bind_task(task, stage)
-                                                              : foundation::invalid_state("feature builder is empty"));
-}
-
-foundation::Result FeatureBuildContext::reads(PipelineStageHandle stage, const ArtifactBinding& binding) {
-    return feature_backend_ != nullptr ? feature_backend_->reads(stage, binding)
-                                       : (builder_ != nullptr ? builder_->reads(stage, binding)
-                                                              : foundation::invalid_state("feature builder is empty"));
-}
-
-foundation::Result FeatureBuildContext::writes(PipelineStageHandle stage, const ArtifactBinding& binding) {
-    return feature_backend_ != nullptr ? feature_backend_->writes(stage, binding)
-                                       : (builder_ != nullptr ? builder_->writes(stage, binding)
-                                                              : foundation::invalid_state("feature builder is empty"));
-}
-
-foundation::Result FeatureBuildContext::reads_writes(PipelineStageHandle stage, const ArtifactBinding& binding) {
-    return feature_backend_ != nullptr ? feature_backend_->reads_writes(stage, binding)
-                                       : (builder_ != nullptr ? builder_->reads_writes(stage, binding)
-                                                              : foundation::invalid_state("feature builder is empty"));
-}
-
-foundation::Result FeatureBuildContext::publish_snapshot(PipelineStageHandle stage, const ArtifactBinding& binding) {
-    return feature_backend_ != nullptr ? feature_backend_->publish_snapshot(stage, binding)
-                                       : (builder_ != nullptr ? builder_->publish_snapshot(stage, binding)
-                                                              : foundation::invalid_state("feature builder is empty"));
-}
-
-foundation::Result FeatureBuildContext::runs_before(PipelineStageHandle stage, StageId other) {
-    return feature_backend_ != nullptr ? feature_backend_->runs_before(stage, other)
-                                       : (builder_ != nullptr ? builder_->runs_before(stage, other)
-                                                              : foundation::invalid_state("feature builder is empty"));
-}
-
-foundation::Result FeatureBuildContext::runs_after(PipelineStageHandle stage, StageId other) {
-    return feature_backend_ != nullptr ? feature_backend_->runs_after(stage, other)
-                                       : (builder_ != nullptr ? builder_->runs_after(stage, other)
-                                                              : foundation::invalid_state("feature builder is empty"));
-}
-
-foundation::Result FeatureBuildContext::expose_artifact(ArtifactId artifact, PipelineScope target_scope) {
-    return feature_backend_ != nullptr ? feature_backend_->expose_artifact(artifact, target_scope)
-                                       : (builder_ != nullptr ? builder_->expose_artifact(artifact, target_scope)
-                                                              : foundation::invalid_state("feature builder is empty"));
-}
-
-foundation::Result PipelineScopeHost::set_configuration(
-    std::shared_ptr<const PipelineInstanceConfiguration> configuration) {
-    if (!configuration || !configuration->instance.is_valid() || !configuration->pipeline.is_valid())
-        return invalid_argument("pipeline instance configuration is invalid");
-    std::unique_lock lock(plan_mutex_);
-    if (active_)
-        return invalid_state("cannot replace configuration while the scope host is active");
-    if (instance_.is_valid() && configuration->instance != instance_)
-        return invalid_argument("pipeline configuration instance does not match host");
-    if (pipeline_.is_valid() && configuration->pipeline != pipeline_)
-        return invalid_argument("pipeline configuration pipeline does not match host");
-    configuration_ = std::move(configuration);
     return foundation::Result::success();
 }
 
@@ -3559,9 +2555,6 @@ foundation::Result rebuild_runtime_schedule(PipelinePlan& plan) {
         }
         PipelineExecutionBatch batch;
         batch.node_indices = current_batch;
-        batch.parallelizable = std::all_of(current_batch.begin(), current_batch.end(), [&](uint32_t node_index) {
-            return is_parallel_safe(plan.nodes[node_index]);
-        });
         plan.topological_order.insert(plan.topological_order.end(), current_batch.begin(), current_batch.end());
         plan.batches.push_back(std::move(batch));
         for (const uint32_t source : current_batch)
@@ -3625,24 +2618,34 @@ bool PipelineScopeHost::is_active() const noexcept {
     return active_;
 }
 
-const PipelinePlan* PipelineScopeHost::active_plan() const noexcept {
-    std::shared_lock plan_lock(plan_mutex_);
-    return active_plan_.get();
+const PipelinePlan* detail::PipelineScopeHostExecution::active_plan(const PipelineScopeHost& host) noexcept {
+    std::shared_lock plan_lock(host.plan_mutex_);
+    return host.active_plan_.get();
 }
 
-PipelinePlanHandle PipelineScopeHost::active_plan_snapshot() const noexcept {
-    std::shared_lock plan_lock(plan_mutex_);
-    return active_plan_;
+PipelinePlanHandle detail::PipelineScopeHostExecution::active_plan_snapshot(const PipelineScopeHost& host) noexcept {
+    std::shared_lock plan_lock(host.plan_mutex_);
+    return host.active_plan_;
 }
 
-bool PipelineScopeHost::has_pending_plan() const noexcept {
-    std::shared_lock plan_lock(plan_mutex_);
-    return pending_plan_ != nullptr;
+bool detail::PipelineScopeHostExecution::has_pending_plan(const PipelineScopeHost& host) noexcept {
+    std::shared_lock plan_lock(host.plan_mutex_);
+    return host.pending_plan_ != nullptr;
 }
 
-std::size_t PipelineScopeHost::retired_plan_count() const noexcept {
-    std::shared_lock plan_lock(plan_mutex_);
-    return retired_plans_.size();
+std::size_t detail::PipelineScopeHostExecution::retired_plan_count(const PipelineScopeHost& host) noexcept {
+    std::shared_lock plan_lock(host.plan_mutex_);
+    return host.retired_plans_.size();
+}
+
+const ArtifactScopeBridge* detail::PipelineScopeHostExecution::scope_bridge(
+    const PipelineScopeHost& host) noexcept {
+    return host.scope_bridge_;
+}
+
+void detail::PipelineScopeHostExecution::set_scope_bridge(
+    PipelineScopeHost& host, const ArtifactScopeBridge* scope_bridge) noexcept {
+    host.scope_bridge_ = scope_bridge;
 }
 
 foundation::Result PipelineScopeHost::apply_pending_plan_internal() const {
@@ -3714,8 +2717,8 @@ foundation::Result PipelineScopeHost::deactivate(const PipelineDeactivationConte
     return foundation::Result::success();
 }
 
-foundation::Result PipelineScopeHost::execute(PipelineScheduler& scheduler, PipelineExecutionContext& context,
-                                              concurrency::CancellationToken cancellation) const {
+foundation::Result PipelineScopeHost::execute(PipelineScheduler& scheduler, PipelineExecutionContext& context) const {
+    context.visited_nodes_.clear();
     const foundation::Result pending_result = apply_pending_plan_internal();
     if (!pending_result && pending_result.code != foundation::ResultCode::kNotReady) {
         return pending_result;
@@ -3738,13 +2741,13 @@ foundation::Result PipelineScopeHost::execute(PipelineScheduler& scheduler, Pipe
     }
     context.set_artifact_runtime(artifact_registry, scope_bridge);
     const PipelinePlanHandle plan = active_plan_;
-    const foundation::Result result = scheduler.execute(*plan, context, std::move(cancellation));
+    const foundation::Result result = scheduler.execute(*plan, context);
     return result;
 }
 
 foundation::Result PipelineScopeHost::execute_phase(PipelineScheduler& scheduler, PipelineExecutionContext& context,
-                                                    PhaseId phase, PipelinePlanHandle pinned_plan,
-                                                    concurrency::CancellationToken cancellation) const {
+                                                    PhaseId phase, PipelinePlanHandle pinned_plan) const {
+    context.visited_nodes_.clear();
     if (!phase.is_valid()) {
         return invalid_argument("pipeline execution phase id is invalid");
     }
@@ -3781,6 +2784,6 @@ foundation::Result PipelineScopeHost::execute_phase(PipelineScheduler& scheduler
         scope_bridge = scope_bridge_;
     }
     context.set_artifact_runtime(artifact_registry, scope_bridge);
-    return scheduler.execute_phase(*plan, context, phase, std::move(cancellation));
+    return scheduler.execute_phase(*plan, context, phase);
 }
 }  // namespace aeg::pipeline

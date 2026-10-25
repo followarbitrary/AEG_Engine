@@ -8,26 +8,26 @@ int main() {
     using aeg::module::ModuleContextTable;
 
     ModuleContextTable table(0xAEE6u);
-    auto pipeline = table.allocate(ModuleContextKind::kPipeline);
-    if (!pipeline || table.active_count() != 1)
+    auto feature = table.allocate(ModuleContextKind::kFeatureDefinition);
+    if (!feature || table.active_count() != 1)
         return 1;
-    if (!table.validate(pipeline.value, ModuleContextKind::kPipeline))
+    if (!table.validate(feature.value, ModuleContextKind::kFeatureDefinition))
         return 2;
-    if (table.validate(pipeline.value, ModuleContextKind::kFeature).code != ResultCode::kInvalidArgument)
+    if (table.validate(feature.value, ModuleContextKind::kFeatureInstance).code != ResultCode::kInvalidArgument)
         return 3;
 
-    auto foreign = pipeline.value;
+    auto foreign = feature.value;
     foreign.owner_cookie += 1;
-    if (table.validate(foreign, ModuleContextKind::kPipeline).code != ResultCode::kInvalidState)
+    if (table.validate(foreign, ModuleContextKind::kFeatureDefinition).code != ResultCode::kInvalidState)
         return 4;
 
-    if (!table.release(pipeline.value, ModuleContextKind::kPipeline))
+    if (!table.release(feature.value, ModuleContextKind::kFeatureDefinition))
         return 5;
-    if (table.validate(pipeline.value, ModuleContextKind::kPipeline).code != ResultCode::kInvalidState)
+    if (table.validate(feature.value, ModuleContextKind::kFeatureDefinition).code != ResultCode::kInvalidState)
         return 6;
-    auto recycled = table.allocate(ModuleContextKind::kPipeline);
-    if (!recycled || recycled.value.slot != pipeline.value.slot ||
-        recycled.value.generation == pipeline.value.generation)
+    auto recycled = table.allocate(ModuleContextKind::kFeatureDefinition);
+    if (!recycled || recycled.value.slot != feature.value.slot ||
+        recycled.value.generation == feature.value.generation)
         return 7;
 
     {

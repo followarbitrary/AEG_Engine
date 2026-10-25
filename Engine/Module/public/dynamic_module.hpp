@@ -2,10 +2,11 @@
 #include <memory>
 
 #include "../abi/module_api.h"
+#include "module.hpp"
 #include "module_bundle.hpp"
+#include "feature_module.hpp"
 namespace aeg::module {
-inline constexpr uint64_t kDynamicV1Capabilities = AEG_CAP_METADATA | AEG_CAP_PIPELINE_DECLARATION | AEG_CAP_LOGIC |
-                                                   AEG_CAP_RENDER | AEG_CAP_VALUE_REFLECTION | AEG_CAP_RENDER_PROGRAMS;
+inline constexpr uint64_t kDynamicModuleCapabilities = AEG_CAP_ALL;
 
 struct DynamicModuleLeaseState;
 
@@ -39,12 +40,17 @@ struct DynamicModuleHandle final {
 
 class DynamicModuleLoader final {
 public:
-    explicit DynamicModuleLoader(ModuleRegistry& registry, uint64_t capabilities = kDynamicV1Capabilities) noexcept
+    explicit DynamicModuleLoader(ModuleRegistry& registry, uint64_t capabilities = kDynamicModuleCapabilities) noexcept
         : registry_(&registry), capabilities_(capabilities) {}
+    /** Revalidates the selected bundle and rejects changed build/content/contract
+     * facts before opening code. A different build requires explicit selection.
+     */
     [[nodiscard]] foundation::Result load(const ModuleBundle& bundle, DynamicModuleHandle& handle);
     [[nodiscard]] foundation::Result unload(DynamicModuleHandle& handle, uint64_t timeout_ms = 0);
     /** Acquire a borrow for callbacks, plans or instances that may outlive a frame. */
     [[nodiscard]] foundation::ResultValue<DynamicModuleLease> acquire(const DynamicModuleHandle& handle) const;
+    /** Owning host callbacks automatically borrow the verified DLL's code. */
+    [[nodiscard]] foundation::ResultValue<FeatureModuleDefinition> make_feature_module(const DynamicModuleHandle&) const;
     [[nodiscard]] bool is_loaded(const DynamicModuleHandle& handle) const noexcept {
         return handle.loaded && handle.generation != 0;
     }
@@ -52,6 +58,6 @@ public:
 
 private:
     ModuleRegistry* registry_{};
-    uint64_t capabilities_{kDynamicV1Capabilities};
+    uint64_t capabilities_{kDynamicModuleCapabilities};
 };
 }  // namespace aeg::module

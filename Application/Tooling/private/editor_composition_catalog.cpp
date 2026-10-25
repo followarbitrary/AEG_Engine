@@ -1,16 +1,16 @@
 #include "../public/editor_composition_catalog.hpp"
 
-#include "../../../Engine/Module/public/module_bundle.hpp"
+#include "module_bundle.hpp"
 namespace aeg::tooling {
-foundation::Result EditorCompositionCatalog::replace_catalog(pipeline::TypeCatalog catalog) {
+foundation::Result EditorCompositionCatalog::replace_catalog(feature::FeatureCatalog catalog) {
     catalog_ = std::move(catalog);
     return foundation::Result::success();
 }
-foundation::Result EditorCompositionCatalog::replace_module_catalogs(std::span<const pipeline::TypeCatalog> catalogs) {
-    pipeline::TypeCatalog merged;
+foundation::Result EditorCompositionCatalog::replace_module_catalogs(std::span<const feature::FeatureCatalog> catalogs) {
+    feature::FeatureCatalog merged;
     for (const auto& catalog : catalogs)
         for (const auto& entry : catalog.entries())
-            if (auto result = merged.add(entry); !result)
+            if (auto result = merged.add_entry(entry); !result)
                 return result;
     catalog_ = std::move(merged);
     return foundation::Result::success();
@@ -27,6 +27,6 @@ foundation::Result EditorCompositionCatalog::replace_module_metadata(const std::
         return contract.result;
     if (contract.value != loaded.value.contract_digest)
         return foundation::invalid_argument("Module metadata contract digest is stale");
-    return replace_catalog(loaded.value.catalog);
+    return replace_catalog(loaded.value.feature_catalog);
 }
 }  // namespace aeg::tooling

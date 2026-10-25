@@ -1,0 +1,8 @@
+version = 1
+source_uuid = "00000000-0000-4000-8000-000000000012"
+importer = "aeg.feature_graph"
+
+[[products]]
+uuid = "00000000-0000-4000-8000-000000000002"
+kind = "feature_graph"
+key = "Default"

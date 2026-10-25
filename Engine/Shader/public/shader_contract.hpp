@@ -7,12 +7,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
-#include "pipeline_authoring_types.hpp"
+#include "parameter_value.hpp"
 #include "result.hpp"
 #include "rhi.hpp"
 
@@ -106,7 +107,15 @@ struct ShaderPipelineDesc {
     rhi::DebugName name{};
 };
 
-class ShaderManager;
+/** @brief Value metadata for publishing a shader layout's contract and cache generation. */
+struct ShaderPipelineLayoutIdentity {
+    std::uint64_t contract_hash{0};
+    std::uint64_t cache_epoch{0};
+};
+
+namespace detail {
+struct ShaderPipelineLayoutAccess;
+}  // namespace detail
 
 /**
  * @brief Pipeline-layout data generated from a validated shader contract.
@@ -130,12 +139,12 @@ public:
     /** @brief Builds a non-owning RHI pipeline-layout description. */
     [[nodiscard]] rhi::PipelineLayoutDesc desc() const noexcept;
 
-    [[nodiscard]] std::uint64_t contract_hash() const noexcept { return contract_hash_; }
-
 private:
-    friend class ShaderManager;
+    friend struct detail::ShaderPipelineLayoutAccess;
 
-    const ShaderManager* owner_{nullptr};
+    const void* owner_{nullptr};
+    std::weak_ptr<const std::uint8_t> owner_lifetime_{};
+    std::uint64_t cache_epoch_{0};
     std::uint64_t contract_hash_{0};
     std::vector<rhi::BindingLayoutHandle> binding_layouts_{};
     std::vector<rhi::InlineConstantRange> inline_constant_ranges_{};
@@ -148,11 +157,11 @@ private:
 
 /** @brief Validates authored material values against reflected shader fields. */
 [[nodiscard]] foundation::Result validate_parameter_block(const ShaderProgram& program,
-                                                          const pipeline::ParameterBlock& values);
+                                                          const foundation::ParameterBlock& values);
 
 /** @brief Packs reflected numeric material values into the shader constant-buffer ABI. */
 [[nodiscard]] foundation::ResultValue<std::vector<std::byte>> pack_parameter_block(
-    const ShaderProgram& program, const pipeline::ParameterBlock& values);
+    const ShaderProgram& program, const foundation::ParameterBlock& values);
 
 /**
  * @brief Validates shader contracts, caches layouts, and creates RHI pipelines.
@@ -177,6 +186,15 @@ public:
     [[nodiscard]] foundation::ResultValue<ShaderPipelineLayout> build_pipeline_layout(const ShaderProgram& program,
                                                                                       rhi::DebugName name = {});
 
+    /**
+     * @brief Returns identity metadata only for a live layout owned by this manager.
+     *
+     * The returned value is a snapshot for host-published contracts. A cache reset
+     * retires that epoch; querying a foreign, empty, or retired layout fails.
+     */
+    [[nodiscard]] foundation::ResultValue<ShaderPipelineLayoutIdentity> pipeline_layout_identity(
+        const ShaderPipelineLayout& layout) const;
+
     /** @brief Returns the binding layout for one contract group. */
     [[nodiscard]] foundation::ResultValue<rhi::BindingLayoutHandle> binding_layout(const ShaderPipelineLayout& layout,
                                                                                    std::uint32_t group) const;
@@ -188,6 +206,9 @@ public:
 
     /** @brief Destroys cached binding layouts and invalidates their views. */
     [[nodiscard]] foundation::Result clear_layout_cache();
+
+    /** @brief Returns the current epoch for layouts and Shader/PSO cache entries. */
+    [[nodiscard]] std::uint64_t cache_epoch() const noexcept { return cache_epoch_; }
 
 private:
     /** @brief Verifies that a layout belongs to this manager and its cache is live. */
@@ -201,6 +222,13 @@ private:
     [[nodiscard]] std::uint64_t hash_contract(const ShaderProgram& program) const;
 
     rhi::Device& device_;
+    std::shared_ptr<const std::uint8_t> lifetime_token_{};
+    std::uint64_t cache_epoch_{1};
     std::unordered_map<std::string, rhi::BindingLayoutHandle> layout_cache_{};
+    // Layouts that could not be destroyed during a cache reset remain owned by
+    // the manager until their dependent pipelines/sets have been retired. They
+    // are deliberately kept out of layout_cache_ so a new epoch can never
+    // re-wrap a live old handle.
+    std::vector<rhi::BindingLayoutHandle> pending_layout_retirement_{};
 };
 }  // namespace aeg::shader

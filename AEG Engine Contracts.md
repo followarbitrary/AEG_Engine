@@ -2,10 +2,10 @@
 
 > 文档性质：项目级目录、模块边界、命名和扩展约定
 >
-> 维护日期：2026-09-12
+> 维护日期：2026-10-04（补充 Feature/Flow/Function/Frame 术语边界）
 >
-> 详细 API 语义以各模块 `public` 头文件为准；AEG Domain-Oriented Pipeline Architecture
-> 文档负责说明完整的 Pipeline 架构。本文件只保留所有开发者都必须遵守的项目级规则。
+> 目标业务模型、Feature 五域、状态机和旧三层迁移规则以 [Feature 五域架构设计](AEG%20Feature%20Five-Domain%20Architecture.md)
+> 为准；详细 API 语义以各模块 `public` 头文件为准。本文保留项目目录、模块边界和兼容期开发规则。
 
 ## 1. 规范性措辞
 
@@ -263,20 +263,25 @@ Shader 名称另遵守 `shaders/SHADER_NAMING.md`。
 
 ## 6. Pipeline 与 Feature 口头约定
 
-- 所有具有明确执行时机、输入输出和依赖关系的功能，优先建模为 Pipeline。
-- 基础服务，如 Math、Logging、Allocator、RHI Device 和资源缓存，不应伪装成业务 Pipeline。
+- 需要独立身份、契约、配置、生命周期或跨帧状态的业务能力，优先建模为 Feature；其依赖、
+  时钟和执行域由对应 Pipeline profile（若需要）编排。RenderPass 只属于 Frame/Render 投影。
+- 基础服务，如 Math、Logging、Allocator、RHI Device 和资源缓存，不应伪装成业务 Feature。
 - 一个具体 Feature 默认只属于一个主领域，应从 `LogicFeature`、`PhysicsFeature`、
   `RenderFeature`、`AudioFeature` 或 `StreamFeature` 之一继承。
 - `PipelineFeature` 是公共类型擦除根；直接继承在 C++ 上合法，但属于不推荐用法，当前不
   通过类型系统或 Registry 强制禁止。
-- 跨领域 Feature 使用 `CompositeFeature<Parts...>` 的成员组合，不使用多重继承绕过领域
-  Builder 边界。Part 不作为独立顶层 Feature 注册，也不得嵌套 Composite。
-- Feature 只能通过所属领域 Builder 声明 Stage、Task、Artifact 和依赖，不得保存 Builder
-  引用到构建回调之外。
-- Pipeline 的 Definition、Instance 和 Plan 必须分离；一帧内使用的 Plan 必须保持固定。
-- Pipeline 之间通过 Artifact 和显式顺序关系通信，不通过隐式全局调用链通信。
-- 新增 Pipeline 可以注册自定义 Stage 和 FeaturePoint；新增全局 Phase 必须通过
-  `PhaseRegistry` 相对已有 Phase 注册。
+- 同域或跨域 Feature 使用 `CompositeFeature<Parts...>` 的成员组合，不使用多重继承绕过领域
+  Builder 边界；结构必须无递归环。Part 默认不作为独立顶层 Feature 注册；有状态 child
+  必须保留 OwnerPath、StateStore/FlowInstance 边界。
+- Frame/Render projection 的 Feature 才通过所属 Builder 声明 Stage、Task、Artifact、
+  FeaturePoint 和依赖；Logic/Process 使用 State、Event、Resource Contract 和对应 Clock，
+  不把状态机降为 Stage/Pass。
+- Feature Definition、Feature Instance 和 ExecutionPlan 必须分离；一帧/一次 Clock 周期内
+  使用的 Plan 必须保持固定。当前 Pipeline 的 Definition、Instance 和 Plan 是兼容期 API。
+- Feature/ExecutionPlan 之间通过 Artifact/Resource Contract 和显式依赖通信，不通过隐式
+  全局调用链通信。
+- 新增 Frame/Render projection 可以注册自定义 Stage 和 FeaturePoint；新增全局 Phase 必须
+  通过 `PhaseRegistry` 相对已有 Phase 注册。
 
 ## 7. RHI、RenderGraph 与 Shader 约定
 

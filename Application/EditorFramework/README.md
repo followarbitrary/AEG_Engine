@@ -40,10 +40,16 @@ Sampled View 和 Sampler，再将这些句柄注册到 `ImGuiTextureRegistry`，
 只接收复制后的后端无关 `EditorFontCatalog`。Preference 的 Preview 不改变应用的 applied
 状态，Apply/Cancel 的提交和回滚由 Application Controller 完成。
 
-`ImGuiRenderer` 将宿主捕获的 `ImGuiDrawPacket` 上传到 RHI 资源，并由
-`ImGuiRenderFeature` 在 `RenderPipeline.BeforePresent` 阶段声明 RenderGraph 资源和
-Graphics Pass。实际命令只能通过 RenderGraph 的 `RenderPassExecutionContext` 录制；
+`ImGuiRenderer` 将宿主捕获的 `ImGuiDrawPacket` 上传到 RHI 资源，私有固定 overlay
+入口在 prepare 后向实际目标 RenderGraph 声明资源和 Graphics Pass。
+实际命令只能通过 RenderGraph 的 `RenderPassExecutionContext` 录制；
 EditorFramework 不得直接访问 Vulkan、D3D12 或其他 native 图形 API。
+
+公共 `imgui_renderer.hpp` 只保留 renderer 所有者与帧准备合同；目标资源 ID 使用
+`feature::RenderResourceId`。`public/imgui_render_execution.hpp` 提供固定构图与
+多个 Renderer 的 prepared-frame 释放入口，由 Editor 主窗口、偏好窗口与原生视口装配
+使用。旧 ImGuiRenderFeature 类、身份和注册/注销已删除。构图校验真实 Device、目标
+句柄代次、格式、尺寸及 attachment capability，复用 RenderGraph 私有事务 backend。
 
 字体图集和其他 UI 纹理由上层创建、维护和销毁。上层应将 RHI texture、sampled view、
 sampler、纹理描述和初始资源状态注册到 `ImGuiTextureRegistry`；注册表只保存借用句柄。
@@ -58,6 +64,14 @@ sampler、纹理描述和初始资源状态注册到 `ImGuiTextureRegistry`；�
 当前覆盖范围包括顶点/索引/投影矩阵上传、采样纹理、alpha blending、scissor、
 indexed draw、空绘制包、Docking 和 Engine-owned 多视口平台回调。ImGui 用户绘制回调和
 官方多后端输入/渲染 Backend 不在当前公共契约内。
+
+主窗口、Preferences 与 native viewport 按 clear、prepare、固定 overlay、readback/Present
+顺序构图。空 packet 仍保留使用 Load 的有副作用 pass；UI 技术 pass 不携带 Scene 业务
+Feature provenance。PreparedFrame 在 prepare 时由 FrameContext 保活，graph callback
+也持有它。GPU 完成不等于 Renderer 已释放借用纹理的 descriptors；替换共享字体或
+SceneColor 前，Application 必须先 drain 所有可能采样的 host、reset 它们的 graph，
+再批量释放所有 Renderer 的 prepared frames。双实际 Renderer 的 GPU 测试验证只释放
+主 Renderer 时 view 仍不能销毁，完整释放后 view、texture 和 sampler 均能真实退休。
 
 ## 边界
 

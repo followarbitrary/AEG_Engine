@@ -5,8 +5,8 @@
 #include "cooked_asset.hpp"
 #include "scene_payload.hpp"
 
-using aeg::asset::AssetId;
-using aeg::asset::AssetKind;
+using aeg::foundation::AssetId;
+using aeg::foundation::AssetKind;
 
 static AssetId id(const char* text) {
     return AssetId::parse(text).value;

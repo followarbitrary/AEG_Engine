@@ -405,6 +405,30 @@ foundation::Result BinaryWriter::write_bytes(std::span<const uint8_t> bytes) {
     return foundation::Result::success();
 }
 
+foundation::Result BinaryWriter::write_string(std::string_view value, uint32_t max_bytes) {
+    if (value.size() > max_bytes) {
+        return invalid_state("binary string exceeds the configured size limit");
+    }
+    const std::size_t original_size = size();
+    if (const auto result = write_u32(static_cast<uint32_t>(value.size())); !result) {
+        return result;
+    }
+    if (!value.empty()) {
+        const auto result = write_bytes({reinterpret_cast<const uint8_t*>(value.data()), value.size()});
+        if (!result) {
+            truncate(original_size);
+            return result;
+        }
+    }
+    return foundation::Result::success();
+}
+
+foundation::Result BinaryWriter::write_u16(uint16_t value) {
+    const uint8_t bytes[] = {static_cast<uint8_t>(value & 0xffu),
+                             static_cast<uint8_t>((value >> 8u) & 0xffu)};
+    return write_bytes(bytes);
+}
+
 foundation::Result BinaryWriter::write_u32(uint32_t value) {
     const uint8_t bytes[] = {static_cast<uint8_t>(value & 0xffu), static_cast<uint8_t>((value >> 8u) & 0xffu),
                              static_cast<uint8_t>((value >> 16u) & 0xffu),
@@ -438,6 +462,39 @@ foundation::ResultValue<std::span<const uint8_t>> BinaryReader::read_bytes(std::
     const std::span<const uint8_t> result = data_.subspan(offset_, size);
     offset_ += size;
     return {foundation::Result::success(), result};
+}
+
+foundation::ResultValue<std::string> BinaryReader::read_string(uint32_t max_bytes) {
+    const auto size = read_u32();
+    if (!size) {
+        return {size.result, {}};
+    }
+    if (size.value > max_bytes) {
+        return {invalid_state("binary string exceeds the configured size limit"), {}};
+    }
+    const auto bytes = read_bytes(size.value);
+    if (!bytes) {
+        return {bytes.result, {}};
+    }
+    try {
+        if (bytes.value.empty()) {
+            return {foundation::Result::success(), {}};
+        }
+        return {foundation::Result::success(),
+                std::string(reinterpret_cast<const char*>(bytes.value.data()), bytes.value.size())};
+    } catch (const std::bad_alloc&) {
+        return {out_of_memory("binary string allocation failed"), {}};
+    }
+}
+
+foundation::ResultValue<uint16_t> BinaryReader::read_u16() noexcept {
+    const auto bytes = read_bytes(2);
+    if (!bytes) {
+        return {bytes.result, 0};
+    }
+    const uint16_t value = static_cast<uint16_t>(bytes.value[0]) |
+                           (static_cast<uint16_t>(bytes.value[1]) << 8u);
+    return {foundation::Result::success(), value};
 }
 
 foundation::ResultValue<uint32_t> BinaryReader::read_u32() noexcept {

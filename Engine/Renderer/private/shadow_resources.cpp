@@ -29,6 +29,8 @@ foundation::ResultValue<RenderShadowResource> ShadowResources::for_frame(render_
     try {
     if (!impl_ || !frame.is_frame_active())
         return {foundation::invalid_state("shadow requires resources and an active frame"), {}};
+    if (&frame.device() != &impl_->device)
+        return {foundation::invalid_state("shadow FrameContext belongs to a different RHI device"), {}};
     if (!math::is_finite(constants.clip_to_shadow) || !math::is_finite(constants.parameters) ||
         constants.parameters.x <= 0 || constants.parameters.y <= 0 || constants.parameters.z < 0)
         return {foundation::invalid_argument("shadow constants are invalid"), {}};

@@ -33,7 +33,7 @@ struct Reader final {
         offset += size;
         return true;
     }
-    bool uuid(AssetId& output) {
+    bool uuid(foundation::AssetId& output) {
         for (auto& byte : output.value.bytes) {
             if (!value(byte))
                 return false;
@@ -57,13 +57,13 @@ struct Writer final {
         bytes.insert(bytes.end(), data, data + text.size());
     }
 
-    void uuid(const AssetId& id) {
+    void uuid(const foundation::AssetId& id) {
         for (const uint8_t byte : id.value.bytes)
             value(byte);
     }
 };
 
-bool parameter(Reader& reader, pipeline::ParameterValue& output) {
+bool parameter(Reader& reader, foundation::ParameterValue& output) {
     uint8_t tag = 0;
     if (!reader.value(tag) || tag > 6)
         return false;
@@ -119,7 +119,7 @@ bool parameter(Reader& reader, pipeline::ParameterValue& output) {
             std::string value;
             if (!reader.string(value) || value.empty())
                 return false;
-            output = pipeline::AssetReference{std::move(value)};
+            output = foundation::AssetReference{std::move(value)};
             return true;
         }
         default:
@@ -127,7 +127,7 @@ bool parameter(Reader& reader, pipeline::ParameterValue& output) {
     }
 }
 
-[[nodiscard]] foundation::Result validate_parameter_value(const pipeline::ParameterValue& value) {
+[[nodiscard]] foundation::Result validate_parameter_value(const foundation::ParameterValue& value) {
     const bool valid = std::visit(
         [](const auto& item) {
             using Value = std::remove_cvref_t<decltype(item)>;
@@ -138,7 +138,7 @@ bool parameter(Reader& reader, pipeline::ParameterValue& output) {
             } else if constexpr (std::is_same_v<Value, std::vector<double>>) {
                 return item.size() <= kMaxCount &&
                        std::all_of(item.begin(), item.end(), [](double entry) { return std::isfinite(entry); });
-            } else if constexpr (std::is_same_v<Value, pipeline::AssetReference>) {
+            } else if constexpr (std::is_same_v<Value, foundation::AssetReference>) {
                 return !item.uuid.empty() && item.uuid.size() <= kMaxString;
             } else {
                 return true;
@@ -149,7 +149,7 @@ bool parameter(Reader& reader, pipeline::ParameterValue& output) {
                  : foundation::invalid_argument("Material payload parameter value is invalid");
 }
 
-void write_parameter(Writer& writer, const pipeline::ParameterValue& value) {
+void write_parameter(Writer& writer, const foundation::ParameterValue& value) {
     std::visit(
         [&](const auto& item) {
             using Value = std::remove_cvref_t<decltype(item)>;
@@ -173,7 +173,7 @@ void write_parameter(Writer& writer, const pipeline::ParameterValue& value) {
                 writer.value(static_cast<uint32_t>(item.size()));
                 for (const double entry : item)
                     writer.value(entry);
-            } else if constexpr (std::is_same_v<Value, pipeline::AssetReference>) {
+            } else if constexpr (std::is_same_v<Value, foundation::AssetReference>) {
                 writer.value(static_cast<uint8_t>(6));
                 writer.string(item.uuid);
             }
@@ -183,7 +183,7 @@ void write_parameter(Writer& writer, const pipeline::ParameterValue& value) {
 }  // namespace
 
 foundation::ResultValue<std::vector<std::byte>> encode_material_payload(const MaterialPayload& payload) {
-    if (payload.schema_version == 0 || payload.shader == AssetId{} || payload.textures.size() > kMaxCount ||
+    if (payload.schema_version == 0 || payload.shader == foundation::AssetId{} || payload.textures.size() > kMaxCount ||
         payload.parameters.size() > kMaxCount) {
         return {foundation::invalid_argument("Material payload identity or size is invalid"), {}};
     }
@@ -193,7 +193,7 @@ foundation::ResultValue<std::vector<std::byte>> encode_material_payload(const Ma
                   return left.binding_id < right.binding_id;
               });
     for (std::size_t index = 0; index < textures.size(); ++index) {
-        if (textures[index].binding_id == 0 || textures[index].texture == AssetId{} ||
+        if (textures[index].binding_id == 0 || textures[index].texture == foundation::AssetId{} ||
             (index != 0 && textures[index - 1].binding_id == textures[index].binding_id)) {
             return {foundation::invalid_argument("Material payload texture binding is invalid or duplicated"), {}};
         }
@@ -229,7 +229,7 @@ foundation::ResultValue<MaterialPayload> decode_material_payload(std::span<const
         return {foundation::invalid_argument("Material payload header is invalid"), {}};
     }
     result.schema_version = schema;
-    if (!reader.uuid(result.shader) || result.shader == AssetId{} || !reader.value(texture_count) ||
+    if (!reader.uuid(result.shader) || result.shader == foundation::AssetId{} || !reader.value(texture_count) ||
         texture_count > kMaxCount) {
         return {foundation::invalid_argument("Material payload header is invalid"), {}};
     }
@@ -237,7 +237,7 @@ foundation::ResultValue<MaterialPayload> decode_material_payload(std::span<const
     for (uint32_t i = 0; i < texture_count; ++i) {
         MaterialTextureBinding binding{};
         if (!reader.value(binding.binding_id) || binding.binding_id == 0 || !reader.uuid(binding.texture) ||
-            binding.texture == AssetId{}) {
+            binding.texture == foundation::AssetId{}) {
             return {foundation::invalid_argument("Material payload texture binding is invalid"), {}};
         }
         if (!std::none_of(result.textures.begin(), result.textures.end(), [&](const MaterialTextureBinding& existing) {
@@ -252,7 +252,7 @@ foundation::ResultValue<MaterialPayload> decode_material_payload(std::span<const
     }
     for (uint32_t i = 0; i < parameter_count; ++i) {
         uint64_t id = 0;
-        pipeline::ParameterValue value{};
+        foundation::ParameterValue value{};
         if (!reader.value(id) || id == 0 || !parameter(reader, value) ||
             !result.parameters.emplace(id, std::move(value)).second) {
             return {foundation::invalid_argument("Material payload parameter is invalid"), {}};

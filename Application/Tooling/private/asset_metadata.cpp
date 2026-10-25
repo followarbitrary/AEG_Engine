@@ -111,8 +111,8 @@ constexpr uint32_t kCurrentMetaVersion = 1;
     if (name == "font") {
         return {foundation::Result::success(), AssetKind::kFont};
     }
-    if (name == "pipeline") {
-        return {foundation::Result::success(), AssetKind::kPipeline};
+    if (name == "feature_graph") {
+        return {foundation::Result::success(), AssetKind::kFeatureGraph};
     }
     if (name == "shader") {
         return {foundation::Result::success(), AssetKind::kShader};
@@ -132,8 +132,8 @@ constexpr uint32_t kCurrentMetaVersion = 1;
             return "scene";
         case AssetKind::kFont:
             return "font";
-        case AssetKind::kPipeline:
-            return "pipeline";
+        case AssetKind::kFeatureGraph:
+            return "feature_graph";
         case AssetKind::kShader:
             return "shader";
     }

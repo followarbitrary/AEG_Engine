@@ -3,6 +3,13 @@
  * @brief Implements render-graph compilation, transient allocation, and execution.
  */
 #include "../public/render_graph.hpp"
+#include "render_texture_allocation.hpp"
+#include "render_graph_submission.hpp"
+#include "render_graph_upload_submission.hpp"
+#include "render_graph_feature_access.hpp"
+#include "render_graph_execution.hpp"
+#include "render_graph_resource_access.hpp"
+#include "render_graph_upload_access.hpp"
 
 #include <algorithm>
 #include <array>
@@ -69,6 +76,7 @@ struct BufferStateSegment {
     uint64_t offset{0};
     uint64_t size{0};
     rhi::ResourceState state{};
+    friend bool operator==(const BufferStateSegment&, const BufferStateSegment&) = default;
 };
 
 struct PhysicalBuffer {
@@ -84,29 +92,6 @@ struct TextureViewCacheEntry {
     rhi::TextureViewDesc desc{};
     rhi::TextureViewHandle handle{};
     bool owns_handle{false};
-};
-
-/** Keeps graph-owned images/views alive when the graph is rebuilt before GPU completion. */
-struct TextureAllocationOwner {
-    explicit TextureAllocationOwner(rhi::Device& device) : device(device) {}
-    ~TextureAllocationOwner() { release_unreferenced(); }
-    void release_unreferenced() {
-        // A descriptor may outlive the graph that created its views. Keep only
-        // handles the backend still considers referenced; the frame lease retries
-        // after retiring descriptors. Unreferenced imports can be released now.
-        std::erase_if(views, [this](rhi::TextureViewHandle view) {
-            const auto result = device.destroy_texture_view(view);
-            return result || result.code == foundation::ResultCode::kNotFound;
-        });
-        if (views.empty() && texture.is_valid()) {
-            const auto result = device.destroy_texture(texture);
-            if (result || result.code == foundation::ResultCode::kNotFound)
-                texture = {};
-        }
-    }
-    rhi::Device& device;
-    rhi::TextureHandle texture{};
-    std::vector<rhi::TextureViewHandle> views{};
 };
 
 struct PhysicalTexture {
@@ -157,6 +142,7 @@ struct BufferRecord {
     OwnedBufferDesc desc{};
     rhi::BufferHandle imported{};
     PhysicalBuffer physical{};
+    rhi::ResourceState imported_state{};
     rhi::GpuCompletionSet last_completions{};
     bool exported{false};
     bool has_use{false};
@@ -171,6 +157,7 @@ struct TextureRecord {
     OwnedTextureDesc desc{};
     rhi::TextureHandle imported{};
     rhi::TextureViewHandle imported_default_view{};
+    std::shared_ptr<const void> imported_owner{};
     PhysicalTexture physical{};
     rhi::ResourceState imported_state{};
     rhi::GpuCompletionSet last_completions{};
@@ -192,6 +179,9 @@ struct PassRecord {
     PassSetupCallback setup{};
     PassExecuteCallback execute{};
     bool side_effects{false};
+    std::optional<RenderWorkItem> feature_work{};
+    std::shared_ptr<RenderGraphPassSubmission> submission{};
+    std::shared_ptr<const void> recording_lifetime{};
 };
 
 struct TransientBufferSlotPlan {
@@ -234,15 +224,21 @@ struct UseReference {
 struct Edge {
     uint32_t source{kInvalidHandleIndex};
     uint32_t destination{kInvalidHandleIndex};
+    bool keeps_source_live{true};
 
     friend bool operator<(const Edge& lhs, const Edge& rhs) noexcept {
         if (lhs.source != rhs.source) {
             return lhs.source < rhs.source;
         }
-        return lhs.destination < rhs.destination;
+        if (lhs.destination != rhs.destination) return lhs.destination < rhs.destination;
+        // Deduplicate a scheduling hazard and an explicit/content dependency
+        // without losing the latter's liveness requirement.
+        return lhs.keeps_source_live > rhs.keeps_source_live;
     }
 
-    friend bool operator==(const Edge&, const Edge&) = default;
+    friend bool operator==(const Edge& lhs, const Edge& rhs) noexcept {
+        return lhs.source == rhs.source && lhs.destination == rhs.destination;
+    }
 };
 
 struct RuntimeBufferState {
@@ -337,6 +333,27 @@ void initialize_buffer_state_segments(std::vector<BufferStateSegment>& states, u
     if (states.empty() && buffer_size != 0) {
         states.push_back(BufferStateSegment{0, buffer_size, initial_state});
     }
+}
+
+// One admission path for compiler and executor snapshots; retain every
+// native segment rather than substituting a declared first-use hint.
+foundation::Result copy_imported_buffer_states(const rhi::BufferStateSnapshot& snapshot, uint64_t buffer_size,
+                                               std::vector<BufferStateSegment>& states) {
+    if (snapshot.segments.empty())
+        return foundation::invalid_state("Render graph imported buffer state snapshot is empty");
+    uint64_t covered_size = 0;
+    states.clear();
+    states.reserve(snapshot.segments.size());
+    for (const auto& segment : snapshot.segments) {
+        if (segment.size == 0 || segment.offset != covered_size || segment.offset > buffer_size ||
+            segment.size > buffer_size - segment.offset)
+            return foundation::invalid_state("Render graph imported buffer state snapshot is invalid");
+        states.push_back({segment.offset, segment.size, segment.state});
+        covered_size += segment.size;
+    }
+    if (covered_size != buffer_size)
+        return foundation::invalid_state("Render graph imported buffer state snapshot does not cover the resource");
+    return foundation::Result::success();
 }
 
 void refresh_physical_buffer_state(PhysicalBuffer& physical) noexcept {
@@ -531,6 +548,7 @@ struct RenderGraph::Impl {
     std::vector<uint32_t> pass_to_batch{};
     RenderGraphPlan plan{};
     std::vector<std::shared_ptr<const void>> execution_owners{};
+    std::vector<std::shared_ptr<RenderGraphSubmissionObserver>> submission_observers{};
 
     struct FeatureBuildTransaction {
         bool active{false};
@@ -539,6 +557,7 @@ struct RenderGraph::Impl {
         size_t pass_count{0};
         size_t explicit_edge_count{0};
         size_t execution_owner_count{0};
+        size_t submission_observer_count{0};
         uint32_t next_generation{1};
         uint64_t revision{0};
         uint64_t compiled_revision{0};
@@ -692,6 +711,7 @@ foundation::Result RenderGraph::Impl::begin_feature_build_transaction(const Rend
     checkpoint.pass_count = passes.size();
     checkpoint.explicit_edge_count = explicit_edges.size();
     checkpoint.execution_owner_count = execution_owners.size();
+    checkpoint.submission_observer_count = submission_observers.size();
     checkpoint.next_generation = next_generation;
     checkpoint.revision = revision;
     checkpoint.compiled_revision = compiled_revision;
@@ -743,6 +763,7 @@ void RenderGraph::Impl::rollback_feature_build_transaction(RenderGraphCompileInf
     passes.resize(feature_build_transaction.pass_count);
     explicit_edges.resize(feature_build_transaction.explicit_edge_count);
     execution_owners.resize(feature_build_transaction.execution_owner_count);
+    submission_observers.resize(feature_build_transaction.submission_observer_count);
     for (size_t index = 0; index < feature_build_transaction.buffer_exports.size() && index < buffers.size(); ++index) {
         buffers[index].exported = feature_build_transaction.buffer_exports[index] != 0;
     }
@@ -760,51 +781,35 @@ void RenderGraph::Impl::rollback_feature_build_transaction(RenderGraphCompileInf
     feature_build_transaction = {};
 }
 
-foundation::Result RenderGraph::begin_feature_build_transaction() {
-    if (impl_ == nullptr) {
-        return foundation::Result::failure(foundation::ResultCode::kInvalidState,
-                                           "Render graph implementation is not initialized");
-    }
-    return impl_->begin_feature_build_transaction(compile_info_);
+rhi::Device& detail::RenderGraphExecution::device(const RenderGraph& graph) noexcept {
+    return graph.device_;
 }
 
-foundation::Result RenderGraph::retain_execution_owner(std::shared_ptr<const void> owner) {
-    if (impl_ == nullptr) {
-        return foundation::Result::failure(foundation::ResultCode::kInvalidState,
-                                           "Render graph implementation is not initialized");
+const RenderGraphCompileInfo& detail::RenderGraphExecution::compile_info(const RenderGraph& graph) noexcept {
+    return graph.compile_info_;
+}
+
+const RenderGraphPlan& detail::RenderGraphExecution::plan(const RenderGraph& graph) noexcept {
+    return graph.impl_->plan;
+}
+
+foundation::ResultValue<detail::RenderGraphPassInspection> detail::RenderGraphExecution::inspect_pass(
+    const RenderGraph& graph, RenderGraphPass pass) {
+    if (!pass.is_valid()) {
+        return {foundation::invalid_argument("Pass inspection requires a valid graph handle"), {}};
     }
-    if (!impl_->feature_build_transaction.active) {
-        return foundation::Result::failure(
-            foundation::ResultCode::kInvalidState,
-            "Render graph execution ownership requires an active feature build transaction");
+    if (graph.impl_ == nullptr) {
+        return {foundation::invalid_state("Pass inspection requires an initialized graph"), {}};
     }
-    if (owner.use_count() == 0) {
-        return foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
-                                           "Render graph execution owner is empty");
+    const PassRecord* record = graph.impl_->get_pass(pass);
+    if (record == nullptr) {
+        return {foundation::not_found("Pass inspection handle is foreign or stale"), {}};
     }
     try {
-        impl_->execution_owners.push_back(std::move(owner));
+        return {foundation::Result::success(), {.pass = pass, .name = record->name, .queue = record->queue}};
     } catch (const std::bad_alloc&) {
-        return foundation::Result::failure(foundation::ResultCode::kOutOfMemory,
-                                           "Render graph execution ownership allocation failed");
+        return {foundation::out_of_memory("Pass inspection metadata allocation failed"), {}};
     }
-    return foundation::Result::success();
-}
-
-void RenderGraph::commit_feature_build_transaction() noexcept {
-    if (impl_ != nullptr) {
-        impl_->commit_feature_build_transaction();
-    }
-}
-
-void RenderGraph::rollback_feature_build_transaction() noexcept {
-    if (impl_ != nullptr) {
-        impl_->rollback_feature_build_transaction(compile_info_);
-    }
-}
-
-const RenderGraphPlan& RenderGraph::plan() const noexcept {
-    return impl_->plan;
 }
 
 void RenderGraph::clear_passes() noexcept {
@@ -823,6 +828,7 @@ void RenderGraph::clear_passes() noexcept {
     impl_->passes.clear();
     impl_->explicit_edges.clear();
     impl_->execution_owners.clear();
+    impl_->submission_observers.clear();
     impl_->live_passes.clear();
     impl_->topological_order.clear();
     impl_->edges.clear();
@@ -857,6 +863,7 @@ void RenderGraph::reset() noexcept {
     impl_->passes.clear();
     impl_->explicit_edges.clear();
     impl_->execution_owners.clear();
+    impl_->submission_observers.clear();
     impl_->transient_pools.clear();
     impl_->live_passes.clear();
     impl_->topological_order.clear();
@@ -970,21 +977,41 @@ foundation::ResultValue<RenderGraphTexture> RenderGraph::create_texture(const rh
     }
 }
 
-bool RenderGraph::contains_buffer(RenderGraphBuffer resource) const noexcept {
-    return impl_ != nullptr && impl_->get_buffer(resource) != nullptr;
+bool detail::RenderGraphResourceAccess::contains_buffer(const RenderGraph& graph,
+                                                        RenderGraphBuffer resource) noexcept {
+    return graph.impl_ != nullptr && graph.impl_->get_buffer(resource) != nullptr;
 }
 
-bool RenderGraph::contains_texture(RenderGraphTexture resource) const noexcept {
-    return impl_ != nullptr && impl_->get_texture(resource) != nullptr;
+bool detail::RenderGraphResourceAccess::contains_texture(const RenderGraph& graph,
+                                                         RenderGraphTexture resource) noexcept {
+    return graph.impl_ != nullptr && graph.impl_->get_texture(resource) != nullptr;
 }
 
 foundation::ResultValue<RenderGraphBuffer> RenderGraph::import_buffer(rhi::BufferHandle buffer,
                                                                       const rhi::BufferDesc& desc,
                                                                       const rhi::ResourceState& initial_state) {
+    if (!impl_)
+        return {foundation::invalid_state("Render graph is not initialized"), {}};
     if (!buffer.is_valid()) {
         return {foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                             "Cannot import an invalid buffer handle"),
                 {}};
+    }
+    const auto declared_state =
+        initial_state.usage == rhi::ResourceUsage::kUndefined && desc.initial_usage != rhi::ResourceUsage::kUndefined
+            ? rhi::ResourceState{desc.initial_usage, rhi::ShaderStage::kAll, desc.initial_queue, false,
+                                 desc.initial_stages}
+            : initial_state;
+    for (uint32_t index = 0; index < impl_->buffers.size(); ++index) {
+        const auto& existing = impl_->buffers[index];
+        if (existing.lifetime != ResourceLifetime::kImported || existing.imported != buffer) continue;
+        const auto& original = existing.desc.desc;
+        if (original.size != desc.size || original.capabilities != desc.capabilities ||
+            original.memory != desc.memory || original.flags != desc.flags ||
+            !state_matches(normalize_state(existing.imported_state, rhi::QueueClass::kGraphics),
+                           normalize_state(declared_state, rhi::QueueClass::kGraphics)))
+            return {foundation::invalid_argument("Repeated native buffer import has an incompatible contract"), {}};
+        return {foundation::Result::success(), {index, existing.generation, impl_->graph_id}};
     }
     auto resource_result = create_buffer(desc, ResourceLifetime::kPersistent);
     if (!resource_result) {
@@ -996,11 +1023,8 @@ foundation::ResultValue<RenderGraphBuffer> RenderGraph::import_buffer(rhi::Buffe
     record->physical.handle = buffer;
     record->physical.owns_handle = false;
     record->physical.desc = record->desc;
-    record->physical.state =
-        initial_state.usage == rhi::ResourceUsage::kUndefined && desc.initial_usage != rhi::ResourceUsage::kUndefined
-            ? rhi::ResourceState{desc.initial_usage, rhi::ShaderStage::kAll, desc.initial_queue, false,
-                                 desc.initial_stages}
-            : initial_state;
+    record->imported_state = declared_state;
+    record->physical.state = declared_state;
     record->physical.states.clear();
     initialize_buffer_state_segments(record->physical.states, desc.size, record->physical.state);
     impl_->mark_dirty();
@@ -1010,7 +1034,8 @@ foundation::ResultValue<RenderGraphBuffer> RenderGraph::import_buffer(rhi::Buffe
 foundation::ResultValue<RenderGraphTexture> RenderGraph::import_texture(rhi::TextureHandle texture,
                                                                         rhi::TextureViewHandle default_view,
                                                                         const rhi::TextureDesc& desc,
-                                                                        const rhi::ResourceState& initial_state) {
+                                                                        const rhi::ResourceState& initial_state,
+                                                                        std::shared_ptr<const void> texture_owner) {
     if (!texture.is_valid()) {
         return {foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                             "Cannot import an invalid texture handle"),
@@ -1024,6 +1049,7 @@ foundation::ResultValue<RenderGraphTexture> RenderGraph::import_texture(rhi::Tex
     record->lifetime = ResourceLifetime::kImported;
     record->imported = texture;
     record->imported_default_view = default_view;
+    record->imported_owner = std::move(texture_owner);
     record->physical.handle = texture;
     record->physical.owns_handle = false;
     record->physical.desc = record->desc;
@@ -1055,6 +1081,10 @@ foundation::Result RenderGraph::update_imported_buffer(RenderGraphBuffer resourc
         return foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                            "Imported buffer handle must be valid");
     }
+    for (const auto& existing : impl_->buffers) {
+        if (&existing != record && existing.lifetime == ResourceLifetime::kImported && existing.imported == buffer)
+            return foundation::invalid_argument("Native buffer already belongs to another imported graph resource");
+    }
     for (const BufferViewCacheEntry& view : record->physical.views) {
         if (view.handle.is_valid()) {
             (void)impl_->device.destroy_buffer_view(view.handle);
@@ -1071,6 +1101,7 @@ foundation::Result RenderGraph::update_imported_buffer(RenderGraphBuffer resourc
                                  record->desc.desc.initial_queue, false, record->desc.desc.initial_stages}
             : initial_state;
     record->physical.states.clear();
+    record->imported_state = record->physical.state;
     initialize_buffer_state_segments(record->physical.states, record->desc.desc.size, record->physical.state);
     record->last_completions.clear();
     impl_->mark_dirty();
@@ -1135,6 +1166,7 @@ foundation::Result RenderGraph::update_imported_texture(RenderGraphTexture resou
     if (record->physical.owner)
         record->physical.owner->release_unreferenced();
     record->physical.owner.reset();
+    record->imported_owner.reset();
     record->imported = texture;
     record->imported_default_view = default_view;
     record->physical.handle = texture;
@@ -1273,9 +1305,24 @@ foundation::Result RenderGraph::compile() {
     }
     const foundation::Result result = impl_->compile_graph(compile_info_);
     if (!result) {
+        impl_->compiled = false;
         compile_info_ = {};
     }
     return result;
+}
+
+foundation::ResultValue<RenderGraphInspection> RenderGraph::inspect() const {
+    if (impl_ == nullptr) {
+        return {foundation::invalid_state("RenderGraph inspection requires an initialized graph"), {}};
+    }
+    if (!impl_->compiled || impl_->compiled_revision != impl_->revision || impl_->plan.revision == 0) {
+        return {foundation::not_ready("No compiled RenderGraph is available"), {}};
+    }
+    try {
+        return {foundation::Result::success(), {.compilation = compile_info_, .plan = impl_->plan}};
+    } catch (const std::bad_alloc&) {
+        return {foundation::out_of_memory("RenderGraph inspection metadata allocation failed"), {}};
+    }
 }
 
 foundation::Result PassBuilder::read(RenderGraphBuffer buffer, rhi::ResourceUsage usage,
@@ -1794,12 +1841,24 @@ foundation::Result RenderGraph::Impl::validate_pass_attachments(const PassRecord
 }
 
 foundation::Result RenderGraph::Impl::compile_graph(RenderGraphCompileInfo& info) {
-    // Imported resources may be transitioned by another RenderGraph between
-    // two executions of this graph. Refresh their RHI state before deciding
-    // whether the cached barrier plan is reusable; otherwise a cached plan
-    // can omit the transition required by a newly produced external image.
+    // Another graph or CPU upload may change an imported resource between
+    // executions. Refresh actual RHI state before reusing a cached barrier
+    // plan; the immutable import declaration remains its original contract.
     try {
         bool imported_state_changed = false;
+        for (BufferRecord& record : buffers) {
+            if (record.lifetime != ResourceLifetime::kImported || !record.physical.handle.is_valid()) continue;
+            const auto snapshot = device.query_buffer_state(record.physical.handle);
+            if (!snapshot) return snapshot.result;
+            std::vector<BufferStateSegment> observed;
+            if (const auto result = copy_imported_buffer_states(snapshot.value, record.physical.desc.desc.size, observed); !result)
+                return result;
+            if (record.physical.states != observed) {
+                record.physical.states = std::move(observed);
+                refresh_physical_buffer_state(record.physical);
+                imported_state_changed = true;
+            }
+        }
         for (TextureRecord& record : textures) {
             if (record.lifetime != ResourceLifetime::kImported || !record.physical.handle.is_valid()) {
                 continue;
@@ -1823,7 +1882,7 @@ foundation::Result RenderGraph::Impl::compile_graph(RenderGraphCompileInfo& info
         }
     } catch (const std::bad_alloc&) {
         return foundation::Result::failure(foundation::ResultCode::kOutOfMemory,
-                                           "Imported texture state refresh allocation failed");
+                                           "Imported resource state refresh allocation failed");
     }
     if (compiled && compiled_revision == revision) {
         info.resource_count = static_cast<uint32_t>(buffers.size() + textures.size());
@@ -1907,48 +1966,55 @@ foundation::Result RenderGraph::Impl::compile_graph(RenderGraphCompileInfo& info
             }
         }
 
-        const auto add_edge = [this](uint32_t source, uint32_t destination) {
+        const auto add_edge = [this](uint32_t source, uint32_t destination, bool keeps_source_live) {
             if (source != destination) {
-                edges.push_back(Edge{source, destination});
+                edges.push_back(Edge{source, destination, keeps_source_live});
             }
         };
 
-        std::vector<std::vector<UseReference>> buffer_history(buffers.size());
-        std::vector<std::vector<UseReference>> texture_history(textures.size());
-        for (uint32_t pass_index = 0; pass_index < passes.size(); ++pass_index) {
-            PassRecord& pass = passes[pass_index];
-            for (ResourceUse& use : pass.uses) {
-                use.requires_memory_dependency = false;
-                use.requires_queue_transfer = false;
-                std::vector<UseReference>& history = use.kind == ResourceKind::kBuffer
-                                                         ? buffer_history[use.resource_index]
-                                                         : texture_history[use.resource_index];
-                for (const UseReference& previous : history) {
-                    bool overlap = false;
-                    if (use.kind == ResourceKind::kBuffer) {
-                        overlap = ranges_overlap(previous.use->buffer_range, use.buffer_range);
-                    } else {
-                        overlap = ranges_overlap(previous.use->subresources, use.subresources,
-                                                 textures[use.resource_index].desc.desc);
+        const auto build_resource_dependencies = [&](bool live_only, bool emit_edges) {
+            std::vector<std::vector<UseReference>> buffer_history(buffers.size());
+            std::vector<std::vector<UseReference>> texture_history(textures.size());
+            for (uint32_t pass_index = 0; pass_index < passes.size(); ++pass_index) {
+                PassRecord& pass = passes[pass_index];
+                for (ResourceUse& use : pass.uses) {
+                    use.requires_memory_dependency = false;
+                    use.requires_queue_transfer = false;
+                    if (live_only && live_passes[pass_index] == 0) continue;
+                    std::vector<UseReference>& history = use.kind == ResourceKind::kBuffer
+                                                             ? buffer_history[use.resource_index]
+                                                             : texture_history[use.resource_index];
+                    for (const UseReference& previous : history) {
+                        bool overlap = false;
+                        if (use.kind == ResourceKind::kBuffer) {
+                            overlap = ranges_overlap(previous.use->buffer_range, use.buffer_range);
+                        } else {
+                            overlap = ranges_overlap(previous.use->subresources, use.subresources,
+                                                     textures[use.resource_index].desc.desc);
+                        }
+                        if (!overlap) {
+                            continue;
+                        }
+                        const bool hazard = is_write_access(previous.use->access) || is_write_access(use.access);
+                        const bool state_change = !state_matches(previous.use->after_state, use.before_state);
+                        if (hazard) {
+                            use.requires_memory_dependency = true;
+                        }
+                        if (previous.use->after_state.queue != use.before_state.queue) {
+                            use.requires_queue_transfer = true;
+                        }
+                        if (emit_edges && (hazard || state_change)) {
+                            // A read does not produce contents needed by a later
+                            // writer or reader. Keep its ordering edge only when
+                            // both passes survive through actual consumers.
+                            add_edge(previous.pass_index, pass_index, is_write_access(previous.use->access));
+                        }
                     }
-                    if (!overlap) {
-                        continue;
-                    }
-                    const bool hazard = is_write_access(previous.use->access) || is_write_access(use.access);
-                    const bool state_change = !state_matches(previous.use->after_state, use.before_state);
-                    if (hazard) {
-                        use.requires_memory_dependency = true;
-                    }
-                    if (previous.use->after_state.queue != use.before_state.queue) {
-                        use.requires_queue_transfer = true;
-                    }
-                    if (hazard || state_change) {
-                        add_edge(previous.pass_index, pass_index);
-                    }
+                    history.push_back(UseReference{pass_index, &use});
                 }
-                history.push_back(UseReference{pass_index, &use});
             }
-        }
+        };
+        build_resource_dependencies(false, true);
 
         edges.insert(edges.end(), explicit_edges.begin(), explicit_edges.end());
         std::sort(edges.begin(), edges.end());
@@ -1999,7 +2065,7 @@ foundation::Result RenderGraph::Impl::compile_graph(RenderGraphCompileInfo& info
         } else {
             std::vector<std::vector<uint32_t>> reverse_edges(passes.size());
             for (const Edge& edge : edges) {
-                reverse_edges[edge.destination].push_back(edge.source);
+                if (edge.keeps_source_live) reverse_edges[edge.destination].push_back(edge.source);
             }
             std::vector<uint32_t> pending = roots;
             while (!pending.empty()) {
@@ -2013,6 +2079,9 @@ foundation::Result RenderGraph::Impl::compile_graph(RenderGraphCompileInfo& info
             }
         }
 
+        // Dead readers must not leave queue-transfer or memory hazards in
+        // the retained work's barrier plan.
+        build_resource_dependencies(true, false);
         std::vector<uint32_t> indegree(passes.size(), 0);
         for (const Edge& edge : edges) {
             if (live_passes[edge.source] != 0 && live_passes[edge.destination] != 0) {
@@ -2441,6 +2510,7 @@ foundation::Result RenderGraph::Impl::build_plan(RenderGraphCompileInfo& info) {
             RenderGraphPassPlan& pass_plan = built_plan.pass_plans[pass_index];
             const PassRecord& pass = passes[pass_index];
             pass_plan.pass = RenderGraphPass{pass_index, pass.generation, graph_id};
+            pass_plan.feature_work = pass.feature_work;
             pass_plan.live = live_passes[pass_index] != 0;
             pass_plan.topological_index = topological_positions[pass_index];
             pass_plan.batch_index = pass_plan.live ? pass_to_batch[pass_index] : kInvalidHandleIndex;
@@ -3318,28 +3388,8 @@ foundation::Result RenderGraph::Impl::initialize_runtime_states(uint32_t frame_s
             }
             if (runtime.shared == &runtime) {
                 if (record.lifetime == ResourceLifetime::kImported) {
-                    if (imported_snapshot.segments.empty()) {
-                        return foundation::Result::failure(foundation::ResultCode::kInvalidState,
-                                                           "Render graph imported buffer state snapshot is empty");
-                    }
-                    uint64_t covered_size = 0;
-                    runtime.states.reserve(imported_snapshot.segments.size());
-                    for (const rhi::BufferStateSegment& segment : imported_snapshot.segments) {
-                        if (segment.size == 0 || segment.offset != covered_size ||
-                            segment.offset > physical->desc.desc.size ||
-                            segment.size > physical->desc.desc.size - segment.offset) {
-                            return foundation::Result::failure(
-                                foundation::ResultCode::kInvalidState,
-                                "Render graph imported buffer state snapshot is invalid");
-                        }
-                        runtime.states.push_back(BufferStateSegment{segment.offset, segment.size, segment.state});
-                        covered_size += segment.size;
-                    }
-                    if (covered_size != physical->desc.desc.size) {
-                        return foundation::Result::failure(
-                            foundation::ResultCode::kInvalidState,
-                            "Render graph imported buffer state snapshot does not cover the resource");
-                    }
+                    if (const auto result = copy_imported_buffer_states(
+                            imported_snapshot, physical->desc.desc.size, runtime.states); !result) return result;
                 } else {
                     runtime.states = physical->states;
                     initialize_buffer_state_segments(runtime.states, physical->desc.desc.size, physical->state);
@@ -3873,10 +3923,14 @@ foundation::ResultValue<RenderGraphExecutionResult> RenderGraph::execute(FrameCo
     }
 
     const auto fail_execution =
-        [&frame_context](foundation::Result result) -> foundation::ResultValue<RenderGraphExecutionResult> {
+        [this, &frame_context](foundation::Result result) -> foundation::ResultValue<RenderGraphExecutionResult> {
+        for (const auto& observer : impl_->submission_observers) observer->failed();
         (void)frame_context.abort_frame();
         return {std::move(result), {}};
     };
+
+    for (const auto& observer : impl_->submission_observers)
+        if (const auto result = observer->prepare(); !result) return fail_execution(result);
 
     const foundation::Result compile_result = compile();
     if (!compile_result) {
@@ -3958,6 +4012,7 @@ foundation::ResultValue<RenderGraphExecutionResult> RenderGraph::execute(FrameCo
                 continue;
             if (!physical->owner)
                 physical->owner = std::make_shared<TextureAllocationOwner>(device_);
+            physical->owner->imported_texture_owner = record.imported_owner;
             if (physical->owns_handle) {
                 physical->owner->texture = physical->handle;
                 physical->owns_handle = false;
@@ -4285,6 +4340,8 @@ foundation::ResultValue<RenderGraphExecutionResult> RenderGraph::execute(FrameCo
             ++execution_result.submitted_batch_count;
 
             for (const uint32_t pass_index : batch_plan.pass_indices) {
+                if (const auto& receipt = impl_->passes[pass_index].submission)
+                    receipt->submitted_ = true;
                 for (const ResourceUse& use : impl_->passes[pass_index].uses) {
                     if (use.kind == ResourceKind::kBuffer) {
                         BufferRecord& record = impl_->buffers[use.resource_index];
@@ -4304,7 +4361,7 @@ foundation::ResultValue<RenderGraphExecutionResult> RenderGraph::execute(FrameCo
         if (desc.present_acquired_frame) {
             auto present_result = frame_context.present();
             if (!present_result) {
-                return {present_result.result, {}};
+                return fail_execution(present_result.result);
             }
             execution_result.presented = true;
             execution_result.suboptimal = present_result.value.suboptimal;
@@ -4328,10 +4385,150 @@ foundation::ResultValue<RenderGraphExecutionResult> RenderGraph::execute(FrameCo
                 return true;
             });
         }
+        for (const auto& observer : impl_->submission_observers) observer->submitted();
+        // Keep consumed observers until graph reset: replaying a history graph
+        // could otherwise overwrite committed contents without a transaction.
         return {foundation::Result::success(), execution_result};
     } catch (const std::bad_alloc&) {
         return fail_execution(foundation::Result::failure(foundation::ResultCode::kOutOfMemory,
                                                           "Render graph execution allocation failed"));
     }
 }
+namespace detail {
+
+foundation::ResultValue<std::shared_ptr<const void>> RenderGraphUploadAccess::track_pass_submission(
+    RenderGraph& graph, RenderGraphPass pass, uint64_t frame_index) {
+    auto* record = graph.impl_ == nullptr ? nullptr : graph.impl_->get_pass(pass);
+    if (record == nullptr)
+        return {foundation::invalid_argument("Upload receipt references an invalid graph pass"), {}};
+    if (record->submission) {
+        if (!record->submission->is_recorded_for(frame_index))
+            return {foundation::invalid_argument("Upload receipt frame does not match its recording"), {}};
+        return {foundation::Result::success(), record->submission};
+    }
+    try {
+        auto lifetime = std::make_shared<const uint8_t>(0);
+        auto submission = std::make_shared<RenderGraphPassSubmission>();
+        submission->recording_ = lifetime;
+        submission->frame_index_ = frame_index;
+        record->recording_lifetime = std::move(lifetime);
+        record->submission = submission;
+        return {foundation::Result::success(), std::move(submission)};
+    } catch (const std::bad_alloc&) {
+        return {foundation::out_of_memory("Upload receipt allocation failed"), {}};
+    }
+}
+
+foundation::Result RenderGraphFeatureGraphAccess::begin_feature_build_transaction(RenderGraph& graph) {
+    if (graph.impl_ == nullptr) {
+        return foundation::Result::failure(foundation::ResultCode::kInvalidState,
+                                           "Render graph implementation is not initialized");
+    }
+    return graph.impl_->begin_feature_build_transaction(graph.compile_info_);
+}
+
+foundation::Result RenderGraphFeatureGraphAccess::retain_execution_owner(
+    RenderGraph& graph, std::shared_ptr<const void> owner) {
+    if (graph.impl_ == nullptr) {
+        return foundation::Result::failure(foundation::ResultCode::kInvalidState,
+                                           "Render graph implementation is not initialized");
+    }
+    if (!graph.impl_->feature_build_transaction.active) {
+        return foundation::Result::failure(
+            foundation::ResultCode::kInvalidState,
+            "Render graph execution ownership requires an active feature build transaction");
+    }
+    if (owner.use_count() == 0) {
+        return foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
+                                           "Render graph execution owner is empty");
+    }
+    try {
+        graph.impl_->execution_owners.push_back(std::move(owner));
+    } catch (const std::bad_alloc&) {
+        return foundation::Result::failure(foundation::ResultCode::kOutOfMemory,
+                                           "Render graph execution ownership allocation failed");
+    }
+    return foundation::Result::success();
+}
+
+foundation::Result RenderGraphFeatureGraphAccess::retain_submission_owner(
+    RenderGraph& graph, std::shared_ptr<const void> owner) {
+    if (graph.impl_ == nullptr || !graph.impl_->feature_build_transaction.active || !owner)
+        return foundation::invalid_argument("submission observer requires an active feature transaction");
+    auto observer = std::shared_ptr<RenderGraphSubmissionObserver>(
+        owner, static_cast<RenderGraphSubmissionObserver*>(const_cast<void*>(owner.get())));
+    const auto domain = observer->transaction_domain();
+    if (domain.expired()) return foundation::invalid_state("submission observer transaction store has retired");
+    for (const auto& existing : graph.impl_->submission_observers) {
+        const auto previous = existing->transaction_domain();
+        if (!domain.owner_before(previous) && !previous.owner_before(domain))
+            return foundation::invalid_state("a graph accepts one complete Feature history snapshot per store before reset");
+    }
+    try {
+        graph.impl_->submission_observers.push_back(std::move(observer));
+        return foundation::Result::success();
+    } catch (const std::bad_alloc&) {
+        return foundation::Result::failure(foundation::ResultCode::kOutOfMemory,
+                                           "submission observer allocation failed");
+    }
+}
+
+foundation::Result RenderGraphFeatureGraphAccess::set_feature_work(
+    RenderGraph& graph, RenderGraphPass pass, const RenderWorkItem& work) {
+    auto* record = graph.impl_ == nullptr ? nullptr : graph.impl_->get_pass(pass);
+    if (record == nullptr)
+        return foundation::invalid_argument("Feature provenance references an invalid pass");
+    record->feature_work = work;
+    graph.impl_->mark_dirty();
+    return foundation::Result::success();
+}
+
+uint32_t RenderGraphFeatureGraphAccess::feature_pass_checkpoint(const RenderGraph& graph) noexcept {
+    return graph.impl_ == nullptr ? 0 : static_cast<uint32_t>(graph.impl_->passes.size());
+}
+
+foundation::ResultValue<RenderGraphPass> RenderGraphFeatureGraphAccess::attribute_feature_passes_since(
+    RenderGraph& graph, uint32_t first, const RenderWorkItem& work, RenderGraphPass previous) {
+    if (graph.impl_ == nullptr || first >= graph.impl_->passes.size())
+        return {foundation::invalid_state("Renderer scene draw produced no work"), {}};
+    for (uint32_t index = first; index < graph.impl_->passes.size(); ++index) {
+        const RenderGraphPass pass{index, graph.impl_->passes[index].generation, graph.impl_->graph_id};
+        if (const auto result = set_feature_work(graph, pass, work); !result) return {result, {}};
+        if (previous.is_valid()) {
+            if (const auto result = graph.add_dependency(previous, pass); !result) return {result, {}};
+        }
+        previous = pass;
+    }
+    return {foundation::Result::success(), previous};
+}
+
+foundation::ResultValue<rhi::TextureDesc> RenderGraphFeatureGraphAccess::texture_description(
+    const RenderGraph& graph, RenderGraphTexture texture) {
+    const auto* record = graph.impl_ == nullptr ? nullptr : graph.impl_->get_texture(texture);
+    if (record == nullptr)
+        return {foundation::invalid_argument("Feature reference has a stale graph texture"), {}};
+    return {foundation::Result::success(), record->desc.materialize()};
+}
+
+bool RenderGraphFeatureGraphAccess::textures_alias(
+    const RenderGraph& graph, RenderGraphTexture source, RenderGraphTexture destination) noexcept {
+    if (source == destination)
+        return true;
+    const auto* first = graph.impl_ == nullptr ? nullptr : graph.impl_->get_texture(source);
+    const auto* second = graph.impl_ == nullptr ? nullptr : graph.impl_->get_texture(destination);
+    return first != nullptr && second != nullptr && first->imported.is_valid() && first->imported == second->imported;
+}
+
+void RenderGraphFeatureGraphAccess::commit_feature_build_transaction(RenderGraph& graph) noexcept {
+    if (graph.impl_ != nullptr)
+        graph.impl_->commit_feature_build_transaction();
+}
+
+void RenderGraphFeatureGraphAccess::rollback_feature_build_transaction(RenderGraph& graph) noexcept {
+    if (graph.impl_ != nullptr)
+        graph.impl_->rollback_feature_build_transaction(graph.compile_info_);
+}
+
+}  // namespace detail
+
 }  // namespace aeg::render_graph

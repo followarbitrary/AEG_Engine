@@ -1,0 +1,91 @@
+{
+  "schema_version": 3,
+  "owner_module": "4850066999678444163",
+  "feature_contract": {
+    "allows_child_process": false,
+    "child_port_mappings": [],
+    "children": [],
+    "clock": {
+      "capability_version": {
+        "major": 1,
+        "minor": 0,
+        "patch": 0
+      },
+      "frequency_hz": 60,
+      "id": "11179985943425912654",
+      "late_data_policy": 1,
+      "max_backlog": 2,
+      "timing": {
+        "deadline_policy": 1,
+        "phase_ns": "0",
+        "relative_deadline_ns": "16666667"
+      },
+      "work_budget_ns": "250000"
+    },
+    "definition_id": "15301475034715241527",
+    "domains": "4",
+    "execution": 2,
+    "failure": 0,
+    "has_continuation": false,
+    "parameters": [],
+    "permissions": {
+      "capability_mask": "0",
+      "version": 1
+    },
+    "ports": [
+      {
+        "direction": 0,
+        "id": "6767574608112937170",
+        "schema": "1673483225341782395",
+        "version": 1
+      },
+      {
+        "direction": 1,
+        "id": "2486847718074109180",
+        "schema": "1673483225341782395",
+        "version": 1
+      }
+    ],
+    "retry": {
+      "backoff_ticks": 0,
+      "max_attempts": 1
+    },
+    "scope": "17228831225763461510",
+    "side_effects": [],
+    "state": 1,
+    "state_payload": {
+      "max_size": 1048576,
+      "schema_version": {
+        "major": 1,
+        "minor": 0,
+        "patch": 0
+      }
+    },
+    "structure": 0,
+    "version": {
+      "major": 1,
+      "minor": 0,
+      "patch": 0
+    }
+  },
+  "editor_contract": {
+    "schema_version": 2,
+    "source": "compiled",
+    "generated": true,
+    "name": "Game.Render.Outline",
+    "display_name": "Outline contract example",
+    "port_labels": [
+      {
+        "id": "6767574608112937170",
+        "name": "Scene color"
+      },
+      {
+        "id": "2486847718074109180",
+        "name": "Color output"
+      }
+    ],
+    "draft_revision_hash": "",
+    "retired_port_ids": [],
+    "retired_parameter_ids": []
+  }
+}

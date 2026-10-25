@@ -4,7 +4,7 @@
 #include <limits>
 
 namespace aeg::asset {
-foundation::ResultValue<uint64_t> AssetHandleTable::intern(AssetId id, AssetKind kind) {
+foundation::ResultValue<uint64_t> AssetHandleTable::intern(foundation::AssetId id, foundation::AssetKind kind) {
     const Key key{id, kind};
     if (const auto found = by_key_.find(key); found != by_key_.end()) {
         return {foundation::Result::success(), found->second};
@@ -18,7 +18,7 @@ foundation::ResultValue<uint64_t> AssetHandleTable::intern(AssetId id, AssetKind
     return {foundation::Result::success(), handle};
 }
 
-foundation::ResultValue<AssetId> AssetHandleTable::resolve(uint64_t handle, AssetKind expected) const {
+foundation::ResultValue<foundation::AssetId> AssetHandleTable::resolve(uint64_t handle, foundation::AssetKind expected) const {
     const auto found = by_handle_.find(handle);
     if (found == by_handle_.end())
         return {foundation::not_found("Runtime asset handle is unknown"), {}};
@@ -28,7 +28,7 @@ foundation::ResultValue<AssetId> AssetHandleTable::resolve(uint64_t handle, Asse
     return {foundation::Result::success(), found->second.key.id};
 }
 
-foundation::ResultValue<uint64_t> AssetHandleTable::find(AssetId id, AssetKind expected) const {
+foundation::ResultValue<uint64_t> AssetHandleTable::find(foundation::AssetId id, foundation::AssetKind expected) const {
     const auto found = by_key_.find(Key{id, expected});
     if (found == by_key_.end())
         return {foundation::not_found("Runtime asset identity is not interned"), {}};

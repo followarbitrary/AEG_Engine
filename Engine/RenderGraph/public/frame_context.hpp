@@ -199,7 +199,7 @@ private:
 
     [[nodiscard]] foundation::Result validate_desc() const noexcept;
     [[nodiscard]] foundation::Result prepare_slot(FrameSlot& slot);
-    [[nodiscard]] foundation::Result release_deferred(DeferredResources& resources);
+    [[nodiscard]] foundation::Result release_deferred(std::span<FrameSlot> slots);
     [[nodiscard]] foundation::Result reset_command_lists(FrameSlot& slot);
     [[nodiscard]] CommandRecord* find_command(rhi::CommandListHandle command_list) noexcept;
     [[nodiscard]] const CommandRecord* find_command(rhi::CommandListHandle command_list) const noexcept;

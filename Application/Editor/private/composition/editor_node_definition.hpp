@@ -6,42 +6,28 @@
 #include <string>
 #include <vector>
 
-#include "pipeline_authoring.hpp"
+#include "feature_catalog.hpp"
 
 namespace aeg::application {
 
 enum class NodeContractSource : uint8_t { kEditorDraft, kCompiled, kConflict };
-struct NodePortSchema final {
-    pipeline::PortValueKind kind{};
-    uint64_t id{1};
-    const char* display_name{};
-    pipeline::ResourceClass resource_class{};
+struct NodePortLabel final {
+    feature::PortId id{};
+    std::string name{};
 };
-[[nodiscard]] std::span<const NodePortSchema> node_port_schemas() noexcept;
-
 struct NodeContractUsage final {
-    struct Edge final {
-        std::string edge_id{};
-        uint64_t port_id{};
-        uint64_t binding_id{};
-    };
-    struct Binding final {
-        uint64_t binding_id{};
-        uint64_t port_id{};
-    };
+    struct Edge final { std::string edge_id{}; uint64_t port_id{}; std::size_t edge_index{}; };
     std::filesystem::path document_path{};
-    std::string node_id{};
-    std::vector<std::string> edge_ids{};
-    std::vector<uint64_t> binding_ids{};
-    /** Optional exact identities. Legacy callers may leave these empty. */
+    feature::FeatureNodeId node_id{};
     std::vector<Edge> edges{};
-    std::vector<Binding> bindings{};
-    /** Identity of the open editor document that owns this usage. */
     const void* document_identity{};
 };
 
 struct NodeDefinitionDraft final {
-    pipeline::TypeCatalogEntry entry{};
+    feature::FeatureDefinition entry{};
+    std::string name{};
+    std::string display_name{};
+    std::vector<NodePortLabel> port_labels{};
     std::vector<uint64_t> retired_port_ids{};
     std::vector<uint64_t> retired_parameter_ids{};
     NodeContractSource source{NodeContractSource::kEditorDraft};
@@ -58,11 +44,11 @@ struct NodeContractIssue final {
 
 struct NodeContractImpact final {
     std::filesystem::path document_path{};
-    std::string node_id{};
+    feature::FeatureNodeId node_id{};
     std::string edge_id{};
     uint64_t port_id{};
     uint64_t parameter_id{};
-    uint64_t binding_id{};
+    std::size_t edge_index{};
     /** Identity of the open editor document that owns this impact. */
     const void* document_identity{};
 };
@@ -79,17 +65,15 @@ struct NodeContractDiff final {
     std::vector<uint64_t> renamed_parameters{};
     std::vector<uint64_t> changed_parameters{};
     std::vector<std::string> affected_edge_ids{};
-    std::vector<uint64_t> affected_binding_ids{};
     std::vector<NodeContractImpact> impacts{};
     NodeContractVersionLevel version_level{NodeContractVersionLevel::kUnchanged};
     bool requires_confirmation{false};
 };
 
+[[nodiscard]] NodeDefinitionDraft node_definition_from_catalog(const feature::FeatureCatalogEntry&);
 [[nodiscard]] foundation::Result validate_node_definition(const NodeDefinitionDraft& draft);
-[[nodiscard]] NodeContractDiff diff_node_definition(const pipeline::TypeCatalogEntry& before,
+[[nodiscard]] NodeContractDiff diff_node_definition(const NodeDefinitionDraft& before,
                                                     const NodeDefinitionDraft& after,
                                                     std::span<const NodeContractUsage> usages);
 
 }  // namespace aeg::application
-
-\n

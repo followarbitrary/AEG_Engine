@@ -2,13 +2,14 @@
 #pragma once
 
 #include "render_pass.hpp"
+#include "render_feature_context.hpp"
 #include "renderer.hpp"
-#include "renderer_variants.hpp"
+#include "renderer_variants_internal.hpp"
 
 namespace aeg::renderer::detail {
-/** Resource resolution/import belongs to the Feature; all declarations and commands run through the pass.
- *  An authored instance ID is supplied by built-in graph adapters so repeated
- *  Pass nodes of one type retain independent configuration and ordering. */
+/** Renderer resolves/imports resources and prepares the fixed native recorder.
+ *  Actual Scene operations derive native identity from their projector source;
+ *  fixed technical NativePassSequence calls retain their native instance/configuration. */
 [[nodiscard]] foundation::ResultValue<pipeline::RenderGraphPass> add_builtin_render_pass(
     pipeline::RenderGraphBuilder& builder, const RenderFeatureContext& context, pipeline::RenderPassTypeId type,
     pipeline::RenderPassSetupFunction setup, pipeline::RenderPassExecuteFunction execute,

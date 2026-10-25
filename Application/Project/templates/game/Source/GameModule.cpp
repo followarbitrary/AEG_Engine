@@ -1,109 +1,79 @@
-#include "Render/Features/CustomOutlineFeature.hpp"
-#include "Render/Passes/VolumetricFogPass.hpp"
-#include "Render/Pipelines/CustomForwardPipeline.hpp"
-#include "game_module.hpp"
+#include <span>
+#include <utility>
+
+#include "GameModule.hpp"
+#include "feature_contract.hpp"
 #include "module_export.hpp"
 
 namespace {
-using namespace aeg::pipeline;
+using namespace aeg::feature;
 
-void define_identity(aeg::module::ModuleDefinition& definition) {
-    definition.descriptor.id = ModuleId("GameModule");
-    definition.descriptor.name = "Game Module";
-    definition.descriptor.version = {1, 0, 0};
-}
-
-TypeCatalogEntry pipeline_entry() {
-    TypeCatalogEntry entry;
-    entry.key = {AuthoringTypeKind::kPipeline, PipelineId("Game.CustomForward").value()};
-    entry.version = {1, 0, 0};
-    entry.owner_module = ModuleId("GameModule");
-    entry.name = "Game.CustomForward";
-    entry.display_name = "Custom Forward Pipeline";
-    entry.domains = to_mask(FeatureDomain::kRender);
-    entry.scopes = to_mask(PipelineScope::kFrame);
-    PipelineAuthoringDeclaration declaration;
-    declaration.stages = {{.id = StageId("Game.CustomForward.RenderBuild"),
-                           .name = "Render Build",
-                           .phase = PhaseId("RenderBuild"),
-                           .execution_domain = ExecutionDomain::kRenderThread,
-                           .time_policy = TimePolicy::kFrame}};
-    declaration.feature_points = {{.id = FeaturePointId("Game.CustomForward.PostProcess"),
-                                   .name = "Post Process",
-                                   .anchor_stage = StageId("Game.CustomForward.RenderBuild"),
-                                   .position = FeaturePointPosition::kAfter,
-                                   .domains = to_mask(FeatureDomain::kRender),
-                                   .scopes = to_mask(PipelineScope::kFrame),
-                                   .flags = FeaturePointFlags::kMayCreateGraphicsPass}};
-    entry.declaration = std::move(declaration);
-    return entry;
-}
-
-TypeCatalogEntry feature_entry() {
-    TypeCatalogEntry entry;
-    entry.key = {AuthoringTypeKind::kFeature, FeatureId("Game.CustomOutlineFeature").value()};
-    entry.version = {1, 0, 0};
-    entry.owner_module = ModuleId("GameModule");
-    entry.name = "Game.CustomOutlineFeature";
-    entry.display_name = "Custom Outline Feature";
-    entry.domains = to_mask(FeatureDomain::kRender);
-    entry.scopes = to_mask(PipelineScope::kFrame);
-    FeatureAuthoringDeclaration declaration;
-    declaration.parts = {{.part_index = 0, .domain = FeatureDomain::kRender, .name = "render"}};
-    declaration.allowed_pass_types = {RenderPassTypeId("Game.VolumetricFogPass")};
-    declaration.allow_add_passes = true;
-    declaration.default_passes = {{.node_id = "VolumetricFog",
-                                   .type = RenderPassTypeId("Game.VolumetricFogPass"),
-                                   .version = {1, 0, 0},
-                                   .part_id = "render"}};
-    entry.declaration = std::move(declaration);
-    entry.ports = {{.id = 22,
-                    .name = "SceneColor",
-                    .direction = PortDirection::kInput,
-                    .value_kind = PortValueKind::kTexture,
-                    .schema_id = 1,
-                    .binding_id = 77,
-                    .resource_constraints = {.resource_class = ResourceClass::kTexture}}};
-    return entry;
-}
-
-TypeCatalogEntry pass_entry() {
-    TypeCatalogEntry entry;
-    entry.key = {AuthoringTypeKind::kRenderPass, RenderPassTypeId("Game.VolumetricFogPass").value()};
-    entry.version = {1, 0, 0};
-    entry.owner_module = ModuleId("GameModule");
-    entry.name = "Game.VolumetricFogPass";
-    entry.display_name = "Volumetric Fog Pass";
-    entry.domains = to_mask(FeatureDomain::kRender);
-    entry.scopes = to_mask(PipelineScope::kFrame);
-    entry.declaration =
-        PassAuthoringDeclaration{.type = RenderPassTypeId("Game.VolumetricFogPass"),
-                                 .allowed_queue_mask = 1ull << static_cast<uint8_t>(aeg::rhi::QueueClass::kGraphics)};
-    entry.ports = {{.id = 11,
-                    .name = "ColorOut",
-                    .direction = PortDirection::kOutput,
-                    .value_kind = PortValueKind::kTexture,
-                    .schema_id = 1,
-                    .binding_id = 77,
-                    .resource_constraints = {.resource_class = ResourceClass::kTexture}}};
-    return entry;
-}
-}  // namespace
-
-aeg::module::ModuleDefinition aeg_define_GameModule() {
-    aeg::module::ModuleDefinition definition;
-    define_identity(definition);
-    if (auto result = AEG_REGISTER_PIPELINE(definition, game::render::CustomForwardPipeline, pipeline_entry());
-        !result) {
-        return definition;
-    }
-    if (auto result = AEG_REGISTER_FEATURE(definition, game::render::CustomOutlineFeature, feature_entry()); !result) {
-        return definition;
-    }
-    if (auto result = AEG_REGISTER_RENDER_PASS(definition, game::render::VolumetricFogPass, pass_entry()); !result) {
-        return definition;
-    }
+FeatureDefinition make_render_feature() {
+    FeatureDefinition definition{};
+    definition.id = FeatureDefinitionId("Game.Render.Outline");
+    definition.version = {1, 0, 0};
+    definition.contract.definition_id = definition.id;
+    definition.contract.version = definition.version;
+    definition.contract.structure = FeatureStructure::kAtomic;
+    definition.contract.domains = to_mask(FeatureDomain::kRender);
+    definition.contract.execution = ExecutionKind::kContinuous;
+    definition.contract.state = StatePolicy::kInstanceState;
+    definition.contract.scope = ScopeContract{ScopeId("Frame")};
+    definition.contract.clock = aeg::feature::make_periodic_clock_contract(ClockId("RenderFrame"), 60, 2, LateDataPolicy::kUseLatest,
+        aeg::feature::DeadlinePolicy::kObserve, definition.contract.structure == aeg::feature::FeatureStructure::kComposite ? 0 : 250000, 0);
+    definition.contract.permissions.version = 1;
+    definition.contract.ports = {
+        {PortId("SceneColor"), PortDirection::kInput, ValueSchemaId("Texture.v1"), 1},
+        {PortId("ColorOut"), PortDirection::kOutput, ValueSchemaId("Texture.v1"), 1},
+    };
+    definition.execute = [](const InvocationToken&, const StateSnapshot&, std::span<const uint8_t>, std::span<const uint8_t>)
+        -> aeg::foundation::ResultValue<StateDelta> {
+        return {aeg::foundation::Result::success(), StateDelta{}};
+    };
     return definition;
 }
 
-AEG_EXPORT_GAME_MODULE_API();
+FeatureDefinition make_logic_process() {
+    FeatureDefinition definition{};
+    definition.id = FeatureDefinitionId("Game.Logic.Gameplay");
+    definition.version = {1, 0, 0};
+    definition.contract.definition_id = definition.id;
+    definition.contract.version = definition.version;
+    definition.contract.structure = FeatureStructure::kAtomic;
+    definition.contract.domains = to_mask(FeatureDomain::kLogic);
+    definition.contract.execution = ExecutionKind::kProcess;
+    definition.contract.state = StatePolicy::kProcessState;
+    definition.contract.scope = ScopeContract{ScopeId("World")};
+    definition.contract.clock = aeg::feature::make_periodic_clock_contract(ClockId("LogicTick"), 60, 8, LateDataPolicy::kQueue,
+        aeg::feature::DeadlinePolicy::kObserve, definition.contract.structure == aeg::feature::FeatureStructure::kComposite ? 0 : 250000, 0);
+    definition.contract.permissions.version = 1;
+    definition.contract.has_continuation = true;
+    definition.execute = [](const InvocationToken&, const StateSnapshot& state, std::span<const uint8_t>, std::span<const uint8_t>)
+        -> aeg::foundation::ResultValue<StateDelta> {
+        // The starter FeatureGraph declares these two transitions. After a real
+        // Build/Load/Play, Runtime commits one transition per Logic invocation
+        // and completes the Process when it reaches the authored terminal Done.
+        StateDelta delta;
+        if (state.current_state == "Ready") delta.next_state = "Running";
+        else if (state.current_state == "Running") delta.next_state = "Done";
+        return {aeg::foundation::Result::success(), std::move(delta)};
+    };
+    return definition;
+}
+}  // namespace
+
+aeg::module::FeatureModuleDefinition aeg_define_GameModule() {
+    aeg::module::FeatureModuleDefinition definition{};
+    definition.descriptor.id = aeg::module::ModuleId("GameModule");
+    definition.descriptor.name = "Game Module";
+    definition.descriptor.version = {1, 0, 0};
+    if (auto result = AEG_REGISTER_GAME_FEATURE(definition, make_render_feature()); !result)
+        return definition;
+    if (auto result = AEG_REGISTER_GAME_FEATURE(definition, make_logic_process()); !result)
+        return definition;
+    return definition;
+}
+
+#if !defined(AEG_FEATURE_CONTRACT_EXPORTER)
+AEG_EXPORT_GAME_MODULE_API(aeg_define_GameModule);
+#endif

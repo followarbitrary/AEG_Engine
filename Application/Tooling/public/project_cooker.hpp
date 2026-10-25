@@ -8,7 +8,7 @@
 #include <string>
 #include <vector>
 
-#include "pipeline_authoring.hpp"
+#include "project_diagnostic.hpp"
 #include "result.hpp"
 
 namespace aeg::tooling {
@@ -22,7 +22,7 @@ struct ProjectCookRequest final {
 struct ProjectCookResult final {
     std::filesystem::path package{};
     std::filesystem::path game_manifest{};
-    std::vector<pipeline::DocumentDiagnostic> diagnostics{};
+    std::vector<ProjectDiagnostic> diagnostics{};
 };
 
 [[nodiscard]] foundation::ResultValue<ProjectCookResult> cook_project(const ProjectCookRequest& request);

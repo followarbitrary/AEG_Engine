@@ -5,10 +5,15 @@
 #include <array>
 #include <cstdint>
 #include <engine_frame_orchestrator.hpp>
+#include "engine_frame_pipeline_host.hpp"
+#include "engine_frame_pipeline_registration.hpp"
 #include <iostream>
 #include <memory>
 #include <renderer.hpp>
+#include "renderer_frame_contract.hpp"
+#include <renderer_variants_internal.hpp>
 #include <rhi.hpp>
+#include "../Engine/Pipeline/private/pipeline_scope_host_execution.hpp"
 
 namespace {
 using aeg::foundation::Result;
@@ -25,10 +30,10 @@ struct ResolverState final {
     uint32_t object_resolve_count{0};
 };
 
-struct RenderFeatureState final {
-    bool context_seen{false};
-    uint32_t instance_count{0};
-    uint32_t light_count{0};
+struct RenderSceneObservation final {
+    uint32_t post_build_count{0};
+    std::shared_ptr<const aeg::renderer::RenderSceneSnapshot> snapshot{};
+    const aeg::renderer::RenderResourceResolver* resolver{nullptr};
 };
 
 class SmokeRenderResourceResolver final : public aeg::renderer::RenderResourceResolver {
@@ -97,53 +102,6 @@ public:
 
 private:
     ResolverState* state_{nullptr};
-};
-
-class SmokeRenderFeature final : public aeg::pipeline::RenderFeature {
-public:
-    explicit SmokeRenderFeature(RenderFeatureState& state) : state_(&state) {}
-
-    [[nodiscard]] const aeg::pipeline::FeatureDescriptor& descriptor() const noexcept override {
-        static const aeg::pipeline::FeatureDescriptor kDescriptor{
-            .id = aeg::pipeline::FeatureId("RendererSmokeFeature"),
-            .name = "RendererSmokeFeature",
-            .domain = aeg::pipeline::FeatureDomain::kRender,
-            .domain_mask = aeg::pipeline::to_mask(aeg::pipeline::FeatureDomain::kRender),
-            .supported_scopes = aeg::pipeline::to_mask(aeg::pipeline::PipelineScope::kFrame),
-            .version = {1, 0, 0},
-        };
-        return kDescriptor;
-    }
-
-    [[nodiscard]] aeg::foundation::Result build_render_graph(
-        aeg::pipeline::RenderGraphBuilder& builder) const override {
-        const aeg::renderer::RenderFeatureContext* context = aeg::renderer::render_feature_context(builder);
-        if (context == nullptr || !context->is_valid()) {
-            return aeg::foundation::Result::failure(aeg::foundation::ResultCode::kInvalidState,
-                                                    "RendererSmokeFeature did not receive a render context");
-        }
-        state_->context_seen = true;
-        state_->instance_count = static_cast<uint32_t>(context->scene_snapshot->instances.size());
-        state_->light_count = static_cast<uint32_t>(context->scene_snapshot->lights.size());
-        return aeg::foundation::Result::success();
-    }
-
-protected:
-    [[nodiscard]] aeg::foundation::Result setup(aeg::pipeline::RenderGraphBuilder& builder) const override {
-        const aeg::pipeline::PipelineStageHandle stage = builder.add_stage({
-            .id = aeg::pipeline::StageId("RendererSmokeFeature.Stage"),
-            .phase = aeg::pipeline::EnginePhase::kRenderBuild,
-            .execution_domain = aeg::pipeline::ExecutionDomain::kRenderThread,
-            .time_policy = aeg::pipeline::TimePolicy::kFrame,
-            .parallelizable = true,
-        });
-        return stage ? aeg::foundation::Result::success()
-                     : aeg::foundation::Result::failure(aeg::foundation::ResultCode::kInvalidState,
-                                                        "RendererSmokeFeature declaration failed");
-    }
-
-private:
-    RenderFeatureState* state_{nullptr};
 };
 
 [[nodiscard]] Result add_custom_instance(const aeg::renderer::RenderExtractContext& context) {
@@ -324,7 +282,7 @@ int main() {
     if (!render_host.bind_pipeline(aeg::pipeline::PipelineId("RenderPipeline")) || !render_host.rebuild(registry)) {
         return 16;
     }
-    const aeg::pipeline::PipelinePlanHandle render_plan = render_host.active_plan_snapshot();
+    const aeg::pipeline::PipelinePlanHandle render_plan = aeg::pipeline::detail::PipelineScopeHostExecution::active_plan_snapshot(render_host);
     if (render_plan == nullptr || render_plan->nodes.size() != 8 ||
         !has_artifact(*render_plan, aeg::renderer::kRenderSceneSnapshotArtifactId) ||
         !has_stage(*render_plan, aeg::pipeline::StageId("RenderPipeline.Visibility")) ||
@@ -332,21 +290,7 @@ int main() {
         return 17;
     }
 
-    RenderFeatureState render_feature_state{};
-    if (!registry.register_feature(
-            [&render_feature_state] { return std::make_unique<SmokeRenderFeature>(render_feature_state); }) ||
-        !registry.bind_feature({
-            .feature = aeg::pipeline::FeatureId("RendererSmokeFeature"),
-            .pipeline = aeg::pipeline::PipelineId("RenderPipeline"),
-            .scope = aeg::pipeline::PipelineScope::kFrame,
-            .point = aeg::pipeline::FeaturePointId("RenderPipeline.Opaque"),
-            .priority = 0,
-            .enabled = true,
-        })) {
-        return 18;
-    }
-
-    aeg::world::WorldScope world_scope(world, registry, {});
+    aeg::world::WorldScope world_scope(world);
     if (!world_scope.initialize()) {
         return 19;
     }
@@ -362,24 +306,56 @@ int main() {
         return 21;
     }
 
-    aeg::pipeline::PipelineScheduler scheduler({1, 1, 1, 1});
+    aeg::pipeline::PipelineScheduler scheduler;
     aeg::render_graph::FrameContext frame_context(*device);
     aeg::render_graph::RenderGraph render_graph(*device);
-    aeg::engine::EngineFrameOrchestrator orchestrator(registry, scheduler, frame_context, render_graph);
-    if (!orchestrator.register_world_frame(world_scope, frame_host, 4) || !orchestrator.initialize()) {
+    aeg::engine::EngineFramePipelineHost pipeline_host(registry, scheduler);
+    aeg::engine::EngineFrameOrchestrator orchestrator(pipeline_host, frame_context, render_graph);
+    if (!orchestrator.register_world_frame(
+            world_scope, aeg::engine::EngineFramePipelineRegistration{frame_host}, 4) || !orchestrator.initialize()) {
         return 22;
     }
 
+    RenderSceneObservation scene_observation{};
     aeg::engine::EngineFrameDesc frame_desc{};
     frame_desc.renderer = &renderer;
     frame_desc.render_resource_resolver = &resolver;
     const std::array<aeg::renderer::RenderView, 1> views{view};
     frame_desc.render_views = views;
+    frame_desc.render_feature_post_build = [&scene_observation, &frame_host, &world_scope, &resolver](
+                                              const aeg::engine::EngineFramePostBuildContext& context) {
+        if (context.render_scenes.size() != 1 || context.render_scenes.front() == nullptr ||
+            context.render_resource_resolver != &resolver) {
+            return Result::failure(ResultCode::kInvalidState, "Renderer post-build scene or resolver is missing");
+        }
+        scene_observation.snapshot = context.render_scenes.front();
+        scene_observation.resolver = context.render_resource_resolver;
+        const auto& scene = *scene_observation.snapshot;
+        const auto published = frame_host.artifacts().read(aeg::renderer::kRenderSceneSnapshotArtifactId,
+                                                          aeg::renderer::kRenderSceneSnapshotArtifactTypeId,
+                                                          aeg::renderer::kRenderSceneSnapshotArtifactVersion);
+        const auto committed = world_scope.latest_snapshot();
+        if (!published || !committed || !scene.is_valid() ||
+            published.value.owner_scope() != aeg::pipeline::PipelineScope::kFrame ||
+            published.value.storage() != aeg::pipeline::ArtifactStorage::kImmutableSnapshot ||
+            published.value.version() != aeg::renderer::kRenderSceneSnapshotArtifactVersion ||
+            published.value.as<aeg::renderer::RenderSceneSnapshot>(
+                aeg::renderer::kRenderSceneSnapshotArtifactTypeId) != scene_observation.snapshot.get() ||
+            scene.world != world_scope.handle() || scene.view.world != world_scope.handle() ||
+            scene.view.id != aeg::renderer::make_render_view_id(world_scope.handle(), 4) || scene.view.view_id != 4 ||
+            scene.frame_number != 1 || context.frame_context.frame_number() != 1 ||
+            committed.value->frame_number() != 1 || scene.world_revision != committed.value->revision()) {
+            return Result::failure(ResultCode::kInvalidState, "Renderer scene publication lost its owning snapshot");
+        }
+        ++scene_observation.post_build_count;
+        return Result::success();
+    };
     if (!orchestrator.run_frame(frame_desc)) {
         return 23;
     }
-    if (!render_feature_state.context_seen || render_feature_state.instance_count != 1 ||
-        render_feature_state.light_count != 1) {
+    if (scene_observation.post_build_count != 1 || scene_observation.snapshot == nullptr ||
+        scene_observation.resolver != &resolver || scene_observation.snapshot->instances.size() != 1 ||
+        scene_observation.snapshot->lights.size() != 1) {
         return 24;
     }
     const auto frame_snapshot = frame_host.artifacts().read(aeg::renderer::kRenderSceneSnapshotArtifactId,
@@ -392,6 +368,12 @@ int main() {
     if (!orchestrator.shutdown() || !orchestrator.unregister_world_frame(world_scope.handle(), 4) ||
         !orchestrator.unregister_world(world_scope.handle()) || !world_scope.shutdown()) {
         return 26;
+    }
+    if (!scene_observation.snapshot->is_valid() || scene_observation.snapshot->world != world_handle.value ||
+        scene_observation.snapshot->frame_number != 1 || scene_observation.snapshot->view.view_id != 4 ||
+        scene_observation.snapshot->instances.size() != 1 || scene_observation.snapshot->lights.size() != 1 ||
+        scene_observation.snapshot->instances.front().object != aeg::renderer::make_render_object_id(mesh_entity.value)) {
+        return 27;
     }
     return 0;
 }

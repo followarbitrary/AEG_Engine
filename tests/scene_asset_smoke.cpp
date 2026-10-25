@@ -7,11 +7,40 @@
 #include <iostream>
 #include <span>
 #include <string>
+#include <type_traits>
 #include <utility>
 
+#include "asset_identity.hpp"
 #include "scene_asset.hpp"
 
 namespace {
+constexpr aeg::foundation::Uuid kCanonicalGuidUuid{{
+    0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+    0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10,
+}};
+constexpr aeg::scene::SceneAssetId kCanonicalAssetGuid{0x0123456789abcdefull, 0xfedcba9876543210ull};
+constexpr aeg::scene::SceneEntityId kCanonicalEntityGuid{0x0123456789abcdefull, 0xfedcba9876543210ull};
+
+static_assert(kCanonicalAssetGuid.uuid() == kCanonicalGuidUuid);
+static_assert(kCanonicalEntityGuid.uuid() == kCanonicalGuidUuid);
+static_assert(aeg::scene::SceneAssetId::from_uuid(kCanonicalGuidUuid).high() == 0x0123456789abcdefull);
+static_assert(aeg::scene::SceneAssetId::from_uuid(kCanonicalGuidUuid).low() == 0xfedcba9876543210ull);
+static_assert(aeg::scene::SceneEntityId::from_uuid(kCanonicalGuidUuid).high() == 0x0123456789abcdefull);
+static_assert(aeg::scene::SceneEntityId::from_uuid(kCanonicalGuidUuid).low() == 0xfedcba9876543210ull);
+static_assert(aeg::scene::SceneAssetId::from_uuid(kCanonicalAssetGuid.uuid()) == kCanonicalAssetGuid);
+static_assert(aeg::scene::SceneEntityId::from_uuid(kCanonicalEntityGuid.uuid()) == kCanonicalEntityGuid);
+static_assert(aeg::scene::SceneAssetId{}.uuid() == aeg::foundation::Uuid{});
+static_assert(aeg::scene::SceneEntityId{}.uuid() == aeg::foundation::Uuid{});
+static_assert(!aeg::scene::SceneAssetId::from_uuid({}).is_valid());
+static_assert(!aeg::scene::SceneEntityId::from_uuid({}).is_valid());
+static_assert(noexcept(kCanonicalAssetGuid.uuid()) && noexcept(kCanonicalEntityGuid.uuid()));
+static_assert(noexcept(aeg::scene::SceneAssetId::from_uuid(kCanonicalGuidUuid)) &&
+              noexcept(aeg::scene::SceneEntityId::from_uuid(kCanonicalGuidUuid)));
+static_assert(!std::is_convertible_v<aeg::scene::SceneAssetId, aeg::scene::SceneEntityId>);
+static_assert(!std::is_convertible_v<aeg::scene::SceneEntityId, aeg::scene::SceneAssetId>);
+static_assert(sizeof(aeg::scene::SceneAssetId) == 2 * sizeof(uint64_t));
+static_assert(sizeof(aeg::scene::SceneEntityId) == 2 * sizeof(uint64_t));
+
 struct SceneComponent final {
     int32_t health{0};
     float position{0.0F};

@@ -1,12 +1,12 @@
 /** @file shadow_rendering.cpp @brief Fits and draws directional shadow casters. */
 #include "shadow_rendering.hpp"
+#include "render_feature_graph_builders.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <limits>
 
 #include "builtin_render_passes.hpp"
-#include "opaque_render_feature.hpp"
 
 namespace aeg::renderer {
 foundation::ResultValue<RenderShadowView> make_directional_shadow_view(const RenderSceneSnapshot& snapshot) {
@@ -53,6 +53,8 @@ foundation::ResultValue<RenderShadowView> make_directional_shadow_view(const Ren
     const float radius = std::max(0.01f, math::length((upper - lower) * 0.5f)) * 1.05f;
     RenderShadowView shadow{};
     shadow.view = snapshot.view;
+    if (snapshot.view.shadow_extent.is_valid())
+        shadow.view.output_extent = snapshot.view.shadow_extent;
     const uint64_t shadow_id = snapshot.view.id.value() ^ 0x534841444f575649ull;
     shadow.view.id = RenderViewId(shadow_id == 0 ? 1 : shadow_id);
     shadow.view.frustum_culling = false;
@@ -66,7 +68,7 @@ foundation::ResultValue<RenderShadowView> make_directional_shadow_view(const Ren
                                 shadow.view.camera.projection))
         return {invalid_argument("directional shadow projection is invalid"), {}};
     shadow.constants.clip_to_shadow = shadow.view.camera.view_projection() * inverse_camera;
-    shadow.constants.parameters = {1.0f / snapshot.view.output_extent.width, 1.0f / snapshot.view.output_extent.height,
+    shadow.constants.parameters = {1.0f / shadow.view.output_extent.width, 1.0f / shadow.view.output_extent.height,
                                    0.001f, 0};
     shadow.enabled = true;
     return {Result::success(), shadow};

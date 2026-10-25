@@ -7,7 +7,7 @@
 #define AEG_ABI_CALL
 #define AEG_MODULE_EXPORT
 #endif
-#define AEG_MODULE_ABI_MAJOR 1u
+#define AEG_MODULE_ABI_MAJOR 2u
 #define AEG_MODULE_ABI_MINOR 0u
 typedef struct AegAbiContext {
     uint64_t owner_cookie;
@@ -65,12 +65,7 @@ typedef struct AegAbiValue {
 } AegAbiValue;
 typedef struct AegAbiModuleApi AegAbiModuleApi;
 typedef struct AegAbiMetadataApi AegAbiMetadataApi;
-typedef struct AegAbiRegistrationApi AegAbiRegistrationApi;
-typedef struct AegAbiDeclarationApi AegAbiDeclarationApi;
-typedef struct AegAbiTaskApi AegAbiTaskApi;
-typedef struct AegAbiRenderGraphApi AegAbiRenderGraphApi;
-typedef struct AegAbiPassSetupApi AegAbiPassSetupApi;
-typedef struct AegAbiPassCommandApi AegAbiPassCommandApi;
+typedef struct AegFeatureExecutionApi AegFeatureExecutionApi;
 typedef struct AegAbiReflectionApi AegAbiReflectionApi;
 typedef AegAbiResult(AEG_ABI_CALL* AegAbiGetModuleApi)(uint32_t, uint32_t, uint32_t, AegAbiModuleApi*);
 struct AegAbiModuleApi {
@@ -80,12 +75,7 @@ struct AegAbiModuleApi {
     uint32_t reserved;
     uint64_t required_capabilities;
     const AegAbiMetadataApi* metadata;
-    const AegAbiRegistrationApi* registration;
-    const AegAbiDeclarationApi* declaration;
-    const AegAbiTaskApi* task;
-    const AegAbiRenderGraphApi* render_graph;
-    const AegAbiPassSetupApi* pass_setup;
-    const AegAbiPassCommandApi* pass_command;
+    const AegFeatureExecutionApi* features;
     const AegAbiReflectionApi* reflection;
 };
 struct AegAbiMetadataApi {
@@ -104,9 +94,19 @@ AEG_MODULE_EXPORT AegAbiResult AEG_ABI_CALL aeg_get_module_api(uint32_t requeste
 enum { AEG_ABI_OK = 0, AEG_ABI_INVALID_ARGUMENT = 1, AEG_ABI_UNSUPPORTED = 2, AEG_ABI_INVALID_STATE = 3 };
 enum {
     AEG_CAP_METADATA = 1ull << 0,
-    AEG_CAP_PIPELINE_DECLARATION = 1ull << 1,
-    AEG_CAP_LOGIC = 1ull << 2,
-    AEG_CAP_RENDER = 1ull << 3,
+    AEG_CAP_FEATURES = 1ull << 6,
     AEG_CAP_VALUE_REFLECTION = 1ull << 4,
-    AEG_CAP_RENDER_PROGRAMS = 1ull << 5
+    /* Bits 1, 2, 3 and 5 belonged to retired author Pipeline/Pass/logic tables. */
+    AEG_CAP_ALL = AEG_CAP_METADATA | AEG_CAP_FEATURES | AEG_CAP_VALUE_REFLECTION
 };
+
+/* Shared prefix check: invalid negotiation must not enter a module factory. */
+static inline AegAbiResult aeg_check_module_api_request(uint32_t major, uint32_t minor,
+                                                       uint32_t size, AegAbiModuleApi* output) {
+    AegAbiResult result = {sizeof(AegAbiResult), AEG_ABI_OK, {0, 0}};
+    if (!output || size < sizeof(uint32_t) * 4u)
+        result.code = AEG_ABI_INVALID_ARGUMENT;
+    else if (major != AEG_MODULE_ABI_MAJOR || minor > AEG_MODULE_ABI_MINOR)
+        result.code = AEG_ABI_UNSUPPORTED;
+    return result;
+}

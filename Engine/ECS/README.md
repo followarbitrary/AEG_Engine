@@ -22,6 +22,9 @@ ComponentTypeId 与 Reflection TypeId、Schema Version 一并写入 `ComponentDe
 `WorldCommandBuffer`，由 World 在 `Input`/`PreUpdate` 的受控窗口应用。`commit()` 会
 生成独立的不可变快照，快照可以被多个 Frame/View 并行读取。
 
+owner 身份统一使用 `aeg::concurrency::ThreadId` 与
+`aeg::concurrency::current_thread_id()` 比较；ECS 不创建或管理自己的线程。
+
 组件查询期间禁止实体创建、实体销毁、组件类型注册、组件增删和命令批量应用等
 结构性变更；查询回调可以修改当前组件值，但不得改变正在遍历的 pool 结构。
 查询结束后，World 才重新接受这些结构性操作。

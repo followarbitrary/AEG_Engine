@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <concurrency.hpp>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -15,7 +16,6 @@
 #include <span>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <vector>
 
 #include "Components/component_ids.hpp"
@@ -292,14 +292,14 @@ int main() {
     }
 
     for (uint64_t frame = 0; frame < 8; ++frame) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(150));
-        if (!require(runtime.render_frame(frame), "external asset smoke asset stabilization frame failed")) {
+        static_cast<void>(aeg::concurrency::sleep_for(150'000'000ull));
+        if (!require(runtime.render_frame(frame, 1.0 / 60.0), "external asset smoke asset stabilization frame failed")) {
             std::filesystem::remove_all(root, error);
             return 9;
         }
     }
     const auto external_readback = runtime.request_viewport_readback();
-    const auto external_frame = external_readback ? runtime.render_frame(8) : external_readback;
+    const auto external_frame = external_readback ? runtime.render_frame(8, 1.0 / 60.0) : external_readback;
     if (!external_frame) {
         std::cerr << "external asset smoke frame diagnostic: " << external_frame.message << '\n';
     }
@@ -344,7 +344,7 @@ int main() {
         !require(runtime.reimport_asset(blue_material_id), "external asset smoke invalid material reimport failed") ||
         !require(runtime.request_viewport_readback(),
                  "external asset smoke invalid reference readback request failed") ||
-        !require(runtime.render_frame(2), "external asset smoke invalid reference frame failed")) {
+        !require(runtime.render_frame(2, 1.0 / 60.0), "external asset smoke invalid reference frame failed")) {
         std::filesystem::remove_all(root, error);
         return 29;
     }
@@ -369,8 +369,8 @@ int main() {
     }
     bool restored_material = false;
     for (uint64_t frame = 3; frame < 19 && !restored_material; ++frame) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(150));
-        if (!runtime.request_viewport_readback() || !runtime.render_frame(frame)) {
+        static_cast<void>(aeg::concurrency::sleep_for(150'000'000ull));
+        if (!runtime.request_viewport_readback() || !runtime.render_frame(frame, 1.0 / 60.0)) {
             break;
         }
         const auto pixels = runtime.read_viewport_pixels();
@@ -391,8 +391,8 @@ int main() {
     std::vector<std::byte> hot_pixels;
     bool hot_reloaded = false;
     for (uint64_t frame = 6; frame < 50 && !hot_reloaded; ++frame) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(150));
-        if (!runtime.request_viewport_readback() || !runtime.render_frame(frame)) {
+        static_cast<void>(aeg::concurrency::sleep_for(150'000'000ull));
+        if (!runtime.request_viewport_readback() || !runtime.render_frame(frame, 1.0 / 60.0)) {
             break;
         }
         const auto pixels = runtime.read_viewport_pixels();
@@ -412,7 +412,7 @@ int main() {
         std::filesystem::remove_all(root, error);
         return 14;
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(350));
+    static_cast<void>(aeg::concurrency::sleep_for(350'000'000ull));
     if (!require(write_bmp(root / "Assets" / "blue.bmp", {24, 48, 240, 255}),
                  "external asset smoke watched texture restore failed") ||
         !require(runtime.reimport_asset(blue_texture_id), "external asset smoke texture restore reimport failed")) {
@@ -422,8 +422,8 @@ int main() {
     bool hot_restore = false;
     std::vector<std::byte> last_restore_pixels;
     for (uint64_t frame = 50; frame < 90 && !hot_restore; ++frame) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(150));
-        if (!runtime.request_viewport_readback() || !runtime.render_frame(frame)) {
+        static_cast<void>(aeg::concurrency::sleep_for(150'000'000ull));
+        if (!runtime.request_viewport_readback() || !runtime.render_frame(frame, 1.0 / 60.0)) {
             break;
         }
         const auto pixels = runtime.read_viewport_pixels();
@@ -447,7 +447,7 @@ int main() {
     if (!require(runtime.save_scene(), "external asset smoke save failed") ||
         !require(runtime.open_scene(runtime.scene_path()), "external asset smoke reopen failed") ||
         !require(runtime.request_viewport_readback(), "external asset smoke reopen readback request failed") ||
-        !require(runtime.render_frame(2), "external asset smoke reopened frame failed")) {
+        !require(runtime.render_frame(2, 1.0 / 60.0), "external asset smoke reopened frame failed")) {
         std::filesystem::remove_all(root, error);
         return 17;
     }
@@ -463,7 +463,7 @@ int main() {
                  "external asset smoke invalidation write failed") ||
         !require(runtime.reimport_asset(triangle_source->id), "external asset smoke reimport request failed") ||
         !require(runtime.request_viewport_readback(), "external asset smoke last-good readback request failed") ||
-        !require(runtime.render_frame(3), "external asset smoke last-good frame failed")) {
+        !require(runtime.render_frame(3, 1.0 / 60.0), "external asset smoke last-good frame failed")) {
         std::filesystem::remove_all(root, error);
         return 19;
     }
@@ -477,12 +477,12 @@ int main() {
 
     if (!require(runtime.play(), "external asset smoke Play failed") ||
         !require(runtime.request_viewport_readback(), "external asset smoke Play readback request failed") ||
-        !require(runtime.render_frame(4), "external asset smoke Play frame failed") ||
+        !require(runtime.render_frame(4, 1.0 / 60.0), "external asset smoke Play frame failed") ||
         !require(runtime.stop(), "external asset smoke Stop failed") ||
         !require(runtime.mode() == aeg::application::EditorSceneRuntime::Mode::kEdit,
                  "external asset smoke Stop did not restore Edit mode") ||
         !require(runtime.request_viewport_readback(), "external asset smoke post-Stop readback request failed") ||
-        !require(runtime.render_frame(5), "external asset smoke post-Stop frame failed")) {
+        !require(runtime.render_frame(5, 1.0 / 60.0), "external asset smoke post-Stop frame failed")) {
         std::filesystem::remove_all(root, error);
         return 21;
     }
@@ -513,7 +513,7 @@ int main() {
         return 25;
     }
     if (!require(runtime.request_viewport_readback(), "external asset smoke text readback request failed") ||
-        !require(runtime.render_frame(55), "external asset smoke text frame failed")) {
+        !require(runtime.render_frame(55, 1.0 / 60.0), "external asset smoke text frame failed")) {
         std::filesystem::remove_all(root, error);
         return 26;
     }

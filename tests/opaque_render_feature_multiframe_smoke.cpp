@@ -2,7 +2,10 @@
  * @file opaque_render_feature_multiframe_smoke.cpp
  * @brief Verifies multi-entity materials, frame-versioned bindings, and readback pixels.
  */
+#include "feature_clock_test_fixture.hpp"
+#include <algorithm>
 #include <array>
+#include <vector>
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
@@ -10,13 +13,25 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
+#include <utility>
 
 #include "engine_frame_orchestrator.hpp"
+#include "feature_render_test_fixture.hpp"
+#include "feature_runtime.hpp"
+#include "render_feature_draw.hpp"
+#include "render_scene_provenance_fixture.hpp"
+#include "native_scene_pass_source.hpp"
+#include "../Engine/RenderGraph/private/render_graph_execution.hpp"
+#include "../Engine/Pipeline/private/render_pass_registry_execution.hpp"
+#include "engine_frame_pipeline_host.hpp"
 #include "material.hpp"
-#include "opaque_render_feature.hpp"
 #include "pipeline.hpp"
 #include "render_graph.hpp"
 #include "renderer.hpp"
+#include "renderer_variants_internal.hpp"
+#include "../Engine/RenderGraph/private/render_graph_resource_access.hpp"
+#include "../Engine/Shader/private/shader_pipeline_layout_access.hpp"
 #include "resource_uploader.hpp"
 #include "rhi.hpp"
 #include "shader_contract.hpp"
@@ -26,12 +41,8 @@
 namespace {
 using aeg::foundation::Result;
 using aeg::foundation::ResultCode;
-using aeg::pipeline::PipelineId;
-using aeg::pipeline::PipelineInstanceId;
 using aeg::pipeline::PipelineRegistry;
-using aeg::pipeline::PipelineScope;
 using aeg::pipeline::RenderGraphBuffer;
-using aeg::pipeline::RenderGraphTexture;
 using aeg::pipeline::RenderResourceId;
 using aeg::render_graph::FrameAllocation;
 using aeg::rhi::BindingLayoutHandle;
@@ -74,7 +85,6 @@ using aeg::rhi::VertexBindingDesc;
 using aeg::rhi::VertexInputRate;
 
 inline constexpr RenderResourceId kSceneColor{"OpaqueMultiFrameSceneColor"};
-inline constexpr aeg::pipeline::FeatureId kReadbackFeatureId{"Renderer.OpaqueMultiFrameReadback"};
 constexpr uint32_t kWidth = 64;
 constexpr uint32_t kHeight = 64;
 constexpr std::size_t kReadbackSize = static_cast<std::size_t>(kWidth) * kHeight * 4u;
@@ -175,72 +185,58 @@ bool require(const Value& condition, const char* message) {
     return {handle.index, handle.generation, handle.graph_id};
 }
 
-struct OpaqueReadbackFeature final : public aeg::pipeline::RenderFeature {
-    [[nodiscard]] const aeg::pipeline::FeatureDescriptor& descriptor() const noexcept override {
-        static const aeg::pipeline::FeatureDescriptor kDescriptor{
-            .id = kReadbackFeatureId,
-            .name = "Renderer.OpaqueMultiFrameReadback",
-            .domain = aeg::pipeline::FeatureDomain::kRender,
-            .domain_mask = aeg::pipeline::to_mask(aeg::pipeline::FeatureDomain::kRender),
-            .supported_scopes = aeg::pipeline::to_mask(PipelineScope::kFrame),
-            .version = {1, 0, 0},
-        };
-        return kDescriptor;
+struct NativeFrameObservation final {
+    struct Prepared final {
+        aeg::render_graph::RenderSceneOperationSource source{};
+        std::weak_ptr<const aeg::pipeline::RenderPassRuntimeData> commands{};
+    };
+    std::vector<Prepared> prepared{};
+    std::vector<aeg::render_graph::RenderSceneOperationSource> executed{};
+    std::weak_ptr<const aeg::pipeline::RenderPass> delegate{};
+    uint32_t stale_prepared_rejections{0};
+};
+
+class ObservedMultiFramePass final : public aeg::pipeline::RenderPass {
+public:
+    ObservedMultiFramePass(std::shared_ptr<const aeg::pipeline::RenderPass> delegate,
+                          NativeFrameObservation& observation)
+        : delegate_(std::move(delegate)), observation_(observation) {}
+
+    [[nodiscard]] const aeg::pipeline::RenderPassDescriptor& descriptor() const noexcept override {
+        return delegate_->descriptor();
     }
 
-    [[nodiscard]] Result build_render_graph(aeg::pipeline::RenderGraphBuilder& builder) const override {
-        auto* state = static_cast<SmokeState*>(builder.user_data());
-        if (state == nullptr || state->current_readback >= kFrameCount ||
-            !state->readbacks[state->current_readback].is_valid() ||
-            !state->readback_resources[state->current_readback].is_valid()) {
-            return aeg::foundation::invalid_state("multi-frame readback state is incomplete");
+    [[nodiscard]] Result setup(aeg::pipeline::RenderPassBuilder& builder,
+                              const aeg::pipeline::RenderPassConfiguration& configuration) const override {
+        const auto source = aeg::renderer::detail::NativeScenePassInspection::source(configuration);
+        if (!source) return source.result;
+        if (!observation_.prepared.empty()) {
+            auto previous_frame = configuration;
+            previous_frame.runtime_data = observation_.prepared.back().commands.lock();
+            if (previous_frame.runtime_data) {
+                const auto rejected = delegate_->setup(builder, previous_frame);
+                if (rejected || rejected.code != ResultCode::kInvalidArgument)
+                    return aeg::foundation::invalid_state("native multi-frame setup accepted previous-frame commands");
+                ++observation_.stale_prepared_rejections;
+            }
         }
-        const auto target = builder.find_texture(kSceneColor);
-        if (!target) {
-            return target.result;
-        }
-        const FrameAllocation readback = state->readbacks[state->current_readback];
-        const RenderGraphBuffer readback_resource = state->readback_resources[state->current_readback];
-        const auto pass = builder.add_graphics_pass(
-            "ReadbackOpaqueMultiFrame",
-            [target = target.value, readback_resource, readback](aeg::pipeline::RenderPassBuilder& pass_builder) {
-                if (const Result result =
-                        pass_builder.read(target, ResourceUsage::kCopySource, PipelineStage::kCopy, ShaderStage::kAll);
-                    !result) {
-                    return result;
-                }
-                if (const Result result = pass_builder.write(
-                        readback_resource, ResourceUsage::kCopyDestination, PipelineStage::kCopy, ShaderStage::kAll,
-                        aeg::pipeline::RenderGraphBufferRange{readback.offset, kReadbackSize});
-                    !result) {
-                    return result;
-                }
-                pass_builder.set_side_effects();
-                return Result::success();
-            },
-            [target = target.value, readback_resource, readback](aeg::pipeline::RenderPassExecutionContext& execution) {
-                return execution.copy_texture_to_buffer(
-                    target, TextureSubresourceLayers{aeg::rhi::Aspect::kColor, 0, 0, 1}, Offset3D{0, 0, 0},
-                    Extent3D{kWidth, kHeight, 1}, readback_resource, readback.offset, 0, 0);
-            });
-        if (!pass) {
-            return pass.result;
-        }
-        ++state->readback_build_count;
+        if (const auto result = delegate_->setup(builder, configuration); !result) return result;
+        observation_.prepared.push_back({source.value, configuration.runtime_data});
         return Result::success();
     }
 
-protected:
-    [[nodiscard]] Result setup(aeg::pipeline::RenderGraphBuilder& builder) const override {
-        const auto stage = builder.add_stage({
-            .id = aeg::pipeline::StageId("Renderer.OpaqueMultiFrameReadback.Build"),
-            .phase = aeg::pipeline::EnginePhase::kRenderBuild,
-            .execution_domain = aeg::pipeline::ExecutionDomain::kRenderThread,
-            .time_policy = aeg::pipeline::TimePolicy::kFrame,
-            .parallelizable = false,
-        });
-        return stage ? Result::success() : aeg::foundation::invalid_state("multi-frame readback stage failed");
+    [[nodiscard]] Result execute(aeg::pipeline::RenderPassExecutionContext& command,
+                                const aeg::pipeline::RenderPassConfiguration& configuration) const override {
+        const auto source = aeg::renderer::detail::NativeScenePassInspection::source(configuration);
+        if (!source) return source.result;
+        if (const auto result = delegate_->execute(command, configuration); !result) return result;
+        observation_.executed.push_back(source.value);
+        return Result::success();
     }
+
+private:
+    std::shared_ptr<const aeg::pipeline::RenderPass> delegate_;
+    NativeFrameObservation& observation_;
 };
 
 class MultiMaterialResolver final : public aeg::renderer::RenderResourceResolver {
@@ -411,21 +407,20 @@ int main() {
         aeg::renderer::RenderObjectId{4}};
 
     PipelineRegistry registry;
-    if (!require(aeg::renderer::register_render_pipeline(registry), "render pipeline registration failed") ||
-        !require(aeg::renderer::register_opaque_render_feature(registry), "opaque feature registration failed") ||
-        !require(aeg::renderer::bind_opaque_render_feature(registry), "opaque feature binding failed") ||
-        !require(registry.register_feature([] { return std::make_unique<OpaqueReadbackFeature>(); }),
-                 "readback feature registration failed") ||
-        !require(registry.bind_feature({
-                     .feature = kReadbackFeatureId,
-                     .pipeline = PipelineId("RenderPipeline"),
-                     .scope = PipelineScope::kFrame,
-                     .point = aeg::pipeline::FeaturePointId("RenderPipeline.Opaque"),
-                     .priority = 1,
-                     .enabled = true,
-                 }),
-                 "readback feature binding failed")) {
+    aeg::pipeline::RenderPassRegistry passes;
+    NativeFrameObservation native_frames;
+    if (!require(aeg::renderer::register_builtin_render_passes(passes), "native pass registration failed")) {
         return 1;
+    }
+    {
+        const auto real = aeg::pipeline::detail::RenderPassRegistryExecution::find_pass(
+            passes, aeg::renderer::kForwardOpaquePassTypeId);
+        if (!require(real, "native multi-frame pass lookup failed") ||
+            !require(passes.unregister_pass(aeg::renderer::kForwardOpaquePassTypeId), "native pass replacement failed") ||
+            !require(passes.register_pass([delegate = real.value, &native_frames] {
+                return std::make_unique<ObservedMultiFramePass>(delegate, native_frames);
+            }), "observed native pass registration failed")) return 1;
+        native_frames.delegate = real.value;
     }
 
     aeg::ecs::WorldManager world_manager;
@@ -442,16 +437,10 @@ int main() {
         return 4;
     }
 
-    aeg::world::WorldScope world_scope(world_result.value, registry, {});
+    aeg::world::WorldScope world_scope(world_result.value);
     if (!require(world_scope.initialize(), "WorldScope initialization failed")) {
         return 5;
     }
-    aeg::pipeline::PipelineScopeHost frame_host(PipelineScope::kFrame, PipelineInstanceId("OpaqueMultiFrameHost"));
-    if (!require(frame_host.bind_pipeline(PipelineId("RenderPipeline")), "frame pipeline binding failed") ||
-        !require(frame_host.rebuild(registry), "frame pipeline rebuild failed")) {
-        return 6;
-    }
-
     aeg::renderer::Renderer renderer;
     const auto extractor = renderer.register_extractor(
         [mesh_id, material_ids, object_ids](const aeg::renderer::RenderExtractContext& context) {
@@ -482,6 +471,11 @@ int main() {
         return 10;
     }
     aeg::shader::ShaderPipelineLayout shader_layout = std::move(shader_layout_result.value);
+    const uint64_t material_pso_epoch = shader_manager.cache_epoch();
+    const aeg::renderer::RenderMaterialShaderContract material_shader_contract{
+        aeg::renderer::kRenderMaterialShaderContractVersion,
+        aeg::shader::detail::ShaderPipelineLayoutAccess::contract_hash(shader_layout),
+        aeg::shader::detail::ShaderPipelineLayoutAccess::cache_epoch(shader_layout)};
     const auto object_layout_result = shader_manager.binding_layout(shader_layout, 0);
     const auto material_layout_result = shader_manager.binding_layout(shader_layout, 1);
     const auto lighting_layout_result = shader_manager.binding_layout(shader_layout, 2);
@@ -609,6 +603,8 @@ int main() {
     graphics_state.topology = PrimitiveTopology::kTriangleList;
     graphics_state.cull_mode = CullMode::kNone;
     graphics_state.color_formats = color_formats;
+    const aeg::renderer::RenderMaterialAttachmentContract material_attachment_contract{
+        graphics_state.color_formats[0], graphics_state.samples, graphics_state.depth_stencil_format};
     const auto pipeline_result = shader_manager.create_pipeline(
         shader_program_result.value, shader_layout,
         aeg::shader::ShaderPipelineDesc{PipelineType::kGraphics, graphics_state,
@@ -635,14 +631,47 @@ int main() {
     MultiMaterialResolver resolver(*device, mesh_id, material_ids, object_ids, mesh_resource, object_resources);
     resolver.set_pipeline(graphics_pipeline);
 
-    aeg::pipeline::PipelineScheduler scheduler({1, 1, 1, 1});
+    // Every frame projects a fresh committed AtomicFeature invocation into the
+    // registered native pass using the actual current Renderer snapshot.
+    aeg::feature::FeatureRegistry feature_registry{aeg::feature::test::clock_test_host()};
+    aeg::feature::FeatureRuntime feature_runtime(feature_registry);
+    auto scene_feature = render_feature_test::definition();
+    scene_feature.id = aeg::feature::FeatureDefinitionId("Renderer.MultiFrame.SceneDraw");
+    scene_feature.contract.definition_id = scene_feature.id;
+    scene_feature.owner_module = aeg::feature::ModuleIdentity("Renderer.MultiFrame.Fixture");
+    scene_feature.execute = [](const aeg::feature::InvocationToken& token, const aeg::feature::StateSnapshot&,
+        std::span<const uint8_t>, std::span<const uint8_t>) {
+        using namespace aeg::feature;
+        const RenderTextureReference target{RenderResourceId(kSceneColor.value()), 1, true};
+        StateDelta delta{token.state_version};
+        delta.render_intent = RenderIntent{};
+        delta.render_intent->operations = {RenderDrawScene{{RenderResourceId("MultiFrame.Scene"), 1}, target,
+            RenderAttachmentLoad::kClear}};
+        delta.render_intent->final_output = target;
+        return aeg::foundation::ResultValue<StateDelta>{Result::success(), std::move(delta)};
+    };
+    if (!require(aeg::feature::test::register_clock_test_definition(feature_registry, scene_feature), "actual Scene Feature registration failed")) return 39;
+    auto feature_document = render_feature_test::document(scene_feature);
+    feature_document.nodes.resize(1);
+    auto feature_plan = aeg::feature::FeatureGraphCompiler{}.compile(feature_document, feature_registry);
+    if (!require(feature_plan, "actual Scene Feature compile failed") ||
+        !require(feature_runtime.publish_graph(feature_document, feature_plan.value), "actual Scene Feature publication failed")) return 39;
+    std::shared_ptr<const std::vector<aeg::feature::RenderFeatureOutput>> current_outputs;
+    aeg::renderer::RenderViewId current_view{};
+    std::vector<aeg::feature::InvocationToken> committed_tokens;
+    std::vector<std::weak_ptr<const std::vector<aeg::feature::RenderFeatureOutput>>> submitted_outputs;
+    std::vector<std::weak_ptr<const aeg::renderer::RenderSceneSnapshot>> submitted_scenes;
+
+    aeg::pipeline::PipelineScheduler scheduler;
+    aeg::engine::EngineFramePipelineHost pipeline_host(registry, scheduler);
     auto frame_context = std::make_unique<aeg::render_graph::FrameContext>(
         *device, aeg::render_graph::FrameContextDesc{4, 4u * 1024u * 1024u, 4u * 1024u * 1024u, 256,
                                                      std::numeric_limits<uint64_t>::max()});
     aeg::render_graph::RenderGraph render_graph(*device);
     std::optional<aeg::engine::EngineFrameOrchestrator> orchestrator;
-    orchestrator.emplace(registry, scheduler, *frame_context, render_graph);
-    if (!require(orchestrator->register_world_frame(world_scope, frame_host, 1), "world frame registration failed") ||
+    orchestrator.emplace(pipeline_host, *frame_context, render_graph);
+    if (!require(orchestrator->register_world_frame(world_scope, 1),
+                 "world frame registration failed") ||
         !require(orchestrator->initialize(), "orchestrator initialization failed")) {
         return 20;
     }
@@ -669,7 +698,8 @@ int main() {
     };
     frame_desc.render_feature_preparation = [&smoke_state, &resolver, device_ptr = device.get(), material_layout,
                                              lighting_layout, graphics_pipeline, target_texture, target_view,
-                                             target_desc](const aeg::engine::EngineFramePreparationContext& context) {
+                                             target_desc, material_shader_contract, material_attachment_contract,
+                                             material_pso_epoch](const aeg::engine::EngineFramePreparationContext& context) {
         const auto target_resource =
             context.render_graph.import_texture(target_texture, target_view, target_desc,
                                                 ResourceState{ResourceUsage::kUndefined, ShaderStage::kAll,
@@ -750,17 +780,23 @@ int main() {
             } else {
                 const aeg::resource::GpuTexture old_texture = state.texture;
                 const BufferHandle old_parameter_buffer = state.parameter_buffer;
+                const BindingSetHandle old_material_set = state.material.binding_set;
                 if (const Result result = aeg::resource::update_texture_material_for_frame(
                         *device_ptr, context.frame_context, state.material, texture_upload.value.texture.sampled_view);
                     !result) {
                     return result;
                 }
+                const BindingSetHandle texture_material_set = state.material.binding_set;
                 if (const Result result = aeg::resource::update_texture_material_parameters_for_frame(
                         *device_ptr, context.frame_context, state.material,
                         BufferRange{parameter_upload.value.destination, 0, sizeof(input.parameters)});
                     !result) {
                     return result;
                 }
+                if (old_material_set == texture_material_set || texture_material_set == state.material.binding_set ||
+                    state.material.texture_view != texture_upload.value.texture.sampled_view ||
+                    state.material.parameter_buffer.buffer != parameter_upload.value.destination)
+                    return aeg::foundation::invalid_state("frame material update reused a submitted descriptor version");
                 aeg::resource::GpuTexture retired_texture = old_texture;
                 if (const Result result =
                         texture_uploader.defer_destroy_texture(context.frame_context, retired_texture);
@@ -777,12 +813,14 @@ int main() {
             state.parameter_buffer_desc = parameter_desc;
             state.parameter_resource = to_pipeline_handle(parameter_upload.value.target);
 
-            resolver.set_material(
-                material_index,
-                aeg::renderer::RenderMaterialResource{
-                    graphics_pipeline, state.material.binding_set, state.material.binding_group,
-                    to_pipeline_handle(texture_upload.value.target), state.parameter_buffer,
-                    state.parameter_buffer_desc, state.parameter_resource, 0, sizeof(input.parameters)});
+            aeg::renderer::RenderMaterialResource material_resource{
+                graphics_pipeline, state.material.binding_set, state.material.binding_group,
+                to_pipeline_handle(texture_upload.value.target), state.parameter_buffer,
+                state.parameter_buffer_desc, state.parameter_resource, 0, sizeof(input.parameters)};
+            material_resource.shader_contract = material_shader_contract;
+            material_resource.attachment_contract = material_attachment_contract;
+            material_resource.variant_cache_epoch = material_pso_epoch;
+            resolver.set_material(material_index, material_resource);
         }
 
         const aeg::renderer::RenderLightingConstants lighting_constants{
@@ -858,6 +896,110 @@ int main() {
         return Result::success();
     };
 
+    frame_desc.render_feature_post_build = [&](const aeg::engine::EngineFramePostBuildContext& context) {
+        if (context.render_scenes.size() != 1 || !context.render_scenes.front()->is_valid() ||
+            context.render_scenes.front()->frame_number != context.frame_context.frame_number() ||
+            context.render_scenes.front()->instances.size() != kObjectCount)
+            return aeg::foundation::invalid_state("actual current Renderer snapshot is missing");
+        current_view = context.render_scenes.front()->view.id;
+        if (const auto result = feature_runtime.tick(scene_feature.contract.clock.id); !result) return result;
+        const auto captured = feature_runtime.capture_render_outputs(feature_plan.value);
+        if (!captured) return captured.result;
+        if (captured.value.size() != 1) return aeg::foundation::invalid_state("actual Scene Feature capture has another owner count");
+        const auto& captured_output = captured.value.front();
+        const auto* owner = feature_runtime.find_instance(captured_output.instance_id);
+        const auto provenance = std::find_if(feature_plan.value.provenance.begin(), feature_plan.value.provenance.end(),
+            [&](const auto& entry) { return entry.instance_id == captured_output.instance_id; });
+        if (!owner || !owner->last_invocation_committed ||
+            owner->last_invocation_committed->attempt.token != captured_output.invocation ||
+            owner->state.commit_count != committed_tokens.size() + 1 ||
+            captured_output.resource_owner.definition_digest != owner->definition_digest ||
+            captured_output.resource_owner.resource_epoch != owner->render_resource_epoch ||
+            provenance == feature_plan.value.provenance.end() ||
+            provenance->definition_id != captured_output.contract.definition_id ||
+            provenance->owner_module != captured_output.owner_module || provenance->node_id != captured_output.node_id ||
+            !captured_output.invocation.invocation_id.is_valid() ||
+            std::find(committed_tokens.begin(), committed_tokens.end(), captured_output.invocation) != committed_tokens.end())
+            return aeg::foundation::invalid_state("multi-frame capture has no fresh actual committed Feature owner");
+        committed_tokens.push_back(captured_output.invocation);
+        const std::vector<aeg::feature::RenderFeatureOutput> scoped{
+            aeg::renderer::scope_render_feature_output(captured_output, current_view, true)};
+        current_outputs = std::make_shared<const std::vector<aeg::feature::RenderFeatureOutput>>(scoped);
+        const auto& output = current_outputs->front();
+        const auto& draw = std::get<aeg::feature::RenderDrawScene>(output.intent.operations.front());
+        const std::array scenes{aeg::renderer::RenderFeatureSceneBinding{
+            draw.scene.id, draw.scene.version, output.instance_id, context.render_scenes.front(),
+            context.render_resource_resolver}};
+        const aeg::render_graph::RenderPassExecutionHost pass_host{
+            &passes, aeg::pipeline::detail::RenderPassRegistryExecution::execution_epoch(passes)};
+        aeg::renderer::RenderFeatureDrawLowerer lowerer(scenes, pass_host);
+        if (const auto result = aeg::render_graph::build_render_graph_features(context.render_graph, current_outputs,
+                {.textures = context.feature_textures, .draw_lowerer = &lowerer}, context.frame_context.frame_number());
+            !result) return result;
+
+        const auto target = std::find_if(context.feature_textures.begin(), context.feature_textures.end(),
+            [&](const auto& binding) { return binding.id == draw.target.id && binding.version == draw.target.version; });
+        if (target == context.feature_textures.end() || smoke_state.current_readback >= kFrameCount)
+            return aeg::foundation::invalid_state("multi-frame readback target is missing");
+        const auto readback = smoke_state.readbacks[smoke_state.current_readback];
+        const auto resource = smoke_state.readback_resources[smoke_state.current_readback];
+        const aeg::render_graph::RenderGraphBuffer buffer{resource.index, resource.generation, resource.graph_id};
+        // Allocation frame_number is the zero-based slot generation; the
+        // active FrameContext exposes the next, one-based frame number.
+        if (!readback.is_valid() || readback.frame_number + 1 != context.frame_context.frame_number() ||
+            readback.frame_slot != context.frame_context.frame_slot_index() ||
+            !aeg::render_graph::detail::RenderGraphResourceAccess::contains_buffer(context.render_graph, buffer))
+            return aeg::foundation::invalid_state("multi-frame readback allocation is stale");
+        const auto copied = context.render_graph.add_pass("ReadbackOpaqueMultiFrame", QueueClass::kGraphics,
+            [target = target->texture, buffer, readback](aeg::render_graph::PassBuilder& pass) {
+                if (const auto result = pass.read(target, ResourceUsage::kCopySource, PipelineStage::kCopy); !result)
+                    return result;
+                if (const auto result = pass.write(buffer, ResourceUsage::kCopyDestination, PipelineStage::kCopy,
+                        ShaderStage::kAll, {readback.offset, kReadbackSize}); !result) return result;
+                pass.set_side_effects();
+                return Result::success();
+            }, [target = target->texture, buffer, readback](aeg::render_graph::PassExecutionContext& command) {
+                return command.copy_texture_to_buffer(target, TextureSubresourceLayers{aeg::rhi::Aspect::kColor, 0, 0, 1},
+                    Offset3D{0, 0, 0}, Extent3D{kWidth, kHeight, 1}, buffer, readback.offset, 0, 0);
+            });
+        if (!copied) return copied.result;
+        ++smoke_state.readback_build_count;
+        submitted_outputs.emplace_back(current_outputs);
+        submitted_scenes.emplace_back(context.render_scenes.front());
+        return Result::success();
+    };
+    const auto actual_geometry_has_owner = [&] {
+        if (orchestrator->draw_call_count() < kObjectCount || !current_outputs || current_outputs->size() != 1) return false;
+        const auto& output = current_outputs->front();
+        const auto actual = render_feature_test::check_scene_draw_provenance(render_graph, *current_outputs,
+            frame_context->frame_number());
+        if (!actual || actual.value != 1 || native_frames.prepared.empty() || native_frames.executed.empty()) return false;
+        const auto& prepared = native_frames.prepared.back().source;
+        const auto& executed = native_frames.executed.back();
+        if (!current_view.is_valid() || output.view_key != current_view.value() ||
+            prepared.view_key != output.view_key || executed.view_key != output.view_key ||
+            prepared.owner != output.resource_owner || executed.owner != output.resource_owner ||
+            prepared.kind != aeg::render_graph::RenderSceneOperationKind::kDrawScene || executed.kind != prepared.kind)
+            return false;
+        const auto same_work = [](const auto& source, const auto& work) {
+            return source.id == work.id && source.domain == work.domain && source.kind == work.kind &&
+                source.feature_definition_id == work.feature_definition_id && source.owner_module == work.owner_module &&
+                source.node_id == work.node_id && source.instance_id == work.instance_id &&
+                source.invocation == work.invocation && source.frame_index == work.frame_index &&
+                source.operation_index == work.operation_index;
+        };
+        size_t native_draws = 0;
+        for (const auto& pass : aeg::render_graph::detail::RenderGraphExecution::plan(render_graph).pass_plans) {
+            const auto inspected = aeg::render_graph::detail::RenderGraphExecution::inspect_pass(render_graph, pass.pass);
+            if (!inspected) return false;
+            if (!pass.live || (inspected.value.name != "DrawOpaque" && inspected.value.name != "Renderer.ForwardOpaquePass")) continue;
+            ++native_draws;
+            if (!pass.feature_work || !same_work(prepared.work, *pass.feature_work) ||
+                !same_work(executed.work, *pass.feature_work)) return false;
+        }
+        return native_draws == actual.value;
+    };
+
     for (uint32_t frame = 0; frame < kFrameCount; ++frame) {
         smoke_state.frame_index = frame;
         const Result frame_result = orchestrator->run_frame(frame_desc);
@@ -867,8 +1009,14 @@ int main() {
         if (!require(frame_result, "multi-material frame execution failed")) {
             return 21;
         }
+        if (!require(actual_geometry_has_owner(), "actual multi-material geometry has no current compiled Feature invocation")) return 42;
     }
-    if (!require(smoke_state.readback_build_count == kFrameCount, "readback feature did not run once per frame") ||
+    if (!require(smoke_state.readback_build_count == kFrameCount, "technical readback did not run once per frame") ||
+        !require(native_frames.prepared.size() == kFrameCount && native_frames.executed.size() == kFrameCount,
+                 "multi-material frames bypassed their registered native pass") ||
+        !require(shader_manager.cache_epoch() == material_pso_epoch &&
+                     aeg::shader::detail::ShaderPipelineLayoutAccess::cache_epoch(shader_layout) == material_pso_epoch,
+                 "multi-material frame changed its shader contract epoch") ||
         !require(resolver.mesh_resolve_count >= kObjectCount * kFrameCount &&
                      resolver.material_resolve_count >= kObjectCount * kFrameCount &&
                      resolver.object_resolve_count >= kObjectCount * kFrameCount,
@@ -933,9 +1081,16 @@ int main() {
         return 29;
     }
     render_graph.reset();
-    if (!require(!render_graph.contains_texture(stale_texture_resource.value),
+    current_outputs.reset();
+    if (!require(!aeg::render_graph::detail::RenderGraphResourceAccess::contains_texture(
+                         render_graph, stale_texture_resource.value),
                  "stale RenderGraph handle was accepted")) {
         return 30;
+    }
+    for (size_t frame = 0; frame < submitted_outputs.size(); ++frame) {
+        if (!require(!submitted_outputs[frame].expired() && !submitted_scenes[frame].expired() &&
+                         !native_frames.prepared[frame].commands.expired(),
+                     "graph reset retired a submitted multi-frame source before its frame slot")) return 43;
     }
 
     smoke_state.missing_texture = true;
@@ -944,7 +1099,15 @@ int main() {
     if (!missing_texture_result) {
         std::cerr << "expected missing texture failure: " << missing_texture_result.message << '\n';
     }
-    if (!require(!missing_texture_result, "missing material texture did not fail the frame")) {
+    if (!require(!missing_texture_result && missing_texture_result.code == ResultCode::kInvalidState &&
+                     missing_texture_result.message.find("material texture") != std::string::npos,
+                 "missing material texture did not fail the frame") ||
+        !require(smoke_state.materials[0].material.binding_set == material_set_before_failure &&
+                     smoke_state.materials[0].material.texture_view == texture_before_failure &&
+                     smoke_state.materials[0].material.parameter_buffer.buffer == parameter_before_failure.buffer &&
+                     smoke_state.readback_build_count == kFrameCount && native_frames.prepared.size() == kFrameCount &&
+                     native_frames.executed.size() == kFrameCount,
+                 "failed material frame submitted work or replaced its active material version")) {
         return 31;
     }
     resolver.set_missing_texture(false);
@@ -956,6 +1119,21 @@ int main() {
     if (!require(recovery_result, "material did not recover after a failed frame")) {
         return 32;
     }
+    if (!require(actual_geometry_has_owner(), "recovery geometry has no current compiled Feature invocation")) return 42;
+    if (!require(smoke_state.readback_build_count == kFrameCount + 1 &&
+                     native_frames.prepared.size() == kFrameCount + 1 && native_frames.executed.size() == kFrameCount + 1 &&
+                     native_frames.stale_prepared_rejections >= kFrameCount - 1,
+                 "recovery did not use a fresh registered native frame") ||
+        !require(device->wait_idle(), "recovery GPU wait failed")) return 44;
+    std::array<std::byte, kReadbackSize> recovery_pixels{};
+    if (!require(frame_context->read_readback(smoke_state.readbacks[smoke_state.current_readback], recovery_pixels),
+                 "recovery pixel readback failed") ||
+        !require(count_color(recovery_pixels, 0, 24, expected_color(kFrames.back()[0])) > 20,
+                 "recovery shared material region is incorrect") ||
+        !require(count_color(recovery_pixels, 24, 43, expected_color(kFrames.back()[1])) > 20,
+                 "recovery second material region is incorrect") ||
+        !require(count_color(recovery_pixels, 43, 64, expected_color(kFrames.back()[2])) > 20,
+                 "recovery third material region is incorrect")) return 45;
 
     const auto incompatible_layout_result = device->create_binding_layout(
         {std::array<aeg::rhi::BindingLayoutEntry, 2>{aeg::rhi::BindingLayoutEntry{{1, 0},
@@ -994,6 +1172,26 @@ int main() {
         !require(device->destroy_binding_layout(incompatible_layout_result.value),
                  "incompatible layout destruction failed")) {
         return 35;
+    }
+
+    frame_desc.render_feature_post_build = {};
+    current_outputs.reset();
+    render_graph.reset();
+    if (!require(passes.unregister_pass(aeg::renderer::kForwardOpaquePassTypeId), "native pass retirement failed") ||
+        !require(!native_frames.delegate.expired(), "native multi-frame pass retired before submitted work")) return 46;
+    for (size_t frame = kFrameCount - 1; frame < submitted_outputs.size(); ++frame) {
+        if (!require(!submitted_outputs[frame].expired() && !submitted_scenes[frame].expired() &&
+                         !native_frames.prepared[frame].commands.expired(),
+                     "multi-frame source or prepared commands retired before GPU drain")) return 46;
+    }
+    const auto drained = frame_context->drain();
+    if (!drained) std::cerr << "multi-frame GPU drain: " << drained.message << '\n';
+    if (!require(drained, "multi-frame GPU drain failed") ||
+        !require(native_frames.delegate.expired(), "native multi-frame pass survived GPU drain")) return 47;
+    for (size_t frame = 0; frame < submitted_outputs.size(); ++frame) {
+        if (!require(submitted_outputs[frame].expired() && submitted_scenes[frame].expired() &&
+                         native_frames.prepared[frame].commands.expired(),
+                     "multi-frame source or prepared commands survived GPU drain")) return 47;
     }
 
     if (!require(orchestrator->shutdown(), "orchestrator shutdown failed") ||

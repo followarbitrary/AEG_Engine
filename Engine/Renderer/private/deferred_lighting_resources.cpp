@@ -4,6 +4,7 @@
 #include <array>
 
 #include "frame_context.hpp"
+#include "../../Shader/private/shader_pipeline_layout_access.hpp"
 #include "shader_contract.hpp"
 #include "shadow_rendering.hpp"
 
@@ -22,6 +23,10 @@ struct DeferredLightingResources::Impl final {
     rhi::BindingLayoutHandle inputs_layout{};
     rhi::PipelineHandle shadow_pipeline{};
     rhi::BindingLayoutHandle shadow_layout{};
+    RenderMaterialAttachmentContract attachment_contract{};
+    RenderMaterialAttachmentContract shadow_pipeline_contract{};
+    RendererProfilePsoContract profile_contract{};
+    RendererProfilePsoContract shadow_profile_contract{};
 };
 
 DeferredLightingResources::DeferredLightingResources() = default;
@@ -54,6 +59,13 @@ foundation::Result DeferredLightingResources::initialize(rhi::Device& device,
     if (!pipeline)
         return pipeline.result;
     state->pipeline = pipeline.value;
+    state->attachment_contract = {graphics.color_formats.front(), graphics.samples, graphics.depth_stencil_format};
+    state->profile_contract = {
+        {kRendererProfileContractVersion, RendererProfile::kDeferredLighting,
+         shader::detail::ShaderPipelineLayoutAccess::contract_hash(layout.value),
+         shader::detail::ShaderPipelineLayoutAccess::cache_epoch(layout.value)},
+        state->attachment_contract,
+        shader::detail::ShaderPipelineLayoutAccess::cache_epoch(layout.value)};
     state->inputs_layout = inputs.value;
     if (!shadow_package.empty()) {
         const auto shadow_program = shader::load_shader_program(shadow_package);
@@ -71,6 +83,13 @@ foundation::Result DeferredLightingResources::initialize(rhi::Device& device,
         if (!shadow_pipeline)
             return shadow_pipeline.result;
         state->shadow_pipeline = shadow_pipeline.value;
+        state->shadow_pipeline_contract = {graphics.color_formats.front(), graphics.samples, graphics.depth_stencil_format};
+        state->shadow_profile_contract = {
+            {kRendererProfileContractVersion, RendererProfile::kDeferredLighting,
+             shader::detail::ShaderPipelineLayoutAccess::contract_hash(shadow_layout.value),
+             shader::detail::ShaderPipelineLayoutAccess::cache_epoch(shadow_layout.value)},
+            state->shadow_pipeline_contract,
+            shader::detail::ShaderPipelineLayoutAccess::cache_epoch(shadow_layout.value)};
         state->shadow_layout = shadow_inputs.value;
     }
     impl_ = std::move(state);
@@ -84,10 +103,17 @@ foundation::ResultValue<RenderDeferredLightingResource> DeferredLightingResource
     if (!impl_ || !frame.is_frame_active()) {
         return {foundation::invalid_state("deferred lighting requires initialized resources and an active frame"), {}};
     }
+    if (&frame.device() != &impl_->device) {
+        return {foundation::invalid_state("deferred lighting FrameContext belongs to a different RHI device"), {}};
+    }
     const auto frame_number = frame.frame_number();
     RenderDeferredLightingResource resource;
     resource.pipeline = impl_->pipeline;
     resource.shadow_pipeline = impl_->shadow_pipeline;
+    resource.attachment_contract = impl_->attachment_contract;
+    resource.shadow_pipeline_contract = impl_->shadow_pipeline_contract;
+    resource.profile_contract = impl_->profile_contract;
+    resource.shadow_profile_contract = impl_->shadow_profile_contract;
     resource.prepare_inputs =
         [state = impl_, &frame,
          frame_number](const RenderDeferredLightingInputs& inputs) -> foundation::ResultValue<rhi::BindingSetHandle> {

@@ -1,8 +1,9 @@
 /**
  * @file imgui_renderer.cpp
- * @brief Implements the backend-neutral Dear ImGui RenderFeature.
+ * @brief Implements fixed Dear ImGui overlay recording and prepared resource ownership.
  */
 #include "../../public/imgui_renderer.hpp"
+#include "../../public/imgui_render_execution.hpp"
 
 #include <algorithm>
 #include <array>
@@ -20,6 +21,10 @@
 
 #include "frame_context.hpp"
 #include "math.hpp"
+#include "../../../../Engine/RenderGraph/private/render_graph_execution.hpp"
+#include "../../../../Engine/RenderGraph/private/render_graph_resource_access.hpp"
+#include "../../../../Engine/RenderGraph/private/render_graph_feature_access.hpp"
+#include "../../../../Engine/RenderGraph/private/native_graph_build_session.hpp"
 #include "render_graph.hpp"
 #include "resource_uploader.hpp"
 #include "rhi.hpp"
@@ -27,9 +32,6 @@
 
 namespace aeg::editor {
 namespace {
-inline constexpr pipeline::FeatureId kImGuiRenderFeatureId{"Editor.ImGuiRenderFeature"};
-inline constexpr pipeline::FeaturePointId kImGuiFeaturePointId{"RenderPipeline.BeforePresent"};
-inline constexpr pipeline::StageId kImGuiStageId{"Editor.ImGuiRenderFeature"};
 inline constexpr pipeline::RenderResourceId kImGuiVertexResourceId{"Editor.ImGui.VertexBuffer"};
 inline constexpr pipeline::RenderResourceId kImGuiIndexResourceId{"Editor.ImGui.IndexBuffer"};
 inline constexpr pipeline::RenderResourceId kImGuiProjectionResourceId{"Editor.ImGui.ProjectionBuffer"};
@@ -416,7 +418,8 @@ foundation::Result ImGuiRenderer::prepare_frame(render_graph::FrameContext& fram
     // the new packet fails.
     impl_->prepared_frame.reset();
     impl_->imported_textures.clear();
-    if (&frame_context.device() != &impl_->device || &graph.device() != &impl_->device) {
+    if (&frame_context.device() != &impl_->device ||
+        &render_graph::detail::RenderGraphExecution::device(graph) != &impl_->device) {
         return foundation::invalid_argument("ImGui renderer objects must use the same RHI device");
     }
     if (!frame_context.is_frame_active()) {
@@ -632,7 +635,8 @@ foundation::Result ImGuiRenderer::prepare_frame(render_graph::FrameContext& fram
             }
         } else {
             imported = &imported_iterator->second;
-            const bool graph_resource_valid = graph.contains_texture(imported->resource);
+            const bool graph_resource_valid =
+                render_graph::detail::RenderGraphResourceAccess::contains_texture(graph, imported->resource);
             const bool external_resource_matches = imported->texture == texture.binding.texture &&
                                                    imported->sampled_view == texture.binding.sampled_view &&
                                                    texture_desc_matches(imported->desc, texture.binding.texture_desc);
@@ -699,14 +703,37 @@ foundation::Result ImGuiRenderer::prepare_frame(render_graph::FrameContext& fram
     return impl_->store_prepared_frame(std::move(prepared));
 }
 
-foundation::Result ImGuiRenderer::build_render_graph(pipeline::RenderGraphBuilder& builder) const {
+foundation::Result detail::ImGuiRenderExecution::build_render_graph(const ImGuiRenderer& renderer,
+    render_graph::RenderGraph& graph, render_graph::RenderGraphTexture output) {
+    const auto& impl_ = renderer.impl_;
     if (impl_ == nullptr || !impl_->initialized) {
         return foundation::invalid_state("ImGui renderer is not initialized");
     }
-    const std::shared_ptr<Impl::PreparedFrame> prepared = impl_->prepared_frame;
+    if (&render_graph::detail::RenderGraphExecution::device(graph) != &impl_->device) {
+        return foundation::invalid_argument("ImGui overlay and prepared renderer must use the same RHI device");
+    }
+    const std::shared_ptr<ImGuiRenderer::Impl::PreparedFrame> prepared = impl_->prepared_frame;
     if (prepared == nullptr) {
         return foundation::Result::success();
     }
+    const auto description = render_graph::detail::RenderGraphFeatureGraphAccess::texture_description(graph, output);
+    if (!description) return description.result;
+    if (description.value.format != prepared->target.format ||
+        description.value.extent.width != prepared->target.extent.width ||
+        description.value.extent.height != prepared->target.extent.height ||
+        !rhi::has_flag(description.value.capabilities, rhi::TextureCapability::kColorAttachment)) {
+        return foundation::invalid_argument("ImGui overlay target differs from its prepared attachment");
+    }
+    const std::array bindings{render_graph::RenderGraphFeatureTextureBinding{prepared->target.resource_id, output}};
+    const auto flags = pipeline::RenderGraphBuildFlags::kMayCreateResources |
+        pipeline::RenderGraphBuildFlags::kMayCreateGraphicsPass | pipeline::RenderGraphBuildFlags::kMayWriteFinalOutput;
+    const auto session = render_graph::NativeGraphBuildSession::begin(graph, bindings, flags);
+    if (!session) return session.result;
+    auto& builder = session.value->builder();
+    const auto finish = [&](foundation::Result result) {
+        if (result) session.value->commit();
+        return result;
+    };
 
     const foundation::ResultValue<pipeline::RenderGraphTexture> target_result =
         builder.find_texture(prepared->target.resource_id);
@@ -733,7 +760,7 @@ foundation::Result ImGuiRenderer::build_render_graph(pipeline::RenderGraphBuilde
                 }
                 return context.end_rendering();
             });
-        return pass_result ? foundation::Result::success() : pass_result.result;
+        return finish(pass_result ? foundation::Result::success() : pass_result.result);
     }
 
     const pipeline::RenderGraphBuffer vertex_resource = to_pipeline_buffer(prepared->vertex_resource);
@@ -757,7 +784,7 @@ foundation::Result ImGuiRenderer::build_render_graph(pipeline::RenderGraphBuilde
         return foundation::out_of_memory("ImGui graph texture resource allocation failed");
     }
     for (std::size_t index = 0; index < prepared->textures.size(); ++index) {
-        const Impl::TextureEntry& texture = prepared->textures[index];
+        const ImGuiRenderer::Impl::TextureEntry& texture = prepared->textures[index];
         const pipeline::RenderResourceId resource_id = make_imgui_texture_resource_id(texture.identity);
         const pipeline::RenderGraphTexture resource = to_pipeline_texture(texture.resource);
         if (const foundation::Result result = builder.bind_texture(resource_id, resource); !result) {
@@ -842,7 +869,7 @@ foundation::Result ImGuiRenderer::build_render_graph(pipeline::RenderGraphBuilde
                 !result) {
                 return fail_rendering(result);
             }
-            for (const Impl::DrawCall& draw_call : prepared->draw_calls) {
+            for (const ImGuiRenderer::Impl::DrawCall& draw_call : prepared->draw_calls) {
                 if (const foundation::Result result = context.set_scissor(draw_call.scissor); !result) {
                     return fail_rendering(result);
                 }
@@ -864,7 +891,7 @@ foundation::Result ImGuiRenderer::build_render_graph(pipeline::RenderGraphBuilde
             }
             return context.end_rendering();
         });
-    return pass_result ? foundation::Result::success() : pass_result.result;
+    return finish(pass_result ? foundation::Result::success() : pass_result.result);
 }
 
 foundation::Result ImGuiRenderer::shutdown() {
@@ -949,6 +976,17 @@ foundation::Result ImGuiRenderer::release_prepared_frame() {
     }
 }
 
+foundation::Result detail::ImGuiRenderExecution::release_prepared_frames(
+    std::span<ImGuiRenderer* const> renderers) {
+    foundation::Result first_result = foundation::Result::success();
+    for (ImGuiRenderer* renderer : renderers) {
+        if (renderer == nullptr) continue;
+        const auto result = renderer->release_prepared_frame();
+        if (!result && first_result) first_result = result;
+    }
+    return first_result;
+}
+
 bool ImGuiRenderer::is_initialized() const noexcept {
     return impl_ != nullptr && impl_->initialized;
 }
@@ -957,82 +995,4 @@ bool ImGuiRenderer::has_prepared_frame() const noexcept {
     return impl_ != nullptr && impl_->prepared_frame != nullptr;
 }
 
-ImGuiRenderFeature::ImGuiRenderFeature(ImGuiRenderer& renderer) noexcept : renderer_(&renderer) {
-    descriptor_.id = kImGuiRenderFeatureId;
-    descriptor_.name = "Editor.ImGuiRenderFeature";
-    descriptor_.domain = pipeline::FeatureDomain::kRender;
-    descriptor_.domain_mask = pipeline::to_mask(pipeline::FeatureDomain::kRender);
-    descriptor_.supported_scopes = pipeline::to_mask(pipeline::PipelineScope::kFrame);
-    descriptor_.version = {1, 0, 0};
-}
-
-foundation::Result ImGuiRenderFeature::setup(pipeline::RenderGraphBuilder& builder) const {
-    const pipeline::PipelineStageHandle stage = builder.add_stage({
-        kImGuiStageId,
-        pipeline::EnginePhase::kPresent,
-        pipeline::ExecutionDomain::kRenderThread,
-        pipeline::TimePolicy::kFrame,
-        false,
-    });
-    if (!stage) {
-        return foundation::invalid_state("ImGui RenderFeature stage declaration failed");
-    }
-    return foundation::Result::success();
-}
-
-foundation::Result ImGuiRenderFeature::build_render_graph(pipeline::RenderGraphBuilder& builder) const {
-    if (renderer_ == nullptr) {
-        return foundation::invalid_state("ImGui RenderFeature has no renderer");
-    }
-    return renderer_->build_render_graph(builder);
-}
-
-foundation::Result register_imgui_render_feature(pipeline::PipelineRegistry& registry, ImGuiRenderer& renderer) {
-    if (!renderer.is_initialized()) {
-        return foundation::invalid_state("ImGui renderer must be initialized before feature registration");
-    }
-    if (const foundation::Result result =
-            registry.register_feature([&renderer] { return std::make_unique<ImGuiRenderFeature>(renderer); });
-        !result) {
-        return result;
-    }
-    const foundation::Result binding_result = registry.bind_feature({
-        kImGuiRenderFeatureId,
-        pipeline::PipelineId("RenderPipeline"),
-        pipeline::PipelineScope::kFrame,
-        kImGuiFeaturePointId,
-        0,
-        true,
-        {},
-    });
-    if (!binding_result) {
-        static_cast<void>(registry.unregister_feature(kImGuiRenderFeatureId));
-        return binding_result;
-    }
-    return foundation::Result::success();
-}
-
-foundation::Result unregister_imgui_render_feature(pipeline::PipelineRegistry& registry) {
-    const pipeline::FeatureInstanceId instance =
-        pipeline::make_feature_instance_id(kImGuiRenderFeatureId, pipeline::PipelineId("RenderPipeline"),
-                                           pipeline::PipelineScope::kFrame, kImGuiFeaturePointId);
-    foundation::Result first_result = registry.unbind_feature(instance);
-    if (!first_result && first_result.code == foundation::ResultCode::kNotFound) {
-        first_result = foundation::Result::success();
-    }
-
-    const foundation::Result unregister_pipeline_result =
-        registry.unregister_pipeline(pipeline::PipelineId("RenderPipeline"));
-    if (!unregister_pipeline_result && unregister_pipeline_result.code != foundation::ResultCode::kNotFound &&
-        first_result) {
-        first_result = unregister_pipeline_result;
-    }
-
-    const foundation::Result unregister_feature_result = registry.unregister_feature(kImGuiRenderFeatureId);
-    if (!unregister_feature_result && unregister_feature_result.code != foundation::ResultCode::kNotFound &&
-        first_result) {
-        first_result = unregister_feature_result;
-    }
-    return first_result;
-}
 }  // namespace aeg::editor

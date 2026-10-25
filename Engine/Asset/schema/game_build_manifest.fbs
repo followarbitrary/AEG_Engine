@@ -1,17 +1,31 @@
 namespace aeg.asset;
 
+table WorldCommandRoute {
+  graph_asset_uuid:string (required);
+  node_id:ulong;
+  owner_path:[ulong];
+  scene_asset:[ubyte] (required);
+  scene_entity:[ubyte] (required);
+  effect:ulong;
+  version:uint;
+  observation_port:ulong;
+}
+
 table GameBuildManifest {
-  schema_version:uint;
+  schema_version:uint = 3;
   project_uuid:string;
   module_id:string;
   build_id:string;
   module_contract_digest:string;
   package_digest:string;
   startup_scene:[ubyte] (required);
-  startup_pipelines:[[ubyte]];
+  startup_feature_graphs:[[ubyte]];
   target:string;
   configuration:string;
   package_name:string;
+  module_manifest_name:string;
+  module_manifest_sha256:string;
+  world_command_routes:[WorldCommandRoute];
 }
 
 root_type GameBuildManifest;

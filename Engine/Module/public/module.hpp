@@ -10,28 +10,15 @@
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
-#include "pipeline.hpp"
+#include "feature_registry.hpp"
+#include "module_descriptor.hpp"
 #include "reflection.hpp"
-#include "render_pass.hpp"
 #include "result.hpp"
 
 namespace aeg::module {
-
-/** @brief Minimum version required from one dependent module. */
-struct ModuleDependency final {
-    pipeline::ModuleId module{};
-    pipeline::Version minimum_version{1, 0, 0};
-};
-
-/** @brief Immutable identity and dependency metadata for one engine module. */
-struct ModuleDescriptor final {
-    pipeline::ModuleId id{};
-    std::string name{};
-    pipeline::Version version{1, 0, 0};
-    std::vector<ModuleDependency> dependencies{};
-};
 
 class Module;
 class ModuleRegistry;
@@ -39,45 +26,30 @@ class ModuleRegistry;
 /** @brief Restricted registration surface exposed to one module during startup. */
 class ModuleRegistrationContext final {
 public:
-    [[nodiscard]] pipeline::ModuleId module_id() const noexcept { return module_id_; }
-    [[nodiscard]] pipeline::PipelineRegistry& pipeline_registry() const noexcept { return pipeline_registry_; }
-    [[nodiscard]] pipeline::RenderPassRegistry* render_pass_registry() const noexcept { return render_pass_registry_; }
+    [[nodiscard]] ModuleId module_id() const noexcept { return module_id_; }
     [[nodiscard]] reflection::TypeRegistry* reflection_registry() const noexcept { return reflection_registry_; }
 
-    /** @brief Registers a custom global Phase owned by the current module. */
-    [[nodiscard]] foundation::Result register_phase(const pipeline::PhaseDescriptor& descriptor);
-    /** @brief Registers a Pipeline definition owned by the current module. */
-    [[nodiscard]] foundation::Result register_pipeline(pipeline::PipelineFactory factory);
-    /** @brief Registers a Feature definition owned by the current module. */
-    [[nodiscard]] foundation::Result register_feature(pipeline::FeatureFactory factory);
-    /** @brief Registers a RenderPass type owned by the current module. */
-    [[nodiscard]] foundation::Result register_render_pass(pipeline::RenderPassFactory factory);
-    /** @brief Binds a Feature to a Pipeline extension point under module ownership. */
-    [[nodiscard]] foundation::Result bind_feature(const pipeline::FeatureBindingDescriptor& binding);
+    /** @brief Registers a five-domain Feature contract and its module-owned implementation. */
+    [[nodiscard]] foundation::Result register_feature(feature::FeatureDefinition definition);
     /** @brief Registers reflected type metadata and records it for module unload. */
     [[nodiscard]] foundation::Result register_type(reflection::TypeDescriptor descriptor);
 
 private:
-    ModuleRegistrationContext(pipeline::PipelineRegistry& pipeline_registry,
-                              reflection::TypeRegistry* reflection_registry,
-                              pipeline::RenderPassRegistry* render_pass_registry, pipeline::ModuleId module_id) noexcept
-        : pipeline_registry_(pipeline_registry),
+    ModuleRegistrationContext(feature::FeatureRegistry& feature_registry,
+                              reflection::TypeRegistry* reflection_registry, ModuleId module_id) noexcept
+        : feature_registry_(feature_registry),
           reflection_registry_(reflection_registry),
-          render_pass_registry_(render_pass_registry),
           module_id_(module_id) {}
 
     [[nodiscard]] foundation::Result rollback() noexcept;
 
-    pipeline::PipelineRegistry& pipeline_registry_;
+    feature::FeatureRegistry& feature_registry_;
     reflection::TypeRegistry* reflection_registry_{nullptr};
-    pipeline::RenderPassRegistry* render_pass_registry_{nullptr};
-    pipeline::ModuleId module_id_{};
-    std::vector<pipeline::PhaseId> phases_{};
-    std::vector<pipeline::PipelineId> pipelines_{};
-    std::vector<pipeline::FeatureId> features_{};
-    std::vector<pipeline::RenderPassTypeId> render_passes_{};
-    std::vector<pipeline::FeatureInstanceId> feature_bindings_{};
+    ModuleId module_id_{};
+    std::vector<feature::FeatureDefinitionId> feature_definitions_{};
     std::vector<reflection::TypeId> types_{};
+    // Only bindings first approved during this registration transaction.
+    std::vector<std::pair<feature::ClockId, feature::Version>> new_clock_bindings_{};
 
     friend class ModuleRegistry;
 };
@@ -97,12 +69,10 @@ using ModuleFactory = std::function<std::unique_ptr<Module>()>;
 /** @brief Registry that owns module implementations and their registered definitions. */
 class ModuleRegistry final {
 public:
-    explicit ModuleRegistry(pipeline::PipelineRegistry& pipeline_registry,
-                            reflection::TypeRegistry* reflection_registry = nullptr,
-                            pipeline::RenderPassRegistry* render_pass_registry = nullptr) noexcept
-        : pipeline_registry_(pipeline_registry),
-          reflection_registry_(reflection_registry),
-          render_pass_registry_(render_pass_registry) {}
+    explicit ModuleRegistry(feature::FeatureRegistry& feature_registry,
+                            reflection::TypeRegistry* reflection_registry = nullptr) noexcept
+        : feature_registry_(feature_registry),
+          reflection_registry_(reflection_registry) {}
     ~ModuleRegistry() = default;
 
     ModuleRegistry(const ModuleRegistry&) = delete;
@@ -113,11 +83,11 @@ public:
     /** @brief Constructs, validates, registers, and retains one module. */
     [[nodiscard]] foundation::Result register_module(ModuleFactory factory);
     /** @brief Safely unregisters one module and all definitions owned by it. */
-    [[nodiscard]] foundation::Result unregister_module(pipeline::ModuleId id);
+    [[nodiscard]] foundation::Result unregister_module(ModuleId id);
     /** @brief Tests whether a module is currently registered. */
-    [[nodiscard]] bool contains(pipeline::ModuleId id) const noexcept;
+    [[nodiscard]] bool contains(ModuleId id) const noexcept;
     /** @brief Returns immutable metadata for one registered module. */
-    [[nodiscard]] foundation::ResultValue<ModuleDescriptor> find_module(pipeline::ModuleId id) const;
+    [[nodiscard]] foundation::ResultValue<ModuleDescriptor> find_module(ModuleId id) const;
     /** @brief Returns a stable snapshot of registered module metadata for tooling and diagnostics. */
     [[nodiscard]] std::vector<ModuleDescriptor> list_modules() const;
 
@@ -125,22 +95,16 @@ private:
     struct Registration final {
         std::shared_ptr<Module> implementation{};
         ModuleDescriptor descriptor{};
-        std::vector<pipeline::PhaseId> phases{};
-        std::vector<pipeline::PipelineId> pipelines{};
-        std::vector<pipeline::FeatureId> features{};
-        std::vector<pipeline::RenderPassTypeId> render_passes{};
-        std::vector<pipeline::FeatureInstanceId> feature_bindings{};
+        std::vector<feature::FeatureDefinitionId> feature_definitions{};
         std::vector<reflection::TypeId> types{};
     };
 
     [[nodiscard]] foundation::Result validate_descriptor(const ModuleDescriptor& descriptor) const;
     [[nodiscard]] foundation::Result unregister_owned(const Registration& registration) noexcept;
 
-    pipeline::PipelineRegistry& pipeline_registry_;
+    feature::FeatureRegistry& feature_registry_;
     reflection::TypeRegistry* reflection_registry_{nullptr};
-    pipeline::RenderPassRegistry* render_pass_registry_{nullptr};
     mutable std::shared_mutex mutex_;
-    std::unordered_map<pipeline::ModuleId, Registration, pipeline::StableIdHash<pipeline::ModuleIdTag>>
-        registrations_{};
+    std::unordered_map<ModuleId, Registration, ModuleIdHash> registrations_{};
 };
 }  // namespace aeg::module

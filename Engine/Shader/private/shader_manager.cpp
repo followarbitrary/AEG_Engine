@@ -22,6 +22,7 @@
 
 #include "../public/shader_asset.hpp"
 #include "../public/shader_contract.hpp"
+#include "shader_pipeline_layout_access.hpp"
 
 namespace aeg::shader {
 namespace {
@@ -570,8 +571,56 @@ void append_hash_string(std::uint64_t& hash, std::string_view value) noexcept {
 }
 }  // namespace
 
+namespace detail {
+
+void ShaderPipelineLayoutAccess::initialize(ShaderPipelineLayout& layout, const ShaderManager* owner,
+                                            std::uint64_t cache_epoch, std::uint64_t contract_hash,
+                                            std::weak_ptr<const std::uint8_t> lifetime) noexcept {
+    layout.owner_ = owner;
+    layout.owner_lifetime_ = std::move(lifetime);
+    layout.cache_epoch_ = cache_epoch;
+    layout.contract_hash_ = contract_hash;
+}
+
+bool ShaderPipelineLayoutAccess::belongs_to(const ShaderPipelineLayout& layout,
+                                            const ShaderManager* owner) noexcept {
+    return layout.owner_ == owner && owner != nullptr && !layout.owner_lifetime_.expired();
+}
+
+bool ShaderPipelineLayoutAccess::is_valid(const ShaderPipelineLayout& layout) noexcept {
+    const auto lifetime = layout.owner_lifetime_.lock();
+    const auto* owner = static_cast<const ShaderManager*>(layout.owner_);
+    return lifetime != nullptr && owner != nullptr && layout.cache_epoch_ != 0 &&
+           owner->cache_epoch() == layout.cache_epoch_;
+}
+
+std::uint64_t ShaderPipelineLayoutAccess::cache_epoch(const ShaderPipelineLayout& layout) noexcept {
+    return layout.cache_epoch_;
+}
+
+std::uint64_t ShaderPipelineLayoutAccess::contract_hash(const ShaderPipelineLayout& layout) noexcept {
+    return layout.contract_hash_;
+}
+
+std::vector<rhi::BindingLayoutHandle>& ShaderPipelineLayoutAccess::binding_layouts(
+    ShaderPipelineLayout& layout) noexcept {
+    return layout.binding_layouts_;
+}
+
+const std::vector<rhi::BindingLayoutHandle>& ShaderPipelineLayoutAccess::binding_layouts(
+    const ShaderPipelineLayout& layout) noexcept {
+    return layout.binding_layouts_;
+}
+
+std::vector<rhi::InlineConstantRange>& ShaderPipelineLayoutAccess::inline_constant_ranges(
+    ShaderPipelineLayout& layout) noexcept {
+    return layout.inline_constant_ranges_;
+}
+
+}  // namespace detail
+
 bool ShaderPipelineLayout::is_valid() const noexcept {
-    return owner_ != nullptr;
+    return detail::ShaderPipelineLayoutAccess::is_valid(*this);
 }
 
 std::span<const rhi::BindingLayoutHandle> ShaderPipelineLayout::binding_layouts() const noexcept {
@@ -676,7 +725,7 @@ ResultValue<ShaderProgram> load_shader_program(std::span<const std::byte> bytes)
 }
 
 namespace {
-[[nodiscard]] bool parameter_value_bytes(ShaderParameterType type, const pipeline::ParameterValue& value,
+[[nodiscard]] bool parameter_value_bytes(ShaderParameterType type, const foundation::ParameterValue& value,
                                          std::span<std::byte> output) noexcept {
     auto write_scalar = [&output](const auto& scalar) {
         if (output.size() != sizeof(scalar))
@@ -739,7 +788,7 @@ namespace {
 }
 }  // namespace
 
-Result validate_parameter_block(const ShaderProgram& program, const pipeline::ParameterBlock& values) {
+Result validate_parameter_block(const ShaderProgram& program, const foundation::ParameterBlock& values) {
     if (const Result result = validate_reflection(program); !result)
         return result;
     for (const auto& [id, value] : values) {
@@ -756,7 +805,7 @@ Result validate_parameter_block(const ShaderProgram& program, const pipeline::Pa
 }
 
 ResultValue<std::vector<std::byte>> pack_parameter_block(const ShaderProgram& program,
-                                                         const pipeline::ParameterBlock& values) {
+                                                         const foundation::ParameterBlock& values) {
     if (const Result result = validate_parameter_block(program, values); !result)
         return {result, {}};
     std::size_t buffer_size = 0;
@@ -767,7 +816,8 @@ ResultValue<std::vector<std::byte>> pack_parameter_block(const ShaderProgram& pr
     std::vector<std::byte> packed(buffer_size);
     for (const ShaderParameterField& field : program.contract.reflection.parameters) {
         const auto found = values.find(field.id);
-        const pipeline::ParameterValue& value = found == values.end() ? pipeline::ParameterValue{} : found->second;
+        const foundation::ParameterValue& value =
+            found == values.end() ? foundation::ParameterValue{} : found->second;
         if (found == values.end()) {
             if (field.default_value.size() != field.size)
                 return {Result::failure(ResultCode::kInvalidArgument, "Shader parameter default value is invalid"), {}};
@@ -780,7 +830,8 @@ ResultValue<std::vector<std::byte>> pack_parameter_block(const ShaderProgram& pr
     return {Result::success(), std::move(packed)};
 }
 
-ShaderManager::ShaderManager(rhi::Device& device) : device_(device) {}
+ShaderManager::ShaderManager(rhi::Device& device)
+    : device_(device), lifetime_token_(std::make_shared<const std::uint8_t>(0)) {}
 
 ShaderManager::~ShaderManager() {
     (void)clear_layout_cache();
@@ -861,11 +912,15 @@ std::uint64_t ShaderManager::hash_contract(const ShaderProgram& program) const {
 }
 
 Result ShaderManager::validate_layout_owner(const ShaderPipelineLayout& layout) const {
-    if (layout.owner_ != this || !layout.is_valid()) {
+    if (!detail::ShaderPipelineLayoutAccess::belongs_to(layout, this)) {
         return Result::failure(ResultCode::kInvalidState,
                                "Shader pipeline layout belongs to a different shader manager");
     }
-    for (const rhi::BindingLayoutHandle handle : layout.binding_layouts_) {
+    if (detail::ShaderPipelineLayoutAccess::cache_epoch(layout) != cache_epoch_ || !layout.is_valid()) {
+        return Result::failure(ResultCode::kInvalidState,
+                               "Shader pipeline layout belongs to a retired shader cache epoch");
+    }
+    for (const rhi::BindingLayoutHandle handle : detail::ShaderPipelineLayoutAccess::binding_layouts(layout)) {
         if (!handle.is_valid()) {
             return Result::failure(ResultCode::kInvalidState,
                                    "Shader pipeline layout contains an invalid binding layout");
@@ -903,8 +958,8 @@ ResultValue<ShaderPipelineLayout> ShaderManager::build_pipeline_layout(const Sha
     }
 
     ShaderPipelineLayout layout{};
-    layout.owner_ = this;
-    layout.contract_hash_ = hash_contract(program);
+    const std::uint64_t contract_hash = hash_contract(program);
+    detail::ShaderPipelineLayoutAccess::initialize(layout, this, cache_epoch_, contract_hash, lifetime_token_);
     std::vector<std::string> newly_created_keys;
     newly_created_keys.reserve(resources_by_group.size());
 
@@ -928,7 +983,7 @@ ResultValue<ShaderPipelineLayout> ShaderManager::build_pipeline_layout(const Sha
         std::string key = make_layout_key(group, entries);
         const auto cached = layout_cache_.find(key);
         if (cached != layout_cache_.end()) {
-            layout.binding_layouts_.push_back(cached->second);
+            detail::ShaderPipelineLayoutAccess::binding_layouts(layout).push_back(cached->second);
             continue;
         }
 
@@ -948,19 +1003,29 @@ ResultValue<ShaderPipelineLayout> ShaderManager::build_pipeline_layout(const Sha
         const auto [created, inserted] = layout_cache_.emplace(std::move(key), binding_result.value);
         if (!inserted) {
             (void)device_.destroy_binding_layout(binding_result.value);
-            layout.binding_layouts_.push_back(created->second);
+            detail::ShaderPipelineLayoutAccess::binding_layouts(layout).push_back(created->second);
             continue;
         }
         newly_created_keys.push_back(created->first);
-        layout.binding_layouts_.push_back(created->second);
+        detail::ShaderPipelineLayoutAccess::binding_layouts(layout).push_back(created->second);
     }
 
-    layout.inline_constant_ranges_.reserve(program.contract.reflection.constant_ranges.size());
+    detail::ShaderPipelineLayoutAccess::inline_constant_ranges(layout).reserve(
+        program.contract.reflection.constant_ranges.size());
     for (const ShaderConstantRange& range : program.contract.reflection.constant_ranges) {
-        layout.inline_constant_ranges_.push_back(
+        detail::ShaderPipelineLayoutAccess::inline_constant_ranges(layout).push_back(
             rhi::InlineConstantRange{range.shader_stages, range.offset, range.size});
     }
     return {Result::success(), std::move(layout)};
+}
+
+ResultValue<ShaderPipelineLayoutIdentity> ShaderManager::pipeline_layout_identity(
+    const ShaderPipelineLayout& layout) const {
+    const Result owner_result = validate_layout_owner(layout);
+    if (!owner_result) {
+        return {owner_result, {}};
+    }
+    return {Result::success(), {detail::ShaderPipelineLayoutAccess::contract_hash(layout), cache_epoch_}};
 }
 
 ResultValue<rhi::BindingLayoutHandle> ShaderManager::binding_layout(const ShaderPipelineLayout& layout,
@@ -969,10 +1034,11 @@ ResultValue<rhi::BindingLayoutHandle> ShaderManager::binding_layout(const Shader
     if (!owner_result) {
         return {owner_result, {}};
     }
-    if (group >= layout.binding_layouts_.size()) {
+    const auto& binding_layouts = detail::ShaderPipelineLayoutAccess::binding_layouts(layout);
+    if (group >= binding_layouts.size()) {
         return {Result::failure(ResultCode::kNotFound, "Shader pipeline layout group is not present"), {}};
     }
-    return {Result::success(), layout.binding_layouts_[group]};
+    return {Result::success(), binding_layouts[group]};
 }
 
 Result ShaderManager::validate_vertex_inputs(const ShaderProgram& program,
@@ -1004,7 +1070,7 @@ ResultValue<rhi::PipelineHandle> ShaderManager::create_pipeline(const ShaderProg
     if (!owner_result) {
         return {owner_result, {}};
     }
-    if (layout.contract_hash_ != hash_contract(program)) {
+    if (detail::ShaderPipelineLayoutAccess::contract_hash(layout) != hash_contract(program)) {
         return {Result::failure(ResultCode::kInvalidArgument,
                                 "Shader pipeline layout was built from a different shader contract"),
                 {}};
@@ -1033,17 +1099,34 @@ ResultValue<rhi::PipelineHandle> ShaderManager::create_pipeline(const ShaderProg
 }
 
 Result ShaderManager::clear_layout_cache() {
+    if (cache_epoch_ == std::numeric_limits<std::uint64_t>::max()) {
+        return Result::failure(ResultCode::kInvalidState, "Shader cache epoch is exhausted");
+    }
+    ++cache_epoch_;
     Result first_error = Result::success();
-    for (auto iterator = layout_cache_.begin(); iterator != layout_cache_.end();) {
-        const Result result = device_.destroy_binding_layout(iterator->second);
+    std::vector<rhi::BindingLayoutHandle> handles;
+    handles.reserve(pending_layout_retirement_.size() + layout_cache_.size());
+    handles.insert(handles.end(), pending_layout_retirement_.begin(), pending_layout_retirement_.end());
+    for (const auto& [key, handle] : layout_cache_) {
+        (void)key;
+        handles.push_back(handle);
+    }
+    pending_layout_retirement_.clear();
+    layout_cache_.clear();
+
+    for (const rhi::BindingLayoutHandle handle : handles) {
+        const Result result = device_.destroy_binding_layout(handle);
         if (result || result.code == ResultCode::kNotFound) {
-            iterator = layout_cache_.erase(iterator);
             continue;
         }
         if (first_error) {
             first_error = result;
         }
-        ++iterator;
+        const auto already_pending = std::find(pending_layout_retirement_.begin(),
+                                               pending_layout_retirement_.end(), handle);
+        if (already_pending == pending_layout_retirement_.end()) {
+            pending_layout_retirement_.push_back(handle);
+        }
     }
     return first_error;
 }

@@ -8,10 +8,11 @@
 #include "cooked_asset.hpp"
 #include "runtime_asset_cache.hpp"
 #include "runtime_asset_resolver.hpp"
+#include "runtime_asset_upload_host.hpp"
 namespace {
 using namespace aeg;
-asset::AssetId id(const char* v) {
-    return asset::AssetId::parse(v).value;
+foundation::AssetId id(const char* v) {
+    return foundation::AssetId::parse(v).value;
 }
 void u32(std::vector<std::byte>& d, size_t o, uint32_t v) {
     std::memcpy(d.data() + o, &v, 4);
@@ -32,7 +33,7 @@ std::vector<std::byte> tex() {
     u32(d, 8, 4);
     return d;
 }
-std::vector<std::byte> mat(asset::AssetId t, asset::AssetId shader) {
+std::vector<std::byte> mat(foundation::AssetId t, foundation::AssetId shader) {
     std::vector<std::byte> d(4 + 4 + 16 + 4 + 8 + 16 + 4);
     u32(d, 0, 0x314d4741u);
     u32(d, 4, 1);
@@ -52,17 +53,17 @@ int main() {
          mm = id("60112233-4455-6677-8899-aabbccddeeff"), bm = id("70112233-4455-6677-8899-aabbccddeeff"),
          shader = id("90112233-4455-6677-8899-aabbccddeeff");
     std::vector<tooling::AssetPackageEntry> es;
-    auto add = [&](asset::AssetId x, asset::AssetKind k, std::vector<std::byte> p) {
+    auto add = [&](foundation::AssetId x, foundation::AssetKind k, std::vector<std::byte> p) {
         auto c = asset::encode_cooked_asset({x, k, 1, {}, std::move(p)});
         if (!c)
             return false;
         es.push_back({x, k, 1, c.value});
         return true;
     };
-    if (!add(a, asset::AssetKind::kMesh, mesh()) || !add(b, asset::AssetKind::kMesh, mesh()) ||
-        !add(t, asset::AssetKind::kTexture, tex()) || !add(bt, asset::AssetKind::kTexture, {std::byte{1}}) ||
-        !add(m, asset::AssetKind::kMaterial, mat(t, shader)) ||
-        !add(mm, asset::AssetKind::kMaterial, mat(mt, shader)) || !add(bm, asset::AssetKind::kMesh, {std::byte{1}}))
+    if (!add(a, foundation::AssetKind::kMesh, mesh()) || !add(b, foundation::AssetKind::kMesh, mesh()) ||
+        !add(t, foundation::AssetKind::kTexture, tex()) || !add(bt, foundation::AssetKind::kTexture, {std::byte{1}}) ||
+        !add(m, foundation::AssetKind::kMaterial, mat(t, shader)) ||
+        !add(mm, foundation::AssetKind::kMaterial, mat(mt, shader)) || !add(bm, foundation::AssetKind::kMesh, {std::byte{1}}))
         return 1;
     auto p = std::filesystem::temp_directory_path() / "aeg_runtime_asset_resolution.aegbin";
     if (!tooling::AssetPackageWriter{}.write(p, es))
@@ -83,7 +84,7 @@ int main() {
     auto i = c.load_mesh(bm), r = c.load_mesh(bm);
     if (i || r || i.result.code != foundation::ResultCode::kInvalidArgument || i.result.message != r.result.message)
         return 7;
-    if (!c.retry(bm, asset::AssetKind::kMesh) || c.load_mesh(bm))
+    if (!c.retry(bm, foundation::AssetKind::kMesh) || c.load_mesh(bm))
         return 8;
     auto q = c.load_texture(bt);
     if (q || q.result.code != foundation::ResultCode::kInvalidArgument)

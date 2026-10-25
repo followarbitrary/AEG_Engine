@@ -5,7 +5,6 @@
 #include "project_context.hpp"
 
 #include <fstream>
-#include <limits>
 #include <system_error>
 #include <toml.hpp>
 #include <utility>
@@ -20,6 +19,93 @@
 namespace aeg::application::project {
 namespace {
 constexpr uint32_t kCurrentFormatVersion = 2;
+
+[[nodiscard]] std::string path_text(const std::filesystem::path& path) {
+    const auto text = path.generic_u8string();
+    return {text.begin(), text.end()};
+}
+
+[[nodiscard]] std::filesystem::path source_path(const std::string& text) {
+    return std::filesystem::path{std::u8string{text.begin(), text.end()}};
+}
+
+[[nodiscard]] toml::value parse_project_document(const std::filesystem::path& file) {
+    std::ifstream input(file, std::ios::binary);
+    if (!input.good()) throw toml::file_io_error("toml::parse: error opening file", path_text(file));
+    input.exceptions(std::ifstream::failbit | std::ifstream::badbit);
+    return toml::parse(input, path_text(file));
+}
+
+[[nodiscard]] foundation::Result reject_retired_project_file(const std::filesystem::path& file) {
+    auto extension = path_text(file.extension());
+    for (auto& character : extension)
+        if (character >= 'A' && character <= 'Z') character = static_cast<char>(character - 'A' + 'a');
+    if (extension == ".aegproject")
+        return foundation::unsupported("Unsupported retired project extension: .aegproject");
+    std::ifstream input(file, std::ios::binary);
+    std::string header;
+    if (input && std::getline(input, header) && header.starts_with("AEG_PROJECT\t"))
+        return foundation::unsupported("Unsupported retired project header: AEG_PROJECT");
+    return foundation::Result::success();
+}
+
+[[nodiscard]] foundation::Result validate_source_format(const toml::value& document) {
+    if (!document.is_table() || !document.contains("format_version"))
+        return foundation::unsupported("Unsupported project format_version: missing version");
+    const auto& version = toml::find(document, "format_version");
+    if (!version.is_integer() || version.as_integer() != kCurrentFormatVersion)
+        return foundation::unsupported("Unsupported project format_version: only version 2 is supported");
+    return foundation::Result::success();
+}
+
+[[nodiscard]] foundation::Result reject_removed_feature_graph_extension(const std::filesystem::path& path) {
+    auto extension = path_text(path.extension());
+    for (auto& character : extension) {
+        if (character >= 'A' && character <= 'Z') character = static_cast<char>(character - 'A' + 'a');
+    }
+    if (extension == ".aegpipe" || extension == ".aegframe")
+        return foundation::unsupported("Removed startup asset extension in build.startup_feature_graphs: " +
+                                       path_text(path));
+    return foundation::Result::success();
+}
+
+[[nodiscard]] foundation::Result reject_removed_startup_fields(const toml::value& document) {
+    if (!document.is_table() || !document.contains("build")) return foundation::Result::success();
+    const auto& build = toml::find(document, "build");
+    if (!build.is_table()) return foundation::Result::success();
+    for (const auto* key : {"startup_frame_projections", "startup_pipelines"}) {
+        if (build.contains(key))
+            return foundation::unsupported(std::string{"Removed project startup field: build."} + key);
+    }
+    if (build.contains("startup_feature_graphs")) {
+        for (const auto& path : toml::find<std::vector<std::string>>(build, "startup_feature_graphs")) {
+            if (const auto result = reject_removed_feature_graph_extension(source_path(path)); !result) return result;
+        }
+    }
+    return foundation::Result::success();
+}
+
+[[nodiscard]] foundation::Result validate_existing_target(const std::filesystem::path& file) {
+    std::error_code error;
+    const bool exists = std::filesystem::exists(file, error);
+    if (error)
+        return foundation::Result::failure(foundation::ResultCode::kBackendError,
+                                           "Could not inspect existing project target: " + error.message());
+    if (!exists) return foundation::Result::success();
+    if (!std::filesystem::is_regular_file(file, error)) {
+        if (error)
+            return foundation::Result::failure(foundation::ResultCode::kBackendError,
+                                               "Could not inspect existing project target: " + error.message());
+        return foundation::invalid_argument("Existing project target is not a regular file");
+    }
+    try {
+        const auto document = parse_project_document(file);
+        if (const auto result = validate_source_format(document); !result) return result;
+        return reject_removed_startup_fields(document);
+    } catch (const std::exception& exception) {
+        return foundation::invalid_argument(std::string{"Existing project target is invalid: "} + exception.what());
+    }
+}
 
 [[nodiscard]] bool is_safe_relative_path(const std::filesystem::path& path) noexcept {
     if (path.empty() || path.is_absolute() || path.has_root_directory() || path.has_root_name()) {
@@ -49,14 +135,17 @@ constexpr uint32_t kCurrentFormatVersion = 2;
 }
 
 [[nodiscard]] foundation::Result validate_config(const ProjectConfig& config) {
-    if ((config.format_version != 1 && config.format_version != kCurrentFormatVersion) || config.name.empty() ||
+    if (config.format_version != kCurrentFormatVersion)
+        return foundation::unsupported("Unsupported project format_version: only version 2 is supported");
+    if (config.name.empty() ||
         config.target.empty() || !is_safe_relative_path(config.startup_scene)) {
         return foundation::invalid_argument("Project configuration is invalid");
     }
-    for (const auto& pipeline : config.startup_pipelines) {
+    for (const auto& pipeline : config.startup_feature_graphs) {
         if (!is_safe_relative_path(pipeline)) {
             return invalid_project_path();
         }
+        if (const auto result = reject_removed_feature_graph_extension(pipeline); !result) return result;
     }
     return validate_paths(config.paths);
 }
@@ -76,7 +165,8 @@ constexpr uint32_t kCurrentFormatVersion = 2;
 }
 
 [[nodiscard]] foundation::Result write_text(const std::filesystem::path& file, std::string_view text) {
-    const std::filesystem::path temporary = file.string() + ".tmp";
+    auto temporary = file;
+    temporary += ".tmp";
     std::ofstream stream(temporary, std::ios::binary | std::ios::trunc);
     if (!stream) {
         return foundation::Result::failure(foundation::ResultCode::kUnknown, "Cannot open project file for writing");
@@ -158,21 +248,15 @@ foundation::ResultValue<std::filesystem::path> ProjectPaths::resolve_under(
 
 foundation::ResultValue<ProjectFile> ProjectFileCodec::load(const std::filesystem::path& file) const {
     try {
-        auto retained = std::make_shared<toml::value>(toml::parse(file));
+        if (const auto result = reject_retired_project_file(file); !result) return {result, {}};
+        auto retained = std::make_shared<toml::value>(parse_project_document(file));
         const toml::value& document = *retained;
+        if (const auto result = validate_source_format(document); !result) return {result, {}};
         ProjectConfig config{};
-        int64_t format_version = 1;
-        if (document.contains("format_version")) {
-            format_version = toml::find<int64_t>(document, "format_version");
-        }
-        if (format_version < 1 || format_version > std::numeric_limits<uint32_t>::max() ||
-            (format_version != 1 && format_version != kCurrentFormatVersion)) {
-            return {foundation::unsupported("Unsupported project format version"), {}};
-        }
-        config.format_version = static_cast<uint32_t>(format_version);
+        if (const auto result = reject_removed_startup_fields(document); !result) return {result, {}};
 
         config.name = toml::find<std::string>(document, "project", "name");
-        if (format_version >= 2) {
+        {
             if (toml::find(document, "project").contains("uuid")) {
                 config.project_uuid = toml::find<std::string>(document, "project", "uuid");
             }
@@ -189,85 +273,37 @@ foundation::ResultValue<ProjectFile> ProjectFileCodec::load(const std::filesyste
             }
         }
         config.target = toml::find<std::string>(document, "build", "target");
-        config.startup_scene = toml::find<std::string>(document, "build", "startup_scene");
-        if (format_version >= 2 && toml::find(document, "build").contains("startup_pipelines")) {
-            for (const auto& path : toml::find<std::vector<std::string>>(document, "build", "startup_pipelines")) {
-                config.startup_pipelines.emplace_back(path);
+        config.startup_scene = source_path(toml::find<std::string>(document, "build", "startup_scene"));
+        if (toml::find(document, "build").contains("startup_feature_graphs")) {
+            for (const auto& path : toml::find<std::vector<std::string>>(document, "build", "startup_feature_graphs")) {
+                config.startup_feature_graphs.push_back(source_path(path));
             }
         }
-        config.paths.assets = toml::find<std::string>(document, "paths", "assets");
-        if (format_version >= 2) {
-            config.paths.source = toml::find<std::string>(document, "paths", "source");
-            config.paths.build = toml::find<std::string>(document, "paths", "build");
-        }
-        config.paths.cache = toml::find<std::string>(document, "paths", "cache");
-        config.paths.saved = toml::find<std::string>(document, "paths", "saved");
-        config.paths.binaries = toml::find<std::string>(document, "paths", "binaries");
+        config.paths.assets = source_path(toml::find<std::string>(document, "paths", "assets"));
+        config.paths.source = source_path(toml::find<std::string>(document, "paths", "source"));
+        config.paths.build = source_path(toml::find<std::string>(document, "paths", "build"));
+        config.paths.cache = source_path(toml::find<std::string>(document, "paths", "cache"));
+        config.paths.saved = source_path(toml::find<std::string>(document, "paths", "saved"));
+        config.paths.binaries = source_path(toml::find<std::string>(document, "paths", "binaries"));
         if (const foundation::Result result = validate_config(config); !result) {
             return {result, {}};
         }
         return {foundation::Result::success(),
-                ProjectFile{std::move(config), std::move(retained), format_version == 1}};
+                ProjectFile{std::move(config), std::move(retained)}};
     } catch (const std::exception& exception) {
         return {foundation::Result::failure(foundation::ResultCode::kInvalidArgument, exception.what()), {}};
     }
 }
 
 foundation::Result ProjectFileCodec::save(const std::filesystem::path& file, const ProjectConfig& config) const {
-    if (file.empty() || file.filename().empty()) {
-        return foundation::invalid_argument("Project file path is invalid");
-    }
-    if (const foundation::Result result = validate_config(config); !result) {
-        return result;
-    }
-
-    try {
-        toml::value document(toml::table{});
-        document["format_version"] = static_cast<int64_t>(config.format_version);
-        document["project"] = toml::table{};
-        document["project"]["name"] = config.name;
-        if (config.format_version >= 2 && !config.project_uuid.empty()) {
-            document["project"]["uuid"] = config.project_uuid;
-        }
-        if (config.format_version >= 2) {
-            document["engine"] = toml::table{};
-            document["engine"]["association"] = config.engine.association;
-            document["engine"]["sdk_requirement"] = config.engine.sdk_requirement;
-            document["engine"]["template"] = config.engine.template_id;
-            document["module"] = toml::table{};
-            document["module"]["id"] = config.module.id;
-            document["module"]["target"] = config.module.target;
-        }
-        document["paths"] = toml::table{};
-        document["paths"]["assets"] = config.paths.assets.generic_string();
-        if (config.format_version >= 2) {
-            document["paths"]["source"] = config.paths.source.generic_string();
-            document["paths"]["build"] = config.paths.build.generic_string();
-        }
-        document["paths"]["cache"] = config.paths.cache.generic_string();
-        document["paths"]["saved"] = config.paths.saved.generic_string();
-        document["paths"]["binaries"] = config.paths.binaries.generic_string();
-        document["build"] = toml::table{};
-        document["build"]["target"] = config.target;
-        document["build"]["startup_scene"] = config.startup_scene.generic_string();
-        if (config.format_version >= 2 && !config.startup_pipelines.empty()) {
-            std::vector<std::string> pipelines;
-            pipelines.reserve(config.startup_pipelines.size());
-            for (const auto& pipeline : config.startup_pipelines) {
-                pipelines.push_back(pipeline.generic_string());
-            }
-            document["build"]["startup_pipelines"] = std::move(pipelines);
-        }
-        return write_text(file, toml::format(document));
-    } catch (const std::exception& exception) {
-        return foundation::Result::failure(foundation::ResultCode::kUnknown, exception.what());
-    }
+    return save(file, ProjectFile{config, {}});
 }
 
 foundation::Result ProjectFileCodec::save(const std::filesystem::path& file, const ProjectFile& project) const {
     if (file.empty() || file.filename().empty()) {
         return foundation::invalid_argument("Project file path is invalid");
     }
+    if (const auto result = reject_retired_project_file(file); !result) return result;
     if (const foundation::Result result = validate_config(project.config); !result) {
         return result;
     }
@@ -276,34 +312,32 @@ foundation::Result ProjectFileCodec::save(const std::filesystem::path& file, con
         if (project.retained_source != nullptr) {
             const auto retained = std::static_pointer_cast<const toml::value>(project.retained_source);
             document = *retained;
+            if (const auto result = validate_source_format(document); !result) return result;
         }
+        if (const auto result = reject_removed_startup_fields(document); !result) return result;
         document["format_version"] = static_cast<int64_t>(project.config.format_version);
         document["project"]["name"] = project.config.name;
-        if (project.config.format_version >= 2) {
-            if (!project.config.project_uuid.empty())
-                document["project"]["uuid"] = project.config.project_uuid;
-            document["engine"]["association"] = project.config.engine.association;
-            document["engine"]["sdk_requirement"] = project.config.engine.sdk_requirement;
-            document["module"]["id"] = project.config.module.id;
-            document["module"]["target"] = project.config.module.target;
-        }
+        if (!project.config.project_uuid.empty())
+            document["project"]["uuid"] = project.config.project_uuid;
+        document["engine"]["association"] = project.config.engine.association;
+        document["engine"]["sdk_requirement"] = project.config.engine.sdk_requirement;
+        document["engine"]["template"] = project.config.engine.template_id;
+        document["module"]["id"] = project.config.module.id;
+        document["module"]["target"] = project.config.module.target;
         document["build"]["target"] = project.config.target;
-        document["build"]["startup_scene"] = project.config.startup_scene.generic_string();
-        if (project.config.format_version >= 2) {
-            std::vector<std::string> pipelines;
-            pipelines.reserve(project.config.startup_pipelines.size());
-            for (const auto& pipeline : project.config.startup_pipelines)
-                pipelines.push_back(pipeline.generic_string());
-            document["build"]["startup_pipelines"] = std::move(pipelines);
-        }
-        document["paths"]["assets"] = project.config.paths.assets.generic_string();
-        if (project.config.format_version >= 2) {
-            document["paths"]["source"] = project.config.paths.source.generic_string();
-            document["paths"]["build"] = project.config.paths.build.generic_string();
-        }
-        document["paths"]["cache"] = project.config.paths.cache.generic_string();
-        document["paths"]["saved"] = project.config.paths.saved.generic_string();
-        document["paths"]["binaries"] = project.config.paths.binaries.generic_string();
+        document["build"]["startup_scene"] = path_text(project.config.startup_scene);
+        std::vector<std::string> graphs;
+        graphs.reserve(project.config.startup_feature_graphs.size());
+        for (const auto& graph : project.config.startup_feature_graphs)
+            graphs.push_back(path_text(graph));
+        document["build"]["startup_feature_graphs"] = std::move(graphs);
+        document["paths"]["assets"] = path_text(project.config.paths.assets);
+        document["paths"]["source"] = path_text(project.config.paths.source);
+        document["paths"]["build"] = path_text(project.config.paths.build);
+        document["paths"]["cache"] = path_text(project.config.paths.cache);
+        document["paths"]["saved"] = path_text(project.config.paths.saved);
+        document["paths"]["binaries"] = path_text(project.config.paths.binaries);
+        if (const auto result = validate_existing_target(file); !result) return result;
         return write_text(file, toml::format(document));
     } catch (const std::exception& exception) {
         return foundation::Result::failure(foundation::ResultCode::kUnknown, exception.what());
@@ -318,25 +352,32 @@ foundation::ResultValue<std::filesystem::path> discover_project_file(const std::
     if (std::filesystem::is_regular_file(root_or_file, error)) {
         if (error)
             return {foundation::invalid_argument("Project file cannot be inspected"), {}};
+        const auto validated = ProjectFileCodec{}.load(root_or_file);
+        if (!validated) return {validated.result, {}};
         return {foundation::Result::success(), std::filesystem::weakly_canonical(root_or_file, error)};
     }
     const auto root = std::filesystem::is_directory(root_or_file, error) ? root_or_file : root_or_file.parent_path();
     if (error || root.empty()) {
         return {foundation::not_found("Project root cannot be resolved"), {}};
     }
+    if (root != root_or_file) {
+        if (const auto result = reject_retired_project_file(root_or_file); !result) return {result, {}};
+    }
     const auto canonical = root / "Project.aegproj";
     if (std::filesystem::exists(canonical, error)) {
         if (error)
             return {foundation::invalid_argument("Canonical project file cannot be inspected"), {}};
+        const auto validated = ProjectFileCodec{}.load(canonical);
+        if (!validated) return {validated.result, {}};
         return {foundation::Result::success(), std::filesystem::weakly_canonical(canonical, error)};
     }
     const auto legacy = root / "project.aegproject";
     if (std::filesystem::exists(legacy, error)) {
         if (error)
             return {foundation::invalid_argument("Legacy project file cannot be inspected"), {}};
-        return {foundation::Result::success(), std::filesystem::weakly_canonical(legacy, error)};
+        return {foundation::unsupported("Unsupported retired project extension: .aegproject"), {}};
     }
-    return {foundation::not_found("No Project.aegproj or project.aegproject was found"), {}};
+    return {foundation::not_found("No Project.aegproj was found"), {}};
 }
 
 foundation::Result ProjectManager::load(const std::filesystem::path& file) {

@@ -1,0 +1,30 @@
+schema_version = 1
+graph_version = 1
+draft_revision = 1
+layout_revision = 1
+asset_uuid = "00000000-0000-4000-8000-000000000002"
+module_requirements = []
+edges = []
+input_bindings = []
+variadic_slots = []
+extensions = []
+# Bound to Source/GameModule.metadata.json and the shared template factory.
+# Keep this uint64 as decimal text so the full value survives TOML parsing.
+contract_digest = "17641658783943642687"
+
+# A usable authoring example is available before the game module is built.
+# Select this Logic node to inspect its contract and its Process state graph.
+[[nodes]]
+node_id = "6433259440092050486" # Game.Startup.Gameplay
+definition_id = "15211192793283664631" # Game.Logic.Gameplay
+version = [1, 0, 0]
+owner_path = []
+parameters = []
+
+[[process_subgraphs]]
+owner_node = "6433259440092050486"
+states = ["Ready", "Running", "Done"]
+transitions = ["Ready->Running", "Running->Done"]
+state_schema_version = 1
+initial_state = "Ready"
+terminal_states = ["Done"]

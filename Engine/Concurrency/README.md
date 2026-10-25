@@ -2,9 +2,11 @@
 
 ## 目录职责
 
-该目录承载引擎级并发基础设施，负责将逻辑执行域映射到可替换的执行器，并提供
-任务提交、完成传播、协作式取消和批次收敛能力。Pipeline、World、Resource 和
-Renderer 可以依赖这些原语，但不得在各自模块内重复实现线程池或完成状态。
+该目录承载引擎内部并发基础设施，负责将逻辑执行域映射到可替换的执行器，并提供
+任务提交、完成传播、协作式取消和批次收敛能力。Runtime、Editor、Tooling、ECS、Pipeline
+和 Frame/Render 内部实现可以依赖这些原语，但游戏作者编写的 Feature、Module 和 Runtime
+启动代码不属于该 API 的使用者，也不会从 `AEG::GameSDK` 或 `AEG::GameRuntime` 获得它的
+头文件或编译使用要求；最终程序仍链接引擎内部实现所需的库。
 
 ## 当前状态
 
@@ -19,11 +21,21 @@ Renderer 可以依赖这些原语，但不得在各自模块内重复实现线�
 - `ExecutorRegistry`：线程安全的逻辑执行域到执行器映射。
 - `TaskGroup`：批量等待、首个失败传播和失败后的协作式取消。
 - `TaskGraph`：基于显式前驱依赖的通用拓扑任务图；同一拓扑层可跨执行域并行提交。
+- `ThreadId` / `current_thread_id()`：可跨平台比较的进程内线程身份，用于 owner 亲和性检查；
+  不暴露 OS 线程句柄。
+- `yield_current_thread()` / `sleep_for()`：统一的让出和阻塞等待入口；`sleep_for()` 支持
+  `CancellationToken`，被取消时返回 `kCancelled`。它是线程阻塞工具，不是协程定时器。
 
 `PipelineScheduler` 已经通过 `ExecutorRegistry` 使用本目录的执行器，不再持有
 Pipeline 私有线程池，也不再以调度器级全局互斥锁串行化不同的 Pipeline 执行。
 默认的 `kRenderThread` 和 `kGpu` 执行器仍是 CPU 侧编排入口；真正的 GPU 指令和
 `GpuSyncPoint` 必须由 RHI/RenderGraph 的 Queue Submission 产生。
+
+`Engine/Feature/private/feature_execution.*` 复用 WorkerExecutor、CancellationSource 和
+Completion，按需创建五个独立执行器。Logic/Physics/Audio 使用 CPU lane，Render 使用
+RenderThread lane，Stream 使用 IO lane；通用 lane 相同不意味着共享 Domain 所有者。
+完成状态发布 worker 的快照结果，由 Runtime 所属线程回收，不增加第二套线程或锁实现。
+Feature 与 Runtime 的游戏公共入口不包含 Concurrency 类型或使用要求。
 
 ## 边界
 
@@ -41,6 +53,8 @@ Pipeline 私有线程池，也不再以调度器级全局互斥锁串行化不�
   `TaskContext::is_stop_requested()`。
 - `WorkerExecutor` 析构时向全部 `std::jthread` 请求停止，取消尚未开始的任务，并等待
   正在执行的任务完成协作式收敛。
+- `WorkerExecutor` 必须由任务回调之外的生命周期 owner 持有，并从非 worker 线程释放；
+  回调不得销毁或释放最后一个 executor owner，也不得从自身 worker 回调中等待其析构。
 - `TaskGroup` 的析构会请求取消并等待已提交任务收敛，调用方不得让任务回调反向等待
   正在析构的 `TaskGroup`。
 
@@ -70,3 +84,19 @@ Pipeline 私有线程池，也不再以调度器级全局互斥锁串行化不�
   等待既有执行退出，再等待已注册执行器空闲。
 - `TaskGraph` 的拓扑结构在 `execute()` 期间必须保持不变；图可以被重复执行，但每次
   执行都会创建独立的 indegree 和完成状态。
+
+### 第一方边界
+
+`tests/cmake/concurrency_boundary.cmake` 会扫描引擎拥有的 Engine、Editor、Runtime、Tooling、
+Platform、测试和 tools 源码，禁止第一方直接创建标准线程、使用标准异步/协程句柄或调用原生
+线程 API。游戏模板和 DemoProject 只接受“不得引用引擎内部 Concurrency 类型”的表面检查，
+不会被标准线程实现策略约束。
+`Engine/Concurrency` 自身是唯一的标准线程和协程实现边界；第三方日志后端、OS 子进程等待、
+GPU 同步和数据保护锁不属于任务执行器的替代范围。
+Win32 窗口 focus 所用的 native 线程 ID 继续由 Platform 管理，因为 `AttachThreadInput`
+要求 OS 线程身份；它不创建或调度线程。
+
+`allocate_unique_identity()` 复用 `current_thread_id()` 的同一内部原子签发器，供引擎 host 的
+Runtime 会话代次等瞬时身份使用。并发签发保持正数且从不复用；保留 `UINT64_MAX` 为
+耗尽哨兵，耗尽时终止而不回绕。该身份不持久化、不代表 OS 句柄，也不承担数据发布
+同步；任务完成仍使用既有 Completion。此 API 不属于 GameSDK 或游戏作者接口。

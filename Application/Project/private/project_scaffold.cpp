@@ -39,12 +39,22 @@ namespace {
     if (!std::filesystem::is_directory(source, error) || error) {
         return foundation::not_found("Game project template directory is missing");
     }
-    for (const auto& entry : std::filesystem::recursive_directory_iterator(source, error)) {
+    for (auto iterator = std::filesystem::recursive_directory_iterator(source, error);
+         iterator != std::filesystem::recursive_directory_iterator{}; ++iterator) {
         if (error) {
             return foundation::Result::failure(foundation::ResultCode::kUnknown,
                                                "Cannot enumerate game project template");
         }
+        const auto& entry = *iterator;
         const auto relative = entry.path().lexically_relative(source);
+        // The source template can itself have been built or opened in the
+        // editor. A new project must start with its own generated state, not
+        // inherit stale module bundles, build paths or editor cache files.
+        if (relative == "Build" || relative == "Binaries" || relative == "Cache" ||
+            relative == "Saved" || relative == ".aeg") {
+            iterator.disable_recursion_pending();
+            continue;
+        }
         const auto target = destination / relative;
         if (entry.is_directory(error)) {
             std::filesystem::create_directories(target, error);
@@ -163,9 +173,9 @@ foundation::ResultValue<std::filesystem::path> create_project(const ProjectScaff
     project.config.engine.sdk_requirement = request.engine_sdk;
     project.config.module.target = request.module_target;
     project.config.module.id = request.module_target;
-    project.config.startup_pipelines.clear();
-    if (!request.render_pipeline.empty()) {
-        project.config.startup_pipelines.push_back(request.render_pipeline);
+    project.config.startup_feature_graphs.clear();
+    if (!request.startup_feature_graph.empty()) {
+        project.config.startup_feature_graphs.push_back(request.startup_feature_graph);
     }
     if (const foundation::Result save_result = codec.save(manifest, project); !save_result) {
         std::filesystem::remove_all(root, error);

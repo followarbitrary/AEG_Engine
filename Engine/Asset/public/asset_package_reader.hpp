@@ -15,8 +15,8 @@
 namespace aeg::asset {
 /** @brief One package entry returned with an identity and owned bytes. */
 struct PackagedAsset final {
-    AssetId id{};
-    AssetKind kind{AssetKind::kMesh};
+    foundation::AssetId id{};
+    foundation::AssetKind kind{foundation::AssetKind::kMesh};
     uint32_t schema_version{};
     std::vector<std::byte> bytes{};
 };
@@ -26,13 +26,13 @@ class AssetPackageReader final {
 public:
     [[nodiscard]] static foundation::ResultValue<AssetPackageReader> open(const std::filesystem::path& file);
     [[nodiscard]] std::size_t entry_count() const noexcept;
-    [[nodiscard]] foundation::ResultValue<PackagedAsset> read(AssetId id) const;
-    [[nodiscard]] foundation::ResultValue<CookedAsset> read_cooked(AssetId id) const;
+    [[nodiscard]] foundation::ResultValue<PackagedAsset> read(foundation::AssetId id) const;
+    [[nodiscard]] foundation::ResultValue<CookedAsset> read_cooked(foundation::AssetId id) const;
 
 private:
     struct IndexEntry final {
-        AssetId id{};
-        AssetKind kind{AssetKind::kMesh};
+        foundation::AssetId id{};
+        foundation::AssetKind kind{foundation::AssetKind::kMesh};
         uint32_t schema_version{};
         uint64_t offset{};
         uint64_t byte_count{};

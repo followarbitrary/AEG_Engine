@@ -5,16 +5,11 @@ include("${ENGINE_DIR}/cmake/EngineTools.cmake")
 set(GAME_BUILD_ID "dev")
 set(GAME_SOURCES
     Source/GameModule.cpp
-    Source/Render/Pipelines/CustomForwardPipeline.cpp
-    Source/Render/Pipelines/CustomForwardPipeline.hpp
-    Source/Render/Features/CustomOutlineFeature.cpp
-    Source/Render/Features/CustomOutlineFeature.hpp
-    Source/Render/Passes/VolumetricFogPass.cpp
-    Source/Render/Passes/VolumetricFogPass.hpp
 )
 aeg_add_game_module(GameModule
     SOURCES ${GAME_SOURCES}
-    METADATA "${CMAKE_CURRENT_SOURCE_DIR}/Source/GameModule.metadata.json"
+    METADATA_FACTORY_HEADER "Source/GameModule.hpp"
+    METADATA_FACTORY "aeg_define_GameModule"
     BUILD_ID "${GAME_BUILD_ID}"
     TARGET_PLATFORM "windows-x64-vulkan"
     OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/Binaries/Editor/windows-x64-vulkan/${GAME_BUILD_ID}/$<CONFIG>")

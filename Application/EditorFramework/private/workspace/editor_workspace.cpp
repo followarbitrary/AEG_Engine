@@ -737,6 +737,17 @@ foundation::Result EditorWorkspace::build_ui() {
                         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4{0.07f, 0.25f, 0.22f, 1.0f});
                     if (editor_rail_button(label, active)) {
                         if (std::string_view{label} == "FlowGraph") {
+                            // The navigation rail can be drawn before optional panels are
+                            // registered (for example while the editor is bootstrapping).
+                            // Keep the rail selection usable in that state and defer panel
+                            // presentation/visibility changes until the panel exists.
+                            if (find_panel(panel_key) == nullptr) {
+                                active_rail_ = label;
+                                pending_panel_focus_.clear();
+                                if (active)
+                                    ImGui::PopStyleColor();
+                                return;
+                            }
                             // The FlowGraph is a heavyweight authoring surface. Keep the
                             // main editor layout intact and promote it to a native viewport
                             // only when the host supports multi-viewport windows. Headless

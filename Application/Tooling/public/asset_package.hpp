@@ -9,7 +9,7 @@
 #include <filesystem>
 #include <vector>
 
-#include "../../../Engine/Asset/public/asset_package_reader.hpp"
+#include "asset_package_reader.hpp"
 #include "asset_metadata.hpp"
 
 namespace aeg::tooling {

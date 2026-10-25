@@ -6,7 +6,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <span>
+#include <string>
+#include <string_view>
 #include <vector>
 
 #include "reflection.hpp"
@@ -33,6 +36,11 @@ public:
     [[nodiscard]] std::size_t size() const noexcept;
     /** @brief Writes one byte sequence to the stream. */
     [[nodiscard]] foundation::Result write_bytes(std::span<const uint8_t> bytes);
+    /** @brief Writes a length-prefixed byte string with an explicit size limit. */
+    [[nodiscard]] foundation::Result write_string(
+        std::string_view value, uint32_t max_bytes = (std::numeric_limits<uint32_t>::max)());
+    /** @brief Writes one unsigned 16-bit little-endian value. */
+    [[nodiscard]] foundation::Result write_u16(uint16_t value);
     /** @brief Writes one unsigned 32-bit little-endian value. */
     [[nodiscard]] foundation::Result write_u32(uint32_t value);
     /** @brief Writes one unsigned 64-bit little-endian value. */
@@ -56,6 +64,11 @@ public:
     [[nodiscard]] std::size_t remaining() const noexcept;
     /** @brief Reads one byte sequence without copying it. */
     [[nodiscard]] foundation::ResultValue<std::span<const uint8_t>> read_bytes(std::size_t size) noexcept;
+    /** @brief Reads a length-prefixed byte string with an explicit size limit. */
+    [[nodiscard]] foundation::ResultValue<std::string> read_string(
+        uint32_t max_bytes = (std::numeric_limits<uint32_t>::max)());
+    /** @brief Reads one unsigned 16-bit little-endian value. */
+    [[nodiscard]] foundation::ResultValue<uint16_t> read_u16() noexcept;
     /** @brief Reads one unsigned 32-bit little-endian value. */
     [[nodiscard]] foundation::ResultValue<uint32_t> read_u32() noexcept;
     /** @brief Reads one unsigned 64-bit little-endian value. */

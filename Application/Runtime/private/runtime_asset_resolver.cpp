@@ -2,9 +2,14 @@
 
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <span>
 #include <utility>
 
+#include "runtime_asset_upload_host.hpp"
+#include "render_graph_upload_submission.hpp"
+#include "../../../Engine/RenderGraph/private/render_graph_resource_access.hpp"
+#include "../../../Engine/Shader/private/shader_pipeline_layout_access.hpp"
 #include "texture.hpp"
 
 namespace aeg::application::runtime {
@@ -14,22 +19,39 @@ uint64_t stable_value(T value) noexcept {
     return value.value();
 }
 
-pipeline::RenderGraphTexture as_pipeline_texture(render_graph::RenderGraphTexture value) noexcept {
-    return pipeline::RenderGraphTexture{value.index, value.generation, value.graph_id};
+bool upload_available(const std::shared_ptr<const void>& opaque_receipt,
+                      const render_graph::FrameContext& frame, bool current_resources) noexcept {
+    const auto receipt = std::static_pointer_cast<const render_graph::RenderGraphPassSubmission>(opaque_receipt);
+    return receipt && (receipt->was_submitted() ||
+                       (current_resources && receipt->is_recorded_for(frame.frame_number())));
 }
 
-pipeline::RenderGraphBuffer as_pipeline_buffer(render_graph::RenderGraphBuffer value) noexcept {
-    return pipeline::RenderGraphBuffer{value.index, value.generation, value.graph_id};
+const RuntimeAssetUploadHost& upload_host(const RuntimeAssetUploadHost* host) noexcept {
+    static const RuntimeAssetUploadHost empty{};
+    return host != nullptr ? *host : empty;
 }
 
-render_graph::RenderGraphBuffer as_render_graph_buffer(pipeline::RenderGraphBuffer value) noexcept {
-    return render_graph::RenderGraphBuffer{value.index, value.generation, value.graph_id};
+[[nodiscard]] bool shader_variant_epoch_matches(
+    uint64_t expected_epoch, const renderer::RendererProfileShaderContract& contract) noexcept {
+    return expected_epoch != 0 && contract.cache_epoch == expected_epoch;
 }
 
-render_graph::RenderGraphTexture as_render_graph_texture(pipeline::RenderGraphTexture value) noexcept {
-    return render_graph::RenderGraphTexture{value.index, value.generation, value.graph_id};
+[[nodiscard]] bool pso_variant_epoch_matches(
+    uint64_t expected_epoch, const renderer::RendererProfilePsoContract& contract) noexcept {
+    return expected_epoch != 0 && contract.cache_epoch == expected_epoch &&
+           shader_variant_epoch_matches(expected_epoch, contract.shader);
+}
+
+uint64_t material_cache_key(renderer::MaterialInstanceId material, uint64_t contract_epoch,
+                             uint64_t variant_cache_epoch) noexcept {
+    uint64_t key = material.value();
+    key ^= contract_epoch + 0x9e3779b97f4a7c15ull + (key << 6u) + (key >> 2u);
+    key ^= variant_cache_epoch + 0x517cc1b727220a95ull + (key << 6u) + (key >> 2u);
+    return key == 0 ? 1 : key;
 }
 }  // namespace
+
+RuntimeAssetResolver::RuntimeAssetResolver() = default;
 
 RuntimeAssetResolver::RuntimeAssetResolver(asset::AssetPackageReader package) noexcept
     : package_(std::make_shared<asset::AssetPackageReader>(std::move(package))),
@@ -43,31 +65,47 @@ RuntimeAssetResolver::RuntimeAssetResolver(RuntimeAssetResolver&& other) noexcep
       materials_(std::move(other.materials_)),
       next_renderer_id_(other.next_renderer_id_),
       upload_context_(other.upload_context_),
+      upload_resource_cache_epoch_(other.upload_resource_cache_epoch_),
+      upload_device_identity_(other.upload_device_identity_),
+      upload_frame_identity_(other.upload_frame_identity_),
+      upload_graph_identity_(other.upload_graph_identity_),
       gpu_meshes_(std::move(other.gpu_meshes_)),
+      mesh_uploads_(std::move(other.mesh_uploads_)),
       gpu_textures_(std::move(other.gpu_textures_)),
       gpu_texture_resources_(std::move(other.gpu_texture_resources_)),
+      texture_uploads_(std::move(other.texture_uploads_)),
       gpu_materials_(std::move(other.gpu_materials_)),
+      validated_material_contracts_(std::move(other.validated_material_contracts_)),
       gpu_material_resources_(std::move(other.gpu_material_resources_)),
       failed_gpu_materials_(std::move(other.failed_gpu_materials_)),
       failed_material_parameter_buffers_(std::move(other.failed_material_parameter_buffers_)),
       gpu_objects_(std::move(other.gpu_objects_)),
       gpu_object_frame_numbers_(std::move(other.gpu_object_frame_numbers_)),
-      gpu_lighting_(std::move(other.gpu_lighting_)) {
+      gpu_lighting_(std::move(other.gpu_lighting_)),
+      lighting_uploads_(std::move(other.lighting_uploads_)) {
     // A moved-from resolver must never retain the borrowed host pointers or
     // stale maps, otherwise its destructor could attempt a second retirement.
-    other.upload_context_ = {};
+    other.upload_context_ = nullptr;
+    other.upload_resource_cache_epoch_ = 0;
+    other.upload_device_identity_ = nullptr;
+    other.upload_frame_identity_ = nullptr;
+    other.upload_graph_identity_ = nullptr;
     other.meshes_.clear();
     other.materials_.clear();
     other.gpu_meshes_.clear();
+    other.mesh_uploads_.clear();
     other.gpu_textures_.clear();
     other.gpu_texture_resources_.clear();
+    other.texture_uploads_.clear();
     other.gpu_materials_.clear();
+    other.validated_material_contracts_.clear();
     other.gpu_material_resources_.clear();
     other.failed_gpu_materials_.clear();
     other.failed_material_parameter_buffers_.clear();
     other.gpu_objects_.clear();
     other.gpu_object_frame_numbers_.clear();
     other.gpu_lighting_.clear();
+    other.lighting_uploads_.clear();
     other.handles_ = asset::AssetHandleTable{};
     other.next_renderer_id_ = 1;
 }
@@ -76,8 +114,35 @@ RuntimeAssetResolver::~RuntimeAssetResolver() {
     // Hosts own the frame/device ordering. When destruction happens at a safe
     // boundary, release our handles; an active frame is intentionally left for
     // the host's explicit retirement path rather than forcing a hidden wait.
-    if (upload_context_.device && upload_context_.frame_context)
+    if (upload_context_ != nullptr && upload_context_->device && upload_context_->frame_context)
         (void)retire_gpu_resources();
+}
+
+foundation::Result RuntimeAssetResolver::set_upload_context(RuntimeAssetUploadHost* context) noexcept {
+    const uint64_t next_resource_epoch = context == nullptr ? 0 : context->resource_cache_epoch;
+    if (context != nullptr && next_resource_epoch == 0)
+        return foundation::invalid_argument("Runtime upload host requires a non-zero resource cache epoch");
+    const void* next_device = context == nullptr ? nullptr : context->device;
+    const void* next_frame = context == nullptr ? nullptr : context->frame_context;
+    const void* next_graph = context == nullptr ? nullptr : context->graph;
+    const bool same_host_generation = context == upload_context_ &&
+                                      next_resource_epoch == upload_resource_cache_epoch_ &&
+                                      next_device == upload_device_identity_ &&
+                                      next_frame == upload_frame_identity_ &&
+                                      next_graph == upload_graph_identity_;
+    if (same_host_generation)
+        return foundation::Result::success();
+    const bool has_gpu_resources = !gpu_meshes_.empty() || !gpu_textures_.empty() || !gpu_materials_.empty() ||
+                                   !failed_gpu_materials_.empty() || !failed_material_parameter_buffers_.empty() ||
+                                   !gpu_objects_.empty() || !gpu_lighting_.empty();
+    if (has_gpu_resources)
+        return foundation::invalid_state("Runtime upload host cannot change while GPU assets are live; retire first");
+    upload_context_ = context;
+    upload_resource_cache_epoch_ = next_resource_epoch;
+    upload_device_identity_ = next_device;
+    upload_frame_identity_ = next_frame;
+    upload_graph_identity_ = next_graph;
+    return foundation::Result::success();
 }
 
 foundation::ResultValue<RuntimeAssetResolver> RuntimeAssetResolver::open(const std::filesystem::path& package_path) {
@@ -98,15 +163,19 @@ foundation::Result RuntimeAssetResolver::mount(asset::AssetPackageReader package
     meshes_.clear();
     materials_.clear();
     gpu_meshes_.clear();
+    mesh_uploads_.clear();
     gpu_textures_.clear();
     gpu_texture_resources_.clear();
+    texture_uploads_.clear();
     gpu_materials_.clear();
+    validated_material_contracts_.clear();
     gpu_material_resources_.clear();
     failed_gpu_materials_.clear();
     failed_material_parameter_buffers_.clear();
     gpu_objects_.clear();
     gpu_object_frame_numbers_.clear();
     gpu_lighting_.clear();
+    lighting_uploads_.clear();
     handles_ = asset::AssetHandleTable{};
     next_renderer_id_ = 1;
     return foundation::Result::success();
@@ -119,19 +188,19 @@ foundation::Result RuntimeAssetResolver::retire_gpu_resources() noexcept {
     if (!has_gpu_resources) {
         return foundation::Result::success();
     }
-    if (!upload_context_.device || !upload_context_.frame_context) {
+    if (!upload_host(upload_context_).device || !upload_host(upload_context_).frame_context) {
         return foundation::invalid_state("Runtime GPU retirement requires an active upload context");
     }
-    if (upload_context_.frame_context->is_frame_active()) {
+    if (upload_host(upload_context_).frame_context->is_frame_active()) {
         return foundation::invalid_state("Runtime GPU retirement requires no active frame");
     }
     // drain() waits every submitted slot and retires frame-local descriptors
     // before persistent resolver-owned handles are destroyed.
-    if (const foundation::Result result = upload_context_.frame_context->drain(); !result) {
+    if (const foundation::Result result = upload_host(upload_context_).frame_context->drain(); !result) {
         return result;
     }
-    if (upload_context_.graph) {
-        upload_context_.graph->reset();
+    if (upload_host(upload_context_).graph) {
+        upload_host(upload_context_).graph->reset();
     }
 
     foundation::Result first_error = foundation::Result::success();
@@ -142,15 +211,16 @@ foundation::Result RuntimeAssetResolver::retire_gpu_resources() noexcept {
     };
     for (auto iterator = gpu_meshes_.begin(); iterator != gpu_meshes_.end();) {
         auto& mesh = iterator->second;
-        const bool vertex_done = retired(upload_context_.device->destroy_buffer(mesh.vertex_buffer));
-        const bool index_done = retired(upload_context_.device->destroy_buffer(mesh.index_buffer));
+        const bool vertex_done = retired(upload_host(upload_context_).device->destroy_buffer(mesh.vertex_buffer));
+        const bool index_done = retired(upload_host(upload_context_).device->destroy_buffer(mesh.index_buffer));
         if (vertex_done)
             mesh.vertex_buffer = {};
         if (index_done)
             mesh.index_buffer = {};
-        if (vertex_done && index_done)
+        if (vertex_done && index_done) {
+            mesh_uploads_.erase(iterator->first);
             iterator = gpu_meshes_.erase(iterator);
-        else
+        } else
             ++iterator;
     }
     for (auto iterator = gpu_materials_.begin(); iterator != gpu_materials_.end();) {
@@ -158,11 +228,11 @@ foundation::Result RuntimeAssetResolver::retire_gpu_resources() noexcept {
         const rhi::BufferHandle parameter_buffer = material.parameter_buffer.buffer;
         // Destroy the descriptor first; its binding 2 write references the
         // caller-owned parameter buffer.
-        const foundation::Result result = resource::destroy_texture_material(*upload_context_.device, material);
+        const foundation::Result result = resource::destroy_texture_material(*upload_host(upload_context_).device, material);
         bool buffer_done = !parameter_buffer.is_valid();
         if (retired(result) && parameter_buffer.is_valid()) {
             rhi::BufferHandle pending = parameter_buffer;
-            const foundation::Result buffer_result = upload_context_.device->destroy_buffer(pending);
+            const foundation::Result buffer_result = upload_host(upload_context_).device->destroy_buffer(pending);
             buffer_done = retired(buffer_result);
             if (!buffer_done)
                 material.parameter_buffer = {parameter_buffer, 0, sizeof(resource::TextureMaterialParameters)};
@@ -175,11 +245,11 @@ foundation::Result RuntimeAssetResolver::retire_gpu_resources() noexcept {
     for (auto iterator = failed_gpu_materials_.begin(); iterator != failed_gpu_materials_.end();) {
         auto& material = iterator->second;
         const rhi::BufferHandle parameter_buffer = material.parameter_buffer.buffer;
-        const foundation::Result result = resource::destroy_texture_material(*upload_context_.device, material);
+        const foundation::Result result = resource::destroy_texture_material(*upload_host(upload_context_).device, material);
         bool buffer_done = !parameter_buffer.is_valid();
         if (retired(result) && parameter_buffer.is_valid()) {
             rhi::BufferHandle pending = parameter_buffer;
-            const foundation::Result buffer_result = upload_context_.device->destroy_buffer(pending);
+            const foundation::Result buffer_result = upload_host(upload_context_).device->destroy_buffer(pending);
             buffer_done = retired(buffer_result);
             if (!buffer_done)
                 material.parameter_buffer = {parameter_buffer, 0, sizeof(resource::TextureMaterialParameters)};
@@ -192,7 +262,7 @@ foundation::Result RuntimeAssetResolver::retire_gpu_resources() noexcept {
     for (auto iterator = failed_material_parameter_buffers_.begin();
          iterator != failed_material_parameter_buffers_.end();) {
         rhi::BufferHandle buffer = iterator->second;
-        const foundation::Result result = upload_context_.device->destroy_buffer(buffer);
+        const foundation::Result result = upload_host(upload_context_).device->destroy_buffer(buffer);
         if (retired(result))
             iterator = failed_material_parameter_buffers_.erase(iterator);
         else
@@ -202,14 +272,14 @@ foundation::Result RuntimeAssetResolver::retire_gpu_resources() noexcept {
         auto& texture = iterator->second;
         bool view_done = true;
         bool texture_done = true;
-        if (upload_context_.texture_uploader) {
-            const foundation::Result result = upload_context_.texture_uploader->destroy_texture(texture);
+        if (upload_host(upload_context_).texture_uploader) {
+            const foundation::Result result = upload_host(upload_context_).texture_uploader->destroy_texture(texture);
             view_done = !texture.sampled_view.is_valid();
             texture_done = !texture.texture.is_valid();
             retired(result);
         } else {
-            const foundation::Result view_result = upload_context_.device->destroy_texture_view(texture.sampled_view);
-            const foundation::Result texture_result = upload_context_.device->destroy_texture(texture.texture);
+            const foundation::Result view_result = upload_host(upload_context_).device->destroy_texture_view(texture.sampled_view);
+            const foundation::Result texture_result = upload_host(upload_context_).device->destroy_texture(texture.texture);
             view_done = retired(view_result);
             texture_done = retired(texture_result);
             if (view_done)
@@ -217,9 +287,10 @@ foundation::Result RuntimeAssetResolver::retire_gpu_resources() noexcept {
             if (texture_done)
                 texture.texture = {};
         }
-        if (view_done && texture_done)
+        if (view_done && texture_done) {
+            texture_uploads_.erase(iterator->first);
             iterator = gpu_textures_.erase(iterator);
-        else
+        } else
             ++iterator;
     }
     for (auto iterator = gpu_texture_resources_.begin(); iterator != gpu_texture_resources_.end();) {
@@ -236,8 +307,8 @@ foundation::Result RuntimeAssetResolver::retire_gpu_resources() noexcept {
     }
     for (auto iterator = gpu_objects_.begin(); iterator != gpu_objects_.end();) {
         auto& object = iterator->second;
-        const bool set_done = retired(upload_context_.device->destroy_binding_set(object.binding_set));
-        const bool buffer_done = retired(upload_context_.device->destroy_buffer(object.transform_buffer));
+        const bool set_done = retired(upload_host(upload_context_).device->destroy_binding_set(object.binding_set));
+        const bool buffer_done = retired(upload_host(upload_context_).device->destroy_buffer(object.transform_buffer));
         if (set_done)
             object.binding_set = {};
         if (buffer_done)
@@ -251,21 +322,22 @@ foundation::Result RuntimeAssetResolver::retire_gpu_resources() noexcept {
     }
     for (auto iterator = gpu_lighting_.begin(); iterator != gpu_lighting_.end();) {
         auto& lighting = iterator->second;
-        const bool set_done = retired(upload_context_.device->destroy_binding_set(lighting.binding_set));
-        const bool buffer_done = retired(upload_context_.device->destroy_buffer(lighting.lighting_buffer));
+        const bool set_done = retired(upload_host(upload_context_).device->destroy_binding_set(lighting.binding_set));
+        const bool buffer_done = retired(upload_host(upload_context_).device->destroy_buffer(lighting.lighting_buffer));
         if (set_done)
             lighting.binding_set = {};
         if (buffer_done)
             lighting.lighting_buffer = {};
-        if (set_done && buffer_done)
+        if (set_done && buffer_done) {
+            lighting_uploads_.erase(iterator->first);
             iterator = gpu_lighting_.erase(iterator);
-        else
+        } else
             ++iterator;
     }
     return first_error;
 }
 
-uint64_t RuntimeAssetResolver::renderer_key(asset::AssetId id) noexcept {
+uint64_t RuntimeAssetResolver::renderer_key(foundation::AssetId id) noexcept {
     uint64_t value = 14695981039346656037ull;
     for (const uint8_t byte : id.value.bytes) {
         value ^= byte;
@@ -274,11 +346,11 @@ uint64_t RuntimeAssetResolver::renderer_key(asset::AssetId id) noexcept {
     return value == 0 ? 1 : value;
 }
 
-foundation::ResultValue<renderer::MeshAssetId> RuntimeAssetResolver::bind_mesh(asset::AssetId id) {
+foundation::ResultValue<renderer::MeshAssetId> RuntimeAssetResolver::bind_mesh(foundation::AssetId id) {
     if (!package_)
         return {foundation::invalid_state("Runtime asset package is not mounted"), {}};
     const auto cooked = package_->read_cooked(id);
-    if (!cooked || cooked.value.kind != asset::AssetKind::kMesh) {
+    if (!cooked || cooked.value.kind != foundation::AssetKind::kMesh) {
         return {cooked ? foundation::invalid_argument("Asset is not a mesh") : cooked.result, {}};
     }
     for (const auto& [key, existing] : meshes_)
@@ -289,11 +361,11 @@ foundation::ResultValue<renderer::MeshAssetId> RuntimeAssetResolver::bind_mesh(a
     return {foundation::Result::success(), renderer::MeshAssetId{key}};
 }
 
-foundation::ResultValue<renderer::MaterialInstanceId> RuntimeAssetResolver::bind_material(asset::AssetId id) {
+foundation::ResultValue<renderer::MaterialInstanceId> RuntimeAssetResolver::bind_material(foundation::AssetId id) {
     if (!package_)
         return {foundation::invalid_state("Runtime asset package is not mounted"), {}};
     const auto cooked = package_->read_cooked(id);
-    if (!cooked || cooked.value.kind != asset::AssetKind::kMaterial) {
+    if (!cooked || cooked.value.kind != foundation::AssetKind::kMaterial) {
         return {cooked ? foundation::invalid_argument("Asset is not a material") : cooked.result, {}};
     }
     for (const auto& [key, existing] : materials_)
@@ -304,14 +376,14 @@ foundation::ResultValue<renderer::MaterialInstanceId> RuntimeAssetResolver::bind
     return {foundation::Result::success(), renderer::MaterialInstanceId{key}};
 }
 
-foundation::ResultValue<asset::AssetId> RuntimeAssetResolver::mesh_asset(renderer::MeshAssetId id) const {
+foundation::ResultValue<foundation::AssetId> RuntimeAssetResolver::mesh_asset(renderer::MeshAssetId id) const {
     const auto found = meshes_.find(stable_value(id));
     if (found == meshes_.end())
         return {foundation::not_found("Mesh renderer identity is not bound"), {}};
     return {foundation::Result::success(), found->second};
 }
 
-foundation::ResultValue<asset::AssetId> RuntimeAssetResolver::material_asset(renderer::MaterialInstanceId id) const {
+foundation::ResultValue<foundation::AssetId> RuntimeAssetResolver::material_asset(renderer::MaterialInstanceId id) const {
     const auto found = materials_.find(stable_value(id));
     if (found == materials_.end())
         return {foundation::not_found("Material renderer identity is not bound"), {}};
@@ -341,30 +413,41 @@ foundation::ResultValue<renderer::RenderMeshResource> RuntimeAssetResolver::reso
     if (!decoded)
         return {decoded.result, {}};
     const uint64_t key = stable_value(mesh);
-    if (!upload_context_.device || !upload_context_.frame_context || !upload_context_.graph ||
-        !upload_context_.uploader || !upload_context_.frame_context->is_frame_active())
+    if (!upload_host(upload_context_).device || !upload_host(upload_context_).frame_context || !upload_host(upload_context_).graph ||
+        !upload_host(upload_context_).uploader || !upload_host(upload_context_).frame_context->is_frame_active())
         return {foundation::not_ready("Mesh upload requires an active frame context"), {}};
+    std::optional<resource::GpuMesh> replay_destination;
     if (const auto found = gpu_meshes_.find(key); found != gpu_meshes_.end()) {
         auto& cached = found->second;
-        if (cached.vertex_resource.is_valid() && cached.index_resource.is_valid() &&
-            upload_context_.graph->contains_buffer(as_render_graph_buffer(cached.vertex_resource)) &&
-            upload_context_.graph->contains_buffer(as_render_graph_buffer(cached.index_resource)))
+        const bool current = cached.vertex_resource.is_valid() && cached.index_resource.is_valid() &&
+            render_graph::detail::RenderGraphResourceAccess::contains_buffer(
+                *upload_host(upload_context_).graph, cached.vertex_resource) &&
+            render_graph::detail::RenderGraphResourceAccess::contains_buffer(
+                *upload_host(upload_context_).graph, cached.index_resource);
+        const auto receipt = mesh_uploads_.find(key);
+        if (upload_available(receipt == mesh_uploads_.end() ? nullptr : receipt->second,
+                             *upload_host(upload_context_).frame_context, current)) {
+            if (current)
+                return {foundation::Result::success(), cached};
+            const auto vertex = upload_host(upload_context_).graph->import_buffer(
+                cached.vertex_buffer, cached.vertex_buffer_desc,
+                rhi::ResourceState{rhi::ResourceUsage::kVertexInput, rhi::ShaderStage::kVertex, rhi::QueueClass::kGraphics,
+                                   false, rhi::PipelineStage::kVertexInput});
+            if (!vertex)
+                return {vertex.result, {}};
+            const auto index = upload_host(upload_context_).graph->import_buffer(
+                cached.index_buffer, cached.index_buffer_desc,
+                rhi::ResourceState{rhi::ResourceUsage::kIndexInput, rhi::ShaderStage::kVertex, rhi::QueueClass::kGraphics,
+                                   false, rhi::PipelineStage::kVertexInput});
+            if (!index)
+                return {index.result, {}};
+            cached.vertex_resource = vertex.value;
+            cached.index_resource = index.value;
             return {foundation::Result::success(), cached};
-        const auto vertex = upload_context_.graph->import_buffer(
-            cached.vertex_buffer, cached.vertex_buffer_desc,
-            rhi::ResourceState{rhi::ResourceUsage::kVertexInput, rhi::ShaderStage::kVertex, rhi::QueueClass::kGraphics,
-                               false, rhi::PipelineStage::kVertexInput});
-        if (!vertex)
-            return {vertex.result, {}};
-        const auto index = upload_context_.graph->import_buffer(
-            cached.index_buffer, cached.index_buffer_desc,
-            rhi::ResourceState{rhi::ResourceUsage::kIndexInput, rhi::ShaderStage::kVertex, rhi::QueueClass::kGraphics,
-                               false, rhi::PipelineStage::kVertexInput});
-        if (!index)
-            return {index.result, {}};
-        cached.vertex_resource = as_pipeline_buffer(vertex.value);
-        cached.index_resource = as_pipeline_buffer(index.value);
-        return {foundation::Result::success(), cached};
+        }
+        replay_destination = resource::GpuMesh{cached.vertex_buffer, cached.index_buffer,
+            cached.vertex_buffer_desc.size, cached.index_buffer_desc.size, cached.vertex_stride,
+            cached.vertex_count, cached.index_count, cached.index_format};
     }
     const auto& payload = decoded.value.payload;
     const auto vertex_bytes = std::as_bytes(std::span<const RuntimeMeshVertex>{decoded.value.vertices});
@@ -372,8 +455,8 @@ foundation::ResultValue<renderer::RenderMeshResource> RuntimeAssetResolver::reso
     const resource::MeshData mesh_data{
         vertex_bytes, sizeof(RuntimeMeshVertex), static_cast<uint32_t>(decoded.value.vertices.size()),
         index_bytes,  rhi::IndexFormat::kUint32, static_cast<uint32_t>(payload.indices.size())};
-    const auto upload = upload_context_.uploader->upload_mesh(*upload_context_.frame_context, *upload_context_.graph,
-                                                              mesh_data, "Runtime.Mesh");
+    const auto upload = upload_host(upload_context_).uploader->upload_mesh(*upload_host(upload_context_).frame_context, *upload_host(upload_context_).graph,
+            mesh_data, "Runtime.Mesh", replay_destination ? &*replay_destination : nullptr);
     if (!upload)
         return {upload.result, {}};
     renderer::RenderMeshResource resource{};
@@ -401,9 +484,10 @@ foundation::ResultValue<renderer::RenderMeshResource> RuntimeAssetResolver::reso
     resource.vertex_layout.position_format = rhi::Format::kRgba32Float;
     resource.vertex_layout.uv_offset = sizeof(float) * 4u;
     resource.vertex_layout.normal_offset = sizeof(float) * 6u;
-    resource.vertex_resource = as_pipeline_buffer(upload.value.vertex_resource);
-    resource.index_resource = as_pipeline_buffer(upload.value.index_resource);
-    gpu_meshes_.emplace(key, resource);
+    resource.vertex_resource = upload.value.vertex_resource;
+    resource.index_resource = upload.value.index_resource;
+    gpu_meshes_.insert_or_assign(key, resource);
+    mesh_uploads_.insert_or_assign(key, upload.value.submission);
     return {foundation::Result::success(), resource};
 }
 
@@ -417,29 +501,46 @@ foundation::ResultValue<renderer::RenderMaterialResource> RuntimeAssetResolver::
     const auto decoded = cache_->load_material(asset_id.value);
     if (!decoded)
         return {decoded.result, {}};
-    std::vector<std::byte> authored_parameters;
-    if (!decoded.value.payload.parameters.empty()) {
-        if (upload_context_.material_shader_program == nullptr)
-            return {foundation::invalid_argument(
-                        "Runtime material authored parameters require a host shader reflection contract"),
-                    {}};
-        const auto packed =
-            shader::pack_parameter_block(*upload_context_.material_shader_program, decoded.value.payload.parameters);
-        if (!packed)
-            return {packed.result, {}};
-        authored_parameters = packed.value;
-    }
     // The payload carries a shader UUID, but the current runtime has no
     // reflection/packing table that can translate arbitrary logical texture
     // bindings into the renderer's descriptor slots. Keep the accepted ABI
     // explicit instead of silently treating every payload binding as slot 0.
-    if (decoded.value.payload.shader == asset::AssetId{}) {
+    if (decoded.value.payload.shader == foundation::AssetId{}) {
         return {foundation::invalid_argument("Runtime material requires a valid shader asset reference"), {}};
     }
-    if (upload_context_.material_shader == asset::AssetId{}) {
+    if (upload_host(upload_context_).material_contract_epoch == 0) {
+        return {foundation::invalid_argument("Material GPU contract requires a non-zero contract epoch"), {}};
+    }
+    if (upload_host(upload_context_).variant_cache_epoch == 0) {
+        return {foundation::invalid_argument("Material Shader/PSO variant cache requires a non-zero epoch"), {}};
+    }
+    const uint64_t variant_epoch = upload_host(upload_context_).variant_cache_epoch;
+    const uint64_t key = material_cache_key(material, upload_host(upload_context_).material_contract_epoch,
+                                            variant_epoch);
+    std::vector<std::byte> authored_parameters;
+    if (!decoded.value.payload.parameters.empty()) {
+        if (upload_host(upload_context_).material_shader_program == nullptr &&
+            (upload_host(upload_context_).material_shader != foundation::AssetId{} ||
+             validated_material_contracts_.find(key) == validated_material_contracts_.end()))
+            return {foundation::invalid_argument(
+                        "Runtime material authored parameters require a host shader reflection contract"),
+                    {}};
+        if (upload_host(upload_context_).material_shader_program != nullptr) {
+            const auto packed =
+                shader::pack_parameter_block(*upload_host(upload_context_).material_shader_program, decoded.value.payload.parameters);
+            if (!packed)
+                return {packed.result, {}};
+            authored_parameters = packed.value;
+            validated_material_contracts_.insert(key);
+        }
+    }
+    // Validate the authored payload before checking runtime readiness.  A
+    // material with an invalid parameter contract must report that authoring
+    // error even when the renderer has not published its host shader yet.
+    if (upload_host(upload_context_).material_shader == foundation::AssetId{}) {
         return {foundation::not_ready("Material GPU contract requires a host shader"), {}};
     }
-    if (decoded.value.payload.shader != upload_context_.material_shader) {
+    if (decoded.value.payload.shader != upload_host(upload_context_).material_shader) {
         return {foundation::invalid_argument("Runtime material shader does not match the host shader contract"), {}};
     }
     if (decoded.value.payload.textures.size() != 1u) {
@@ -450,23 +551,92 @@ foundation::ResultValue<renderer::RenderMaterialResource> RuntimeAssetResolver::
                                              "shader reflection is available"),
                 {}};
     }
-    const uint64_t key = stable_value(material);
-    if (!upload_context_.device || !upload_context_.frame_context || !upload_context_.graph ||
-        !upload_context_.texture_uploader || !upload_context_.frame_context->is_frame_active()) {
+    if (!upload_host(upload_context_).material_shader_contract.is_valid() ||
+        upload_host(upload_context_).material_shader_layout == nullptr ||
+        !upload_host(upload_context_).material_shader_layout->is_valid()) {
+        return {foundation::not_ready("Material GPU contract requires a shader layout contract"), {}};
+    }
+    if (shader::detail::ShaderPipelineLayoutAccess::contract_hash(
+            *upload_host(upload_context_).material_shader_layout) !=
+        upload_host(upload_context_).material_shader_contract.layout_hash) {
+        return {foundation::invalid_argument("Runtime material shader layout does not match the host shader contract"), {}};
+    }
+    if (shader::detail::ShaderPipelineLayoutAccess::cache_epoch(
+            *upload_host(upload_context_).material_shader_layout) !=
+        upload_host(upload_context_).material_shader_contract.cache_epoch) {
+        return {foundation::invalid_argument("Runtime material shader layout belongs to a retired cache epoch"), {}};
+    }
+    const auto& host = upload_host(upload_context_);
+    if (!host.material_attachment_contract.is_single_color_attachment())
+        return {foundation::invalid_argument("Runtime material PSO requires a single color attachment contract"), {}};
+    if (host.depth_attachment_variant) {
+        const auto& variant = *host.depth_attachment_variant;
+        if (!variant.pipeline.is_valid() || !variant.attachment_contract.is_single_color_attachment() ||
+            !variant.shader_contract.is_valid() ||
+            variant.shader_contract != host.material_shader_contract)
+            return {foundation::invalid_argument("Runtime color/depth PSO does not match the material shader contract"), {}};
+        if (variant.cache_epoch == 0 || variant.cache_epoch != variant_epoch)
+            return {foundation::not_ready("Runtime color/depth PSO belongs to a retired variant cache epoch"), {}};
+    }
+    if (host.shadow_pipeline.is_valid()) {
+        if (!host.shadow_shader_contract.is_valid() || !host.shadow_pipeline_contract.is_single_color_attachment())
+            return {foundation::invalid_argument("Runtime forward shadow PSO requires a shader and attachment contract"), {}};
+        if (host.shadow_pipeline_cache_epoch == 0 || host.shadow_pipeline_cache_epoch != variant_epoch)
+            return {foundation::not_ready("Runtime forward shadow PSO belongs to a retired variant cache epoch"), {}};
+        if (host.shadow_shader_layout == nullptr || !host.shadow_shader_layout->is_valid())
+            return {foundation::not_ready("Runtime forward shadow PSO requires its live reflected layout"), {}};
+        if (shader::detail::ShaderPipelineLayoutAccess::contract_hash(*host.shadow_shader_layout) != host.shadow_shader_contract.layout_hash ||
+            shader::detail::ShaderPipelineLayoutAccess::cache_epoch(*host.shadow_shader_layout) != host.shadow_shader_contract.cache_epoch)
+            return {foundation::invalid_argument("Runtime forward shadow layout does not match its shader contract"), {}};
+    }
+    if (host.depth_pipeline.is_valid()) {
+        const auto& profile = host.depth_profile_contract;
+        if (!profile.is_valid(renderer::RendererProfile::kShadow) ||
+            profile.attachment != host.depth_pipeline_contract)
+            return {foundation::invalid_argument("Runtime depth PSO profile or attachment contract is incompatible"), {}};
+        if (!pso_variant_epoch_matches(variant_epoch, profile))
+            return {foundation::not_ready("Runtime depth PSO belongs to a retired variant cache epoch"), {}};
+        if (host.depth_shader_layout == nullptr || !host.depth_shader_layout->is_valid())
+            return {foundation::not_ready("Runtime depth PSO requires its live reflected layout"), {}};
+        if (shader::detail::ShaderPipelineLayoutAccess::contract_hash(*host.depth_shader_layout) != profile.shader.layout_hash ||
+            shader::detail::ShaderPipelineLayoutAccess::cache_epoch(*host.depth_shader_layout) != profile.shader.cache_epoch)
+            return {foundation::invalid_argument("Runtime depth shader layout does not match its profile contract"), {}};
+    }
+    if (host.gbuffer_pipeline.is_valid()) {
+        const auto& profile = host.gbuffer_profile_contract;
+        if (!profile.is_valid(renderer::RendererProfile::kGBuffer) ||
+            profile.attachment != host.gbuffer_pipeline_contract)
+            return {foundation::invalid_argument("Runtime GBuffer PSO profile or ordered MRT contract is incompatible"), {}};
+        if (!pso_variant_epoch_matches(variant_epoch, profile))
+            return {foundation::not_ready("Runtime GBuffer PSO belongs to a retired variant cache epoch"), {}};
+        if (host.gbuffer_shader_layout == nullptr || !host.gbuffer_shader_layout->is_valid())
+            return {foundation::not_ready("Runtime GBuffer PSO requires its live reflected layout"), {}};
+        if (shader::detail::ShaderPipelineLayoutAccess::contract_hash(*host.gbuffer_shader_layout) != profile.shader.layout_hash ||
+            shader::detail::ShaderPipelineLayoutAccess::cache_epoch(*host.gbuffer_shader_layout) != profile.shader.cache_epoch)
+            return {foundation::invalid_argument("Runtime GBuffer shader layout does not match its profile contract"), {}};
+    }
+    if (!upload_host(upload_context_).device || !upload_host(upload_context_).frame_context || !upload_host(upload_context_).graph ||
+        !upload_host(upload_context_).texture_uploader || !upload_host(upload_context_).frame_context->is_frame_active()) {
         return {foundation::not_ready("Material upload requires an active frame context"), {}};
     }
-    if (!upload_context_.material_pipeline.is_valid() || !upload_context_.material_binding_layout.is_valid()) {
+    if (!upload_host(upload_context_).material_pipeline.is_valid() || !upload_host(upload_context_).material_binding_layout.is_valid()) {
         return {foundation::not_ready("Material GPU contract requires a pipeline and binding layout"), {}};
     }
-    const asset::AssetId texture_id = decoded.value.payload.textures.front().texture;
+    const foundation::AssetId texture_id = decoded.value.payload.textures.front().texture;
     const uint64_t texture_key = renderer_key(texture_id);
     auto texture_asset = cache_->load_texture(texture_id);
     if (!texture_asset)
         return {texture_asset.result, {}};
 
-    pipeline::RenderGraphTexture texture_resource{};
+    render_graph::RenderGraphTexture texture_resource{};
     auto texture_found = gpu_texture_resources_.find(texture_key);
-    if (texture_found == gpu_texture_resources_.end()) {
+    const auto gpu_texture = gpu_textures_.find(texture_key);
+    const auto receipt = texture_uploads_.find(texture_key);
+    const bool current_texture = texture_found != gpu_texture_resources_.end() &&
+        render_graph::detail::RenderGraphResourceAccess::contains_texture(
+            *upload_host(upload_context_).graph, texture_found->second);
+    if (!upload_available(receipt == texture_uploads_.end() ? nullptr : receipt->second,
+                          *upload_host(upload_context_).frame_context, current_texture)) {
         const asset::TexturePayload& payload = texture_asset.value.payload;
         if (payload.width == 0 || payload.height == 0 || payload.channels == 0 || payload.pixels.empty()) {
             return {foundation::invalid_argument("Runtime texture payload is empty"), {}};
@@ -495,17 +665,19 @@ foundation::ResultValue<renderer::RenderMaterialResource> RuntimeAssetResolver::
             static_cast<uint32_t>(payload.pixels.size())};
         const resource::TextureData texture_data{desc,
                                                  std::span<const resource::TextureSubresourceData>{&subresource, 1}};
-        const auto upload = upload_context_.texture_uploader->upload_texture(
-            *upload_context_.frame_context, *upload_context_.graph, texture_data, "Runtime.Texture");
+        const auto upload = upload_host(upload_context_).texture_uploader->upload_texture(
+            *upload_host(upload_context_).frame_context, *upload_host(upload_context_).graph, texture_data, "Runtime.Texture",
+            gpu_texture == gpu_textures_.end() ? nullptr : &gpu_texture->second);
         if (!upload || !upload.value.is_valid())
             return {upload ? foundation::Result::failure(foundation::ResultCode::kUnknown,
                                                          "Texture uploader returned an invalid upload")
                            : upload.result,
                     {}};
-        gpu_textures_.emplace(texture_key, upload.value.texture);
-        texture_resource = as_pipeline_texture(upload.value.target);
-        gpu_texture_resources_.emplace(texture_key, texture_resource);
-    } else if (upload_context_.graph->contains_texture(as_render_graph_texture(texture_found->second))) {
+        gpu_textures_.insert_or_assign(texture_key, upload.value.texture);
+        texture_uploads_.insert_or_assign(texture_key, upload.value.submission);
+        texture_resource = upload.value.target;
+        gpu_texture_resources_.insert_or_assign(texture_key, texture_resource);
+    } else if (current_texture) {
         texture_resource = texture_found->second;
     }
     const auto texture_found_gpu = gpu_textures_.find(texture_key);
@@ -525,18 +697,18 @@ foundation::ResultValue<renderer::RenderMaterialResource> RuntimeAssetResolver::
         graph_desc.format = texture_found_gpu->second.format;
         graph_desc.mip_levels = texture_found_gpu->second.mip_levels;
         graph_desc.array_layers = texture_found_gpu->second.array_layers;
-        graph_desc.capabilities = rhi::TextureCapability::kSampled;
+        graph_desc.capabilities = rhi::TextureCapability::kSampled | rhi::TextureCapability::kTransferDestination;
         graph_desc.initial_usage = rhi::ResourceUsage::kSampledRead;
         graph_desc.initial_stages = rhi::PipelineStage::kFragmentShader;
         graph_desc.initial_queue = rhi::QueueClass::kGraphics;
         graph_desc.name = rhi::DebugName{"Runtime.TextureImported"};
-        const auto imported = upload_context_.graph->import_texture(
+        const auto imported = upload_host(upload_context_).graph->import_texture(
             texture_found_gpu->second.texture, texture_found_gpu->second.sampled_view, graph_desc,
             rhi::ResourceState{rhi::ResourceUsage::kSampledRead, rhi::ShaderStage::kFragment,
                                rhi::QueueClass::kGraphics, false, rhi::PipelineStage::kFragmentShader});
         if (!imported)
             return {imported.result, {}};
-        texture_resource = as_pipeline_texture(imported.value);
+        texture_resource = imported.value;
         gpu_texture_resources_[texture_key] = texture_resource;
     }
 
@@ -552,7 +724,7 @@ foundation::ResultValue<renderer::RenderMaterialResource> RuntimeAssetResolver::
         parameter_desc.initial_stages = rhi::PipelineStage::kAllCommands;
         parameter_desc.initial_queue = rhi::QueueClass::kGraphics;
         parameter_desc.name = rhi::DebugName{"Runtime.Material.Parameters"};
-        const auto parameter_result = upload_context_.device->create_buffer(parameter_desc);
+        const auto parameter_result = upload_host(upload_context_).device->create_buffer(parameter_desc);
         if (!parameter_result)
             return {parameter_result.result, {}};
         const resource::TextureMaterialParameters parameters{};
@@ -561,10 +733,10 @@ foundation::ResultValue<renderer::RenderMaterialResource> RuntimeAssetResolver::
                 ? std::as_bytes(std::span{&parameters, 1})
                 : std::span<const std::byte>{authored_parameters.data(), authored_parameters.size()};
         if (const foundation::Result write_result =
-                upload_context_.device->write_buffer(parameter_result.value, 0, initial_bytes);
+                upload_host(upload_context_).device->write_buffer(parameter_result.value, 0, initial_bytes);
             !write_result) {
             rhi::BufferHandle failed_buffer = parameter_result.value;
-            if (const foundation::Result destroy_result = upload_context_.device->destroy_buffer(failed_buffer);
+            if (const foundation::Result destroy_result = upload_host(upload_context_).device->destroy_buffer(failed_buffer);
                 !destroy_result) {
                 failed_material_parameter_buffers_.emplace(key, failed_buffer);
             }
@@ -572,14 +744,14 @@ foundation::ResultValue<renderer::RenderMaterialResource> RuntimeAssetResolver::
         }
         resource::TextureMaterialDesc material_desc{};
         material_desc.texture_view = texture_found_gpu->second.sampled_view;
-        material_desc.sampler = upload_context_.material_sampler;
-        material_desc.binding_layout = upload_context_.material_binding_layout;
-        material_desc.binding_group = upload_context_.material_binding_group;
+        material_desc.sampler = upload_host(upload_context_).material_sampler;
+        material_desc.binding_layout = upload_host(upload_context_).material_binding_layout;
+        material_desc.binding_group = upload_host(upload_context_).material_binding_group;
         material_desc.name = rhi::DebugName{"Runtime.Material"};
-        const auto material_result = resource::create_texture_material(*upload_context_.device, material_desc);
+        const auto material_result = resource::create_texture_material(*upload_host(upload_context_).device, material_desc);
         if (!material_result) {
             rhi::BufferHandle failed_buffer = parameter_result.value;
-            if (const foundation::Result destroy_result = upload_context_.device->destroy_buffer(failed_buffer);
+            if (const foundation::Result destroy_result = upload_host(upload_context_).device->destroy_buffer(failed_buffer);
                 !destroy_result) {
                 failed_material_parameter_buffers_.emplace(key, failed_buffer);
             }
@@ -588,7 +760,7 @@ foundation::ResultValue<renderer::RenderMaterialResource> RuntimeAssetResolver::
         material_value = material_result.value;
         material_value.parameter_buffer = {parameter_result.value, 0, parameter_desc.size};
         if (const foundation::Result bind_result = resource::update_texture_material_parameters(
-                *upload_context_.device, material_value, material_value.parameter_buffer);
+                *upload_host(upload_context_).device, material_value, material_value.parameter_buffer);
             !bind_result) {
             failed_gpu_materials_.emplace(key, material_value);
             return {bind_result, {}};
@@ -605,27 +777,52 @@ foundation::ResultValue<renderer::RenderMaterialResource> RuntimeAssetResolver::
                 {}};
     }
     const auto imported_parameter =
-        upload_context_.graph->import_buffer(material_value.parameter_buffer.buffer, parameter_desc);
+        upload_host(upload_context_).graph->import_buffer(material_value.parameter_buffer.buffer, parameter_desc);
     if (!imported_parameter) {
         if (material_found == gpu_materials_.end())
             failed_gpu_materials_.emplace(key, material_value);
         return {imported_parameter.result, {}};
     }
     renderer::RenderMaterialResource result{};
-    result.pipeline = upload_context_.material_pipeline;
+    result.pipeline = upload_host(upload_context_).material_pipeline;
+    result.attachment_contract = upload_host(upload_context_).material_attachment_contract;
+    result.shader_contract = upload_host(upload_context_).material_shader_contract;
+    result.depth_attachment_variant = upload_host(upload_context_).depth_attachment_variant;
     result.binding_set = material_value.binding_set;
     result.binding_group = material_value.binding_group;
     result.material_texture = texture_resource;
     result.material_parameter_buffer = material_value.parameter_buffer.buffer;
     result.material_parameter_buffer_desc = parameter_desc;
-    result.material_parameter_resource = pipeline::RenderGraphBuffer{
+    result.material_parameter_resource = render_graph::RenderGraphBuffer{
         imported_parameter.value.index, imported_parameter.value.generation, imported_parameter.value.graph_id};
     result.material_parameter_offset = material_value.parameter_buffer.offset;
     result.material_parameter_size = material_value.parameter_buffer.size;
-    result.depth_pipeline = upload_context_.depth_pipeline;
-    result.gbuffer_pipeline = upload_context_.gbuffer_pipeline;
-    result.shadow_pipeline = upload_context_.shadow_pipeline;
-    result.clustered_pipeline = upload_context_.clustered_pipeline;
+    result.depth_pipeline = upload_host(upload_context_).depth_pipeline;
+    result.depth_pipeline_contract = host.depth_pipeline.is_valid() ? host.depth_pipeline_contract
+                                                                   : renderer::RenderMaterialAttachmentContract{};
+    result.depth_profile_contract = host.depth_pipeline.is_valid() ? host.depth_profile_contract
+                                                                  : renderer::RendererProfilePsoContract{};
+    result.gbuffer_pipeline = upload_host(upload_context_).gbuffer_pipeline;
+    result.gbuffer_pipeline_contract = host.gbuffer_pipeline.is_valid() ? host.gbuffer_pipeline_contract
+                                                                     : renderer::RenderMaterialAttachmentContract{};
+    result.gbuffer_profile_contract = host.gbuffer_pipeline.is_valid() ? host.gbuffer_profile_contract
+                                                                    : renderer::RendererProfilePsoContract{};
+    result.shadow_pipeline = upload_host(upload_context_).shadow_pipeline;
+    result.shadow_pipeline_contract = host.shadow_pipeline.is_valid() ? host.shadow_pipeline_contract
+                                                                    : renderer::RenderMaterialAttachmentContract{};
+    result.shadow_shader_contract = host.shadow_pipeline.is_valid() ? host.shadow_shader_contract
+                                                                  : renderer::RenderMaterialShaderContract{};
+    result.shadow_pipeline_cache_epoch = host.shadow_pipeline.is_valid() ? host.shadow_pipeline_cache_epoch : 0;
+    result.clustered_pipeline = upload_host(upload_context_).clustered_pipeline;
+    result.clustered_pipeline_contract = upload_host(upload_context_).clustered_pipeline_contract;
+    result.clustered_profile_contract = upload_host(upload_context_).clustered_profile_contract;
+    result.unshadowed_clustered_variant = upload_host(upload_context_).unshadowed_clustered_variant;
+    result.variant_cache_epoch = variant_epoch;
+    result.clustered_profile_contract.cache_epoch = variant_epoch;
+    if (result.unshadowed_clustered_variant) {
+        result.unshadowed_clustered_variant->cache_epoch = variant_epoch;
+        result.unshadowed_clustered_variant->profile_contract.cache_epoch = variant_epoch;
+    }
     if (!result.is_valid()) {
         if (material_found == gpu_materials_.end())
             failed_gpu_materials_.emplace(key, material_value);
@@ -641,9 +838,9 @@ foundation::ResultValue<renderer::RenderMaterialResource> RuntimeAssetResolver::
 
 foundation::ResultValue<renderer::RenderObjectResource> RuntimeAssetResolver::resolve_object(
     const renderer::RenderInstance& instance, const renderer::RenderView& view) const {
-    if (!upload_context_.device || !upload_context_.frame_context || !upload_context_.frame_context->is_frame_active())
+    if (!upload_host(upload_context_).device || !upload_host(upload_context_).frame_context || !upload_host(upload_context_).frame_context->is_frame_active())
         return {foundation::not_ready("Object upload requires an active frame context"), {}};
-    if (!upload_context_.object_binding_layout.is_valid())
+    if (!upload_host(upload_context_).object_binding_layout.is_valid())
         return {foundation::not_ready("Object GPU contract requires a binding layout"), {}};
 
     // Include the active frame slot in the key. A slot can be reused only after
@@ -651,8 +848,8 @@ foundation::ResultValue<renderer::RenderObjectResource> RuntimeAssetResolver::re
     // the current frame while avoiding mutation of an in-flight descriptor set.
     uint64_t key = view.id.value();
     key ^= instance.object.value() + 0x9e3779b97f4a7c15ull + (key << 6u) + (key >> 2u);
-    key ^= static_cast<uint64_t>(upload_context_.frame_context->frame_slot_index()) * 0x517cc1b727220a95ull;
-    const uint64_t frame_number = upload_context_.frame_context->frame_number() - 1u;
+    key ^= static_cast<uint64_t>(upload_host(upload_context_).frame_context->frame_slot_index()) * 0x517cc1b727220a95ull;
+    const uint64_t frame_number = upload_host(upload_context_).frame_context->frame_number() - 1u;
     const auto found = gpu_objects_.find(key);
     const auto frame_found = gpu_object_frame_numbers_.find(key);
 
@@ -668,7 +865,7 @@ foundation::ResultValue<renderer::RenderObjectResource> RuntimeAssetResolver::re
     if (found != gpu_objects_.end()) {
         if (frame_found != gpu_object_frame_numbers_.end() && frame_found->second == frame_number)
             return {foundation::Result::success(), found->second};
-        if (const auto result = upload_context_.device->write_buffer(found->second.transform_buffer, 0,
+        if (const auto result = upload_host(upload_context_).device->write_buffer(found->second.transform_buffer, 0,
                                                                      std::as_bytes(std::span{&constants, 1}));
             !result)
             return {result, {}};
@@ -688,37 +885,37 @@ foundation::ResultValue<renderer::RenderObjectResource> RuntimeAssetResolver::re
     desc.initial_stages = rhi::PipelineStage::kAllCommands;
     desc.initial_queue = rhi::QueueClass::kGraphics;
     desc.name = rhi::DebugName{"Runtime.Object.Buffer"};
-    const auto buffer = upload_context_.device->create_buffer(desc);
+    const auto buffer = upload_host(upload_context_).device->create_buffer(desc);
     if (!buffer)
         return {buffer.result, {}};
-    const auto set = upload_context_.device->create_binding_set({upload_context_.object_binding_layout,
+    const auto set = upload_host(upload_context_).device->create_binding_set({upload_host(upload_context_).object_binding_layout,
                                                                  rhi::BindingSetLifetime::kPersistent,
                                                                  rhi::DebugName{"Runtime.Object.Set"}});
     if (!set) {
-        (void)upload_context_.device->destroy_buffer(buffer.value);
+        (void)upload_host(upload_context_).device->destroy_buffer(buffer.value);
         return {set.result, {}};
     }
     rhi::BindingWrite write{};
     write.location = {0, 0};
     write.resource.type = rhi::BindingType::kUniformBuffer;
     write.resource.buffer_range = {buffer.value, 0, sizeof(renderer::RenderObjectConstants)};
-    if (const auto result = upload_context_.device->update_binding_set(set.value, std::span{&write, 1}); !result) {
-        (void)upload_context_.device->destroy_binding_set(set.value);
-        (void)upload_context_.device->destroy_buffer(buffer.value);
+    if (const auto result = upload_host(upload_context_).device->update_binding_set(set.value, std::span{&write, 1}); !result) {
+        (void)upload_host(upload_context_).device->destroy_binding_set(set.value);
+        (void)upload_host(upload_context_).device->destroy_buffer(buffer.value);
         return {result, {}};
     }
 
     if (const auto result =
-            upload_context_.device->write_buffer(buffer.value, 0, std::as_bytes(std::span{&constants, 1}));
+            upload_host(upload_context_).device->write_buffer(buffer.value, 0, std::as_bytes(std::span{&constants, 1}));
         !result) {
-        (void)upload_context_.device->destroy_binding_set(set.value);
-        (void)upload_context_.device->destroy_buffer(buffer.value);
+        (void)upload_host(upload_context_).device->destroy_binding_set(set.value);
+        (void)upload_host(upload_context_).device->destroy_buffer(buffer.value);
         return {result, {}};
     }
     renderer::RenderObjectResource resource{};
     resource.transform_buffer = buffer.value;
     resource.transform_buffer_desc = desc;
-    resource.binding_layout = upload_context_.object_binding_layout;
+    resource.binding_layout = upload_host(upload_context_).object_binding_layout;
     resource.binding_set = set.value;
     resource.binding_group = 0;
     resource.transform_offset = 0;
@@ -729,20 +926,20 @@ foundation::ResultValue<renderer::RenderObjectResource> RuntimeAssetResolver::re
     } catch (const std::bad_alloc&) {
         gpu_objects_.erase(key);
         gpu_object_frame_numbers_.erase(key);
-        (void)upload_context_.device->destroy_binding_set(set.value);
-        (void)upload_context_.device->destroy_buffer(buffer.value);
+        (void)upload_host(upload_context_).device->destroy_binding_set(set.value);
+        (void)upload_host(upload_context_).device->destroy_buffer(buffer.value);
         return {foundation::out_of_memory("Runtime object resource cache allocation failed"), {}};
     }
     return {foundation::Result::success(), resource};
 }
 
 foundation::ResultValue<renderer::RenderLightingResource> RuntimeAssetResolver::resolve_lighting(
-    const renderer::RenderSceneSnapshot& snapshot, const renderer::RenderView&) const {
-    if (!upload_context_.device || !upload_context_.frame_context || !upload_context_.graph ||
-        !upload_context_.uploader || !upload_context_.frame_context->is_frame_active()) {
+    const renderer::RenderSceneSnapshot& snapshot, const renderer::RenderView& view) const {
+    if (!upload_host(upload_context_).device || !upload_host(upload_context_).frame_context || !upload_host(upload_context_).graph ||
+        !upload_host(upload_context_).uploader || !upload_host(upload_context_).frame_context->is_frame_active()) {
         return {foundation::not_ready("Lighting upload requires an active frame context"), {}};
     }
-    if (!upload_context_.lighting_binding_layout.is_valid()) {
+    if (!upload_host(upload_context_).lighting_binding_layout.is_valid()) {
         return {foundation::not_ready("Lighting GPU contract requires a binding layout"), {}};
     }
     const auto constants = renderer::make_render_lighting_constants(snapshot.lights);
@@ -750,16 +947,33 @@ foundation::ResultValue<renderer::RenderLightingResource> RuntimeAssetResolver::
         return {constants.result, {}};
     }
 
-    const uint64_t frame_number = upload_context_.frame_context->frame_number() - 1u;
-    const auto found = gpu_lighting_.find(frame_number);
+    const uint64_t frame_number = upload_host(upload_context_).frame_context->frame_number() - 1u;
+    const LightingCacheKey key{frame_number, view.id, constants.value};
+    const auto found = gpu_lighting_.find(key);
     if (found != gpu_lighting_.end()) {
+        auto& cached = found->second;
+        const bool current = render_graph::detail::RenderGraphResourceAccess::contains_buffer(
+            *upload_host(upload_context_).graph, cached.lighting_resource);
+        const auto receipt = lighting_uploads_.find(key);
+        if (!upload_available(receipt == lighting_uploads_.end() ? nullptr : receipt->second,
+                              *upload_host(upload_context_).frame_context, current)) {
+            const auto upload = upload_host(upload_context_).uploader->upload_buffer(
+                *upload_host(upload_context_).frame_context, *upload_host(upload_context_).graph,
+                resource::BufferUploadDesc{std::as_bytes(std::span{&constants.value, 1}),
+                                          cached.lighting_buffer_desc, 0, 4}, cached.lighting_buffer);
+            if (!upload) return {upload.result, {}};
+            cached.lighting_resource = upload.value.target;
+            lighting_uploads_.insert_or_assign(key, upload.value.submission);
+            return {foundation::Result::success(), cached};
+        }
+        if (current) return {foundation::Result::success(), cached};
         const auto imported =
-            upload_context_.graph->import_buffer(found->second.lighting_buffer, found->second.lighting_buffer_desc);
+            upload_host(upload_context_).graph->import_buffer(found->second.lighting_buffer, found->second.lighting_buffer_desc);
         if (!imported) {
             return {imported.result, {}};
         }
         found->second.lighting_resource =
-            pipeline::RenderGraphBuffer{imported.value.index, imported.value.generation, imported.value.graph_id};
+            render_graph::RenderGraphBuffer{imported.value.index, imported.value.generation, imported.value.graph_id};
         return {foundation::Result::success(), found->second};
     }
 
@@ -768,35 +982,36 @@ foundation::ResultValue<renderer::RenderLightingResource> RuntimeAssetResolver::
     // Keep the fixed lighting UBO copyable so diagnostics/readback and future
     // frame capture can inspect the same device-local resource without a
     // second mirror allocation.
-    destination.capabilities = rhi::BufferCapability::kUniform | rhi::BufferCapability::kTransferSource;
+    destination.capabilities = rhi::BufferCapability::kUniform | rhi::BufferCapability::kTransferSource |
+                               rhi::BufferCapability::kTransferDestination;
     destination.memory = rhi::MemoryClass::kDeviceLocal;
     destination.initial_usage = rhi::ResourceUsage::kUniformRead;
     destination.initial_stages = rhi::PipelineStage::kFragmentShader;
     destination.initial_queue = rhi::QueueClass::kGraphics;
     destination.name = rhi::DebugName{"Runtime.Lighting.Constants"};
-    const auto upload = upload_context_.uploader->upload_buffer(
-        *upload_context_.frame_context, *upload_context_.graph,
+    const auto upload = upload_host(upload_context_).uploader->upload_buffer(
+        *upload_host(upload_context_).frame_context, *upload_host(upload_context_).graph,
         resource::BufferUploadDesc{std::as_bytes(std::span{&constants.value, 1}), destination, 0, 4});
     if (!upload) {
         return {upload.result, {}};
     }
-    const auto set = upload_context_.device->create_binding_set({upload_context_.lighting_binding_layout,
+    const auto set = upload_host(upload_context_).device->create_binding_set({upload_host(upload_context_).lighting_binding_layout,
                                                                  rhi::BindingSetLifetime::kPersistent,
                                                                  rhi::DebugName{"Runtime.Lighting.Set"}});
     if (!set) {
         rhi::BufferHandle buffer = upload.value.destination;
-        (void)upload_context_.device->destroy_buffer(buffer);
+        (void)upload_host(upload_context_).device->destroy_buffer(buffer);
         return {set.result, {}};
     }
     rhi::BindingWrite write{};
     write.location = {2, 0};
     write.resource.type = rhi::BindingType::kUniformBuffer;
     write.resource.buffer_range = {upload.value.destination, 0, sizeof(renderer::RenderLightingConstants)};
-    if (const foundation::Result result = upload_context_.device->update_binding_set(set.value, std::span{&write, 1});
+    if (const foundation::Result result = upload_host(upload_context_).device->update_binding_set(set.value, std::span{&write, 1});
         !result) {
-        (void)upload_context_.device->destroy_binding_set(set.value);
+        (void)upload_host(upload_context_).device->destroy_binding_set(set.value);
         rhi::BufferHandle buffer = upload.value.destination;
-        (void)upload_context_.device->destroy_buffer(buffer);
+        (void)upload_host(upload_context_).device->destroy_buffer(buffer);
         return {result, {}};
     }
 
@@ -805,24 +1020,27 @@ foundation::ResultValue<renderer::RenderLightingResource> RuntimeAssetResolver::
     resource.binding_group = 2;
     resource.lighting_buffer = upload.value.destination;
     resource.lighting_buffer_desc = destination;
-    resource.lighting_resource = pipeline::RenderGraphBuffer{upload.value.target.index, upload.value.target.generation,
+    resource.lighting_resource = render_graph::RenderGraphBuffer{upload.value.target.index, upload.value.target.generation,
                                                              upload.value.target.graph_id};
     resource.lighting_offset = upload.value.destination_offset;
     resource.lighting_size = sizeof(renderer::RenderLightingConstants);
     if (!resource.is_valid()) {
-        (void)upload_context_.device->destroy_binding_set(set.value);
+        (void)upload_host(upload_context_).device->destroy_binding_set(set.value);
         rhi::BufferHandle buffer = upload.value.destination;
-        (void)upload_context_.device->destroy_buffer(buffer);
+        (void)upload_host(upload_context_).device->destroy_buffer(buffer);
         return {foundation::Result::failure(foundation::ResultCode::kUnknown,
                                             "Runtime lighting produced an invalid renderer resource"),
                 {}};
     }
     try {
-        gpu_lighting_.emplace(frame_number, resource);
+        gpu_lighting_.emplace(key, resource);
+        lighting_uploads_.insert_or_assign(key, upload.value.submission);
     } catch (const std::bad_alloc&) {
-        (void)upload_context_.device->destroy_binding_set(set.value);
+        gpu_lighting_.erase(key);
+        lighting_uploads_.erase(key);
+        (void)upload_host(upload_context_).device->destroy_binding_set(set.value);
         rhi::BufferHandle buffer = upload.value.destination;
-        (void)upload_context_.device->destroy_buffer(buffer);
+        (void)upload_host(upload_context_).device->destroy_buffer(buffer);
         return {foundation::out_of_memory("Runtime lighting resource cache allocation failed"), {}};
     }
     return {foundation::Result::success(), resource};
@@ -830,35 +1048,67 @@ foundation::ResultValue<renderer::RenderLightingResource> RuntimeAssetResolver::
 
 foundation::ResultValue<renderer::RenderDeferredLightingResource> RuntimeAssetResolver::resolve_deferred_lighting(
     const renderer::RenderView& view) const {
-    if (upload_context_.deferred_lighting_resolver)
-        return upload_context_.deferred_lighting_resolver(view);
-    if (!upload_context_.deferred_lighting.is_valid()) {
+    const auto& host = upload_host(upload_context_);
+    if (host.deferred_lighting_resolver) {
+        const auto resolved = host.deferred_lighting_resolver(view);
+        if (!resolved)
+            return resolved;
+        if (!resolved.value.is_valid() ||
+            !pso_variant_epoch_matches(host.variant_cache_epoch, resolved.value.profile_contract) ||
+            (resolved.value.shadow_pipeline.is_valid() &&
+             !pso_variant_epoch_matches(host.variant_cache_epoch, resolved.value.shadow_profile_contract)))
+            return {foundation::not_ready("Deferred lighting resolver returned an incomplete Shader/PSO contract"), {}};
+        return resolved;
+    }
+    if (!host.deferred_lighting.is_valid() ||
+        !pso_variant_epoch_matches(host.variant_cache_epoch, host.deferred_lighting.profile_contract) ||
+        (host.deferred_lighting.shadow_pipeline.is_valid() &&
+         !pso_variant_epoch_matches(host.variant_cache_epoch, host.deferred_lighting.shadow_profile_contract))) {
         return {foundation::not_ready("Deferred lighting host contract is incomplete"), {}};
     }
-    return {foundation::Result::success(), upload_context_.deferred_lighting};
+    return {foundation::Result::success(), host.deferred_lighting};
 }
 
 foundation::ResultValue<renderer::RenderShadowResource> RuntimeAssetResolver::resolve_shadow(
     const renderer::RenderShadowView& view) const {
-    if (!upload_context_.shadow_resolver) {
+    if (!upload_host(upload_context_).shadow_resolver) {
         return {foundation::not_ready("Shadow host callback is unavailable"), {}};
     }
-    return upload_context_.shadow_resolver(view);
+    const auto resolved = upload_host(upload_context_).shadow_resolver(view);
+    if (!resolved)
+        return resolved;
+    if (!resolved.value.is_valid())
+        return {foundation::not_ready("Shadow resolver returned an incomplete resource contract"), {}};
+    return resolved;
 }
 
 foundation::ResultValue<renderer::RenderLightCullingResource> RuntimeAssetResolver::resolve_light_culling(
     const renderer::RenderSceneSnapshot& snapshot, const renderer::RenderShadowView& shadow) const {
-    if (!upload_context_.light_culling_resolver) {
+    const auto& host = upload_host(upload_context_);
+    if (!host.light_culling_resolver) {
         return {foundation::not_ready("Light-culling host callback is unavailable"), {}};
     }
-    return upload_context_.light_culling_resolver(snapshot, shadow);
+    const auto resolved = host.light_culling_resolver(snapshot, shadow);
+    if (!resolved)
+        return resolved;
+    if (!resolved.value.is_valid() ||
+        !shader_variant_epoch_matches(host.variant_cache_epoch, resolved.value.shader_contract))
+        return {foundation::not_ready("Light-culling resolver returned an incomplete resource contract"), {}};
+    return resolved;
 }
 
 foundation::ResultValue<renderer::RenderPostProcessResource> RuntimeAssetResolver::resolve_post_process(
     const renderer::RenderView& view) const {
-    if (!upload_context_.post_process_resolver) {
+    const auto& host = upload_host(upload_context_);
+    if (!host.post_process_resolver) {
         return {foundation::not_ready("Post-process host callback is unavailable"), {}};
     }
-    return upload_context_.post_process_resolver(view);
+    const auto resolved = host.post_process_resolver(view);
+    if (!resolved)
+        return resolved;
+    if (!resolved.value.is_valid() ||
+        !pso_variant_epoch_matches(host.variant_cache_epoch, resolved.value.profile_contract))
+        return {foundation::not_ready("Post-process resolver returned an incomplete Shader/PSO contract"), {}};
+    return resolved;
 }
 }  // namespace aeg::application::runtime

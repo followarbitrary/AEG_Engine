@@ -14,8 +14,8 @@
 #include "material_payload.hpp"
 
 namespace {
-using aeg::asset::AssetId;
-using aeg::asset::AssetKind;
+using aeg::foundation::AssetId;
+using aeg::foundation::AssetKind;
 using aeg::asset::MaterialPayload;
 using aeg::tooling::AssetCooker;
 using aeg::tooling::AssetMeta;
@@ -105,7 +105,7 @@ int main() {
                             {4, 0.5},
                             {3, std::string("value")},
                             {2, std::vector<double>{1.0, 2.0}},
-                            {1, aeg::pipeline::AssetReference{texture_a.to_string()}}};
+                            {1, aeg::foundation::AssetReference{texture_a.to_string()}}};
     const auto with_parameters = aeg::asset::encode_material_payload(reordered);
     assert(with_parameters);
     const auto round_trip = aeg::asset::decode_material_payload(with_parameters.value);
@@ -158,7 +158,9 @@ int main() {
     std::fill(zero_texture.begin() + 36, zero_texture.begin() + 52, std::byte{0});
     assert(!aeg::asset::decode_material_payload(zero_texture));
 
-    // Default registration must make valid Material sources cook, while Font stays fail-closed.
+    // Default registration must make valid Material sources cook. A Material
+    // source with a mismatched Font product is rejected by the selected
+    // Material importer before any artifact is published.
     AssetCooker cooker(root / "Cache" / "Cooked");
     assert(cooker.register_default_importers());
     const auto default_result = cooker.cook(valid);
@@ -172,8 +174,8 @@ int main() {
     assert(AssetMetaCodec{}.save(font.string() + ".meta", font_meta));
     const auto font_result = cooker.cook(font);
     assert(!font_result);
-    assert(font_result.result.code == aeg::foundation::ResultCode::kUnsupported);
-    assert(font_result.result.message.find("Font") != std::string::npos);
+    assert(font_result.result.code == aeg::foundation::ResultCode::kInvalidArgument);
+    assert(font_result.result.message.find("Material metadata") != std::string::npos);
 
     std::filesystem::remove_all(root);
     return 0;

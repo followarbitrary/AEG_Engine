@@ -4,7 +4,6 @@
  */
 #include <ecs.hpp>
 #include <memory>
-#include <pipeline.hpp>
 #include <world_scope.hpp>
 
 namespace {
@@ -25,8 +24,7 @@ int main() {
         return 2;
     }
 
-    aeg::pipeline::PipelineRegistry registry;
-    aeg::world::WorldScope scope(world_result.value, registry, {});
+    aeg::world::WorldScope scope(world_result.value);
     if (!scope.initialize() ||
         !scope.state().register_component<Transform>(aeg::ecs::ComponentTypeId("Transform"), "Transform")) {
         return 3;
@@ -53,12 +51,10 @@ int main() {
     if (!first_view) {
         return 7;
     }
-    const aeg::ecs::WorldSnapshot* first_view_snapshot =
-        first_view.value.as<aeg::ecs::WorldSnapshot>(scope.snapshot_type());
-    const Transform* first_transform =
-        first_view_snapshot == nullptr ? nullptr : first_view_snapshot->get<Transform>(entity.value);
+    const Transform* first_transform = first_view.value.get<Transform>(entity.value);
     if (first_transform == nullptr || first_transform->x != 12.0f || first_transform->y != 15.0f ||
-        first_view.value.owner_scope() != aeg::pipeline::PipelineScope::kWorld ||
+        first_view.value.world() != scope.handle() || first_view.value.revision() != 1 ||
+        first_view.value.frame_number() != 21 || first_view.value.fixed_tick() != 4 ||
         frame_result.value.key().view_id != 3) {
         return 8;
     }
@@ -82,11 +78,9 @@ int main() {
     if (!retained_first_view) {
         return 11;
     }
-    const aeg::ecs::WorldSnapshot* retained_snapshot =
-        retained_first_view.value.as<aeg::ecs::WorldSnapshot>(scope.snapshot_type());
-    const Transform* retained_transform =
-        retained_snapshot == nullptr ? nullptr : retained_snapshot->get<Transform>(entity.value);
-    if (retained_transform == nullptr || retained_transform->x != 12.0f) {
+    const Transform* retained_transform = retained_first_view.value.get<Transform>(entity.value);
+    if (retained_transform == nullptr || retained_transform->x != 12.0f ||
+        retained_first_view.value.world() != scope.handle() || retained_first_view.value.revision() != 1) {
         return 12;
     }
 
@@ -95,12 +89,10 @@ int main() {
         return 13;
     }
     const auto second_view = second_frame_result.value.read_snapshot();
-    const aeg::ecs::WorldSnapshot* second_view_snapshot =
-        second_view ? second_view.value.as<aeg::ecs::WorldSnapshot>(scope.snapshot_type()) : nullptr;
-    const Transform* second_transform =
-        second_view_snapshot == nullptr ? nullptr : second_view_snapshot->get<Transform>(entity.value);
+    const Transform* second_transform = second_view ? second_view.value.get<Transform>(entity.value) : nullptr;
     if (!second_view || second_transform == nullptr || second_transform->x != 99.0f ||
-        second_view_snapshot->revision() != 2) {
+        second_view.value.revision() != 2 || second_view.value.world() != scope.handle() ||
+        second_view.value.frame_number() != 22 || second_view.value.fixed_tick() != 5) {
         return 14;
     }
 
@@ -115,9 +107,9 @@ int main() {
     if (!retained_after_shutdown) {
         return 17;
     }
-    const auto retained_after_shutdown_snapshot =
-        retained_after_shutdown.value.as<aeg::ecs::WorldSnapshot>(scope.snapshot_type());
-    if (retained_after_shutdown_snapshot == nullptr || retained_after_shutdown_snapshot->revision() != 1) {
+    const auto* retained_after_shutdown_transform = retained_after_shutdown.value.get<Transform>(entity.value);
+    if (retained_after_shutdown.value.revision() != 1 || retained_after_shutdown.value.world() != scope.handle() ||
+        retained_after_shutdown_transform == nullptr || retained_after_shutdown_transform->x != 12.0f) {
         return 18;
     }
     if (!scope.initialize() || !scope.command_buffer().empty()) {

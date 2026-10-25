@@ -1,19 +1,22 @@
 # AEG Domain-Oriented Pipeline Architecture
 
-> 文档性质：架构说明、公共 API 和 ABI 使用手册
+> 文档性质：历史 Pipeline/Frame/Render 执行投影说明、公共 API 和 ABI 使用手册
 >
-> 更新时间：2026-09-12
+> 更新时间：2026-10-04（补充 A/B/C/D 与 Logic/Flow 边界）
 >
-> 适用范围：Pipeline、PipelineFeature、Scope、Artifact、Domain Graph、RenderGraph、RHI
+> 适用范围：现有 Pipeline/Feature/Pass API、Scope、Artifact、Domain Graph、RenderGraph、RHI
+>
+> 目标业务模型、五域边界和 FeatureGraph 作者契约以 [Feature 五域架构设计](AEG%20Feature%20Five-Domain%20Architecture.md) 为准。
+> 本文的 Pipeline 三层只描述引擎内部 Frame/Render 执行投影，不是游戏开发者的业务身份，也不是新的作者 API。
 
 ## 1. 文档目的
 
 本文档用于说明 AEG Domain-Oriented Pipeline Architecture，以及游戏代码、引擎模块和
 插件如何使用这套架构。下文将其简称为“本架构”。它回答以下问题：
 
-- 为什么引擎功能统一抽象为 Pipeline。
+- 现有 Frame/Render 执行投影如何工作；目标方案不再把 Pipeline 作为业务功能身份。
 - Pipeline、Stage、Task、Feature、Artifact 和 Graph 分别负责什么。
-- 游戏开发者如何定义、注册、绑定和执行自定义 Pipeline。
+- 引擎内部如何维护历史 Pipeline API；游戏作者入口以 FeatureGraph/FeatureModule 契约为准。
 - 内置领域 Feature 如何扩展，以及跨领域功能如何使用 `CompositeFeature`。
 - Engine、World、Frame 和 Editor 之间如何隔离数据和生命周期。
 - 公共 API 的使用边界、对象所有权、线程安全和 ABI 兼容规则是什么。
@@ -106,7 +109,8 @@ Artifact 和 Bridge 规则为准。
 
 核心结论如下：
 
-1. 所有具有明确执行时机、输入输出和依赖关系的功能都可以表达为 Pipeline。
+1. 需要独立身份、契约、配置、生命周期或跨帧状态的业务能力都由 Feature 表达；
+   Pipeline 只作为某个 Scope/TimePolicy 下的可选执行计划容器，不是 Feature 的父层。
 2. Math、Logging、Allocator、RHI Device、Resource Cache 等基础服务不伪装成业务
    Pipeline。
 3. `EnginePhase` 是稳定的公共生命周期锚点；Pipeline 内部可以拥有自己的 Stage。
@@ -119,6 +123,38 @@ Artifact 和 Bridge 规则为准。
 9. RenderGraph 负责渲染资源、生命周期、Barrier 和 Queue Sync；RHI 负责后端无关的
    GPU 对象和命令接口。
 10. Vulkan、D3D12 或其他后端类型不得越过 RHI private 边界进入公共 Pipeline API。
+
+### 2.1 Feature、Pipeline、Pass 和 Function 的边界
+
+`Feature` 是业务能力的唯一语义身份；若该能力拥有跨帧可变状态，则由其 `FeatureInstance`
+负责状态所有权。`Pipeline` 统一调度语义，但不统一所有领域的
+内核，也不接管 Feature/Flow 的 mutable state。`FunctionCall` 是 Feature 或 Flow 内一次
+无状态调用；`RenderPass` 只属于 Frame Scope 的 RenderGraph 投影。`Pipeline → Feature →
+Pass` 因而只能作为 Frame/Render profile 的作者和执行视图，不能当作 Logic、Physics、
+Audio 或 Stream 的通用功能层级。
+
+用户语义中的 A“功能层”、B“函数层”、C“流程层”、D“逻辑域”是正交标签：A 在本表中
+特指跨帧 CPU Logic Feature 的能力和状态外壳；全域业务身份仍统一由 Feature 表达。B 是
+一次调用记录，C 是 Feature 持有的跨帧 continuation，D 是
+`FeatureDomain::kLogic` 的分类和状态边界。Frame 是 Scope/TimePolicy，不承载跨帧状态。
+
+跨帧流程的最小运行契约为：
+
+```text
+FeatureInstanceId + OwnerPath
+  -> FlowDefinitionId + FlowInstanceId
+      -> StateId + StateVersion + TransitionId
+          -> Event/Command consume
+          -> guard/action FunctionCall
+          -> atomic state commit
+          -> Snapshot/Event/Receipt publish
+```
+
+`ExecutionInstanceId` 只表示一次 Frame/Tick/Event 调用；`FlowInstanceId` 表示持续到完成、
+取消、暂停或迁移的流程实例。状态、取消令牌、等待条件和版本迁移策略属于 Feature/Flow
+StateStore，不进入不可变 `PipelinePlan`。当前公共 `LogicFeature` 主要提供静态
+`setup()`/`collect_contributions()`；上述 tick/event/transition 生命周期是目标语义，不能
+被误写成现有 API 已经提供。
 
 ## 3. 为什么采用 Pipeline
 
@@ -448,7 +484,11 @@ Preferences 的预览字体是独立 Host 内的暂态状态，不得修改主�
 编辑器字体设置只影响编辑器自身，不得改变游戏运行时的字体资源或字体状态。错误通知
 由 Application/Platform 提供 native dialog，native dialog 不得再次嵌套 ImGui 窗口。
 
-## 6. Pipeline 的三层对象
+## 6. 内部 Frame/Render Pipeline 的三层执行投影
+
+本节保留执行基础设施的术语，供 Runtime、Renderer 和 RenderGraph 维护者使用。它不参与
+FeatureGraph 的业务编排；游戏开发者只登记 FeatureDefinition/FeatureContract，编排器再把
+需要的 Render 工作投影到这里。Logic/Physics/Audio/Stream 的跨帧状态也不得放入这些对象。
 
 ### 6.1 PipelineDefinition
 
@@ -457,8 +497,9 @@ Preferences 的预览字体是独立 Host 内的暂态状态，不得修改主�
 
 ### 6.2 PipelineInstance
 
-实例是 Definition 绑定到具体 Scope 后的运行对象，保存配置、Feature 绑定和领域内部
-状态。World Scope 的 Instance 必须绑定 `WorldHandle`。
+实例是 Definition 绑定到具体 Scope 后的运行对象，保存配置、Feature 绑定和调度器/Host
+bookkeeping。业务状态由 Feature/Flow owner 的 StateStore 持有；World Scope 的 Instance
+必须绑定 `WorldHandle`。
 
 ### 6.3 PipelinePlan
 
@@ -473,6 +514,10 @@ Plan 是 Compiler 根据 Definition、Instance 和 Feature 贡献生成的不可
 RenderGraph Barrier/Queue Dependency 或结构化诊断索引。Artifact 生命周期和 GPU 同步
 由 RenderGraph/RHI 管理，Scope Bridge 和 Completion 由运行时上下文管理，编译诊断通过
 `Result` 及日志/诊断系统返回或记录。
+
+`PipelinePlan` 也不得保存跨帧 Flow continuation、StateStore、待处理事件或可变 World
+状态。它可以保存 Flow Definition 的静态 dispatch/依赖信息；每个 `FlowInstance` 的
+`StateVersion`、取消/恢复信息和 OwnerPath 由 Feature owner 的运行时状态持有。
 
 三者关系：
 
@@ -657,12 +702,13 @@ const auto weather_stage = builder.add_stage({
 | `PhaseRegistry::register_phase()`      | 将一个扩展 Phase 加入全局偏序图，并执行环检测                     | ID 重复、锚点不存在、关系非法或形成环时失败；成功后 revision 递增                            |
 | `PhaseRegistry::unregister_phase()`    | 删除一个未被其他扩展 Phase 作为锚点引用的扩展 Phase               | 内置 Phase、被引用 Phase 或不存在的 ID 不能删除                                              |
 | `PhaseRegistry::find_phase()`          | 查询一个 Phase 的声明元数据                                       | 返回的 `name` 是 Registry 内部存储的借用视图；Registry 销毁后或对应 Phase 删除后不得继续使用 |
-| `PhaseRegistry::snapshot()`            | 在同一读锁内捕获有序 Phase 列表和 revision                        | 用于 Compiler、Orchestrator 等需要同时消费顺序和版本的调用方；返回值是独立拥有的快照         |
+| `PhaseRegistryExecution::snapshot()`  | Pipeline-private bridge 在同一读锁内捕获有序 Phase 列表和 revision | 仅供 Compiler、Orchestrator 等 Engine 内部调用；返回值是独立拥有的快照                     |
 | `PhaseRegistry::ordered_phases()`      | 返回确定性的全局拓扑序；同等约束下按内置顺序和稳定 ID 排序        | 发现环或内部状态损坏时返回错误；调用方不得自行按注册顺序排序                                 |
-| `PhaseRegistry::revision()`            | 反映 Phase 集合或顺序约束是否发生变化的单调版本                   | 每次成功注册/删除递增；`PipelinePlan::phase_revision` 记录编译时版本                         |
+| `PhaseRegistryExecution::revision()`  | Pipeline-private bridge 读取 Phase 集合或顺序约束的单调版本        | 每次成功注册/删除递增；`PipelinePlan::phase_revision` 记录编译时版本                         |
 | `PipelineCompileInput::phase_registry` | 可选的编译注册表；为空时使用 `PipelineRegistry::phase_registry()` | 编译结果必须记录所用 revision；Stage 引用未注册 Phase 时失败                                 |
 
-Phase 注册属于拓扑变更。`snapshot()` 将顺序和 revision 作为一个逻辑版本读取；Compiler
+Phase 注册属于拓扑变更。`PhaseRegistryExecution::snapshot()` 将顺序和 revision 作为一个
+逻辑版本读取；Compiler
 在构建 Plan 时记录该 revision，并在已知的并发变更情况下返回 `kOutOfDate`，调用方应
 重新获取快照后重试。运行中的 Orchestrator 不在当前帧中替换 Phase 图；它会在下一
 个帧边界检测 `PhaseRegistry` revision，重编译并切换所有受影响的 Plan。若
@@ -1210,7 +1256,7 @@ Builder 权限，也不会改变 Pipeline 的 Scope、Domain 或执行线程。
 | `kAudio`      | 生成或处理音频输出的 Pipeline                         | 声场、混音、播放调度               | 不表示可以直接访问音频设备句柄       |
 | `kStreaming`  | 负责外部数据读取、解码和资源发布的 Pipeline           | Mesh/Texture/Shader 流送           | 不表示 IO 结果可以绕过 Artifact 发布 |
 | `kTooling`    | 编辑器、诊断、录制和分析用途的 Pipeline               | Editor Overlay、Profiler、Capture  | 不表示可以修改运行时 World 状态      |
-| `kCustom`     | 不适合内置分类但遵守公共 Pipeline 契约的用户 Pipeline | 游戏专用管线、插件管线             | 不会放宽任何编译或权限校验           |
+| `kCustom`     | 不适合内置分类但遵守内部 Pipeline 契约的引擎扩展 | 引擎诊断、编辑器或后端适配         | 不会放宽任何编译或权限校验           |
 
 一个 Pipeline 只能有一个 `category` 值；一个 Pipeline 需要多个业务领域时，使用
 `domains` Mask 表达，而不是把多个 Category 拼接到一个整数中。
@@ -1634,8 +1680,16 @@ struct FeatureDescriptor {
 };
 ```
 
-对于普通领域 Feature，`domain` 和 `domain_mask` 都指向一个领域；对于 Composite，
-`domain` 为 `kComposite`，`domain_mask` 是全部 Part 领域的并集。
+当前公共 API 对普通领域 Feature 使用单一 `domain` 和 `domain_mask`；对 Composite 使用
+`domain = kComposite`、`domain_mask` 为全部 Part 领域并集。这是兼容期结构标记。目标五域
+语义不把 `kComposite` 当作第六域，而是把 Composite 的 DomainSet 定义为叶子域并集。
+
+上面的 `FeatureDescriptor` 是当前公共静态契约。为了支持本文件定义的 A/B/C/D 语义，目标
+作者契约还需要补充 `ExecutionKind`、`StatePolicy`、Clock/Trigger、Lifecycle、
+Reentrancy/Concurrency、SideEffect/CommitPolicy、Failure/Retry 和 Determinism/Cache 等
+字段；这些字段目前尚未成为同名公共 API。Logic/Flow 的 `FlowInstanceId`、`StateVersion`、
+Transition 事务和 StateStore 也属于目标语义，不能从当前 `setup()`/`collect_contributions()`
+接口推断为已经实现。
 
 ### 11.5 CompositeFeature
 
@@ -1645,8 +1699,13 @@ struct FeatureDescriptor {
 Artifact 命名空间和诊断来源。模板允许一个 Part，但若功能只属于一个领域，开发约定仍是
 直接继承相应领域基类，而不是使用 `CompositeFeature<Part>` 包装。
 
-模板仅验证 Part 数量非零、Part 与 `PipelineFeature` 存在继承关系、Part 暴露 `kDomain` 与
-`BuilderType`，并拒绝 `kDomain == kComposite` 的嵌套组合。它不会验证 Part 是否公开继承、
+这里的 Part 身份不等于 Registry 顶层 Feature 身份。Render Part 的 FeaturePoint 是
+Frame/Render 投影约定；若 Part 持有跨帧状态，它必须额外保留 `OwnerPath`、StateStore 和
+FlowInstance 边界，不能因 Composite 展开而丢失状态所有权。
+
+当前模板仅验证 Part 数量非零、Part 与 `PipelineFeature` 存在继承关系、Part 暴露 `kDomain` 与
+`BuilderType`，并拒绝 `kDomain == kComposite` 的嵌套组合；这是兼容期实现限制，不是目标
+五域模型的组合规则。目标注册适配器必须允许同域/跨域递归，但拒绝结构递归环。它不会验证 Part 是否公开继承、
 是否恰好属于一个领域，或是否借由多重继承规避领域边界；这些均属于开发约定，不由模板
 实例化或 Registry 注册阶段自动拒绝。
 
@@ -1963,8 +2022,9 @@ World 与 Game World 拥有完全独立的可变状态。
 `execute_phase()` 是 Orchestrator 使用的帧内入口。调用方传入的 `pinned_plan` 若非空，
 Host 会在本次调用中使用该不可变快照，而不会读取可能已经切换的 Active Plan；这保证同一
 帧的各个 Phase 使用同一个 Plan。未传入快照时，Host 使用当前 Active Plan，并在必要时
-尝试应用 Pending Plan。直接使用该接口时，调用方必须按照 `PhaseRegistry::snapshot()`
-返回的全局顺序驱动 Phase，并自行保证帧边界和跨作用域 Bridge 已就绪。
+尝试应用 Pending Plan。直接使用该接口时，Engine 内部调用方必须按照
+`PhaseRegistryExecution::snapshot()` 返回的全局顺序驱动 Phase，并自行保证帧边界和跨作用域
+Bridge 已就绪。
 
 ### 13.2.1 当前 World/ECS Scope 适配
 
@@ -2035,7 +2095,9 @@ orchestrator.run_frame({});
 `register_world_frame()` 会为该 View 创建 `WorldFrameKey` 和 World-to-Frame
 `ArtifactScopeBridge`。`WorldCommit` 完成后，Bridge 捕获不可变快照；Frame Pipeline
 在 `RenderExtract` 中通过声明的 `ArtifactBinding` 读取它。Frame Pipeline 永远不会
-获得 `ecs::World&`，也不能绕过 Artifact 合约访问 World 可变存储。
+获得 `ecs::World&`，也不能绕过 Artifact 合约访问 World 可变存储。Host 与该 Bridge 的
+执行期 wiring 由 `Pipeline/private/pipeline_scope_host_execution.hpp` 管理，public host
+只保留 Scope 生命周期合同。
 
 执行上下文中的两个不透明指针具有不同语义：`EngineFrameDesc::user_data` 会原样传递
 给本帧执行的每个 `PipelineExecutionContext`，用于承载宿主上下文；
@@ -2077,7 +2139,7 @@ Orchestrator 不拥有传入的 Registry、Scheduler、FrameContext、RenderGrap
 对象必须在 Orchestrator 整个生命周期内保持有效。Host 在 `begin_frame()` 时按 Scope、
 PipelineId 和 InstanceId 进行稳定排序，并固定每个 Active Plan；帧执行期间已固定的 Plan
 不会被 Registry 或 Host 的拓扑变化替换。`EngineFrameOrchestrator` 只会自动检测
-`PhaseRegistry::revision()`；Pipeline/Feature 的注册、解绑和绑定变化没有独立的自动检测
+`PhaseRegistryExecution::revision()`；Pipeline/Feature 的注册、解绑和绑定变化没有独立的自动检测
 机制，调用方必须在安全边界显式调用 `PipelineScopeHost::rebuild()`，并由 Host 在合适的
 边界应用 Pending Plan。
 World 命令在 `PreUpdate` 由 World Owner 线程消费；`WorldCommit` 为每个已登记 World
@@ -2089,12 +2151,17 @@ World 命令在 `PreUpdate` 由 World Owner 线程消费；`WorldCommit` 为每�
 Compiler 把静态定义和运行时绑定编译为不可变 Plan：
 
 ```cpp
-class PipelineCompiler {
-public:
-    [[nodiscard]] foundation::ResultValue<PipelinePlan> compile(
-            const PipelineCompileInput& input) const;
+namespace aeg::pipeline::detail {
+struct PipelineCompilerExecution final {
+    [[nodiscard]] static foundation::ResultValue<PipelinePlan> compile(
+            const PipelineCompileInput& input);
 };
+} // namespace aeg::pipeline::detail
 ```
+
+`PipelineCompilerExecution` 位于 `Engine/Pipeline/private/pipeline_compiler_execution.hpp`；
+`PipelineCompileInput` 仍是中性值描述，但编译执行入口属于 Engine 内部。业务和 Editor
+调用 `PipelineScopeHost::rebuild()`，由 Host 组装输入并在安全边界发布 Plan。
 
 Compiler 负责：
 
@@ -2105,10 +2172,10 @@ Compiler 负责：
 5. 建立 Artifact 数据依赖和显式 Ordering 依赖。
 6. 检查循环、多写者和跨 Scope 非法访问。
 7. 生成稳定拓扑和执行批次。
-8. 保存领域贡献及其实现引用；`PipelineCompiler::compile()` 只生成 Pipeline Plan，
+8. 保存领域贡献及其实现引用；`PipelineCompilerExecution::compile()` 只生成 Pipeline Plan，
    不直接编译或提交 RenderGraph。统一的 `EngineFrameOrchestrator` 在
    `RenderBuild`/`RenderExecute` 边界调用运行期适配器完成连接。
-9. 从 `PhaseRegistry::snapshot()` 同时读取有序 Phase 列表和 revision；如果已知的
+9. 从 `PhaseRegistryExecution::snapshot()` 同时读取有序 Phase 列表和 revision；如果已知的
    编译期间 Phase 版本发生变化，则返回 `kOutOfDate`，不发布与新旧版本都不一致的 Plan。
 10. 通过 `Result` 和统一日志/诊断系统返回带上下文的编译诊断；失败时不发布部分
     Plan。
@@ -2127,7 +2194,7 @@ Compiler 负责：
 | `feature_implementations`             | 将每项贡献关联到 `shared_ptr<const PipelineFeature>`，使已编译贡献不受后续 Registry 撤销影响 |
 | `definition_owner` / `feature_owners` | 延长编译时定义对象与 Feature 对象的生命周期                                                  |
 | `PipelinePlanHandle`                  | `shared_ptr<const PipelinePlan>`；用于获取和持有不可变计划快照                               |
-| `phase_revision`                      | 记录该 Plan 所依据的 `PhaseRegistry::revision()`；不匹配时必须在帧边界重编译                 |
+| `phase_revision`                      | 记录该 Plan 所依据的 `PhaseRegistryExecution::revision()`；不匹配时必须在帧边界重编译       |
 
 `PipelinePlan` 当前不保存通用 Completion 列表、Scope Bridge、RenderGraph 资源生命周期、
 Barrier、Queue Dependency、结构化诊断列表或 `PipelinePlanKey`。这些信息分别由运行时
@@ -2678,10 +2745,10 @@ ABI 中的回调和字符串必须在接口定义中明确所有权、有效期�
 
 ## 17. Pipeline 使用方法
 
-### 17.1 定义一个 Pipeline
+### 17.1 定义一个 Pipeline（历史引擎内部 API）
 
-游戏代码通过继承 `Pipeline` 声明自己的功能拓扑。定义阶段只描述节点和契约，不执行
-实际业务：
+历史引擎模块代码可以通过继承 `Pipeline` 声明内部执行拓扑。定义阶段只描述节点和契约，
+不执行实际业务；该接口不属于 `AEG::GameSDK`：
 
 ```cpp
 class WeatherPipeline final : public aeg::pipeline::Pipeline {
@@ -2934,7 +3001,7 @@ public:
 
 ### 18.3 Feature 的构建时和运行时
 
-当前 Feature 调用分为三层：
+当前 Render Feature 的调用分为三层（这是 Frame/Render profile，不是全域 Feature 生命周期）：
 
 1. `setup()` 在 Pipeline 编译期间声明 Stage、Task、Artifact、访问依赖与执行策略；
    此时不能使用运行期 RenderGraph 资源接口。
@@ -2955,7 +3022,10 @@ public:
 };
 ```
 
-不得在 `setup()` 中保存运行时指针，也不得在执行回调中再次修改拓扑。
+不得在 `setup()` 中保存运行时指针，也不得在执行回调中再次修改拓扑。Logic/Flow Feature
+不使用 `build_render_graph()` 表达状态迁移；其目标生命周期是 `activate → tick/event →
+transition commit → snapshot/event publish → suspend/resume/cancel/complete`，并由 owner 在
+安全提交边界更新 StateStore。
 
 ## 19. 一帧的使用流程
 
@@ -3000,7 +3070,7 @@ return orchestrator.shutdown();
 
 1. 调用 `FrameContext::begin_frame()`，等待当前帧槽可复用。
 2. 复制调用方提供的绑定 span，并在帧边界固定每个 Active `PipelinePlan`。
-3. 按 `PhaseRegistry::snapshot()` 的全局顺序执行 `FrameBegin` 至 `FrameEnd` 之间的
+3. 按 `PhaseRegistryExecution::snapshot()` 的全局顺序执行 `FrameBegin` 至 `FrameEnd` 之间的
    所有 Phase；落在该区间内的自定义 Phase 会自动参与执行。
 4. 在 `RenderBuild` 阶段自动展开当前固定 Plan 中的所有 RenderFeature，包括挂载到
    `BeforePresent` 语义锚点的贡献。
@@ -3030,7 +3100,8 @@ acquired frame，Orchestrator 会确保该帧最终被解析；没有 Present �
 if (auto result = orchestrator.begin_frame(frame_desc); !result) {
     return result;
 }
-const auto phase_snapshot = registry.phase_registry().snapshot();
+const auto phase_snapshot = aeg::pipeline::detail::PhaseRegistryExecution::snapshot(
+        registry.phase_registry());
 if (!phase_snapshot) {
     return phase_snapshot.result;
 }
@@ -3266,11 +3337,11 @@ FrameContext 的工作或未纳入持有对象的裸指针。Plan 保活不自�
 
 不能在模块仍有执行回调或 GPU 相关延迟销毁项时卸载 DLL。
 
-## 21. 哪些内容应该设计为 Pipeline
+## 21. 哪些内容应该设计为 Feature，以及何时生成 Pipeline 投影
 
-### 21.1 适合使用 Pipeline 的功能
+### 21.1 适合使用 Feature 的功能
 
-一个功能通常在满足以下条件时适合设计为 Pipeline：
+一个功能通常在满足以下条件时适合设计为 Feature：
 
 - 有稳定的功能边界。
 - 有明确的输入和输出 Artifact。
@@ -3279,24 +3350,24 @@ FrameContext 的工作或未纳入持有对象的裸指针。Plan 保活不自�
 - 可能需要并行、裁剪、统计或独立启停。
 - 需要被不同运行模式选择或替换。
 
-典型例子：
+典型的 Feature/Composite/Process 例子：
 
 ```text
-Gameplay Pipeline
-Simulation/Physics Pipeline
-Animation Pipeline
-RenderExtract Pipeline
-Render Pipeline
-Audio Pipeline
-Streaming Pipeline
-Networking Pipeline
-Editor Pipeline
-Game-specific Pipeline
+Gameplay Composite Feature（Logic）
+Simulation/Physics Feature
+Animation Process Feature
+RenderExtract Feature
+Render Feature（由 Frame Pipeline profile 投影）
+Audio Feature
+Streaming Feature
+Networking Feature
+Editor Composite Feature
+Game-specific Feature
 ```
 
-### 21.2 不应伪装为 Pipeline 的基础服务
+### 21.2 不应伪装为 Feature 的基础服务
 
-以下对象为 Pipeline 提供能力，但本身不是业务调度节点：
+以下对象为 Feature/ExecutionPlan 提供能力，但本身不是业务 Feature：
 
 ```text
 Math
@@ -3310,35 +3381,36 @@ Shader Manager
 Descriptor Allocator
 ```
 
-把基础服务包装成 Pipeline 会增加无意义的拓扑节点，并让生命周期、配置和依赖变得
-模糊。基础服务可以被 Pipeline 使用，但不应因为“所有东西都管线化”而被强行纳入
+把基础服务包装成 Feature 会增加无意义的拓扑节点，并让生命周期、配置和依赖变得
+模糊。基础服务可以被 Feature 或 Pipeline profile 使用，但不应因为“万物皆 Feature”而被强行纳入
 业务图。
 
 ### 21.3 必需、默认和可选
 
-“是否为 Pipeline”与“是否必需加载”是两个独立问题：
+“是否为 Feature”与“是否必需加载”是两个独立问题。Pipeline 只在需要某个 Scope/Clock
+的执行投影时生成：
 
 | 类别             | 说明                                                                   |
 |------------------|------------------------------------------------------------------------|
 | Runtime Core     | Registry、Compiler、Scheduler、Artifact Registry 和 Host，属于框架基础 |
-| Profile Required | 某个运行模式必须具备的职责，例如客户端的 Render Pipeline               |
-| Default Module   | 标准发行版默认提供，但可以替换或关闭的模块，例如 Physics               |
+| Profile Required | 某个运行模式必须具备的 Feature profile，例如客户端的 Render execution plan |
+| Default Module   | 标准发行版默认提供，但可以替换或关闭的 Feature，例如 Physics               |
 | Optional Module  | 按项目需求加载的模块，例如 Navigation、Cutscene、Terrain               |
-| User Pipeline    | 游戏项目或插件自行注册的功能                                           |
+| User Feature     | 游戏项目或插件自行注册的功能                                           |
 
-例如，服务器可以不加载 Render 和 Present Pipeline，但仍然使用同一套 Registry、
-Artifact 和 Scheduler；编辑器可以创建多个 Preview World，并分别绑定不同的 Render
-Pipeline 实例。
+例如，服务器可以不加载 Render Feature profile，但仍然使用同一套 Registry、Artifact 和
+Scheduler；编辑器可以创建多个 Preview World，并为各自的 Render Feature 图生成不同的
+Pipeline execution plan 实例。
 
 ## 22. 生命周期、线程和所有权
 
 ### 22.1 Definition 生命周期
 
 ```text
-创建 Definition
+创建 FeatureDefinition
     -> 注册到 Registry
-        -> 编译为 PipelinePlan
-            -> 被多个 Scope Instance 使用
+        -> 按 Scope/Clock 编译为 ExecutionPlan（Pipeline 兼容投影）
+            -> 被多个 FeatureInstance 使用
                 -> Registry 撤销
                     -> 等待引用结束
                         -> 销毁 Definition
@@ -3387,6 +3459,13 @@ Plan 采用只读和版本化策略：
 
 Pipeline 之间优先使用不可变 Snapshot、CommandBuffer 和 CompletionToken，不以全局
 互斥锁保护整个 World 或 RenderScene。
+
+上述“任务图”和“完成点”必须落到 `aeg::concurrency` 的 `Executor`、`TaskGraph`、
+`Completion` 与 `CancellationToken`；引擎拥有的 Feature 运行时、World、RenderGraph 和各域
+执行基础设施不得直接创建 `std::thread`/`std::jthread`、调用 `std::async` 或自建线程池。
+这是引擎内部实现约束，游戏作者的 Feature/Module 不受此线程实现规则约束，也不能通过
+`AEG::GameSDK`/`AEG::GameRuntime` 接触 Concurrency API。引擎中的标准线程设施只允许存在于
+`Engine/Concurrency` 的封装实现内部。
 
 ### 22.5 指针和引用规则
 
@@ -3612,17 +3691,17 @@ WorkerExecutor 视为真实 GPU 执行线程。
 
 | 开发者需求             | 应实现/调用                                                                                                                                 |
 |------------------------|---------------------------------------------------------------------------------------------------------------------------------------------|
-| 新增功能调度单元       | 继承 `Pipeline`，实现 `descriptor()` 和 `build()`                                                                                           |
+| 新增业务功能           | 注册 Logic/Physics/Render/Audio/Stream Feature，声明 Contract/State/Clock；需要 Frame/Render 投影时再提供适配器 |
 | 新增单领域功能         | 继承 `LogicFeature`、`PhysicsFeature`、`RenderFeature`、`AudioFeature` 或 `StreamFeature`                                                   |
 | 新增跨领域功能         | 继承 `CompositeFeature<Parts...>`，组合具体领域 Part                                                                                        |
 | 复用 Feature 公共逻辑  | 优先使用成员组合，或声明仍只继承一个领域基类的抽象中间类；避免让业务 Feature 直接继承 `PipelineFeature`（开发约定）                         |
 | 声明输入输出           | 使用 `PipelineBuilder`/领域 Builder 声明 ArtifactBinding                                                                                    |
-| 接入已有 Pipeline      | 注册 Feature 类型并绑定到公开 FeaturePoint                                                                                                  |
+| 接入已有 Frame/Render profile | 注册 Feature 类型并绑定到公开 FeaturePoint；FeaturePoint 只作为 ProjectionAnchor/权限合同 |
 | 使用多个 World         | 由 `WorldManager` 创建独立 World，并为每个 World 创建独立 `WorldScope` 和 Host                                                              |
 | 修改运行拓扑           | 显式调用 `PipelineScopeHost::rebuild(registry)`，并在安全点切换 Plan                                                                        |
 | 增加渲染能力           | 实现 `RenderFeature`，使用 `RenderGraphBuilder`                                                                                             |
 | 增加编辑器绘制         | 当前使用 `PipelineScopeHost(kEditor)` 与 RenderFeature/RenderGraphRuntime；`FrameOverlayBuilder` 仍属于目标封装，不直接修改基础 RenderGraph |
-| 增加静态 Gameplay 模块 | 继承 `aeg::module::Module`，通过 `ModuleRegistrationContext` 注册 Pipeline、Feature 和 Reflection Type                                      |
+| 增加静态 Gameplay 模块 | 继承 `aeg::module::Module`，通过 `ModuleRegistrationContext` 注册 Feature、Execution profile 和 Reflection Type |
 | 增加动态插件           | 在静态 Module Runtime 之上实现版本化 Module ABI，不跨 DLL 传递 STL/异常                                                                     |
 
 ### 26.2 架构约束与不推荐用法
@@ -3647,24 +3726,25 @@ WorkerExecutor 视为真实 GPU 执行线程。
 ## 27. 架构不变量
 
 1. Pipeline 统一的是调度语义，不是所有领域的算法实现。
-2. 基础服务不因为形式统一而包装成业务 Pipeline。
+2. 基础服务不因为形式统一而包装成业务 Feature。
 3. EnginePhase 是稳定公共锚点，Pipeline Stage 是局部细分，FeaturePoint 是扩展入口。
 4. Shader Stage 不是 EnginePhase；Vertex、Fragment、Compute 等只表示 GPU Shader 语义。
-5. Pipeline 之间通过 Artifact 和显式依赖通信，不通过隐式函数调用通信。
-6. `PipelineDefinition`、`PipelineInstance`、`PipelinePlan` 三者生命周期和职责分离。
+5. Feature/ExecutionPlan 之间通过 Artifact 和显式依赖通信，不通过隐式函数调用通信。
+6. 目标模型中 `FeatureDefinition`、`FeatureInstance`、`ExecutionPlan` 三者生命周期和职责分离；
+   当前 `PipelineDefinition`/`PipelineInstance`/`PipelinePlan` 只作为内部 Frame/Render 计划投影 API。
 7. Engine、World、Frame、Editor 遵守严格的单向数据依赖。
-8. World Pipeline 必须绑定 `WorldHandle`，不得采用 Singleton 实例化策略。
+8. World Scope 的 Feature/Execution profile 必须绑定 `WorldHandle`，不得采用 Singleton 实例化策略。
 9. Frame 只能读取发布后的 World Snapshot，不得读取 World 可变状态。
 10. Editor 只能通过 Frame Overlay 和 Command Channel 参与，不得直接改写 World。
 11. `PipelineFeature` 是公开的类型擦除根；具体业务 Feature 通常经由一个领域基类或
     `CompositeFeature` 构造。直接根派生在 C++ 层面可表达，框架不自动拦截；是否遵守该
     扩展约定由开发人员负责。
-12. 跨领域功能按开发约定使用成员组合 `CompositeFeature<Parts...>`，不使用多重继承。
+12. 同域或跨域功能按开发约定使用成员组合 `CompositeFeature<Parts...>`，不使用多重继承。
 13. Composite 的 Part 不具有独立顶层注册身份。
 14. tuple 顺序不代表执行顺序，执行顺序由契约和约束决定。
 15. 多写者、跨 Scope 写入和资源所有权转移必须显式声明。
-16. 拓扑变化才需要重编译，普通帧数据变化只更新 Artifact 内容；Pipeline/Feature 拓扑
-    变化必须由调用方显式触发 `PipelineScopeHost::rebuild()`，只有 `PhaseRegistry`
+16. 执行投影拓扑变化才需要重编译，普通帧数据变化只更新 Artifact 内容；Feature/Projection
+    拓扑变化必须由调用方显式触发 `PipelineScopeHost::rebuild()`，只有 `PhaseRegistry`
     revision 变化会由 `EngineFrameOrchestrator` 自动检测并同步。
 17. 已发布 Plan 只读；Plan 切换只在 Host 的安全 CPU 边界执行。当前 Host 不负责轮询
     或等待 GPU Completion，GPU 完成、资源退休和模块卸载由调用方、`FrameContext` 或
@@ -3675,7 +3755,9 @@ WorkerExecutor 视为真实 GPU 执行线程。
     不得暴露 `Device`、Command List 或 native handle。
 21. 已导入的 Swapchain image 必须由首个访问 batch 等待 acquire，并由最终输出 batch
     signal present；该语义不得依赖 Feature 或 Pass 注册顺序。
-22. 诊断必须能够定位到 Pipeline、Feature、Part、Stage 和 Artifact 来源路径。
+22. 诊断必须能够定位到 Definition、Node、FeatureInstance、Process、Invocation、OwnerPath、
+    ExecutionPlan/WorkItem、Part、Stage 和 Artifact 来源路径；StateMachine 不得静态压扁为
+    Stage/Task/Pass 而丢失流程身份。
 23. EditorFramework 只能通过 Engine public API 使用 GPU 资源和 RenderGraph；编辑器
     字体预览、应用字体与游戏运行时字体必须保持独立。
 

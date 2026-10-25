@@ -12,17 +12,11 @@
 
 namespace aeg::application::runtime {
 namespace {
-scene::SceneAssetId scene_asset_id_from_runtime(asset::AssetId id) noexcept {
-    uint64_t high = 0;
-    uint64_t low = 0;
-    for (std::size_t index = 0; index < 8; ++index)
-        high = (high << 8u) | id.value.bytes[index];
-    for (std::size_t index = 8; index < 16; ++index)
-        low = (low << 8u) | id.value.bytes[index];
-    return scene::SceneAssetId{high, low};
+scene::SceneAssetId scene_asset_id_from_runtime(foundation::AssetId id) noexcept {
+    return scene::SceneAssetId::from_uuid(id.value);
 }
 
-foundation::Result with_scene(foundation::Result result, asset::AssetId id, const char* phase) {
+foundation::Result with_scene(foundation::Result result, foundation::AssetId id, const char* phase) {
     if (result)
         return result;
     std::string message = "startup scene " + id.to_string() + " " + phase;
@@ -71,15 +65,6 @@ foundation::Result parse_component_fields(const scene::SceneComponentRecord& com
     return foundation::Result::success();
 }
 
-scene::SceneEntityId reference_entity(const asset::SceneAssetReference& reference) noexcept {
-    uint64_t high = 0, low = 0;
-    for (int index = 0; index != 8; ++index)
-        high = (high << 8u) | reference.scene_entity_uuid[static_cast<std::size_t>(index)];
-    for (int index = 0; index != 8; ++index)
-        low = (low << 8u) | reference.scene_entity_uuid[static_cast<std::size_t>(8 + index)];
-    return scene::SceneEntityId{high, low};
-}
-
 foundation::Result apply_scene_references(scene::SceneAsset& asset, const asset::ScenePayload& payload,
                                           reflection::TypeRegistry& reflection_registry,
                                           RuntimeAssetResolver* resolver) {
@@ -97,7 +82,7 @@ foundation::Result apply_scene_references(scene::SceneAsset& asset, const asset:
         auto mutable_payload = component.payload;
         for (std::size_t index = 0; index < payload.references.size(); ++index) {
             const auto& reference = payload.references[index];
-            if (reference_entity(reference) != component.entity)
+            if (RuntimeSceneLoader::scene_entity_id(foundation::Uuid{reference.scene_entity_uuid}) != component.entity)
                 continue;
             if (reference.component_type != "MeshRenderer" || reference.component_version != component.schema_version)
                 return foundation::invalid_argument("Scene reference component identity does not match archive");
@@ -115,14 +100,14 @@ foundation::Result apply_scene_references(scene::SceneAsset& asset, const asset:
                 return foundation::invalid_argument("Scene reference points at an empty asset field");
             foundation::ResultValue<uint64_t> bound{foundation::Result::success(), 0};
             if (mesh_field) {
-                if (reference.kind != asset::AssetKind::kMesh)
+                if (reference.kind != foundation::AssetKind::kMesh)
                     return foundation::invalid_argument("MeshRenderer mesh reference has the wrong AssetKind");
                 const auto result = resolver->bind_mesh(reference.asset);
                 if (!result)
                     return result.result;
                 bound.value = result.value.value();
             } else {
-                if (reference.kind != asset::AssetKind::kMaterial)
+                if (reference.kind != foundation::AssetKind::kMaterial)
                     return foundation::invalid_argument("MeshRenderer material reference has the wrong AssetKind");
                 const auto result = resolver->bind_material(reference.asset);
                 if (!result)
@@ -145,7 +130,8 @@ foundation::Result apply_scene_references(scene::SceneAsset& asset, const asset:
             std::size_t matches = 0;
             for (std::size_t index = 0; index < payload.references.size(); ++index) {
                 const auto& reference = payload.references[index];
-                if (reference_entity(reference) == component.entity && reference.component_type == "MeshRenderer" &&
+                if (RuntimeSceneLoader::scene_entity_id(foundation::Uuid{reference.scene_entity_uuid}) == component.entity &&
+                    reference.component_type == "MeshRenderer" &&
                     reference.field_id == field.id)
                     ++matches;
             }
@@ -164,17 +150,20 @@ foundation::Result apply_scene_references(scene::SceneAsset& asset, const asset:
 }
 }  // namespace
 
+scene::SceneEntityId RuntimeSceneLoader::scene_entity_id(foundation::Uuid uuid) noexcept {
+    return scene::SceneEntityId::from_uuid(uuid);
+}
+
 foundation::ResultValue<RuntimeSceneLoadResult> RuntimeSceneLoader::load_startup_scene(
-    const asset::AssetPackageReader& package, asset::AssetId startup_scene, pipeline::PipelineRegistry& pipelines,
-    reflection::TypeRegistry& reflection_registry, const world::WorldScopeDesc& requested_scope,
-    RuntimeAssetResolver* resolver) {
-    if (startup_scene == asset::AssetId{})
+    const asset::AssetPackageReader& package, foundation::AssetId startup_scene,
+    reflection::TypeRegistry& reflection_registry, RuntimeAssetResolver* resolver) {
+    if (startup_scene == foundation::AssetId{})
         return {foundation::invalid_argument("startup scene UUID is invalid"), {}};
 
     const auto cooked = package.read_cooked(startup_scene);
     if (!cooked)
         return {with_scene(cooked.result, startup_scene, "could not be read"), {}};
-    if (cooked.value.kind != asset::AssetKind::kScene)
+    if (cooked.value.kind != foundation::AssetKind::kScene)
         return {with_scene(foundation::invalid_argument("asset kind is not Scene"), startup_scene, "has invalid kind"),
                 {}};
     if (cooked.value.payload.empty())
@@ -185,7 +174,7 @@ foundation::ResultValue<RuntimeSceneLoadResult> RuntimeSceneLoader::load_startup
     const auto payload = asset::decode_scene_payload(cooked.value.payload);
     if (!payload)
         return {with_scene(payload.result, startup_scene, "payload decode failed"), {}};
-    if (payload.value.schema_version != 1u)
+    if (payload.value.schema_version != asset::kScenePayloadSchemaVersion)
         return {with_scene(foundation::unsupported("Scene payload schema version is unsupported"), startup_scene,
                            "schema validation failed"),
                 {}};
@@ -228,15 +217,9 @@ foundation::ResultValue<RuntimeSceneLoadResult> RuntimeSceneLoader::load_startup
         return {with_scene(registered, startup_scene, "component registration failed"), {}};
     }
 
-    world::WorldScopeDesc scope_desc = requested_scope;
-    auto scope = std::make_unique<world::WorldScope>(world_state, pipelines, scope_desc);
+    auto scope = std::make_unique<world::WorldScope>(world_state);
     if (const foundation::Result initialized = scope->initialize(); !initialized)
         return {with_scene(initialized, startup_scene, "World Scope initialization failed"), {}};
-    if (scope_desc.pipeline.is_valid()) {
-        if (const foundation::Result activated = scope->activate(); !activated)
-            return {with_scene(activated, startup_scene, "World Scope activation failed"), {}};
-    }
-
     const auto instance = decoded.value.instantiate(*world_state, reflection_registry);
     if (!instance) {
         (void)scope->shutdown();

@@ -5,8 +5,14 @@
 #include <array>
 #include <cstdint>
 #include <engine_frame_orchestrator.hpp>
+#include "engine_frame_pipeline_host.hpp"
+#include "engine_frame_pipeline_registration.hpp"
 #include <memory>
 #include <rhi.hpp>
+#include <utility>
+#include "../Engine/Pipeline/private/pipeline_scope_host_execution.hpp"
+#include "world_snapshot_execution.hpp"
+#include "engine_frame_inspection.hpp"
 
 namespace {
 struct Transform final {
@@ -44,105 +50,78 @@ struct MultiViewState final {
     return aeg::foundation::Result::failure(aeg::foundation::ResultCode::kInvalidState, message);
 }
 
-[[nodiscard]] aeg::foundation::Result read_world_snapshot(aeg::pipeline::PipelineTaskContext& context) {
-    auto* state = static_cast<MultiViewState*>(context.user_data());
-    auto* frame_scope = static_cast<aeg::world::WorldFrameScope*>(context.scope_data());
-    if (state == nullptr || frame_scope == nullptr || !frame_scope->is_valid()) {
-        return invalid_state("Frame task did not receive a valid WorldFrameScope");
+[[nodiscard]] aeg::foundation::Result read_world_snapshot(
+    const aeg::engine::EngineFrameOrchestrator& owner, MultiViewState& state, uint64_t frame_number) {
+    const auto trace = aeg::engine::detail::EngineFrameInspection::capture(owner);
+    if (!trace) return trace.result;
+    uint32_t matches = 0;
+    for (const auto& event : trace.value.stages) {
+        if (event.stage != aeg::pipeline::StageId{"WorldMultiViewExtract"} || event.frame_number != frame_number) continue;
+        ++matches;
+        if (!event.world_frame || !event.world_snapshot || !event.bridged_snapshot || event.scope_identity == 0 ||
+            event.phase != aeg::pipeline::to_phase_id(aeg::pipeline::EnginePhase::kRenderExtract))
+            return invalid_state("Frame Stage lost current World ownership");
+        const auto& key = *event.world_frame;
+        auto* observation = state.find(key.world, key.view_id);
+        if (!observation || observation->call_count >= 2) return invalid_state("Repeated or unregistered World view");
+        const auto& snapshot = *event.world_snapshot;
+        const auto* bridged = event.bridged_snapshot->as<aeg::ecs::WorldSnapshot>(aeg::world::detail::kWorldSnapshotArtifactTypeId);
+        const auto* transform = snapshot.get<Transform>(observation->entity);
+        if (!bridged || !transform || snapshot.world() != observation->world || snapshot.world() != key.world ||
+            event.bridged_snapshot->owner_scope() != aeg::pipeline::PipelineScope::kWorld ||
+            snapshot.world() != bridged->world() || snapshot.revision() != bridged->revision() ||
+            snapshot.frame_number() != key.frame_number || snapshot.fixed_tick() != event.fixed_tick)
+            return invalid_state("Frame Stage snapshot and actual bridge disagree");
+        const uint32_t call_index = observation->call_count++;
+        observation->scope_addresses[call_index] = event.scope_identity;
+        observation->frame_numbers[call_index] = key.frame_number;
+        observation->revisions[call_index] = snapshot.revision();
+        observation->values[call_index] = transform->value;
+        observation->user_data_matches[call_index] = event.user_data_identity == reinterpret_cast<uintptr_t>(state.expected_user_data);
     }
-
-    const aeg::world::WorldFrameKey& key = frame_scope->key();
-    ViewObservation* observation = state->find(key.world, key.view_id);
-    if (observation == nullptr || observation->call_count >= 2) {
-        return invalid_state("Frame task received an unregistered or repeated World view");
-    }
-
-    const auto view =
-        context.read_artifact(aeg::world::kWorldSnapshotArtifactId, aeg::world::kWorldSnapshotArtifactTypeId,
-                              aeg::world::kWorldSnapshotArtifactVersion);
-    if (!view) {
-        return view.result;
-    }
-    const auto* snapshot = view.value.as<aeg::ecs::WorldSnapshot>(aeg::world::kWorldSnapshotArtifactTypeId);
-    if (snapshot == nullptr || snapshot->world() != observation->world ||
-        view.value.owner_scope() != aeg::pipeline::PipelineScope::kWorld) {
-        return invalid_state("Frame task received an invalid World snapshot");
-    }
-
-    const Transform* transform = snapshot->get<Transform>(observation->entity);
-    if (transform == nullptr) {
-        return aeg::foundation::Result::failure(aeg::foundation::ResultCode::kNotFound,
-                                                "Frame task snapshot entity is missing");
-    }
-
-    const uint32_t call_index = observation->call_count++;
-    observation->scope_addresses[call_index] = reinterpret_cast<uintptr_t>(frame_scope);
-    observation->frame_numbers[call_index] = key.frame_number;
-    observation->revisions[call_index] = snapshot->revision();
-    observation->values[call_index] = transform->value;
-    observation->user_data_matches[call_index] = context.execution_context().user_data() == state->expected_user_data;
-    return aeg::foundation::Result::success();
+    return matches == 3 ? aeg::foundation::Result::success() : invalid_state("Unexpected multi-View Stage visit count");
 }
-
-class MultiViewPipeline final : public aeg::pipeline::Pipeline {
-public:
-    explicit MultiViewPipeline(MultiViewState& state) : state_(state) {
-        descriptor_.id = aeg::pipeline::PipelineId("WorldMultiViewFrame");
-        descriptor_.name = "WorldMultiViewFrame";
-        descriptor_.category = aeg::pipeline::PipelineCategory::kRendering;
-        descriptor_.supported_scopes = aeg::pipeline::to_mask(aeg::pipeline::PipelineScope::kFrame);
+[[nodiscard]] aeg::foundation::ResultValue<aeg::pipeline::PipelineDefinition> multi_view_pipeline_definition() {
+    aeg::pipeline::PipelineDescriptor descriptor{};
+    descriptor.id = aeg::pipeline::PipelineId("WorldMultiViewFrame");
+    descriptor.name = "WorldMultiViewFrame";
+    descriptor.category = aeg::pipeline::PipelineCategory::kRendering;
+    descriptor.supported_scopes = aeg::pipeline::to_mask(aeg::pipeline::PipelineScope::kFrame);
+    aeg::pipeline::PipelineBuilder builder(descriptor);
+    const auto stage = builder.add_stage({
+        aeg::pipeline::StageId("WorldMultiViewExtract"),
+        aeg::pipeline::EnginePhase::kRenderExtract,
+        aeg::pipeline::ExecutionDomain::kMainThread,
+        aeg::pipeline::TimePolicy::kFrame,
+        false,
+    });
+    const auto artifact = builder.declare_artifact({
+        aeg::world::detail::kWorldSnapshotArtifactId,
+        aeg::world::detail::kWorldSnapshotArtifactTypeId,
+        aeg::pipeline::PipelineScope::kWorld,
+        aeg::pipeline::ArtifactStorage::kImmutableSnapshot,
+        aeg::pipeline::ArtifactLifetime::kWorld,
+        aeg::pipeline::OwnershipPolicy::kSharedImmutable,
+        aeg::world::detail::kWorldSnapshotArtifactVersion,
+        0,
+        true,
+    });
+    if (!stage || !artifact) {
+        return {builder.status(), {}};
     }
-
-    [[nodiscard]] const aeg::pipeline::PipelineDescriptor& descriptor() const noexcept override { return descriptor_; }
-
-    [[nodiscard]] aeg::foundation::Result build(aeg::pipeline::PipelineBuilder& builder) const override {
-        const auto stage = builder.add_stage({
-            aeg::pipeline::StageId("WorldMultiViewExtract"),
-            aeg::pipeline::EnginePhase::kRenderExtract,
-            aeg::pipeline::ExecutionDomain::kMainThread,
-            aeg::pipeline::TimePolicy::kFrame,
-            false,
-        });
-        const auto task = builder.add_task({
-            aeg::pipeline::TaskId("WorldMultiViewExtractTask"),
-            aeg::pipeline::TaskFlags::kMustRun,
-            &read_world_snapshot,
-            &state_,
-        });
-        const auto artifact = builder.declare_artifact({
-            aeg::world::kWorldSnapshotArtifactId,
-            aeg::world::kWorldSnapshotArtifactTypeId,
-            aeg::pipeline::PipelineScope::kWorld,
-            aeg::pipeline::ArtifactStorage::kImmutableSnapshot,
-            aeg::pipeline::ArtifactLifetime::kWorld,
-            aeg::pipeline::OwnershipPolicy::kSharedImmutable,
-            aeg::world::kWorldSnapshotArtifactVersion,
-            0,
-            true,
-        });
-        if (!stage || !task || !artifact) {
-            return builder.status();
-        }
-        if (const auto result = builder.bind_task(task, stage); !result) {
-            return result;
-        }
-        if (const auto result =
-                builder.expose_artifact(aeg::world::kWorldSnapshotArtifactId, aeg::pipeline::PipelineScope::kFrame);
-            !result) {
-            return result;
-        }
-        return builder.reads(stage, {
-                                        aeg::world::kWorldSnapshotArtifactId,
-                                        aeg::pipeline::ArtifactAccess::kRead,
-                                        aeg::world::kWorldSnapshotArtifactVersion,
-                                        aeg::pipeline::AccessFlags::kNone,
-                                    });
+    if (const auto result =
+            builder.expose_artifact(aeg::world::detail::kWorldSnapshotArtifactId, aeg::pipeline::PipelineScope::kFrame);
+        !result) {
+        return {result, {}};
     }
-
-private:
-    aeg::pipeline::PipelineDescriptor descriptor_{};
-    MultiViewState& state_;
-};
+    if (const auto result = builder.reads(stage, {
+                                    aeg::world::detail::kWorldSnapshotArtifactId,
+                                    aeg::pipeline::ArtifactAccess::kRead,
+                                    aeg::world::detail::kWorldSnapshotArtifactVersion,
+                                    aeg::pipeline::AccessFlags::kNone,
+                                }); !result) return {result, {}};
+    return builder.finish();
+}
 
 [[nodiscard]] bool check_frame(const MultiViewState& state, uint32_t call_index, uint64_t frame_number,
                                uint64_t revision, int first_world_value, int second_world_value) {
@@ -201,17 +180,18 @@ int main() {
     };
 
     aeg::pipeline::PipelineRegistry registry;
-    if (!registry.register_pipeline([&state] { return std::make_unique<MultiViewPipeline>(state); })) {
+    auto definition = multi_view_pipeline_definition();
+    if (!definition || !registry.register_pipeline(std::move(definition.value))) {
         return 5;
     }
 
-    aeg::world::WorldScope first_scope(first_world.value, registry, {});
-    aeg::world::WorldScope second_scope(second_world.value, registry, {});
+    aeg::world::WorldScope first_scope(first_world.value);
+    aeg::world::WorldScope second_scope(second_world.value);
     if (!first_scope.initialize() || !second_scope.initialize()) {
         return 6;
     }
 
-    auto sentinel_result = first_scope.create_frame_bridge();
+    auto sentinel_result = aeg::world::detail::WorldSnapshotExecution::create_frame_bridge(first_scope);
     if (!sentinel_result) {
         return 7;
     }
@@ -223,7 +203,7 @@ int main() {
                                                       aeg::pipeline::PipelineInstanceId("MultiViewGameView20"));
     aeg::pipeline::PipelineScopeHost preview_view_host(aeg::pipeline::PipelineScope::kFrame,
                                                        aeg::pipeline::PipelineInstanceId("MultiViewPreviewView30"));
-    first_view_host.set_scope_bridge(sentinel_bridge.get());
+    aeg::pipeline::detail::PipelineScopeHostExecution::set_scope_bridge(first_view_host, sentinel_bridge.get());
     if (!first_view_host.bind_pipeline(aeg::pipeline::PipelineId("WorldMultiViewFrame")) ||
         !second_view_host.bind_pipeline(aeg::pipeline::PipelineId("WorldMultiViewFrame")) ||
         !preview_view_host.bind_pipeline(aeg::pipeline::PipelineId("WorldMultiViewFrame")) ||
@@ -232,23 +212,31 @@ int main() {
         return 8;
     }
 
-    aeg::pipeline::PipelineScheduler scheduler({1, 1, 1, 1});
+    aeg::pipeline::PipelineScheduler scheduler;
     aeg::render_graph::FrameContext frame_context(*device);
     aeg::render_graph::RenderGraph render_graph(*device);
-    aeg::engine::EngineFrameOrchestrator orchestrator(registry, scheduler, frame_context, render_graph);
-    if (!orchestrator.register_world_frame(first_scope, first_view_host, 10) ||
-        !orchestrator.register_world_frame(first_scope, second_view_host, 20) ||
-        !orchestrator.register_world_frame(second_scope, preview_view_host, 30) || orchestrator.world_count() != 2 ||
+    aeg::engine::EngineFramePipelineHost pipeline_host(registry, scheduler);
+    aeg::engine::EngineFrameOrchestrator orchestrator(pipeline_host, frame_context, render_graph);
+    if (!orchestrator.register_world_frame(
+            first_scope, aeg::engine::EngineFramePipelineRegistration{first_view_host}, 10) ||
+        !orchestrator.register_world_frame(
+            first_scope, aeg::engine::EngineFramePipelineRegistration{second_view_host}, 20) ||
+        !orchestrator.register_world_frame(
+            second_scope, aeg::engine::EngineFramePipelineRegistration{preview_view_host}, 30) ||
+        orchestrator.world_count() != 2 ||
         orchestrator.world_frame_count() != 3 || !orchestrator.initialize()) {
         return 9;
     }
 
+    if (!aeg::engine::detail::EngineFrameInspection::enable(orchestrator)) return 14;
     aeg::engine::EngineFrameDesc first_frame{};
     first_frame.fixed_tick = 4;
     first_frame.user_data = &frame_user_data;
-    if (!orchestrator.run_frame(first_frame) || !check_frame(state, 0, 1, 1, 10, 20) ||
-        orchestrator.is_frame_active() || first_view_host.scope_bridge() != sentinel_bridge.get() ||
-        second_view_host.scope_bridge() != nullptr || preview_view_host.scope_bridge() != nullptr) {
+    if (!orchestrator.run_frame(first_frame) || !read_world_snapshot(orchestrator, state, 1) || !check_frame(state, 0, 1, 1, 10, 20) ||
+        orchestrator.is_frame_active() ||
+        aeg::pipeline::detail::PipelineScopeHostExecution::scope_bridge(first_view_host) != sentinel_bridge.get() ||
+        aeg::pipeline::detail::PipelineScopeHostExecution::scope_bridge(second_view_host) != nullptr ||
+        aeg::pipeline::detail::PipelineScopeHostExecution::scope_bridge(preview_view_host) != nullptr) {
         return 10;
     }
 
@@ -257,7 +245,7 @@ int main() {
     aeg::engine::EngineFrameDesc second_frame{};
     second_frame.fixed_tick = 5;
     second_frame.user_data = &frame_user_data;
-    if (!orchestrator.run_frame(second_frame) || !check_frame(state, 1, 2, 2, 11, 21)) {
+    if (!orchestrator.run_frame(second_frame) || !read_world_snapshot(orchestrator, state, 2) || !check_frame(state, 1, 2, 2, 11, 21)) {
         return 11;
     }
 
@@ -270,7 +258,20 @@ int main() {
         return 12;
     }
 
-    first_view_host.set_scope_bridge(nullptr);
+    const auto retained_trace = aeg::engine::detail::EngineFrameInspection::capture(orchestrator);
+    if (!retained_trace) return 15;
+    if (!aeg::engine::detail::EngineFrameInspection::enable(orchestrator, false) ||
+        !aeg::engine::detail::EngineFrameInspection::capture(orchestrator).value.stages.empty()) return 16;
+    uint32_t retained_views = 0;
+    for (const auto& event : retained_trace.value.stages) {
+        if (!event.world_snapshot || event.frame_number != 1) continue;
+        const auto* observation = state.find(event.world_frame->world, event.world_frame->view_id);
+        const auto* original = observation ? event.world_snapshot->get<Transform>(observation->entity) : nullptr;
+        if (!original || original->value != observation->expected_values[0] || event.world_snapshot->revision() != 1) return 17;
+        ++retained_views;
+    }
+    if (retained_views != 3) return 18;
+    aeg::pipeline::detail::PipelineScopeHostExecution::set_scope_bridge(first_view_host, nullptr);
     sentinel_bridge.reset();
     if (!first_scope.shutdown() || !second_scope.shutdown()) {
         return 13;

@@ -3,6 +3,8 @@
  * @brief Implements the minimum editable scene lifecycle and offscreen preview.
  */
 #include "editor_scene_runtime.hpp"
+#include "composition/editor_render_graph_inspection.hpp"
+#include "composition/editor_feature_graph_document.hpp"
 
 #include <algorithm>
 #include <array>
@@ -14,7 +16,6 @@
 #include <map>
 #include <new>
 #include <optional>
-#include <render_feature_flow.hpp>
 #include <span>
 #include <unordered_map>
 #include <unordered_set>
@@ -24,15 +25,31 @@
 #include "Components/component_ids.hpp"
 #include "Components/component_render_extraction.hpp"
 #include "deferred_lighting_resources.hpp"
+#include "dynamic_module.hpp"
+#include "module_bundle.hpp"
+#include "engine_frame_pipeline_host.hpp"
+#include "engine_frame_orchestrator.hpp"
+#include "engine_frame_world_commands.hpp"
+#include "feature_execution_control.hpp"
+#include "feature_clock_host.hpp"
+#include "feature_world_commands.hpp"
+#include "feature_world_transform.hpp"
+#include "world_command_routes.hpp"
+#include "world_scope.hpp"
+#include "feature_graph_io.hpp"
+#include "editor_renderer_feature_host.hpp"
+#include "project_operation.hpp"
 #include "editor_asset_pipeline.hpp"
 #include "editor_font_pipeline.hpp"
 #include "light_culling.hpp"
+#include "clustered_forward.hpp"
 #include "material.hpp"
-#include "opaque_render_feature.hpp"
-#include "pipeline_document_io.hpp"
 #include "post_process.hpp"
 #include "project_context.hpp"
-#include "renderer_variants.hpp"
+#include "render_feature_draw.hpp"
+#include "render_feature_history.hpp"
+#include "render_pass_registry_execution.hpp"
+#include "renderer_variants_internal.hpp"
 #include "resource_uploader.hpp"
 #include "shader_contract.hpp"
 #include "shadow_rendering.hpp"
@@ -50,9 +67,9 @@ using aeg::engine::components::TextRenderer;
 using aeg::engine::components::Transform;
 using foundation::Result;
 using foundation::ResultCode;
-using pipeline::RenderGraphBuffer;
-using pipeline::RenderGraphTexture;
-using pipeline::RenderResourceId;
+using render_graph::RenderGraphBuffer;
+using render_graph::RenderGraphTexture;
+using feature::RenderResourceId;
 using rhi::BindingLayoutHandle;
 using rhi::BindingResource;
 using rhi::BindingSetDesc;
@@ -100,16 +117,28 @@ inline constexpr uint32_t kMaterialCount = 2;
 inline constexpr uint64_t kMeshAssetA = 1;
 inline constexpr uint64_t kMeshAssetB = 2;
 
-inline constexpr pipeline::FeatureId kEditorViewportReadbackFeatureId{"Editor.ViewportReadbackFeature"};
-inline constexpr pipeline::StageId kEditorViewportReadbackStageId{"Editor.ViewportReadbackFeature.Build"};
-inline constexpr pipeline::RenderResourceId kEditorViewportReadbackBuffer{"Editor.ViewportReadback.Buffer"};
+[[nodiscard]] Result reject_retired_scene_authoring(const std::filesystem::path& path) {
+    auto extension = path.extension().string();
+    std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char value) {
+        return static_cast<char>(value >= 'A' && value <= 'Z' ? value + ('a' - 'A') : value);
+    });
+    if (extension == ".aegframe" || extension == ".aegpipe" || extension == ".aegpipeline" || extension == ".pipeline")
+        return foundation::unsupported("Retired Frame/Pipeline author documents cannot be opened as a Scene");
+    if (path.empty()) return Result::success();
+    std::error_code error;
+    const auto sidecar = std::filesystem::path{path.string() + ".pipeline"};
+    const bool exists = std::filesystem::exists(sidecar, error);
+    if (error)
+        return foundation::invalid_state("Could not inspect retired Scene author sidecar: " + error.message());
+    if (exists)
+        return foundation::unsupported("Retired Scene author sidecar is unsupported: " + sidecar.string());
+    return Result::success();
+}
 
 struct ViewportReadbackState final {
     bool requested{false};
     bool pass_built{false};
     bool pass_executed{false};
-    /** The renderer graph reached its final Present state for this frame. */
-    bool present_connected{true};
     render_graph::FrameAllocation allocation{};
     BufferDesc desc{};
     ResourceState initial_state{};
@@ -486,21 +515,106 @@ constexpr std::array<uint16_t, 6> kQuadIndices{{0, 1, 2, 0, 2, 3}};
     if (had_target) {
         std::filesystem::rename(path, backup, error);
         if (error) {
+            const auto staging_error = "Existing scene file could not be staged for replacement: " +
+                path.generic_string() + " (" + std::to_string(error.value()) + ": " + error.message() + ")";
             std::filesystem::remove(temporary, error);
-            return Result::failure(ResultCode::kUnknown, "Existing scene file could not be staged for replacement");
+            return Result::failure(ResultCode::kUnknown, staging_error);
         }
     }
     std::filesystem::rename(temporary, path, error);
     if (error) {
+        const auto replacement_error = "Scene file replacement failed: " + temporary.generic_string() +
+            " -> " + path.generic_string() + " (" + std::to_string(error.value()) + ": " + error.message() + ")";
         if (had_target) {
             std::error_code restore_error;
             std::filesystem::rename(backup, path, restore_error);
         }
         std::filesystem::remove(temporary, error);
-        return Result::failure(ResultCode::kUnknown, "Scene file replacement failed");
+        return Result::failure(ResultCode::kUnknown, replacement_error);
     }
     if (had_target) {
         std::filesystem::remove(backup, error);
+    }
+    return Result::success();
+}
+
+[[nodiscard]] asset::WorldCommandRoute to_world_command_route(const EditorFeatureWorldBinding& binding) {
+    return {binding.graph_asset_uuid, binding.node_id, binding.owner_path,
+        foundation::AssetId{binding.scene_asset.uuid()}, binding.scene_entity.uuid(),
+        binding.effect, binding.version, binding.observation_port};
+}
+
+[[nodiscard]] EditorFeatureWorldBinding to_editor_world_binding(asset::WorldCommandRoute route) {
+    return {std::move(route.graph_asset_uuid), route.node_id, std::move(route.owner_path),
+        scene::SceneAssetId::from_uuid(route.scene_asset.value), scene::SceneEntityId::from_uuid(route.scene_entity),
+        route.effect, route.version, route.observation_port};
+}
+
+[[nodiscard]] Result write_editor_world_bindings(const std::filesystem::path& scene_path,
+                                                 std::span<const EditorFeatureWorldBinding> bindings) {
+    if (scene_path.empty() || bindings.size() > asset::kMaxWorldCommandRoutes)
+        return foundation::invalid_argument("Editor World binding sidecar has an invalid path or route count");
+    try {
+        std::vector<asset::WorldCommandRoute> routes;
+        routes.reserve(bindings.size());
+        for (const auto& binding : bindings) routes.push_back(to_world_command_route(binding));
+        const auto encoded = asset::encode_world_command_routes(routes);
+        if (!encoded) return encoded.result;
+        return write_bytes_atomically(asset::world_command_routes_sidecar_path(scene_path),
+            {reinterpret_cast<const uint8_t*>(encoded.value.data()), encoded.value.size()});
+    } catch (const std::bad_alloc&) {
+        return foundation::out_of_memory("Editor World binding sidecar allocation failed");
+    }
+}
+
+[[nodiscard]] foundation::ResultValue<std::vector<EditorFeatureWorldBinding>> read_editor_world_bindings(
+    const std::filesystem::path& scene_path, scene::SceneAssetId expected_scene) {
+    const auto path = asset::world_command_routes_sidecar_path(scene_path);
+    std::error_code error;
+    const bool exists = std::filesystem::exists(path, error);
+    if (error)
+        return {foundation::invalid_state("Editor World binding sidecar could not be inspected: " + error.message()), {}};
+    if (!exists) return {Result::success(), {}};
+    std::ifstream file(path, std::ios::binary);
+    if (!file) return {foundation::not_found("Editor World binding sidecar could not be opened"), {}};
+    file.seekg(0, std::ios::end);
+    const std::streamoff size = file.tellg();
+    file.seekg(0, std::ios::beg);
+    if (size < 0 || static_cast<uint64_t>(size) > asset::kMaxWorldCommandRoutesBytes)
+        return {foundation::invalid_argument("Editor World binding sidecar size is invalid"), {}};
+    try {
+        std::vector<std::byte> bytes(static_cast<std::size_t>(size));
+        if (!bytes.empty()) file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        if (!file) return {Result::failure(ResultCode::kUnknown, "Editor World binding sidecar read failed"), {}};
+        auto decoded = asset::decode_world_command_routes(bytes);
+        if (!decoded) return {decoded.result, {}};
+        std::vector<EditorFeatureWorldBinding> bindings;
+        bindings.reserve(decoded.value.size());
+        for (auto& route : decoded.value) {
+            if (route.scene_asset.value != expected_scene.uuid())
+                return {foundation::invalid_argument("Editor World binding sidecar references a different Scene asset"), {}};
+            bindings.push_back(to_editor_world_binding(std::move(route)));
+        }
+        return {Result::success(), std::move(bindings)};
+    } catch (const std::bad_alloc&) {
+        return {foundation::out_of_memory("Editor World binding sidecar allocation failed"), {}};
+    }
+}
+
+[[nodiscard]] Result validate_editor_world_binding_targets(
+    std::span<const EditorFeatureWorldBinding> bindings, const scene::SceneAsset& asset) {
+    const ecs::ComponentTypeId transform_type(engine::components::kTransformName);
+    for (const auto& binding : bindings) {
+        if (binding.scene_asset != asset.id())
+            return foundation::invalid_argument("Editor World binding references a different Scene asset");
+        const auto entity = std::find_if(asset.entities().begin(), asset.entities().end(),
+            [&](const scene::SceneEntityRecord& candidate) { return candidate.id == binding.scene_entity; });
+        const bool has_transform = std::any_of(asset.components().begin(), asset.components().end(),
+            [&](const scene::SceneComponentRecord& component) {
+                return component.entity == binding.scene_entity && component.component_type == transform_type;
+            });
+        if (entity == asset.entities().end() || !has_transform)
+            return foundation::invalid_argument("Editor World binding references a missing Transform entity");
     }
     return Result::success();
 }
@@ -555,121 +669,193 @@ constexpr std::array<uint16_t, 6> kQuadIndices{{0, 1, 2, 0, 2, 3}};
     return math::is_finite(world_hit) && math::is_finite(distance) && distance >= 0.0f;
 }
 
-class EditorViewportReadbackFeature final : public pipeline::RenderFeature {
-public:
-    [[nodiscard]] const pipeline::FeatureDescriptor& descriptor() const noexcept override {
-        static const pipeline::FeatureDescriptor kDescriptor{
-            .id = kEditorViewportReadbackFeatureId,
-            .name = "Editor.ViewportReadbackFeature",
-            .domain = pipeline::FeatureDomain::kRender,
-            .domain_mask = pipeline::to_mask(pipeline::FeatureDomain::kRender),
-            .supported_scopes = pipeline::to_mask(pipeline::PipelineScope::kFrame),
-            .version = {1, 0, 0},
-        };
-        return kDescriptor;
-    }
-
-    [[nodiscard]] foundation::Result build_render_graph(pipeline::RenderGraphBuilder& builder) const override {
-        const renderer::RenderFeatureContext* context = renderer::render_feature_context(builder);
-        if (context == nullptr || !context->is_valid()) {
-            return foundation::invalid_state("viewport readback requires a valid renderer context");
-        }
-        auto* state = static_cast<ViewportReadbackState*>(context->user_data);
-        if (state == nullptr) {
-            return foundation::invalid_state("viewport output requires a state object");
-        }
-        // This frame feature is scheduled inside the Render pipeline, before the
-        // runtime appends its terminal SceneColor composite.  For a serial state
-        // chain, read the directly declared state input so a readback observes the
-        // same frame's output rather than the prior SceneColor contents.  The
-        // visible viewport itself samples SceneColor after terminal composition.
-        pipeline::RenderGraphTexture color = builder.state_input();
-        if (!color.is_valid()) {
-            const auto scene_color = builder.find_texture(context->scene_snapshot->view.color_target);
-            if (!scene_color) {
-                return scene_color.result;
-            }
-            color = scene_color.value;
-        }
-        if (!state->present_connected) {
-            const auto clear = builder.add_graphics_pass(
-                "Editor.Viewport.NoPresent",
-                [color](pipeline::RenderPassBuilder& pass) {
-                    return pass.use_color_attachment(color, rhi::LoadOp::kClear, rhi::StoreOp::kStore,
-                                                     ClearColorValue{0.0f, 0.0f, 0.0f, 1.0f},
-                                                     ResourceUsage::kSampledRead);
-                },
-                [](pipeline::RenderPassExecutionContext& pass) {
-                    if (const Result result = pass.begin_rendering(); !result) {
-                        return result;
-                    }
-                    return pass.end_rendering();
-                });
-            if (!clear) {
-                return clear.result;
-            }
-        }
-        if (!state->requested) {
-            return foundation::Result::success();
-        }
-        if (!state->allocation.is_valid() || state->width == 0 || state->height == 0) {
-            return foundation::invalid_state("viewport readback was requested without a valid allocation");
-        }
-        const auto readback = builder.import_buffer(kEditorViewportReadbackBuffer, state->allocation.buffer,
-                                                    state->desc, state->initial_state);
-        if (!readback) {
-            return readback.result;
-        }
-        const uint64_t pixel_bytes = static_cast<uint64_t>(state->width) * state->height * 4u;
-        const render_graph::FrameAllocation allocation = state->allocation;
-        const uint32_t width = state->width;
-        const uint32_t height = state->height;
-        state->pass_built = false;
-        state->pass_executed = false;
-        const auto pass = builder.add_graphics_pass(
-            "Editor.ViewportReadback",
-            [color, readback = readback.value, allocation, pixel_bytes](pipeline::RenderPassBuilder& pass) {
-                if (const foundation::Result result =
-                        pass.read(color, ResourceUsage::kCopySource, PipelineStage::kCopy, ShaderStage::kAll);
-                    !result) {
-                    return result;
-                }
-                if (const foundation::Result result =
-                        pass.write(readback, ResourceUsage::kCopyDestination, PipelineStage::kCopy, ShaderStage::kAll,
-                                   pipeline::RenderGraphBufferRange{allocation.offset, pixel_bytes}, true);
-                    !result) {
-                    return result;
-                }
-                pass.set_side_effects();
-                return foundation::Result::success();
-            },
-            [state, color, readback = readback.value, allocation, width,
-             height](pipeline::RenderPassExecutionContext& pass) {
-                state->pass_executed = true;
-                return pass.copy_texture_to_buffer(color, rhi::TextureSubresourceLayers{rhi::Aspect::kColor, 0, 0, 1},
-                                                   rhi::Offset3D{0, 0, 0}, rhi::Extent3D{width, height, 1}, readback,
-                                                   allocation.offset, 0, 0);
-            });
-        if (!pass) {
-            return pass.result;
-        }
-        state->pass_built = true;
-        return foundation::Result::success();
-    }
-
-protected:
-    [[nodiscard]] foundation::Result setup(pipeline::RenderGraphBuilder& builder) const override {
-        const auto stage = builder.add_stage({
-            .id = kEditorViewportReadbackStageId,
-            .phase = pipeline::EnginePhase::kRenderBuild,
-            .execution_domain = pipeline::ExecutionDomain::kRenderThread,
-            .time_policy = pipeline::TimePolicy::kFrame,
-            .parallelizable = false,
+// Sole viewport readback implementation; declared after legacy composition and Feature projection.
+[[nodiscard]] Result build_viewport_readback(render_graph::RenderGraph& graph,
+                                            render_graph::RenderGraphTexture color, ViewportReadbackState& state) {
+    if (!state.requested) return Result::success();
+    if (!state.allocation.is_valid() || state.width == 0 || state.height == 0)
+        return foundation::invalid_state("viewport readback was requested without a valid allocation");
+    const auto readback = graph.import_buffer(state.allocation.buffer, state.desc, state.initial_state);
+    if (!readback) return readback.result;
+    const uint64_t pixel_bytes = static_cast<uint64_t>(state.width) * state.height * 4u;
+    const auto allocation = state.allocation;
+    const auto width = state.width;
+    const auto height = state.height;
+    state.pass_built = false;
+    state.pass_executed = false;
+    const auto pass = graph.add_pass(
+        "Editor.ViewportReadback", QueueClass::kGraphics,
+        [color, readback = readback.value, allocation, pixel_bytes](render_graph::PassBuilder& pass) {
+            if (const auto result = pass.read_to(color, ResourceUsage::kCopySource, PipelineStage::kCopy,
+                                                ShaderStage::kAll, ResourceUsage::kSampledRead); !result) return result;
+            if (const auto result = pass.write(readback, ResourceUsage::kCopyDestination, PipelineStage::kCopy,
+                                              ShaderStage::kAll, {allocation.offset, pixel_bytes}, true); !result) return result;
+            pass.set_side_effects();
+            return Result::success();
+        },
+        [state = &state, color, readback = readback.value, allocation, width, height]
+        (render_graph::RenderPassCommandContext& pass) {
+            state->pass_executed = true;
+            return pass.copy_texture_to_buffer(color, {rhi::Aspect::kColor, 0, 0, 1}, {0, 0, 0},
+                                               {width, height, 1}, readback, allocation.offset, 0, 0);
         });
-        return stage ? foundation::Result::success()
-                     : foundation::invalid_state("viewport readback feature stage declaration failed");
+    if (!pass) return pass.result;
+    state.pass_built = true;
+    return Result::success();
+}
+
+Result build_scene_feature_outputs(
+    const engine::EngineFramePostBuildContext& context,
+    std::shared_ptr<const std::vector<feature::RenderFeatureOutput>> outputs,
+    std::span<const feature::RenderResourceOwner> owners, render_graph::RenderFeatureHistory& history,
+    render_graph::RenderPassExecutionHost pass_host) {
+    if (context.render_scenes.empty())
+        return renderer::build_render_feature_outputs(context.render_graph, context.frame_context,
+            std::move(outputs), owners, context.feature_textures, {}, history, 0, pass_host);
+    for (std::size_t index = 0; index < context.render_scenes.size(); ++index) {
+        const auto& scene = context.render_scenes[index];
+        if (!scene) continue;
+        const bool canonical = index == 0;
+        const auto scene_id = canonical ? renderer::kRuntimeSceneResourceId
+            : renderer::make_view_scoped_render_resource_id(renderer::kRuntimeSceneResourceId, scene->view.id);
+        std::vector<renderer::RenderFeatureSceneBinding> scenes{{scene_id, 1, {}, scene, context.render_resource_resolver}};
+        std::vector<render_graph::RenderGraphFeatureTextureBinding> textures(
+            context.feature_textures.begin(), context.feature_textures.end());
+        if (!canonical) {
+            for (const auto& binding : context.feature_textures) {
+                const auto alias = renderer::make_view_scoped_render_resource_id(binding.id, scene->view.id);
+                if (std::none_of(textures.begin(), textures.end(), [&](const auto& value) { return value.id == alias; }))
+                    textures.push_back({alias, binding.texture, binding.version, binding.owner});
+            }
+        }
+        std::vector<feature::RenderFeatureOutput> scoped;
+        scoped.reserve(outputs->size());
+        for (const auto& output : *outputs)
+            scoped.push_back(renderer::scope_render_feature_output(output, scene->view.id, canonical));
+        auto snapshot = std::make_shared<const std::vector<feature::RenderFeatureOutput>>(std::move(scoped));
+        if (const auto result = renderer::build_render_feature_outputs(context.render_graph, context.frame_context,
+                std::move(snapshot), owners, textures, scenes, history, scene->view.id.value(), pass_host); !result)
+            return result;
     }
+    return Result::success();
+}
+
+struct ResolvedEditorWorldBinding final {
+    feature::FeatureInstanceId instance{};
+    ecs::EntityId entity{};
 };
+
+foundation::Result validate_editor_world_binding_candidate(
+    const EditorFeatureWorldBinding& binding,
+    std::span<const feature::FeatureGraphDocument> graphs,
+    const feature::FeatureRegistry& registry,
+    const scene::SceneAsset& scene_asset,
+    const scene::SceneInstance& instance,
+    const world::WorldScope& scope) {
+    if (binding.graph_asset_uuid.empty() || !binding.node_id.is_valid() || !binding.scene_entity.is_valid() ||
+        binding.scene_asset != scene_asset.id() || binding.effect != feature::kWorldTransformCommandEffect ||
+        binding.version != feature::kWorldTransformCommandVersion || !scope.is_initialized())
+        return foundation::invalid_argument("Editor World binding has an invalid authored identity or protocol");
+
+    try {
+        if (const auto result = asset::validate_world_command_route_source(to_world_command_route(binding), graphs,
+                registry); !result)
+            return result;
+    } catch (const std::bad_alloc&) {
+        return foundation::out_of_memory("Editor World binding validation allocation failed");
+    }
+
+    const auto entity = instance.runtime_entity(binding.scene_entity);
+    if (!entity) return entity.result;
+    const auto transform = scope.state().get_component_data(entity.value,
+        ecs::ComponentTypeId(engine::components::kTransformName));
+    return transform ? Result::success() : transform.result;
+}
+
+foundation::ResultValue<ResolvedEditorWorldBinding> resolve_editor_world_binding(
+    const EditorFeatureWorldBinding& binding, const runtime::FeatureGraphRuntimeHost& host,
+    const scene::SceneAsset& scene_asset, const scene::SceneInstance& instance,
+    const world::WorldScope& scope) {
+    if (binding.graph_asset_uuid.empty() || !binding.node_id.is_valid() || !binding.scene_entity.is_valid() ||
+        binding.scene_asset != scene_asset.id() || binding.effect != feature::kWorldTransformCommandEffect ||
+        binding.version != feature::kWorldTransformCommandVersion || !scope.is_initialized())
+        return {foundation::invalid_argument("Editor World binding has an invalid authored identity or protocol"), {}};
+
+    const auto execution = host.inspect_execution(binding.graph_asset_uuid);
+    if (!execution) return {execution.result, {}};
+    const runtime::FeatureRuntimeExecutionProvenance* selected = nullptr;
+    for (const auto& candidate : execution.value.provenance) {
+        if (candidate.authored_node_id != binding.node_id ||
+            candidate.authored_instance_path.nodes != binding.owner_path.nodes) continue;
+        if (selected)
+            return {foundation::invalid_argument("Editor World binding has ambiguous authored owner attribution"), {}};
+        selected = &candidate;
+    }
+    if (!selected)
+        return {foundation::invalid_argument("Editor World binding has no exact published authored owner"), {}};
+
+    const auto node = host.inspect_node(binding.graph_asset_uuid, binding.node_id);
+    if (!node) return {node.result, {}};
+    const auto owner = std::find_if(node.value.owners.begin(), node.value.owners.end(), [&](const auto& candidate) {
+        return candidate.owner.instance_id == selected->runtime.instance_id;
+    });
+    if (owner == node.value.owners.end())
+        return {foundation::invalid_state("Editor World binding owner is absent from the active Feature graph"), {}};
+    try {
+        if (const auto result = asset::validate_world_command_route_contract(to_world_command_route(binding),
+                owner->contract); !result)
+            return {result, {}};
+    } catch (const std::bad_alloc&) {
+        return {foundation::out_of_memory("Editor World binding validation allocation failed"), {}};
+    }
+
+    const auto entity = instance.runtime_entity(binding.scene_entity);
+    if (!entity) return {entity.result, {}};
+    const auto transform = scope.state().get_component_data(entity.value,
+        ecs::ComponentTypeId(engine::components::kTransformName));
+    if (!transform) return {transform.result, {}};
+    return {Result::success(), {selected->runtime.instance_id, entity.value}};
+}
+
+foundation::ResultValue<bool> editor_world_binding_has_issued_work(
+    const EditorFeatureWorldBinding& binding, const runtime::FeatureGraphRuntimeHost& host,
+    const scene::SceneAsset& scene_asset, const scene::SceneInstance& instance,
+    const world::WorldScope& scope) {
+    const auto resolved = resolve_editor_world_binding(binding, host, scene_asset, instance, scope);
+    if (!resolved) return {resolved.result, false};
+    const auto node = host.inspect_node(binding.graph_asset_uuid, binding.node_id);
+    if (!node) return {node.result, false};
+    const auto owner = std::find_if(node.value.owners.begin(), node.value.owners.end(), [&](const auto& candidate) {
+        return candidate.owner.instance_id == resolved.value.instance;
+    });
+    if (owner == node.value.owners.end())
+        return {foundation::invalid_state("Editor World binding owner retired before its Apply boundary"), false};
+    return {Result::success(), !owner->invocations.open_attempts.empty()};
+}
+
+foundation::ResultValue<std::unique_ptr<engine::detail::FeatureWorldCommandConsumer>>
+make_editor_world_command_consumer(
+    feature::FeatureRuntime& runtime, const reflection::TypeRegistry& schemas,
+    const runtime::FeatureGraphRuntimeHost& host, std::span<const EditorFeatureWorldBinding> bindings,
+    const scene::SceneAsset& scene_asset, const scene::SceneInstance& instance, world::WorldScope& scope) {
+    try {
+        auto consumer = std::make_unique<engine::detail::FeatureWorldCommandConsumer>(runtime, schemas);
+        for (const auto& binding : bindings) {
+            const auto resolved = resolve_editor_world_binding(binding, host, scene_asset, instance, scope);
+            if (!resolved) return {resolved.result, {}};
+            if (const auto result = consumer->bind(resolved.value.instance, scope, resolved.value.entity,
+                    binding.effect, binding.version, binding.observation_port); !result)
+                return {result, {}};
+        }
+        return {Result::success(), std::move(consumer)};
+    } catch (const std::bad_alloc&) {
+        return {foundation::out_of_memory("Editor World command consumer allocation failed"), {}};
+    } catch (const std::exception& error) {
+        return {foundation::unknown_exception(error), {}};
+    } catch (...) {
+        return {foundation::invalid_state("Editor World command consumer construction threw an exception"), {}};
+    }
+}
 
 }  // namespace
 
@@ -723,8 +909,8 @@ struct EditorSceneRuntime::Impl final {
         std::array<BufferHandle, kFramesInFlight> parameter_buffers{};
         std::array<BindingSetHandle, kFramesInFlight> binding_sets{};
         BufferDesc parameter_desc{};
-        pipeline::RenderGraphTexture graph_texture{};
-        pipeline::RenderGraphBuffer graph_parameter{};
+        render_graph::RenderGraphTexture graph_texture{};
+        render_graph::RenderGraphBuffer graph_parameter{};
         std::array<float, 4> tint{1.0f, 1.0f, 1.0f, 1.0f};
     };
 
@@ -744,7 +930,7 @@ struct EditorSceneRuntime::Impl final {
         bool transient{false};
         resource::GpuTexture gpu{};
         TextureDesc desc{};
-        pipeline::RenderGraphTexture graph_texture{};
+        render_graph::RenderGraphTexture graph_texture{};
     };
 
     struct CachedFont final {
@@ -786,6 +972,29 @@ struct EditorSceneRuntime::Impl final {
             if (owner == nullptr) {
                 return {foundation::invalid_state("Editor scene resolver is detached"), {}};
             }
+            const auto resource_for = [&](const MaterialGpu& gpu) {
+                renderer::RenderMaterialResource resource{
+                    owner->pipeline, gpu.binding_sets[owner->current_slot], 1, gpu.graph_texture,
+                    gpu.parameter_buffers[owner->current_slot], gpu.parameter_desc, gpu.graph_parameter, 0,
+                    sizeof(resource::TextureMaterialParameters), owner->gbuffer_pipeline, owner->depth_pipeline,
+                    owner->shadow_pipeline, owner->clustered_pipeline};
+                resource.shader_contract = owner->material_shader_contract;
+                resource.attachment_contract = owner->material_attachment_contract;
+                resource.shadow_shader_contract = owner->shadow_shader_contract;
+                resource.shadow_pipeline_contract = owner->shadow_pipeline_contract;
+                resource.shadow_pipeline_cache_epoch = owner->shadow_pipeline.is_valid()
+                    ? owner->shadow_shader_contract.cache_epoch : 0;
+                resource.clustered_pipeline_contract = owner->clustered_contract;
+                resource.clustered_profile_contract = owner->clustered_profile_contract;
+                resource.depth_profile_contract = owner->depth_profile_contract;
+                resource.depth_pipeline_contract = owner->depth_profile_contract.attachment;
+                resource.gbuffer_profile_contract = owner->gbuffer_profile_contract;
+                resource.gbuffer_pipeline_contract = owner->gbuffer_profile_contract.attachment;
+                resource.variant_cache_epoch = owner->material_shader_contract.cache_epoch;
+                if (owner->unshadowed_clustered.pipeline.is_valid())
+                    resource.unshadowed_clustered_variant = owner->unshadowed_clustered;
+                return resource;
+            };
             const uint64_t id = material.value();
             const auto imported = owner->imported_materials.find(id);
             const auto* asset = owner->asset_database.find(id);
@@ -794,12 +1003,7 @@ struct EditorSceneRuntime::Impl final {
                 (asset->status == EditorAssetStatus::kImported || asset->status == EditorAssetStatus::kFailed);
             if (imported != owner->imported_materials.end() && (imported->second.transient || can_use_last_good)) {
                 const MaterialGpu& gpu = imported->second;
-                return {Result::success(),
-                        renderer::RenderMaterialResource{
-                            owner->pipeline, gpu.binding_sets[owner->current_slot], 1, gpu.graph_texture,
-                            gpu.parameter_buffers[owner->current_slot], gpu.parameter_desc, gpu.graph_parameter, 0,
-                            sizeof(resource::TextureMaterialParameters), owner->gbuffer_pipeline, owner->depth_pipeline,
-                            owner->shadow_pipeline, owner->clustered_pipeline}};
+                return {Result::success(), resource_for(gpu)};
             }
             const uint32_t index = id == kMaterialAssetGreen ? 1u : 0u;
             if (id != kMaterialAssetRed && id != kMaterialAssetGreen) {
@@ -811,12 +1015,7 @@ struct EditorSceneRuntime::Impl final {
                         : "Material Asset ID is missing; using editor fallback material.";
             }
             const MaterialGpu& gpu = owner->materials[index];
-            return {Result::success(),
-                    renderer::RenderMaterialResource{
-                        owner->pipeline, gpu.binding_sets[owner->current_slot], 1, gpu.graph_texture,
-                        gpu.parameter_buffers[owner->current_slot], gpu.parameter_desc, gpu.graph_parameter, 0,
-                        sizeof(resource::TextureMaterialParameters), owner->gbuffer_pipeline, owner->depth_pipeline,
-                        owner->shadow_pipeline, owner->clustered_pipeline}};
+            return {Result::success(), resource_for(gpu)};
         }
 
         [[nodiscard]] foundation::ResultValue<renderer::RenderObjectResource> resolve_object(
@@ -937,16 +1136,94 @@ struct EditorSceneRuntime::Impl final {
         Impl* owner{nullptr};
     };
 
+    // Application ownership only: execution, registration and DLL leases retain their existing implementations.
+    struct FeatureSession final {
+        FeatureSession(Device& device, const std::filesystem::path& project_file,
+                       const feature::ClockHost& clock_host,
+                       const feature::FeatureRuntime* previous)
+            : history(device), registry(clock_host), asset_kind_resolver(snapshot_editor_asset_kind_resolver(project_file)),
+              execution(previous ? previous->make_reset_runtime(registry, asset_kind_resolver)
+                                 : std::make_unique<feature::FeatureRuntime>(registry, asset_kind_resolver)) {}
+        render_graph::RenderFeatureHistory history;
+        feature::FeatureRegistry registry{};
+        module::ModuleRegistry modules{registry};
+        module::DynamicModuleLoader loader{modules};
+        module::DynamicModuleHandle handle{};
+        // Published session authority; authoring refreshes do not replace this immutable directory.
+        feature::AssetKindResolver asset_kind_resolver{};
+        std::unique_ptr<feature::FeatureRuntime> execution{
+            std::make_unique<feature::FeatureRuntime>(registry, asset_kind_resolver)};
+        std::unique_ptr<runtime::FeatureGraphRuntimeHost> host{
+            std::make_unique<runtime::FeatureGraphRuntimeHost>(*execution, registry)};
+
+        ~FeatureSession() { static_cast<void>(close()); }
+        [[nodiscard]] Result close() {
+            if (execution != nullptr) {
+                if (const auto result = execution->shutdown_execution(); !result) return result;
+                history.clear();
+                host.reset();
+                execution.reset();
+            }
+            if (handle.loaded) {
+                const auto id = handle.bundle.metadata.module.id;
+                if (modules.contains(id)) {
+                    if (const auto result = modules.unregister_module(id); !result) return result;
+                }
+                if (const auto result = loader.unload(handle); !result) return result;
+            }
+            return Result::success();
+        }
+        [[nodiscard]] Result reset_execution() {
+            auto next_execution = execution->make_reset_runtime();
+            auto next_host = std::make_unique<runtime::FeatureGraphRuntimeHost>(*next_execution, registry);
+            if (const auto result = next_execution->enable_async_execution(); !result) return result;
+            for (const auto& graph : host->active_documents()) {
+                if (const auto result = next_host->stage(graph); !result) return result;
+            }
+            if (next_host->has_pending()) {
+                if (const auto result = next_host->apply_pending(); !result) return result;
+            }
+            if (const auto result = execution->shutdown_execution(); !result) return result;
+            history.clear();
+            host = std::move(next_host);
+            execution = std::move(next_execution);
+            return Result::success();
+        }
+    };
+    feature::ClockHost clock_host{};
+    std::unique_ptr<FeatureSession> feature_session{};
+    std::unique_ptr<FeatureSession> pending_feature_session{};
+    std::vector<EditorFeatureWorldBinding> feature_world_bindings{};
+    std::unique_ptr<engine::detail::FeatureWorldCommandConsumer> world_command_consumer{};
+    std::unique_ptr<EditorRendererFeatureHost> preview_renderer{};
+    std::unique_ptr<render_graph::RenderFeatureHistory> preview_history{};
+    [[nodiscard]] Result close_features() {
+        if (world_command_consumer != nullptr) {
+            // The orchestrator borrows the consumer, so retire its attachment before the route leases.
+            orchestrator.reset();
+            world_command_consumer.reset();
+        }
+        if (pending_feature_session != nullptr) {
+            if (const auto result = pending_feature_session->close(); !result) return result;
+            pending_feature_session.reset();
+        }
+        if (feature_session != nullptr) {
+            if (const auto result = feature_session->close(); !result) return result;
+            feature_session.reset();
+        }
+        return Result::success();
+    }
+
     Device* device{nullptr};
     reflection::TypeRegistry reflection_registry{};
     pipeline::PipelineRegistry registry{};
-    pipeline::RenderPassRegistry passes{};
     pipeline::PipelineScheduler scheduler{};
+    pipeline::RenderPassRegistry scene_passes{};
+    engine::EngineFramePipelineHost pipeline_host{registry, scheduler};
     std::unique_ptr<render_graph::FrameContext> frame_context{};
     std::unique_ptr<render_graph::RenderGraph> render_graph{};
+    std::shared_ptr<const EditorRenderGraphSnapshot> rendered_inspection{};
     renderer::Renderer renderer{};
-    std::unique_ptr<pipeline::PipelineScopeHost> frame_host{std::make_unique<pipeline::PipelineScopeHost>(
-        pipeline::PipelineScope::kFrame, pipeline::PipelineInstanceId("Editor.Scene.Frame"))};
     std::unique_ptr<engine::EngineFrameOrchestrator> orchestrator{};
     ecs::WorldManager world_manager{};
     std::shared_ptr<ecs::World> edit_state{};
@@ -956,7 +1233,7 @@ struct EditorSceneRuntime::Impl final {
     world::WorldScope* active_scope{nullptr};
     scene::SceneAsset scene_asset{};
     EditorProjectManager project_manager{};
-    EditorProjectPipelineAuthoring project_pipeline_authoring{};
+    EditorProjectFeatureAuthoring project_feature_authoring{};
     EditorAssetDatabase asset_database{};
     asset_pipeline::EditorAssetPipeline asset_pipeline{};
     bool asset_pipeline_ready{false};
@@ -980,11 +1257,6 @@ struct EditorSceneRuntime::Impl final {
     bool materials_ready{false};
     bool target_has_previous_frame{false};
     uint32_t current_slot{0};
-    std::vector<render_graph::RenderStateLinkOverride> render_state_link_overrides{};
-    std::vector<render_graph::RenderStateBlendOverride> render_state_blend_overrides{};
-    pipeline::PipelinePlanHandle project_renderer_pipeline{};
-    std::filesystem::path active_renderer_document{};
-    std::string renderer_pipeline_diagnostic{};
     EditTransaction transform_edit{};
     EditorCommand component_edit_command{};
     bool component_edit_active{false};
@@ -992,29 +1264,35 @@ struct EditorSceneRuntime::Impl final {
     std::size_t history_cursor{0};
     std::size_t clean_history_cursor{0};
     bool scene_dirty_base{false};
-    float runtime_demo_time{0.0f};
 
     shader::ShaderManager* shader_manager{nullptr};
     std::unique_ptr<shader::ShaderManager> shader_manager_owner{};
     shader::ShaderPipelineLayout shader_layout{};
+    shader::ShaderPipelineLayout depth_shader_layout{};
     shader::ShaderPipelineLayout gbuffer_shader_layout{};
-    shader::ShaderPipelineLayout state_composite_layout{};
+    shader::ShaderPipelineLayout shadow_shader_layout{};
     BindingLayoutHandle object_layout{};
     BindingLayoutHandle material_layout{};
     BindingLayoutHandle lighting_layout{};
-    BindingLayoutHandle state_composite_binding_layout{};
     rhi::PipelineHandle pipeline{};
+    renderer::RenderMaterialShaderContract material_shader_contract{};
+    renderer::RenderMaterialAttachmentContract material_attachment_contract{};
     rhi::PipelineHandle gbuffer_pipeline{};
+    renderer::RendererProfilePsoContract gbuffer_profile_contract{};
     rhi::PipelineHandle depth_pipeline{};
+    renderer::RendererProfilePsoContract depth_profile_contract{};
     rhi::PipelineHandle shadow_pipeline{};
+    renderer::RenderMaterialShaderContract shadow_shader_contract{};
+    renderer::RenderMaterialAttachmentContract shadow_pipeline_contract{};
     rhi::PipelineHandle clustered_pipeline{};
+    renderer::RenderMaterialAttachmentContract clustered_contract{};
+    renderer::RendererProfilePsoContract clustered_profile_contract{};
+    renderer::RenderMaterialPipelineVariant unshadowed_clustered{};
     std::unique_ptr<renderer::LightCullingResources> light_culling{};
     std::unique_ptr<renderer::PostProcessResources> post_process{};
     std::unique_ptr<renderer::ShadowResources> shadows{};
     std::unique_ptr<renderer::DeferredLightingResources> deferred_lighting{};
-    std::array<rhi::PipelineHandle, 3> state_composite_pipelines{};
     /** State-composite descriptors are valid only until their frame has been submitted. */
-    std::vector<BindingSetHandle> state_composite_sets{};
     std::array<renderer::RenderMeshResource, 2> meshes{};
     std::array<BufferHandle, 2> mesh_vertex_buffers{};
     std::array<BufferDesc, 2> mesh_vertex_descs{};
@@ -1025,14 +1303,14 @@ struct EditorSceneRuntime::Impl final {
     std::array<BufferHandle, kFramesInFlight> lighting_buffers{};
     std::array<BindingSetHandle, kFramesInFlight> lighting_sets{};
     BufferDesc lighting_desc{};
-    pipeline::RenderGraphBuffer lighting_graph{};
+    render_graph::RenderGraphBuffer lighting_graph{};
     std::array<MaterialGpu, kMaterialCount> materials{};
     std::unordered_map<uint64_t, ImportedMeshGpu> imported_meshes{};
     std::unordered_map<uint64_t, ImportedTextureGpu> imported_textures{};
     std::unordered_map<uint64_t, MaterialGpu> imported_materials{};
-    std::unordered_map<uint64_t, pipeline::RenderGraphTexture> frame_texture_graphs{};
-    std::unordered_map<uint64_t, pipeline::RenderGraphBuffer> frame_vertex_graphs{};
-    std::unordered_map<uint64_t, pipeline::RenderGraphBuffer> frame_index_graphs{};
+    std::unordered_map<uint64_t, render_graph::RenderGraphTexture> frame_texture_graphs{};
+    std::unordered_map<uint64_t, render_graph::RenderGraphBuffer> frame_vertex_graphs{};
+    std::unordered_map<uint64_t, render_graph::RenderGraphBuffer> frame_index_graphs{};
     std::unordered_map<uint64_t, CachedFont> cached_fonts{};
     ViewportReadbackState viewport_readback{};
     TextureHandle color_texture{};
@@ -1054,20 +1332,11 @@ struct EditorSceneRuntime::Impl final {
 
     [[nodiscard]] Result initialize_device(Device& device);
     [[nodiscard]] Result initialize_graphics_resources();
-    /** Creates one descriptor set for a state-composite pass. */
-    [[nodiscard]] foundation::ResultValue<BindingSetHandle> create_state_composite_set();
-    /** Releases submitted state-composite descriptors before their transient source views are recycled. */
-    [[nodiscard]] Result release_state_composite_sets();
     [[nodiscard]] Result create_static_meshes();
     [[nodiscard]] Result create_object_and_lighting_resources();
     [[nodiscard]] Result create_targets();
     [[nodiscard]] Result resize_targets();
     [[nodiscard]] Result create_orchestrator_for(world::WorldScope& scope);
-    [[nodiscard]] Result activate_renderer_document(const std::filesystem::path& path, bool persist);
-    [[nodiscard]] Result restore_startup_renderer();
-    [[nodiscard]] Result restore_default_renderer(bool persist, bool expose);
-    [[nodiscard]] Result switch_renderer(std::shared_ptr<const pipeline::PipelineInstanceConfiguration> configuration,
-                                         std::filesystem::path document_path, bool persist, bool expose);
     [[nodiscard]] Result rebuild_edit_world();
     [[nodiscard]] Result instantiate_world(scene::SceneAsset const& asset, std::shared_ptr<ecs::World>& state,
                                            std::unique_ptr<world::WorldScope>& scope, scene::SceneInstance& instance,
@@ -1077,7 +1346,7 @@ struct EditorSceneRuntime::Impl final {
     [[nodiscard]] Result sync_scene_from_edit_world();
     [[nodiscard]] Result commit_edit_commands();
     [[nodiscard]] Result prepare_frame(const engine::EngineFramePreparationContext& context);
-    [[nodiscard]] Result reload_project_pipeline_authoring();
+    [[nodiscard]] Result reload_project_feature_authoring();
     [[nodiscard]] Result synchronize_asset_pipeline();
     [[nodiscard]] Result consume_asset(const asset_pipeline::CpuAsset& asset,
                                        const engine::EngineFramePreparationContext& context);
@@ -1095,7 +1364,6 @@ struct EditorSceneRuntime::Impl final {
     [[nodiscard]] Result prepare_text_assets(const ecs::WorldSnapshot& snapshot,
                                              const engine::EngineFramePreparationContext& context);
     [[nodiscard]] Result retire_missing_assets(const engine::EngineFramePreparationContext& context);
-    [[nodiscard]] Result advance_runtime_demo();
     [[nodiscard]] Result destroy_resources();
     [[nodiscard]] foundation::ResultValue<ecs::EntityId> runtime_entity_in(const scene::SceneInstance& instance,
                                                                            scene::SceneEntityId entity) const;
@@ -1169,7 +1437,7 @@ EditorSceneRuntime::Mode EditorSceneRuntime::mode() const noexcept {
 std::string_view EditorSceneRuntime::diagnostic() const noexcept {
     if (impl_ == nullptr)
         return {};
-    return impl_->renderer_pipeline_diagnostic.empty() ? impl_->diagnostic : impl_->renderer_pipeline_diagnostic;
+    return impl_->diagnostic;
 }
 
 bool EditorSceneRuntime::project_loaded() const noexcept {
@@ -1177,7 +1445,7 @@ bool EditorSceneRuntime::project_loaded() const noexcept {
 }
 
 uint32_t EditorSceneRuntime::draw_call_count() const noexcept {
-    if (impl_ == nullptr || !impl_->project_manager.loaded() || impl_->orchestrator == nullptr) {
+    if (impl_ == nullptr || impl_->orchestrator == nullptr) {
         return 0;
     }
     return impl_->orchestrator->draw_call_count();
@@ -1190,6 +1458,10 @@ std::string_view EditorSceneRuntime::project_name() const noexcept {
 const std::filesystem::path& EditorSceneRuntime::project_root() const noexcept {
     static const std::filesystem::path kEmptyPath{};
     return impl_ == nullptr ? kEmptyPath : impl_->project_manager.descriptor().root;
+}
+
+std::filesystem::path EditorSceneRuntime::project_file() const {
+    return impl_ == nullptr ? std::filesystem::path{} : impl_->project_manager.project_file();
 }
 
 foundation::ResultValue<renderer::RenderView> EditorSceneRuntime::Impl::make_edit_view(uint32_t width,
@@ -1377,502 +1649,67 @@ const reflection::TypeRegistry& EditorSceneRuntime::reflection_registry() const 
     return impl_ == nullptr ? kEmptyRegistry : impl_->reflection_registry;
 }
 
-std::vector<std::pair<std::string, pipeline::PipelinePlanHandle>> EditorSceneRuntime::pipeline_snapshots() const {
-    std::vector<std::pair<std::string, pipeline::PipelinePlanHandle>> result;
-    if (!impl_)
-        return result;
-    if (impl_->active_scope) {
-        auto plan = impl_->active_scope->pipeline_host().active_plan_snapshot();
-        if (plan)
-            result.emplace_back("Game / World", std::move(plan));
-    }
-    if (!impl_->project_manager.loaded()) {
-        auto plan = impl_->frame_host->active_plan_snapshot();
-        if (plan)
-            result.emplace_back("Game / Renderer", std::move(plan));
-    } else if (impl_->project_renderer_pipeline) {
-        result.emplace_back("Game / Renderer", impl_->project_renderer_pipeline);
-    }
-    return result;
-}
-
-std::span<const EditorProjectPipelineDocument> EditorSceneRuntime::authored_pipeline_documents() const noexcept {
+std::span<const EditorProjectFeatureGraphDocument> EditorSceneRuntime::authored_feature_graphs() const noexcept {
     return impl_ == nullptr
-               ? std::span<const EditorProjectPipelineDocument>{}
-               : std::span<const EditorProjectPipelineDocument>{impl_->project_pipeline_authoring.documents};
+               ? std::span<const EditorProjectFeatureGraphDocument>{}
+               : std::span<const EditorProjectFeatureGraphDocument>{impl_->project_feature_authoring.feature_graphs};
 }
 
-const pipeline::TypeCatalog& EditorSceneRuntime::authored_pipeline_catalog() const noexcept {
-    static const pipeline::TypeCatalog kEmptyCatalog{};
-    return impl_ == nullptr ? kEmptyCatalog : impl_->project_pipeline_authoring.catalog;
+const feature::FeatureCatalog& EditorSceneRuntime::authored_feature_catalog() const noexcept {
+    static const feature::FeatureCatalog kEmptyCatalog{};
+    return impl_ == nullptr ? kEmptyCatalog : impl_->project_feature_authoring.feature_catalog;
 }
 
-std::span<const NodeContractFile> EditorSceneRuntime::authored_pipeline_drafts() const noexcept {
+const feature::FeatureCatalog* EditorSceneRuntime::active_feature_module_catalog() const noexcept {
+    if (impl_ == nullptr || impl_->feature_session == nullptr || !impl_->feature_session->handle.loaded)
+        return nullptr;
+    return &impl_->feature_session->handle.bundle.metadata.feature_catalog;
+}
+
+foundation::ResultValue<feature::FeatureCatalog> EditorSceneRuntime::inspect_feature_module_catalog(
+    const std::filesystem::path& manifest) const {
+    const auto bundle = module::validate_module_bundle(manifest);
+    if (!bundle) return {bundle.result, {}};
+    return {foundation::Result::success(), bundle.value.metadata.feature_catalog};
+}
+
+std::span<const feature::FeatureDefinitionId> EditorSceneRuntime::authored_compiled_features() const noexcept {
+    return impl_ == nullptr ? std::span<const feature::FeatureDefinitionId>{}
+        : std::span<const feature::FeatureDefinitionId>{impl_->project_feature_authoring.compiled_feature_ids};
+}
+
+std::span<const NodeContractFile> EditorSceneRuntime::authored_feature_drafts() const noexcept {
     return impl_ == nullptr ? std::span<const NodeContractFile>{}
-                            : std::span<const NodeContractFile>{impl_->project_pipeline_authoring.drafts};
+                            : std::span<const NodeContractFile>{impl_->project_feature_authoring.drafts};
 }
 
-std::span<const EditorProjectPipelineConflict> EditorSceneRuntime::authored_pipeline_conflicts() const noexcept {
-    return impl_ == nullptr ? std::span<const EditorProjectPipelineConflict>{}
-                            : std::span<const EditorProjectPipelineConflict>{impl_->project_pipeline_authoring.conflicts};
+std::span<const NodeDefinitionDraft> EditorSceneRuntime::authored_feature_presentations() const noexcept {
+    return impl_ == nullptr ? std::span<const NodeDefinitionDraft>{}
+                            : std::span<const NodeDefinitionDraft>{impl_->project_feature_authoring.presentations};
 }
 
-foundation::Result EditorSceneRuntime::set_authored_present_connection(const std::filesystem::path& document_path,
-                                                                       std::string_view source_node, bool connected) {
-    if (impl_ == nullptr || !impl_->initialized)
-        return foundation::invalid_state("Editor scene runtime is not initialized");
-    if (document_path.empty() || source_node.empty())
-        return foundation::invalid_argument("Present connection endpoints are invalid");
-    const auto document = std::find_if(impl_->project_pipeline_authoring.documents.begin(),
-                                       impl_->project_pipeline_authoring.documents.end(),
-                                       [&document_path](const EditorProjectPipelineDocument& item) {
-                                           return item.path.lexically_normal() == document_path.lexically_normal();
-                                       });
-    if (document == impl_->project_pipeline_authoring.documents.end())
-        return foundation::not_found("Authored Pipeline document is not loaded");
-    const auto is_authoring_node = [&source_node](const auto& nodes) {
-        return std::any_of(nodes.begin(), nodes.end(),
-                           [&source_node](const auto& node) { return node.node_id == source_node; });
-    };
-    if (!is_authoring_node(document->document.pipeline_nodes) && !is_authoring_node(document->document.feature_nodes) &&
-        !is_authoring_node(document->document.pass_nodes)) {
-        return foundation::not_found("Present connection source is not an authored Pipeline node");
-    }
+std::span<const EditorProjectFeatureConflict> EditorSceneRuntime::authored_feature_conflicts() const noexcept {
+    return impl_ == nullptr ? std::span<const EditorProjectFeatureConflict>{}
+                            : std::span<const EditorProjectFeatureConflict>{impl_->project_feature_authoring.conflicts};
+}
+
+foundation::Result EditorSceneRuntime::restore_default_renderer_feature() {
+    if (impl_ == nullptr || !impl_->initialized || impl_->device == nullptr || impl_->preview_renderer == nullptr)
+        return foundation::invalid_state("Editor Renderer Feature preview is unavailable");
+    if (impl_->mode != Mode::kEdit || impl_->transform_edit.active || impl_->component_edit_active ||
+        impl_->frame_context->is_frame_active())
+        return foundation::invalid_state("Renderer Feature restoration requires an Edit frame boundary");
+    auto candidate = EditorRendererFeatureHost::create();
+    if (!candidate) return candidate.result;
+    std::unique_ptr<render_graph::RenderFeatureHistory> history;
     try {
-        std::vector<std::string> previous = document->document.present_connections;
-        auto found = std::find(document->document.present_connections.begin(),
-                               document->document.present_connections.end(), source_node);
-        if (connected && found == document->document.present_connections.end())
-            document->document.present_connections.emplace_back(source_node);
-        else if (!connected && found != document->document.present_connections.end())
-            document->document.present_connections.erase(found);
-        else
-            return Result::success();
-        if (const Result saved = project::save_pipeline_document(document->path, document->document); !saved) {
-            document->document.present_connections = std::move(previous);
-            return saved;
-        }
-        return Result::success();
+        history = std::make_unique<render_graph::RenderFeatureHistory>(*impl_->device);
     } catch (const std::bad_alloc&) {
-        return foundation::out_of_memory("Present connection update allocation failed");
+        return foundation::out_of_memory("Editor Renderer Feature history allocation failed");
     }
-}
-
-namespace {
-bool is_builtin_renderer_pipeline(pipeline::PipelineId id) {
-    return id == renderer::kDeferredRenderPipelineId || id == renderer::kForwardRenderPipelineId;
-}
-bool contains_builtin_renderer(const pipeline::PipelineDocument& document) {
-    return std::any_of(document.pipeline_nodes.begin(), document.pipeline_nodes.end(), [](const auto& node) {
-        return node.scope == pipeline::PipelineScope::kFrame && is_builtin_renderer_pipeline(node.type);
-    });
-}
-}  // namespace
-
-foundation::Result EditorSceneRuntime::Impl::switch_renderer(
-    std::shared_ptr<const pipeline::PipelineInstanceConfiguration> configuration, std::filesystem::path document_path,
-    bool persist, bool expose) try {
-    if (!initialized || active_scope == nullptr || orchestrator == nullptr)
-        return foundation::invalid_state("Renderer selection requires an initialized scene");
-    if (mode != Mode::kEdit || transform_edit.active || component_edit_active || frame_context->is_frame_active())
-        return foundation::invalid_state("Renderer selection requires Edit mode at a frame boundary");
-
-    auto candidate = std::make_unique<pipeline::PipelineScopeHost>(
-        pipeline::PipelineScope::kFrame,
-        configuration ? configuration->instance : pipeline::PipelineInstanceId("Editor.Scene.Frame"));
-    if (const auto result =
-            candidate->bind_pipeline(configuration ? configuration->pipeline : pipeline::PipelineId("RenderPipeline"));
-        !result)
-        return result;
-    if (configuration) {
-        if (const auto result = candidate->set_configuration(configuration); !result)
-            return result;
-    }
-    if (const auto result = candidate->rebuild(registry); !result)
-        return result;
-    auto candidate_plan = candidate->active_plan_snapshot();
-    if (!candidate_plan)
-        return foundation::invalid_state("Renderer selection produced no plan");
-
-    // Prepare the file update before touching the live host. Preserve other startup pipelines and unknown TOML fields.
-    std::optional<project::ProjectFile> project_file;
-    std::filesystem::path project_path;
-    if (persist && project_manager.loaded()) {
-        project_path = project_manager.project_file();
-        auto loaded = project::ProjectFileCodec{}.load(project_path);
-        if (!loaded)
-            return loaded.result;
-        project_file = std::move(loaded.value);
-        std::vector<std::filesystem::path> retained;
-        for (const auto& entry : project_file->config.startup_pipelines) {
-            const auto entry_path = (project_manager.descriptor().root / entry).lexically_normal();
-            // The last successfully activated identity remains known even if its source was removed or corrupted.
-            if (!active_renderer_document.empty() && entry_path == active_renderer_document)
-                continue;
-            auto document = project::load_pipeline_document(entry_path);
-            if (!document)
-                return document.result;
-            if (!contains_builtin_renderer(document.value))
-                retained.push_back(entry);
-            else if (document.value.pipeline_nodes.size() != 1)
-                return foundation::unsupported("A renderer startup document must own exactly one pipeline");
-        }
-        if (!document_path.empty())
-            retained.push_back(document_path.lexically_relative(project_manager.descriptor().root));
-        project_file->config.startup_pipelines = std::move(retained);
-        project_file->config.format_version = 2;
-    }
-
-    auto next = std::make_unique<engine::EngineFrameOrchestrator>(registry, scheduler, *frame_context, *render_graph);
-    if (const auto result = next->register_world_frame(*active_scope, *candidate, 0); !result)
-        return result;
-    const auto rollback = [&](Result failure) {
-        if (next->is_initialized())
-            (void)next->shutdown();
-        if (!orchestrator->is_initialized()) {
-            if (const auto restored = orchestrator->initialize(); !restored)
-                return foundation::invalid_state(failure.message +
-                                                 "; previous renderer restore failed: " + restored.message);
-        }
-        return failure;
-    };
-    if (const auto result = orchestrator->shutdown(); !result)
-        return rollback(result);
-    if (const auto result = next->initialize(); !result)
-        return rollback(result);
-    if (project_file) {
-        if (const auto result = project::ProjectFileCodec{}.save(project_path, *project_file); !result)
-            return rollback(result);
-    }
-
-    // Destroy the old orchestrator while its borrowed host is still alive.
-    orchestrator = std::move(next);
-    frame_host = std::move(candidate);
-    render_graph->reset();
-    active_renderer_document.swap(document_path);
-    renderer_pipeline_diagnostic.clear();
-    project_renderer_pipeline = expose ? std::move(candidate_plan) : nullptr;
-    render_state_link_overrides.clear();
-    render_state_blend_overrides.clear();
+    impl_->preview_renderer.swap(candidate.value);
+    impl_->preview_history.swap(history);
     return Result::success();
-} catch (const std::bad_alloc&) {
-    return foundation::out_of_memory("Renderer selection allocation failed");
-}
-
-foundation::Result EditorSceneRuntime::Impl::activate_renderer_document(const std::filesystem::path& path,
-                                                                        bool persist) try {
-    if (!project_manager.loaded())
-        return foundation::invalid_state("Renderer selection requires an open project");
-    if (path.empty())
-        return foundation::invalid_argument("Renderer document path is empty");
-    std::error_code error;
-    const auto root = std::filesystem::weakly_canonical(project_manager.descriptor().root, error);
-    if (error)
-        return foundation::invalid_argument("Could not resolve the project root: " + error.message());
-    const auto resolved = std::filesystem::weakly_canonical(path.is_absolute() ? path : root / path, error);
-    if (error)
-        return foundation::invalid_argument("Could not resolve the renderer document: " + error.message());
-    const auto relative = resolved.lexically_relative(root);
-    if (relative.empty() || relative.is_absolute() || *relative.begin() == ".." || resolved.extension() != ".aegpipe")
-        return foundation::invalid_argument("Renderer document must be a project-local .aegpipe file");
-    auto document = project::load_pipeline_document(resolved);
-    if (!document)
-        return document.result;
-    auto prepared =
-        pipeline::prepare_pipeline_document(document.value, project_pipeline_authoring.catalog, registry, passes);
-    if (!prepared)
-        return prepared.result;
-    if (prepared.value.configurations.size() != 1 ||
-        prepared.value.configurations.front()->scope != pipeline::PipelineScope::kFrame ||
-        !is_builtin_renderer_pipeline(prepared.value.configurations.front()->pipeline))
-        return foundation::unsupported("Viewport selection requires one built-in forward or deferred frame pipeline");
-    if (const auto result = switch_renderer(prepared.value.configurations.front(), resolved, persist, true); !result)
-        return result;
-    for (auto& item : project_pipeline_authoring.documents) {
-        if (item.path.lexically_normal() == resolved) {
-            item.document = std::move(document.value);
-            item.load_result = Result::success();
-            break;
-        }
-    }
-    return Result::success();
-} catch (const std::bad_alloc&) {
-    return foundation::out_of_memory("Renderer document activation allocation failed");
-}
-
-foundation::Result EditorSceneRuntime::Impl::restore_startup_renderer() {
-    renderer_pipeline_diagnostic.clear();
-    const auto recover = [this](const std::filesystem::path& path, const Result& failure) -> Result {
-        if (failure.code == ResultCode::kOutOfMemory || failure.code == ResultCode::kDeviceLost)
-            return failure;
-        // Project data is not an Editor initialization dependency. Do not rewrite its
-        // startup selection or reuse a renderer belonging to the previously opened project.
-        if (const auto fallback = restore_default_renderer(false, false); !fallback)
-            return fallback;
-        renderer_pipeline_diagnostic =
-            "Project pipeline " + path.generic_string() + ": " + failure.message +
-            ". Using the Editor default preview. Repair the pipeline and select Apply to Viewport.";
-        return Result::success();
-    };
-    const auto project_file = project::ProjectFileCodec{}.load(project_manager.project_file());
-    if (!project_file)
-        return recover(project_manager.project_file(), project_file.result);
-    std::filesystem::path selected;
-    for (const auto& entry : project_file.value.config.startup_pipelines) {
-        const auto document = project::load_pipeline_document(project_manager.descriptor().root / entry);
-        if (!document)
-            return recover(entry, document.result);
-        if (!contains_builtin_renderer(document.value))
-            continue;
-        if (!selected.empty())
-            return recover(entry, foundation::invalid_argument("The editor viewport requires one startup renderer"));
-        selected = entry;
-    }
-    if (!selected.empty()) {
-        const auto result = activate_renderer_document(selected, false);
-        return result ? result : recover(selected, result);
-    }
-    if (!active_renderer_document.empty())
-        return restore_default_renderer(false, false);
-    return Result::success();
-}
-
-foundation::Result EditorSceneRuntime::activate_renderer_pipeline_document(const std::filesystem::path& path) {
-    if (!impl_ || !impl_->initialized)
-        return foundation::invalid_state("Editor scene runtime is not initialized");
-    return impl_->activate_renderer_document(path, true);
-}
-
-const std::filesystem::path& EditorSceneRuntime::active_renderer_pipeline_document() const noexcept {
-    static const std::filesystem::path kEmpty;
-    return impl_ ? impl_->active_renderer_document : kEmpty;
-}
-
-std::string_view EditorSceneRuntime::renderer_pipeline_diagnostic() const noexcept {
-    return impl_ ? std::string_view{impl_->renderer_pipeline_diagnostic} : std::string_view{};
-}
-
-foundation::Result EditorSceneRuntime::restore_default_renderer_pipeline() {
-    if (!impl_ || !impl_->initialized)
-        return foundation::invalid_state("Editor scene runtime is not initialized");
-    return impl_->restore_default_renderer(true, true);
-}
-
-foundation::Result EditorSceneRuntime::Impl::restore_default_renderer(bool persist, bool expose) {
-    const pipeline::PipelineId legacy("RenderPipeline");
-    const auto legacy_plan = pipeline::PipelineCompiler{}.compile(
-        {.pipeline = legacy, .scope = pipeline::PipelineScope::kFrame, .registry = &registry});
-    if (!legacy_plan)
-        return legacy_plan.result;
-    const bool needs_opaque =
-        std::none_of(legacy_plan.value.feature_contributions.begin(), legacy_plan.value.feature_contributions.end(),
-                     [](const auto& contribution) { return contribution.feature == renderer::kOpaqueRenderFeatureId; });
-    if (needs_opaque) {
-        if (const auto result = renderer::bind_opaque_render_feature(registry); !result)
-            return result;
-    }
-    const auto result = switch_renderer({}, {}, persist, expose);
-    if (!result && needs_opaque)
-        (void)registry.unbind_feature(pipeline::make_feature_instance_id(
-            renderer::kOpaqueRenderFeatureId, legacy, pipeline::PipelineScope::kFrame,
-            pipeline::FeaturePointId("RenderPipeline.Opaque")));
-    return result;
-}
-
-foundation::Result EditorSceneRuntime::create_project_renderer_pipeline() {
-    if (impl_ == nullptr || !impl_->initialized) {
-        return foundation::invalid_state("Editor scene runtime is not initialized");
-    }
-    if (!impl_->project_manager.loaded()) {
-        return foundation::invalid_state("A game project must be open before creating its Renderer Pipeline");
-    }
-    if (impl_->project_renderer_pipeline) {
-        return Result::success();
-    }
-    const pipeline::PipelineId renderer_pipeline("RenderPipeline");
-    const pipeline::FeaturePointId opaque_point("RenderPipeline.Opaque");
-    const pipeline::FeatureInstanceId opaque_instance = pipeline::make_feature_instance_id(
-        renderer::kOpaqueRenderFeatureId, renderer_pipeline, pipeline::PipelineScope::kFrame, opaque_point);
-    const Result unbound = impl_->registry.unbind_feature(opaque_instance);
-    const bool removed_opaque = static_cast<bool>(unbound);
-    if (!unbound && unbound.code != ResultCode::kNotFound) {
-        return unbound;
-    }
-    const auto restore_opaque = [impl = impl_.get(), removed_opaque]() {
-        if (!removed_opaque) {
-            return;
-        }
-        static_cast<void>(renderer::bind_opaque_render_feature(impl->registry));
-        if (impl->frame_host->rebuild(impl->registry)) {
-            static_cast<void>(impl->frame_host->apply_pending_plan());
-        }
-    };
-    if (const Result result = impl_->frame_host->rebuild(impl_->registry); !result) {
-        restore_opaque();
-        return result;
-    }
-    if (const Result result = impl_->frame_host->apply_pending_plan(); !result) {
-        restore_opaque();
-        return result;
-    }
-    const auto runtime_plan = impl_->frame_host->active_plan_snapshot();
-    if (!runtime_plan) {
-        restore_opaque();
-        return foundation::invalid_state("The renderer has no compiled Pipeline plan");
-    }
-    const auto present = std::find_if(runtime_plan->nodes.begin(), runtime_plan->nodes.end(),
-                                      [](const auto& node) { return node.phase == pipeline::EnginePhase::kPresent; });
-    if (present == runtime_plan->nodes.end()) {
-        restore_opaque();
-        return foundation::invalid_state("The renderer Pipeline has no Present output stage");
-    }
-    try {
-        auto plan = std::make_shared<pipeline::PipelinePlan>();
-        plan->revision = runtime_plan->revision;
-        plan->pipeline = pipeline::PipelineId("Project.RendererPipeline");
-        plan->instance = pipeline::PipelineInstanceId("Project.RendererPipeline.Editor");
-        plan->scope = pipeline::PipelineScope::kFrame;
-        plan->nodes.push_back(*present);
-        plan->topological_order.push_back(0);
-        impl_->project_renderer_pipeline = std::move(plan);
-    } catch (const std::bad_alloc&) {
-        restore_opaque();
-        return foundation::out_of_memory("Project Renderer Pipeline allocation failed");
-    }
-    return Result::success();
-}
-
-foundation::Result EditorSceneRuntime::add_pipeline_runtime_ordering(PipelineTarget target, uint32_t source_node,
-                                                                     uint32_t destination_node) {
-    if (impl_ == nullptr || !impl_->initialized)
-        return foundation::invalid_state("Editor scene runtime is not initialized");
-    if (target == PipelineTarget::kRenderer)
-        return impl_->frame_host->add_runtime_ordering(source_node, destination_node);
-    if (impl_->active_scope == nullptr)
-        return foundation::invalid_state("No active World pipeline is available");
-    return impl_->active_scope->pipeline_host().add_runtime_ordering(source_node, destination_node);
-}
-
-foundation::Result EditorSceneRuntime::remove_pipeline_runtime_ordering(PipelineTarget target, uint32_t source_node,
-                                                                        uint32_t destination_node) {
-    if (impl_ == nullptr || !impl_->initialized)
-        return foundation::invalid_state("Editor scene runtime is not initialized");
-    if (target == PipelineTarget::kRenderer)
-        return impl_->frame_host->remove_runtime_ordering(source_node, destination_node);
-    if (impl_->active_scope == nullptr)
-        return foundation::invalid_state("No active World pipeline is available");
-    return impl_->active_scope->pipeline_host().remove_runtime_ordering(source_node, destination_node);
-}
-
-foundation::Result EditorSceneRuntime::add_render_state_link(uint32_t source_node, uint32_t destination_node) {
-    if (impl_ == nullptr || !impl_->initialized) {
-        return foundation::invalid_state("Editor scene runtime is not initialized");
-    }
-    const auto plan = impl_->frame_host->active_plan_snapshot();
-    if (!plan || source_node >= plan->nodes.size() || destination_node >= plan->nodes.size() ||
-        source_node == destination_node) {
-        return foundation::invalid_argument("Render-state link endpoints are invalid");
-    }
-    const auto contribution_for_node = [&plan](uint32_t node) -> const pipeline::PipelineFeatureContributionRecord* {
-        const uint64_t stage_index = plan->nodes[node].definition_stage_index;
-        const auto found =
-            std::find_if(plan->feature_contributions.begin(), plan->feature_contributions.end(),
-                         [stage_index](const auto& contribution) {
-                             return contribution.domain == pipeline::FeatureDomain::kRender &&
-                                    stage_index >= contribution.first_stage_index &&
-                                    stage_index < contribution.first_stage_index + contribution.stage_count;
-                         });
-        return found == plan->feature_contributions.end() ? nullptr : &*found;
-    };
-    const auto source_contribution = contribution_for_node(source_node);
-    const bool destination_accepts_state = plan->nodes[destination_node].phase == pipeline::EnginePhase::kPresent ||
-                                           contribution_for_node(destination_node) != nullptr;
-    if (source_contribution == nullptr || !destination_accepts_state) {
-        return foundation::invalid_argument(
-            "State Link requires a RenderFeature source and a RenderFeature or Present target");
-    }
-    const auto previous = impl_->render_state_link_overrides;
-    const auto found =
-        std::find_if(impl_->render_state_link_overrides.begin(), impl_->render_state_link_overrides.end(),
-                     [source_node, destination_node](const auto& link) {
-                         return link.source_node == source_node && link.destination_node == destination_node;
-                     });
-    if (found == impl_->render_state_link_overrides.end()) {
-        impl_->render_state_link_overrides.push_back({source_node, destination_node, true});
-    } else {
-        found->connected = true;
-    }
-    if (render_graph::build_render_state_flow(*plan, impl_->render_state_link_overrides).has_cycle) {
-        impl_->render_state_link_overrides = previous;
-        return foundation::invalid_argument("Render-state link would create a cycle");
-    }
-    return Result::success();
-}
-
-foundation::Result EditorSceneRuntime::remove_render_state_link(uint32_t source_node, uint32_t destination_node) {
-    if (impl_ == nullptr || !impl_->initialized) {
-        return foundation::invalid_state("Editor scene runtime is not initialized");
-    }
-    const auto plan = impl_->frame_host->active_plan_snapshot();
-    if (!plan || source_node >= plan->nodes.size() || destination_node >= plan->nodes.size() ||
-        source_node == destination_node) {
-        return foundation::invalid_argument("Render-state link endpoints are invalid");
-    }
-    const auto found =
-        std::find_if(impl_->render_state_link_overrides.begin(), impl_->render_state_link_overrides.end(),
-                     [source_node, destination_node](const auto& link) {
-                         return link.source_node == source_node && link.destination_node == destination_node;
-                     });
-    if (found == impl_->render_state_link_overrides.end()) {
-        impl_->render_state_link_overrides.push_back({source_node, destination_node, false});
-    } else {
-        found->connected = false;
-    }
-    return Result::success();
-}
-
-std::vector<render_graph::RenderStateLinkOverride> EditorSceneRuntime::render_state_link_overrides() const {
-    return impl_ == nullptr ? std::vector<render_graph::RenderStateLinkOverride>{} : impl_->render_state_link_overrides;
-}
-
-foundation::Result EditorSceneRuntime::set_render_state_blend(uint32_t node,
-                                                              pipeline::RenderStateBlendMode blend_mode) {
-    if (impl_ == nullptr || !impl_->initialized) {
-        return foundation::invalid_state("Editor scene runtime is not initialized");
-    }
-    const auto plan = impl_->frame_host->active_plan_snapshot();
-    if (!plan || node >= plan->nodes.size() ||
-        static_cast<uint32_t>(blend_mode) > static_cast<uint32_t>(pipeline::RenderStateBlendMode::kAdd)) {
-        return foundation::invalid_argument("Render-state blend target is invalid");
-    }
-    const uint64_t stage_index = plan->nodes[node].definition_stage_index;
-    bool writes_state = false;
-    for (const auto& contribution : plan->feature_contributions) {
-        if (contribution.domain != pipeline::FeatureDomain::kRender || stage_index < contribution.first_stage_index ||
-            stage_index >= contribution.first_stage_index + contribution.stage_count) {
-            continue;
-        }
-        const auto feature = impl_->registry.find_feature(contribution.feature);
-        writes_state = feature && feature.value->uses_render_state_output();
-        break;
-    }
-    if (!writes_state) {
-        return foundation::invalid_argument("Only a render-state output Feature can select a blend mode");
-    }
-    const auto found =
-        std::find_if(impl_->render_state_blend_overrides.begin(), impl_->render_state_blend_overrides.end(),
-                     [node](const auto& override) { return override.node == node; });
-    if (found == impl_->render_state_blend_overrides.end()) {
-        impl_->render_state_blend_overrides.push_back({node, blend_mode});
-    } else {
-        found->blend_mode = blend_mode;
-    }
-    return Result::success();
-}
-
-std::vector<render_graph::RenderStateBlendOverride> EditorSceneRuntime::render_state_blend_overrides() const {
-    return impl_ == nullptr ? std::vector<render_graph::RenderStateBlendOverride>{}
-                            : impl_->render_state_blend_overrides;
 }
 
 foundation::Result EditorSceneRuntime::initialize(rhi::Device& device,
@@ -1897,30 +1734,10 @@ foundation::Result EditorSceneRuntime::Impl::initialize_device(Device& device) {
     render_graph = std::make_unique<render_graph::RenderGraph>(device);
     mesh_uploader = std::make_unique<resource::ResourceUploader>(device);
     texture_uploader = std::make_unique<resource::TextureUploader>(device);
+    if (const auto result = renderer::register_builtin_render_passes(scene_passes); !result)
+        return result;
 
     if (const Result result = aeg::engine::components::register_render_component_reflection(reflection_registry);
-        !result) {
-        return result;
-    }
-    if (const Result result = renderer::register_builtin_rendering(registry, passes); !result) {
-        return result;
-    }
-    if (const Result result = renderer::bind_opaque_render_feature(registry); !result) {
-        return result;
-    }
-    if (const Result result =
-            registry.register_feature([] { return std::make_unique<EditorViewportReadbackFeature>(); });
-        !result) {
-        return result;
-    }
-    if (const Result result = registry.bind_feature({
-            .feature = kEditorViewportReadbackFeatureId,
-            .pipeline = pipeline::PipelineId("RenderPipeline"),
-            .scope = pipeline::PipelineScope::kFrame,
-            .point = pipeline::FeaturePointId("RenderPipeline.Opaque"),
-            .priority = 100,
-            .enabled = true,
-        });
         !result) {
         return result;
     }
@@ -1935,25 +1752,13 @@ foundation::Result EditorSceneRuntime::Impl::initialize_device(Device& device) {
     }
     if (const auto extractor = aeg::engine::components::register_local_light_extractor(renderer); !extractor)
         return extractor.result;
-    for (const auto& [id, point] :
-         {std::pair{renderer::kDeferredRenderPipelineId,
-                    pipeline::FeaturePointId("Renderer.DeferredRenderPipeline.BeforePresent")},
-          std::pair{renderer::kForwardRenderPipelineId,
-                    pipeline::FeaturePointId("Renderer.ForwardRenderPipeline.BeforePresent")}}) {
-        if (const Result result = registry.bind_feature({.feature = kEditorViewportReadbackFeatureId,
-                                                         .pipeline = id,
-                                                         .scope = pipeline::PipelineScope::kFrame,
-                                                         .point = point,
-                                                         .priority = 100});
-            !result)
-            return result;
-    }
-    if (const Result result = frame_host->bind_pipeline(pipeline::PipelineId("RenderPipeline")); !result) {
-        return result;
-    }
     if (const Result result = initialize_graphics_resources(); !result) {
         return result;
     }
+    auto preview = EditorRendererFeatureHost::create();
+    if (!preview) return preview.result;
+    preview_renderer = std::move(preview.value);
+    preview_history = std::make_unique<render_graph::RenderFeatureHistory>(device);
     if (const Result result = make_default_scene(); !result) {
         return result;
     }
@@ -2024,6 +1829,13 @@ foundation::Result EditorSceneRuntime::Impl::initialize_graphics_resources() {
         return pipeline.result;
     }
     this->pipeline = pipeline.value;
+    const auto material_identity = shader_manager->pipeline_layout_identity(shader_layout);
+    if (!material_identity)
+        return material_identity.result;
+    material_shader_contract = {
+        renderer::kRenderMaterialShaderContractVersion,
+        material_identity.value.contract_hash, material_identity.value.cache_epoch};
+    material_attachment_contract = {graphics.color_formats.front(), graphics.samples, graphics.depth_stencil_format};
 
 #ifdef AEG_FORWARD_SHADOW_SHADER_PACKAGE_PATH
     const auto shadow_program = shader::load_shader_program(AEG_FORWARD_SHADOW_SHADER_PACKAGE_PATH);
@@ -2038,6 +1850,14 @@ foundation::Result EditorSceneRuntime::Impl::initialize_graphics_resources() {
     if (!shadow_pipeline)
         return shadow_pipeline.result;
     this->shadow_pipeline = shadow_pipeline.value;
+    shadow_shader_layout = shadow_layout.value;
+    const auto shadow_identity = shader_manager->pipeline_layout_identity(shadow_shader_layout);
+    if (!shadow_identity)
+        return shadow_identity.result;
+    shadow_shader_contract = {
+        renderer::kRenderMaterialShaderContractVersion,
+        shadow_identity.value.contract_hash, shadow_identity.value.cache_epoch};
+    shadow_pipeline_contract = {graphics.color_formats.front(), graphics.samples, graphics.depth_stencil_format};
     const auto shadow_inputs = shader_manager->binding_layout(shadow_layout.value, 3);
     if (!shadow_inputs)
         return shadow_inputs.result;
@@ -2045,27 +1865,17 @@ foundation::Result EditorSceneRuntime::Impl::initialize_graphics_resources() {
     if (const auto r = shadows->initialize(*device, shadow_inputs.value); !r)
         return r;
 
-    const auto clustered_program = shader::load_shader_program(AEG_FORWARD_CLUSTERED_SHADER_PACKAGE_PATH);
-    if (!clustered_program)
-        return clustered_program.result;
-    const auto clustered_layout = shader_manager->build_pipeline_layout(clustered_program.value);
-    if (!clustered_layout)
-        return clustered_layout.result;
-    const std::array hdr_colors{renderer::kSceneLightingFormat};
-    auto clustered_graphics = graphics;
-    clustered_graphics.color_formats = hdr_colors;
-    const auto clustered_pipeline = shader_manager->create_pipeline(
-        clustered_program.value, clustered_layout.value,
-        {rhi::PipelineType::kGraphics, clustered_graphics, rhi::DebugName{"Editor.ForwardClustered"}});
-    if (!clustered_pipeline)
-        return clustered_pipeline.result;
-    this->clustered_pipeline = clustered_pipeline.value;
-    const auto clustered_inputs = shader_manager->binding_layout(clustered_layout.value, 3);
-    if (!clustered_inputs)
-        return clustered_inputs.result;
+    const auto variants = renderer::create_clustered_forward_pipelines(*device, *shader_manager, graphics,
+        AEG_FORWARD_CLUSTERED_SHADER_PACKAGE_PATH, AEG_FORWARD_CLUSTERED_UNSHADOWED_SHADER_PACKAGE_PATH);
+    if (!variants) return variants.result;
+    clustered_pipeline = variants.value.shadowed.pipeline;
+    clustered_contract = variants.value.shadowed.attachment_contract;
+    clustered_profile_contract = variants.value.shadowed.profile_contract;
+    unshadowed_clustered = variants.value.unshadowed;
     light_culling = std::make_unique<renderer::LightCullingResources>();
     if (const auto r =
-            light_culling->initialize(*device, AEG_LIGHT_CULLING_SHADER_PACKAGE_PATH, clustered_inputs.value);
+            light_culling->initialize(*device, AEG_LIGHT_CULLING_SHADER_PACKAGE_PATH, variants.value.shadowed_inputs,
+                                     variants.value.unshadowed_inputs);
         !r)
         return r;
 #endif
@@ -2091,6 +1901,15 @@ foundation::Result EditorSceneRuntime::Impl::initialize_graphics_resources() {
     if (!depth_pipeline)
         return depth_pipeline.result;
     this->depth_pipeline = depth_pipeline.value;
+    depth_shader_layout = depth_layout.value;
+    const auto depth_identity = shader_manager->pipeline_layout_identity(depth_shader_layout);
+    if (!depth_identity)
+        return depth_identity.result;
+    const auto depth_epoch = depth_identity.value.cache_epoch;
+    depth_profile_contract = {
+        {renderer::kRendererProfileContractVersion, renderer::RendererProfile::kShadow,
+         depth_identity.value.contract_hash, depth_epoch},
+        {Format::kUnknown, depth_graphics.samples, depth_graphics.depth_stencil_format}, depth_epoch};
 #endif
 
 #ifdef AEG_GBUFFER_MESH_SHADER_PACKAGE_PATH
@@ -2131,6 +1950,15 @@ foundation::Result EditorSceneRuntime::Impl::initialize_graphics_resources() {
         return gbuffer_pipeline.result;
     }
     this->gbuffer_pipeline = gbuffer_pipeline.value;
+    const auto gbuffer_identity = shader_manager->pipeline_layout_identity(gbuffer_shader_layout);
+    if (!gbuffer_identity)
+        return gbuffer_identity.result;
+    const auto gbuffer_epoch = gbuffer_identity.value.cache_epoch;
+    gbuffer_profile_contract = {
+        {renderer::kRendererProfileContractVersion, renderer::RendererProfile::kGBuffer,
+         gbuffer_identity.value.contract_hash, gbuffer_epoch},
+        {gbuffer_graphics.color_formats[0], gbuffer_graphics.samples, gbuffer_graphics.depth_stencil_format,
+         {gbuffer_graphics.color_formats[1], gbuffer_graphics.color_formats[2]}}, gbuffer_epoch};
 #endif
 
 #ifdef AEG_DEFERRED_LIGHTING_SHADER_PACKAGE_PATH
@@ -2148,108 +1976,10 @@ foundation::Result EditorSceneRuntime::Impl::initialize_graphics_resources() {
         return r;
 #endif
 
-#ifndef AEG_STATE_COMPOSITE_SHADER_PACKAGE_PATH
-    return foundation::invalid_state("Render-state composite shader package path is not configured for the editor");
-#else
-    auto composite_program = shader::load_shader_program(AEG_STATE_COMPOSITE_SHADER_PACKAGE_PATH);
-    if (!composite_program) {
-        return composite_program.result;
-    }
-    auto composite_layout =
-        shader_manager->build_pipeline_layout(composite_program.value, DebugName{"Editor.StateComposite.Layout"});
-    if (!composite_layout) {
-        return composite_layout.result;
-    }
-    state_composite_layout = std::move(composite_layout.value);
-    const auto composite_binding_layout = shader_manager->binding_layout(state_composite_layout, 0);
-    if (!composite_binding_layout) {
-        return composite_binding_layout.result;
-    }
-    state_composite_binding_layout = composite_binding_layout.value;
-    const std::array<Format, 1> composite_color_formats{{Format::kRgba8Unorm}};
-    const auto create_composite_pipeline = [this, &composite_program, &composite_color_formats](
-                                               pipeline::RenderStateBlendMode mode,
-                                               std::string_view name) -> foundation::ResultValue<rhi::PipelineHandle> {
-        rhi::BlendAttachmentDesc blend{};
-        blend.color_write_mask = rhi::ColorComponent::kAll;
-        switch (mode) {
-            case pipeline::RenderStateBlendMode::kReplace:
-                break;
-            case pipeline::RenderStateBlendMode::kOver:
-                blend.blend_enable = true;
-                blend.source_color_factor = rhi::BlendFactor::kSourceAlpha;
-                blend.destination_color_factor = rhi::BlendFactor::kOneMinusSourceAlpha;
-                blend.source_alpha_factor = rhi::BlendFactor::kOne;
-                blend.destination_alpha_factor = rhi::BlendFactor::kOneMinusSourceAlpha;
-                break;
-            case pipeline::RenderStateBlendMode::kAdd:
-                blend.blend_enable = true;
-                blend.source_color_factor = rhi::BlendFactor::kOne;
-                blend.destination_color_factor = rhi::BlendFactor::kOne;
-                blend.source_alpha_factor = rhi::BlendFactor::kOne;
-                blend.destination_alpha_factor = rhi::BlendFactor::kOne;
-                break;
-        }
-        const std::array<rhi::BlendAttachmentDesc, 1> blend_attachments{{blend}};
-        GraphicsPipelineState graphics{};
-        graphics.topology = PrimitiveTopology::kTriangleList;
-        graphics.cull_mode = CullMode::kNone;
-        graphics.color_formats = composite_color_formats;
-        graphics.blend_attachments = blend_attachments;
-        return shader_manager->create_pipeline(
-            composite_program.value, state_composite_layout,
-            shader::ShaderPipelineDesc{PipelineType::kGraphics, graphics, DebugName{name}});
-    };
-    constexpr std::array<pipeline::RenderStateBlendMode, 3> kCompositeModes{pipeline::RenderStateBlendMode::kReplace,
-                                                                            pipeline::RenderStateBlendMode::kOver,
-                                                                            pipeline::RenderStateBlendMode::kAdd};
-    constexpr std::array<std::string_view, 3> kCompositeNames{
-        "Editor.StateComposite.Replace", "Editor.StateComposite.Over", "Editor.StateComposite.Add"};
-    for (uint32_t index = 0; index < kCompositeModes.size(); ++index) {
-        auto composite_pipeline = create_composite_pipeline(kCompositeModes[index], kCompositeNames[index]);
-        if (!composite_pipeline) {
-            return composite_pipeline.result;
-        }
-        state_composite_pipelines[index] = composite_pipeline.value;
-    }
-#endif
     if (const Result result = create_static_meshes(); !result) {
         return result;
     }
     return create_object_and_lighting_resources();
-}
-
-foundation::ResultValue<BindingSetHandle> EditorSceneRuntime::Impl::create_state_composite_set() {
-    if (!state_composite_binding_layout.is_valid() || !viewport_sampler.is_valid()) {
-        return {foundation::invalid_state("Render-state composite bindings are not initialized"), {}};
-    }
-    auto set = device->create_binding_set(BindingSetDesc{
-        state_composite_binding_layout, BindingSetLifetime::kPersistent, DebugName{"Editor.StateComposite.Set"}});
-    if (!set) {
-        return set;
-    }
-    try {
-        state_composite_sets.push_back(set.value);
-    } catch (const std::bad_alloc&) {
-        static_cast<void>(device->destroy_binding_set(set.value));
-        return {foundation::out_of_memory("Render-state composite descriptor tracking allocation failed"), {}};
-    }
-    return set;
-}
-
-foundation::Result EditorSceneRuntime::Impl::release_state_composite_sets() {
-    Result first_result = Result::success();
-    for (BindingSetHandle set : state_composite_sets) {
-        if (!set.is_valid()) {
-            continue;
-        }
-        const Result result = device->destroy_binding_set(set);
-        if (!result && result.code != foundation::ResultCode::kNotFound && first_result) {
-            first_result = result;
-        }
-    }
-    state_composite_sets.clear();
-    return first_result;
 }
 
 foundation::Result EditorSceneRuntime::Impl::create_static_meshes() {
@@ -2412,9 +2142,6 @@ foundation::Result EditorSceneRuntime::Impl::resize_targets() {
     if (const Result result = frame_context->drain(); !result) {
         return result;
     }
-    if (const Result result = release_state_composite_sets(); !result) {
-        return result;
-    }
     // EngineFrameOrchestrator caches graph-build state. It cannot survive a
     // RenderGraph reset that invalidates the imported viewport resources.
     orchestrator.reset();
@@ -2545,7 +2272,6 @@ foundation::Result EditorSceneRuntime::Impl::make_default_scene() {
 foundation::Result EditorSceneRuntime::Impl::make_empty_project_scene() {
     scene_asset = scene::SceneAsset{};
     active_camera_scene = {};
-    project_renderer_pipeline.reset();
     return scene_asset.set_identity(scene::SceneAssetId{0xAE62026u, 2u}, "Main Scene", 1);
 }
 
@@ -2568,7 +2294,7 @@ foundation::Result EditorSceneRuntime::Impl::instantiate_world(scene::SceneAsset
         return result;
     }
     try {
-        scope = std::make_unique<world::WorldScope>(state, registry);
+        scope = std::make_unique<world::WorldScope>(state);
     } catch (const std::bad_alloc&) {
         return foundation::out_of_memory("Editor World Scope allocation failed");
     }
@@ -2607,12 +2333,16 @@ foundation::Result EditorSceneRuntime::Impl::create_orchestrator_for(world::Worl
     orchestrator.reset();
     try {
         orchestrator =
-            std::make_unique<engine::EngineFrameOrchestrator>(registry, scheduler, *frame_context, *render_graph);
+        std::make_unique<engine::EngineFrameOrchestrator>(pipeline_host, *frame_context, *render_graph);
     } catch (const std::bad_alloc&) {
         return foundation::out_of_memory("Editor scene orchestrator allocation failed");
     }
-    if (const Result result = orchestrator->register_world_frame(scope, *frame_host, 0); !result) {
-        return result;
+    const auto registration = orchestrator->register_world_frame(scope, 0);
+    if (!registration) return registration;
+    if (mode != EditorSceneRuntime::Mode::kEdit && world_command_consumer != nullptr) {
+        if (const auto result = engine::detail::EngineFrameWorldCommands::attach(*orchestrator,
+                *world_command_consumer); !result)
+            return result;
     }
     return orchestrator->initialize();
 }
@@ -2693,50 +2423,25 @@ foundation::Result EditorSceneRuntime::Impl::sync_scene_from_edit_world() {
     return Result::success();
 }
 
-foundation::Result EditorSceneRuntime::Impl::advance_runtime_demo() {
-    if (mode != EditorSceneRuntime::Mode::kPlay || runtime_scope == nullptr || runtime_state == nullptr) {
-        return Result::success();
-    }
-    const auto runtime_entity = runtime_instance.runtime_entity(kRightMeshEntity);
-    if (!runtime_entity) {
-        // The motion is only an editor-sample affordance. Project scenes do
-        // not contain the sample entity and must still be able to enter Play.
-        return runtime_entity.result.code == ResultCode::kNotFound ? Result::success() : runtime_entity.result;
-    }
-    runtime_demo_time += 1.0f / 60.0f;
-    const ecs::ComponentTypeId transform_type(aeg::engine::components::kTransformName);
-    const float angle = std::sin(runtime_demo_time * 1.4f) * 0.35f;
-    const Result queued = runtime_scope->command_buffer().enqueue(
-        [entity = runtime_entity.value, transform_type, angle](ecs::World& world) {
-            const auto value = world.get_component_data(entity, transform_type);
-            if (!value) {
-                return value.result;
-            }
-            auto* transform = static_cast<Transform*>(value.value);
-            transform->rotation = math::quat_from_axis_angle({0.0f, 0.0f, 1.0f}, angle);
-            return Result::success();
-        });
-    if (!queued) {
-        return queued;
-    }
-    if (const Result result = runtime_scope->apply_commands(runtime_scope->command_buffer()); !result) {
-        return result;
-    }
-    const auto snapshot = runtime_scope->commit(frame_context->frame_number());
-    return snapshot ? Result::success() : snapshot.result;
-}
-
-foundation::Result EditorSceneRuntime::Impl::reload_project_pipeline_authoring() {
+foundation::Result EditorSceneRuntime::Impl::reload_project_feature_authoring() {
     if (!project_manager.loaded()) {
-        project_pipeline_authoring = {};
+        project_feature_authoring = {};
         return Result::success();
     }
     const std::filesystem::path root = project_manager.descriptor().root;
+    const std::filesystem::path project_file = project_manager.project_file();
+    const auto project = project::ProjectFileCodec{}.load(project_file);
+    if (!project)
+        return project.result;
+    const auto paths = project::ProjectPaths::resolve(project_file, project.value.config.paths);
+    if (!paths)
+        return paths.result;
     const auto loaded =
-        load_editor_project_pipeline_authoring(root, root / "Source", project_manager.assets_directory());
+        load_editor_project_feature_authoring(root, paths.value.directory(project::ProjectDirectory::kSource),
+                                             project_manager.assets_directory());
     if (!loaded)
         return loaded.result;
-    project_pipeline_authoring = std::move(loaded.value);
+    project_feature_authoring = std::move(loaded.value);
     return Result::success();
 }
 
@@ -3344,9 +3049,6 @@ foundation::Result EditorSceneRuntime::Impl::prepare_frame(const engine::EngineF
     if (active_scope == nullptr) {
         return foundation::invalid_state("Editor scene has no active World scope");
     }
-    if (const Result result = advance_runtime_demo(); !result) {
-        return result;
-    }
     const auto snapshot = active_scope->latest_snapshot();
     if (!snapshot) {
         return snapshot.result;
@@ -3378,6 +3080,58 @@ foundation::Result EditorSceneRuntime::Impl::prepare_frame(const engine::EngineF
     }
     if (const Result result = context.bind_feature_texture(kSceneDepth, depth.value); !result) {
         return result;
+    }
+
+    {
+        const std::array targets{
+            std::pair{RenderResourceId("Renderer.SceneLighting"), Format::kRgba16Float},
+            std::pair{RenderResourceId("Renderer.GBuffer.Albedo"), Format::kRgba16Float},
+            std::pair{RenderResourceId("Renderer.GBuffer.Normal"), Format::kRgba16Float},
+            std::pair{RenderResourceId("Renderer.GBuffer.Material"), Format::kRgba8Unorm},
+        };
+        for (const auto& scene : context.render_scenes) {
+            if (!scene) continue;
+            const bool canonical = scene == context.render_scenes.front();
+            for (const auto& [id, format] : targets) {
+                TextureDesc desc{};
+                desc.dimension = rhi::TextureDimension::kTex2D;
+                desc.format = format;
+                desc.extent = {scene->view.output_extent.width, scene->view.output_extent.height, 1};
+                desc.mip_levels = 1;
+                desc.array_layers = 1;
+                desc.capabilities = TextureCapability::kColorAttachment | TextureCapability::kSampled;
+                desc.initial_queue = QueueClass::kGraphics;
+                const auto texture = context.render_graph.create_texture(desc);
+                if (!texture) return texture.result;
+                const auto target = canonical ? id : renderer::make_view_scoped_render_resource_id(id, scene->view.id);
+                if (const auto result = context.bind_feature_texture(target, texture.value); !result) return result;
+            }
+        }
+    }
+    // External directional ShadowDepth targets are scoped per extracted View.
+    // The first view keeps the legacy identity; additional views use a stable
+    // renderer-scoped identity so their depth maps cannot alias each other.
+    for (std::size_t index = 0; index < context.render_scenes.size(); ++index) {
+        const auto& scene = context.render_scenes[index];
+        if (!scene)
+            continue;
+        const auto extent = scene->view.shadow_extent.is_valid() ? scene->view.shadow_extent
+                                                                  : scene->view.output_extent;
+        if (!extent.is_valid())
+            return foundation::invalid_argument("Editor ShadowDepth view extent is invalid");
+        const auto target = index == 0
+                                ? feature::RenderResourceId{"Renderer.ShadowDepth"}
+                                : renderer::make_view_scoped_render_resource_id(
+                                      feature::RenderResourceId{"Renderer.ShadowDepth"}, scene->view.id);
+        const auto shadow = context.render_graph.create_texture(
+            make_target_desc(extent.width, extent.height, Format::kD32Float,
+                             TextureCapability::kDepthStencil | TextureCapability::kSampled,
+                             "Editor.ShadowDepth"),
+            render_graph::ResourceLifetime::kTransient);
+        if (!shadow)
+            return shadow.result;
+        if (const Result result = context.bind_feature_texture(target, shadow.value); !result)
+            return result;
     }
 
     if (viewport_readback.requested) {
@@ -3682,14 +3436,10 @@ foundation::Result EditorSceneRuntime::Impl::destroy_resources() {
     post_process.reset();
     if (clustered_pipeline.is_valid())
         (void)device->destroy_pipeline(clustered_pipeline);
+    if (unshadowed_clustered.pipeline.is_valid())
+        (void)device->destroy_pipeline(unshadowed_clustered.pipeline);
     if (shadow_pipeline.is_valid())
         (void)device->destroy_pipeline(shadow_pipeline);
-    for (rhi::PipelineHandle pipeline : state_composite_pipelines) {
-        if (pipeline.is_valid()) {
-            (void)device->destroy_pipeline(pipeline);
-        }
-    }
-    static_cast<void>(release_state_composite_sets());
     if (color_view.is_valid()) {
         (void)device->destroy_texture_view(color_view);
         (void)device->destroy_texture_view(color_sampled_view);
@@ -3708,22 +3458,20 @@ foundation::Result EditorSceneRuntime::Impl::destroy_resources() {
 }
 
 foundation::Result EditorSceneRuntime::shutdown() {
-    if (impl_ == nullptr) {
-        return Result::success();
-    }
+    if (impl_ == nullptr) return Result::success();
+    if (const auto result = impl_->close_features(); !result) return result;
+    impl_->initialized = false;
     impl_->orchestrator.reset();
     if (impl_->edit_scope != nullptr) {
-        static_cast<void>(impl_->edit_scope->shutdown());
+        if (const auto result = impl_->edit_scope->shutdown(); !result) return result;
     }
     if (impl_->runtime_scope != nullptr) {
-        static_cast<void>(impl_->runtime_scope->shutdown());
+        if (const auto result = impl_->runtime_scope->shutdown(); !result) return result;
     }
-    impl_->edit_scope.reset();
-    impl_->runtime_scope.reset();
-    const Result result = impl_->destroy_resources();
-    impl_->initialized = false;
+    // Preserve the World owners and GPU context until the existing drain succeeds.
+    if (const auto result = impl_->destroy_resources(); !result) return result;
     impl_.reset();
-    return result;
+    return Result::success();
 }
 
 foundation::Result EditorSceneRuntime::request_viewport_extent(uint32_t width, uint32_t height) {
@@ -3772,33 +3520,6 @@ editor::ImGuiTextureBinding EditorSceneRuntime::viewport_binding() const noexcep
 bool EditorSceneRuntime::viewport_ready() const noexcept {
     return impl_ != nullptr && impl_->initialized && impl_->color_texture.is_valid() &&
            impl_->color_sampled_view.is_valid() && impl_->viewport_sampler.is_valid();
-}
-
-bool EditorSceneRuntime::viewport_present_connected() const noexcept {
-    if (impl_ == nullptr || !impl_->initialized) {
-        return true;
-    }
-    const auto plan = impl_->frame_host->active_plan_snapshot();
-    if (!plan) {
-        return true;
-    }
-    const render_graph::RenderStateFlow state_flow =
-        render_graph::build_render_state_flow(*plan, impl_->render_state_link_overrides);
-    if (state_flow.has_cycle) {
-        return false;
-    }
-    for (std::size_t index = 0; index < plan->feature_contributions.size(); ++index) {
-        const auto& contribution = plan->feature_contributions[index];
-        if (contribution.domain != pipeline::FeatureDomain::kRender ||
-            !state_flow.contributions[index].reaches_present) {
-            continue;
-        }
-        const auto feature = impl_->registry.find_feature(contribution.feature);
-        if (feature && feature.value->uses_render_state_output()) {
-            return true;
-        }
-    }
-    return false;
 }
 
 bool EditorSceneRuntime::viewport_resize_pending() const noexcept {
@@ -4134,118 +3855,202 @@ bool EditorSceneRuntime::transform_edit_active() const noexcept {
     return impl_ != nullptr && impl_->transform_edit.active;
 }
 
-foundation::Result EditorSceneRuntime::render_frame(uint64_t frame_number) {
+foundation::Result EditorSceneRuntime::select_feature_module(const std::filesystem::path& manifest,
+                                                                     std::string_view configuration,
+                                                                     FeatureGraphLoadPolicy policy) {
+    if (impl_ == nullptr || !impl_->initialized || !impl_->project_manager.loaded() || impl_->mode != Mode::kEdit)
+        return foundation::invalid_state("Executable module selection requires an open project in Edit mode");
+    if (policy != FeatureGraphLoadPolicy::kPreserveActive && policy != FeatureGraphLoadPolicy::kSavedStartup)
+        return foundation::invalid_argument("Executable module graph load policy is invalid");
+    if (impl_->pending_feature_session != nullptr ||
+        (impl_->feature_session != nullptr &&
+         (impl_->feature_session->host == nullptr || impl_->feature_session->host->has_pending())))
+        return foundation::invalid_state("A Feature publication is already queued");
+    const auto project_file = impl_->project_manager.project_file();
+    const auto selected = tooling::ProjectOperationService::select_module(project_file, manifest, configuration);
+    if (!selected) return selected.result;
+    const auto project = project::ProjectFileCodec{}.load(project_file);
+    if (!project) return project.result;
+    const auto paths = project::ProjectPaths::resolve(project_file, project.value.config.paths);
+    if (!paths) return paths.result;
+    if (policy == FeatureGraphLoadPolicy::kSavedStartup && project.value.config.startup_feature_graphs.empty())
+        return foundation::invalid_argument("Saved startup module selection requires at least one saved FeatureGraph root");
+    std::vector<feature::FeatureGraphDocument> graphs;
+    if (policy == FeatureGraphLoadPolicy::kPreserveActive &&
+        impl_->feature_session != nullptr && impl_->feature_session->host->active() != nullptr) {
+        graphs = impl_->feature_session->host->active_documents();
+    } else {
+        for (const auto& relative : project.value.config.startup_feature_graphs) {
+            const auto path = paths.value.resolve_under(project::ProjectDirectory::kRoot, relative);
+            if (!path) return path.result;
+            const auto graph = authoring::load_feature_graph_document(path.value);
+            if (!graph) return graph.result;
+            graphs.push_back(graph.value);
+        }
+    }
+    try {
+        if (!impl_->clock_host) {
+            const auto clock_host = feature::make_clock_host();
+            if (!clock_host) return clock_host.result;
+            impl_->clock_host = clock_host.value;
+        }
+        auto candidate = std::make_unique<Impl::FeatureSession>(*impl_->device, project_file, impl_->clock_host,
+            impl_->feature_session ? impl_->feature_session->execution.get() : nullptr);
+        if (const auto result = candidate->loader.load(selected.value, candidate->handle); !result) return result;
+        auto definition = candidate->loader.make_feature_module(candidate->handle);
+        if (!definition) return definition.result;
+        if (const auto result = module::register_static_module(candidate->modules, std::move(definition.value)); !result)
+            return result;
+        if (const auto result = candidate->execution->enable_async_execution(); !result) return result;
+        for (const auto& graph : graphs) {
+            if (const auto result = candidate->host->stage(graph); !result) return result;
+        }
+        impl_->pending_feature_session = std::move(candidate);
+        return Result::success();
+    } catch (const std::bad_alloc&) {
+        return foundation::out_of_memory("Scene Feature session allocation failed");
+    }
+}
+
+foundation::Result EditorSceneRuntime::queue_feature_graph(const feature::FeatureGraphDocument& graph) {
+    if (impl_ == nullptr || !impl_->initialized || impl_->feature_session == nullptr || impl_->feature_session->host == nullptr)
+        return foundation::not_ready("Select an executable Feature module before Apply");
+    if (impl_->pending_feature_session != nullptr || impl_->feature_session->host->has_pending())
+        return foundation::invalid_state("A Feature publication is already queued");
+    auto& host = *impl_->feature_session->host;
+    auto graphs = host.active_documents();
+    const auto previous = std::find_if(graphs.begin(), graphs.end(), [&](const auto& value) {
+        return value.asset_uuid == graph.asset_uuid;
+    });
+    if (previous == graphs.end()) graphs.push_back(graph);
+    else *previous = graph;
+    if (!impl_->feature_world_bindings.empty()) {
+        if (impl_->edit_scope == nullptr)
+            return foundation::invalid_state("Editor Edit World is unavailable while validating a bound Apply candidate");
+        for (const auto& binding : impl_->feature_world_bindings) {
+            if (const auto result = validate_editor_world_binding_candidate(binding, graphs,
+                    impl_->feature_session->registry, impl_->scene_asset, impl_->edit_instance,
+                    *impl_->edit_scope); !result)
+                return result;
+        }
+    }
+    for (const auto& value : graphs) {
+        if (const auto result = host.stage(value); !result) return result;
+    }
+    return Result::success();
+}
+
+foundation::ResultValue<runtime::FeatureRuntimeNodeSnapshot> EditorSceneRuntime::inspect_feature_node(
+    std::string_view asset_uuid, feature::FeatureNodeId node) const {
+    if (impl_ == nullptr || impl_->feature_session == nullptr || impl_->feature_session->host == nullptr)
+        return {foundation::not_ready("Scene has no executable Feature graph"), {}};
+    auto result = impl_->feature_session->host->inspect_node(asset_uuid, node);
+    if (!result)
+        return result;
+    const auto authored = std::find_if(
+        impl_->project_feature_authoring.feature_graphs.begin(),
+        impl_->project_feature_authoring.feature_graphs.end(),
+        [&](const auto& document) { return document.graph.asset_uuid == result.value.asset_uuid; });
+    if (authored != impl_->project_feature_authoring.feature_graphs.end())
+        result.value.source_path = authored->path;
+    return result;
+}
+
+foundation::ResultValue<runtime::FeatureRuntimeExecutionSnapshot> EditorSceneRuntime::inspect_feature_execution(
+    std::string_view asset_uuid) const {
+    if (impl_ == nullptr || impl_->feature_session == nullptr || impl_->feature_session->host == nullptr)
+        return {foundation::not_ready("Scene has no executable Feature graph"), {}};
+    auto result = impl_->feature_session->host->inspect_execution(asset_uuid);
+    if (!result) return result;
+    const auto authored = std::find_if(impl_->project_feature_authoring.feature_graphs.begin(),
+        impl_->project_feature_authoring.feature_graphs.end(),
+        [&](const auto& document) { return document.graph.asset_uuid == result.value.asset_uuid; });
+    if (authored != impl_->project_feature_authoring.feature_graphs.end()) result.value.source_path = authored->path;
+    return result;
+}
+
+foundation::ResultValue<std::shared_ptr<const EditorRenderGraphSnapshot>> EditorSceneRuntime::inspect_render_graph() const {
+    if (impl_ == nullptr || !impl_->initialized || !impl_->rendered_inspection)
+        return {foundation::not_ready("Scene has no captured successful RenderGraph frame"), {}};
+    return {foundation::Result::success(), impl_->rendered_inspection};
+}
+
+foundation::Result EditorSceneRuntime::publish_renderer_feature_graph(const feature::FeatureGraphDocument& graph) {
+    if (impl_ == nullptr || !impl_->initialized || impl_->preview_renderer == nullptr)
+        return foundation::invalid_state("Editor Renderer Feature preview is unavailable");
+    if (impl_->mode != Mode::kEdit || impl_->transform_edit.active || impl_->component_edit_active ||
+        impl_->frame_context->is_frame_active())
+        return foundation::invalid_state("Renderer Feature publication requires an Edit frame boundary");
+    return impl_->preview_renderer->publish(graph);
+}
+
+foundation::ResultValue<runtime::FeatureRuntimeExecutionSnapshot> EditorSceneRuntime::inspect_renderer_feature_execution() const {
+    if (impl_ == nullptr || !impl_->initialized || impl_->preview_renderer == nullptr)
+        return {foundation::invalid_state("Editor Renderer Feature preview is unavailable"), {}};
+    return impl_->preview_renderer->inspect();
+}
+
+foundation::Result EditorSceneRuntime::control_feature_process(const runtime::RuntimeProcessCommand& command) {
+    if (impl_ == nullptr || impl_->feature_session == nullptr || impl_->feature_session->host == nullptr)
+        return foundation::not_ready("Scene has no executable Feature graph");
+    return impl_->feature_session->host->control_process(command);
+}
+
+bool EditorSceneRuntime::feature_publication_pending() const noexcept {
+    return impl_ != nullptr && (impl_->pending_feature_session != nullptr ||
+        (impl_->feature_session != nullptr && impl_->feature_session->host != nullptr &&
+         impl_->feature_session->host->has_pending()));
+}
+
+foundation::Result EditorSceneRuntime::render_frame(uint64_t frame_number, double elapsed_seconds) {
     if (impl_ == nullptr || !impl_->initialized || impl_->active_scope == nullptr || impl_->orchestrator == nullptr) {
         return foundation::invalid_state("Editor scene runtime is not ready to render");
     }
-    // The RenderFeature state descriptor is copied when the frame begins. Resize
-    // the viewport before creating it so the transient state texture and the
-    // imported SceneColor target always have identical dimensions and format.
+    if (!std::isfinite(elapsed_seconds) || elapsed_seconds < 0.0)
+        return foundation::invalid_argument("Scene Feature delta must be finite and nonnegative");
+    bool defer_world_bound_publication = false;
+    if (impl_->pending_feature_session != nullptr) {
+        auto& candidate = *impl_->pending_feature_session;
+        if (candidate.host->has_pending()) {
+            if (const auto result = candidate.host->apply_pending(); !result) return result;
+        }
+        if (impl_->feature_session != nullptr) {
+            if (const auto result = impl_->feature_session->close(); !result) return result;
+        }
+        impl_->feature_session = std::move(impl_->pending_feature_session);
+    }
+    if (impl_->feature_session != nullptr) {
+        auto& session = *impl_->feature_session;
+        defer_world_bound_publication = impl_->world_command_consumer != nullptr &&
+            impl_->mode != Mode::kEdit && session.host->has_pending();
+        if (session.host->has_pending() && !defer_world_bound_publication) {
+            if (const auto result = session.host->apply_pending(); !result) return result;
+        }
+        if (impl_->world_command_consumer != nullptr && impl_->mode != Mode::kEdit) {
+            if (const auto result = impl_->world_command_consumer->set_frame_delta(elapsed_seconds); !result)
+                return result;
+        }
+        // Pause and World-bound Apply retire issued work only; they cannot issue
+        // deferred clocks, queued backlog, or zero-backoff retries.
+        const auto result = impl_->mode == Mode::kPlay && !defer_world_bound_publication
+            ? session.execution->advance(elapsed_seconds)
+            : impl_->mode == Mode::kEdit ? session.execution->pump_completions()
+                                         : feature::detail::FeatureExecutionControl::drain_issued_completions(
+                                               *session.execution);
+        if (!result) return result;
+    }
+    {
+        if (impl_->preview_renderer == nullptr || impl_->preview_history == nullptr)
+            return foundation::invalid_state("Editor Renderer Feature preview is unavailable");
+        if (const auto result = impl_->preview_renderer->tick(); !result) return result;
+    }
     if (const Result result = impl_->resize_targets(); !result) {
         return result;
     }
     impl_->current_slot = impl_->frame_context->frame_slot_index();
-    impl_->viewport_readback.present_connected = viewport_present_connected();
     engine::EngineFrameDesc desc{};
     desc.fixed_tick = frame_number;
     desc.render_output_extent = {impl_->requested_width, impl_->requested_height};
-    desc.render_feature_state = {
-        .enabled = true,
-        .texture_desc = impl_->color_desc,
-        .present_target_id = kSceneColor,
-        .present_extent = {impl_->requested_width, impl_->requested_height, 1},
-        .link_overrides = impl_->render_state_link_overrides,
-        .blend_overrides = impl_->render_state_blend_overrides,
-        .compose_terminal_states = [impl = impl_.get()](pipeline::RenderGraphBuilder& builder,
-                                                        std::span<const render_graph::RenderStateCompositeInput> inputs,
-                                                        pipeline::RenderGraphTexture destination) -> Result {
-            if (inputs.empty() || !destination.is_valid()) {
-                return foundation::invalid_argument("Render-state terminal composition requires valid state inputs");
-            }
-            const auto extent = rhi::Extent3D{impl->requested_width, impl->requested_height, 1};
-            for (uint32_t index = 0; index < inputs.size(); ++index) {
-                const pipeline::RenderGraphTexture source = inputs[index].texture;
-                const uint32_t pipeline_index = static_cast<uint32_t>(inputs[index].blend_mode);
-                if (pipeline_index >= impl->state_composite_pipelines.size() ||
-                    !impl->state_composite_pipelines[pipeline_index].is_valid()) {
-                    return foundation::invalid_state("Render-state blend pipeline is unavailable");
-                }
-                const auto binding_set_result = impl->create_state_composite_set();
-                if (!binding_set_result) {
-                    return binding_set_result.result;
-                }
-                const BindingSetHandle binding_set = binding_set_result.value;
-                const rhi::LoadOp load_op = index == 0 ? rhi::LoadOp::kClear : rhi::LoadOp::kLoad;
-                const auto pass_result = builder.add_graphics_pass(
-                    "RenderState.Composite",
-                    [source, destination, load_op](pipeline::RenderPassBuilder& pass) {
-                        if (const Result result =
-                                pass.read(source, rhi::ResourceUsage::kSampledRead, rhi::PipelineStage::kFragmentShader,
-                                          rhi::ShaderStage::kFragment);
-                            !result) {
-                            return result;
-                        }
-                        if (const Result result = pass.use_color_attachment(destination, load_op, rhi::StoreOp::kStore,
-                                                                            ClearColorValue{0.0f, 0.0f, 0.0f, 0.0f},
-                                                                            rhi::ResourceUsage::kSampledRead);
-                            !result) {
-                            return result;
-                        }
-                        pass.set_side_effects();
-                        return Result::success();
-                    },
-                    [impl, source, binding_set, extent, pipeline_index](pipeline::RenderPassExecutionContext& pass) {
-                        const auto sampled_view =
-                            pass.texture_view(source, TextureViewKind::kSampled, {rhi::Aspect::kColor, 0, 1, 0, 1},
-                                              Format::kRgba8Unorm, TextureViewDimension::kTex2D);
-                        if (!sampled_view) {
-                            return sampled_view.result;
-                        }
-                        const std::array<BindingWrite, 2> writes{
-                            BindingWrite{
-                                {0, 0},
-                                0,
-                                BindingResource{BindingType::kSampledTexture, sampled_view.value, {}, {}, {}, {}}},
-                            BindingWrite{
-                                {0, 1},
-                                0,
-                                BindingResource{BindingType::kSampler, {}, {}, {}, impl->viewport_sampler, {}}},
-                        };
-                        if (const Result result = impl->device->update_binding_set(binding_set, writes); !result) {
-                            return result;
-                        }
-                        if (const Result result = pass.bind_pipeline(impl->state_composite_pipelines[pipeline_index]);
-                            !result) {
-                            return result;
-                        }
-                        if (const Result result = pass.bind_binding_set(0, binding_set); !result) {
-                            return result;
-                        }
-                        if (const Result result = pass.begin_rendering(); !result) {
-                            return result;
-                        }
-                        if (const Result result =
-                                pass.set_viewport(rhi::Viewport{0.0f, 0.0f, static_cast<float>(extent.width),
-                                                                static_cast<float>(extent.height), 0.0f, 1.0f});
-                            !result) {
-                            return result;
-                        }
-                        if (const Result result = pass.set_scissor(rhi::ScissorRect{0, 0, extent.width, extent.height});
-                            !result) {
-                            return result;
-                        }
-                        if (const Result result = pass.draw(rhi::DrawDesc{3, 1, 0, 0}); !result) {
-                            return result;
-                        }
-                        return pass.end_rendering();
-                    });
-                if (!pass_result) {
-                    return pass_result.result;
-                }
-            }
-            return Result::success();
-        },
-    };
     desc.renderer = &impl_->renderer;
     desc.render_view_resolver = [impl = impl_.get()](const engine::EngineFrameRenderViewContext& context) {
         const ecs::EntityId camera =
@@ -4268,7 +4073,6 @@ foundation::Result EditorSceneRuntime::render_frame(uint64_t frame_number) {
         return view;
     };
     desc.render_resource_resolver = &impl_->resolver;
-    desc.render_passes = &impl_->passes;
     // Asset uploads happen in RenderBuild preparation. Extraction therefore
     // accepts stable IDs first and the Resolver resolves fast-path/baked GPU
     // resources after preparation has had a chance to publish them.
@@ -4277,15 +4081,55 @@ foundation::Result EditorSceneRuntime::render_frame(uint64_t frame_number) {
     desc.render_feature_preparation = [impl = impl_.get()](const engine::EngineFramePreparationContext& context) {
         return impl->prepare_frame(context);
     };
+    std::shared_ptr<const std::vector<feature::RenderFeatureOutput>> outputs;
+    std::vector<feature::RenderResourceOwner> owners;
+    std::shared_ptr<const std::vector<feature::RenderFeatureOutput>> preview_outputs;
+    std::vector<feature::RenderResourceOwner> preview_owners;
+    {
+        auto captured = impl_->preview_renderer->capture();
+        if (!captured) return captured.result;
+        auto captured_owners = impl_->preview_renderer->capture_owners();
+        if (!captured_owners) return captured_owners.result;
+        preview_outputs = std::move(captured.value);
+        preview_owners = std::move(captured_owners.value);
+    }
+    auto* session = impl_->feature_session.get();
+    if (session != nullptr && session->host->active()) {
+        auto captured = session->execution->capture_render_outputs(*session->host->active());
+        if (!captured) return captured.result;
+        auto captured_owners = session->execution->capture_render_resource_owners(*session->host->active());
+        if (!captured_owners) return captured_owners.result;
+        outputs = std::make_shared<const std::vector<feature::RenderFeatureOutput>>(std::move(captured.value));
+        owners = std::move(captured_owners.value);
+    }
+    desc.render_feature_post_build = [impl = impl_.get(), session, outputs = std::move(outputs), owners = std::move(owners),
+        preview_outputs = std::move(preview_outputs), preview_owners = std::move(preview_owners)]
+        (const engine::EngineFramePostBuildContext& context) {
+        const render_graph::RenderPassExecutionHost pass_host{&impl->scene_passes,
+            pipeline::detail::RenderPassRegistryExecution::execution_epoch(impl->scene_passes)};
+        if (preview_outputs) {
+            if (const auto result = build_scene_feature_outputs(context, preview_outputs, preview_owners,
+                                                               *impl->preview_history, pass_host); !result) return result;
+        }
+        if (outputs) {
+            if (const auto result = build_scene_feature_outputs(context, outputs, owners, session->history, pass_host); !result)
+                return result;
+        }
+        const auto color = std::find_if(context.feature_textures.begin(), context.feature_textures.end(),
+                                       [](const auto& binding) { return binding.id == kSceneColor; });
+        if (color == context.feature_textures.end()) return foundation::invalid_state("SceneColor frame binding is unavailable");
+        return build_viewport_readback(context.render_graph,
+                                      {color->texture.index, color->texture.generation, color->texture.graph_id},
+                                      impl->viewport_readback);
+    };
     const Result frame_result = impl_->orchestrator->run_frame(desc);
-    const Result composite_release_result = impl_->release_state_composite_sets();
     if (!frame_result) {
         impl_->viewport_readback.requested = false;
         impl_->viewport_readback.allocation = {};
+        if (frame_result.code == ResultCode::kNotReady && impl_->world_command_consumer != nullptr &&
+            impl_->world_command_consumer->observation_waiting())
+            return frame_result;
         return frame_result;
-    }
-    if (!composite_release_result) {
-        return composite_release_result;
     }
     const auto viewport_state = query_texture_initial_state(*impl_->device, impl_->color_texture);
     if (!viewport_state) {
@@ -4313,6 +4157,56 @@ foundation::Result EditorSceneRuntime::render_frame(uint64_t frame_number) {
         impl_->viewport_readback.pixels = std::move(pixels);
         impl_->viewport_readback.requested = false;
         impl_->viewport_readback.allocation = {};
+    }
+    std::vector<runtime::FeatureRuntimeExecutionSnapshot> sources;
+    bool sources_valid = true;
+    {
+        auto source = impl_->preview_renderer->inspect();
+        if (!source) sources_valid = false;
+        else sources.push_back(std::move(source.value));
+    }
+    if (impl_->feature_session && impl_->feature_session->host) {
+        for (const auto& document : impl_->feature_session->host->active_documents()) {
+            auto source = inspect_feature_execution(document.asset_uuid);
+            if (!source) { sources_valid = false; break; }
+            sources.push_back(std::move(source.value));
+        }
+    }
+    if (sources_valid) {
+        auto captured = capture_editor_render_graph(*impl_->render_graph, impl_->frame_context->frame_number(), std::move(sources));
+        if (captured) impl_->rendered_inspection = std::move(captured.value);
+    }
+    if (defer_world_bound_publication && impl_->feature_session != nullptr) {
+        auto& session = *impl_->feature_session;
+        for (const auto& binding : impl_->feature_world_bindings) {
+            const auto issued = editor_world_binding_has_issued_work(binding, *session.host,
+                impl_->scene_asset, impl_->runtime_instance, *impl_->runtime_scope);
+            if (!issued) return issued.result;
+            if (issued.value) return frame_result;
+        }
+        if (const auto result = session.host->apply_pending(); !result) return result;
+        auto created = make_editor_world_command_consumer(*session.execution, impl_->reflection_registry,
+            *session.host, impl_->feature_world_bindings, impl_->scene_asset, impl_->runtime_instance,
+            *impl_->runtime_scope);
+        if (!created) {
+            impl_->orchestrator.reset();
+            impl_->world_command_consumer.reset();
+            return created.result;
+        }
+        if (const auto result = created.value->set_frame_delta(elapsed_seconds); !result) {
+            impl_->orchestrator.reset();
+            impl_->world_command_consumer.reset();
+            return result;
+        }
+        auto retired_consumer = std::move(impl_->world_command_consumer);
+        if (const auto result = engine::detail::EngineFrameWorldCommands::attach(*impl_->orchestrator,
+                *created.value); !result) {
+            impl_->orchestrator.reset();
+            retired_consumer.reset();
+            return result;
+        }
+        impl_->world_command_consumer = std::move(created.value);
+        retired_consumer.reset();
     }
     return frame_result;
 }
@@ -5395,14 +5289,18 @@ foundation::Result EditorSceneRuntime::new_project(const ProjectCreateOptions& o
     if (impl_->mode != Mode::kEdit || impl_->transform_edit.active || impl_->component_edit_active) {
         return foundation::invalid_state("New Project requires Edit mode without an active edit transaction");
     }
-    if (const Result result = impl_->project_manager.new_project(options); !result) {
-        return result;
-    }
+    if (const auto result = reject_retired_scene_authoring(options.root / project::ProjectConfig{}.startup_scene);
+        !result) return result;
+    EditorProjectManager candidate;
+    if (const auto result = candidate.new_project(options); !result) return result;
+    if (const auto result = impl_->close_features(); !result) return result;
+    impl_->project_manager = std::move(candidate);
+    impl_->rendered_inspection.reset();
     if (const Result result = impl_->asset_database.initialize(impl_->project_manager.descriptor().root); !result) {
         static_cast<void>(impl_->project_manager.close_project());
         return result;
     }
-    if (const Result result = impl_->reload_project_pipeline_authoring(); !result) {
+    if (const Result result = impl_->reload_project_feature_authoring(); !result) {
         static_cast<void>(impl_->project_manager.close_project());
         return result;
     }
@@ -5415,7 +5313,7 @@ foundation::Result EditorSceneRuntime::new_project(const ProjectCreateOptions& o
     }
     if (const auto result = save_scene(); !result)
         return result;
-    return impl_->restore_startup_renderer();
+    return restore_default_renderer_feature();
 }
 
 foundation::Result EditorSceneRuntime::update_project_settings(const project::ProjectConfig& config) {
@@ -5425,7 +5323,12 @@ foundation::Result EditorSceneRuntime::update_project_settings(const project::Pr
     if (impl_->mode != Mode::kEdit || impl_->transform_edit.active || impl_->component_edit_active) {
         return foundation::invalid_state("Project settings require Edit mode without an active edit transaction");
     }
-    return impl_->project_manager.update_project_settings(config);
+    if (const auto result = impl_->project_manager.update_project_settings(config); !result)
+        return result;
+    // Project settings can change startup FeatureGraph roots while the Editor
+    // remains open. Refresh the source catalog immediately so Runtime Inspect
+    // can continue to map live owners back to their authored .aegfeature file.
+    return impl_->reload_project_feature_authoring();
 }
 
 foundation::Result EditorSceneRuntime::import_project(const std::filesystem::path& root_or_project_file) {
@@ -5435,17 +5338,19 @@ foundation::Result EditorSceneRuntime::import_project(const std::filesystem::pat
     if (impl_->mode != Mode::kEdit || impl_->transform_edit.active || impl_->component_edit_active) {
         return foundation::invalid_state("Import Project requires Edit mode without an active edit transaction");
     }
-    if (const Result result = impl_->project_manager.import_project(root_or_project_file); !result) {
-        return result;
+    EditorProjectManager candidate;
+    if (const auto result = candidate.import_project(root_or_project_file); !result) return result;
+    for (const auto& path : {candidate.recent_scene(), candidate.default_scene_file()}) {
+        if (const auto result = reject_retired_scene_authoring(path); !result) return result;
     }
-    // A freshly imported project owns no visible Renderer Pipeline until its
-    // scene sidecar is restored by the editor application.
-    impl_->project_renderer_pipeline.reset();
+    if (const auto result = impl_->close_features(); !result) return result;
+    impl_->project_manager = std::move(candidate);
+    impl_->rendered_inspection.reset();
     if (const Result result = impl_->asset_database.initialize(impl_->project_manager.descriptor().root); !result) {
         static_cast<void>(impl_->project_manager.close_project());
         return result;
     }
-    if (const Result result = impl_->reload_project_pipeline_authoring(); !result) {
+    if (const Result result = impl_->reload_project_feature_authoring(); !result) {
         static_cast<void>(impl_->project_manager.close_project());
         return result;
     }
@@ -5458,7 +5363,7 @@ foundation::Result EditorSceneRuntime::import_project(const std::filesystem::pat
     const auto open_with_renderer = [&](const std::filesystem::path& path) {
         if (const auto result = open_scene(path); !result)
             return result;
-        return impl_->restore_startup_renderer();
+        return restore_default_renderer_feature();
     };
     if (!remembered_scene.empty()) {
         std::error_code error;
@@ -5485,7 +5390,7 @@ foundation::Result EditorSceneRuntime::import_project(const std::filesystem::pat
     }
     if (const auto result = save_scene(); !result)
         return result;
-    return impl_->restore_startup_renderer();
+    return restore_default_renderer_feature();
 }
 
 foundation::Result EditorSceneRuntime::close_project() {
@@ -5498,12 +5403,13 @@ foundation::Result EditorSceneRuntime::close_project() {
     if (impl_->mode != Mode::kEdit || impl_->transform_edit.active || impl_->component_edit_active) {
         return foundation::invalid_state("Close Project requires Edit mode without an active edit transaction");
     }
+    if (const auto result = impl_->close_features(); !result) return result;
     if (const Result result = impl_->project_manager.close_project(); !result) {
         return result;
     }
     impl_->asset_database = EditorAssetDatabase{};
-    impl_->project_renderer_pipeline.reset();
-    impl_->project_pipeline_authoring = {};
+    impl_->project_feature_authoring = {};
+    impl_->rendered_inspection.reset();
     if (const Result result = impl_->synchronize_asset_pipeline(); !result) {
         return result;
     }
@@ -5513,7 +5419,7 @@ foundation::Result EditorSceneRuntime::close_project() {
     if (const Result result = save_scene(); !result) {
         return result;
     }
-    return impl_->restore_startup_renderer();
+    return restore_default_renderer_feature();
 }
 
 foundation::Result EditorSceneRuntime::new_scene() {
@@ -5549,6 +5455,7 @@ foundation::Result EditorSceneRuntime::new_scene() {
     const Result result = impl_->rebuild_edit_world();
     if (result) {
         impl_->reset_history(true);
+        impl_->feature_world_bindings.clear();
         impl_->scene_path = impl_->project_manager.loaded() ? impl_->project_manager.default_scene_file()
                                                             : std::filesystem::path{"editor_scene.aegscene"};
     }
@@ -5576,6 +5483,7 @@ foundation::Result EditorSceneRuntime::open_scene(const std::filesystem::path& p
             return foundation::invalid_argument("Scene path is invalid");
         }
     }
+    if (const auto result = reject_retired_scene_authoring(resolved_path); !result) return result;
     std::ifstream file(resolved_path, std::ios::binary);
     if (!file) {
         return foundation::not_found("Scene file could not be opened");
@@ -5599,8 +5507,13 @@ foundation::Result EditorSceneRuntime::open_scene(const std::filesystem::path& p
     if (const Result result = asset.value.validate(); !result) {
         return result;
     }
+    auto loaded_bindings = read_editor_world_bindings(resolved_path, asset.value.id());
+    if (!loaded_bindings) return loaded_bindings.result;
+    if (const auto result = validate_editor_world_binding_targets(loaded_bindings.value, asset.value); !result)
+        return result;
     const scene::SceneAsset previous_asset = impl_->scene_asset;
     const std::filesystem::path previous_path = impl_->scene_path;
+    const std::vector<EditorFeatureWorldBinding> previous_bindings = impl_->feature_world_bindings;
     const std::vector<scene::SceneEntityId> previous_selection = impl_->selected_entities;
     const scene::SceneEntityId previous_selected_entity = impl_->selected_entity;
     const scene::SceneEntityId previous_camera = impl_->active_camera_scene;
@@ -5612,6 +5525,7 @@ foundation::Result EditorSceneRuntime::open_scene(const std::filesystem::path& p
     impl_->transform_edit = {};
     impl_->scene_asset = asset.value;
     impl_->scene_path = resolved_path;
+    impl_->feature_world_bindings = std::move(loaded_bindings.value);
     impl_->active_camera_scene = {};
     const ecs::ComponentTypeId camera_type(aeg::engine::components::kCameraName);
     for (const scene::SceneComponentRecord& component : impl_->scene_asset.components()) {
@@ -5630,7 +5544,16 @@ foundation::Result EditorSceneRuntime::open_scene(const std::filesystem::path& p
     impl_->runtime_scope.reset();
     impl_->runtime_state.reset();
     impl_->active_scope = nullptr;
-    const Result result = impl_->rebuild_edit_world();
+    Result result = impl_->rebuild_edit_world();
+    if (result && !impl_->feature_world_bindings.empty() && impl_->feature_session != nullptr &&
+        impl_->feature_session->host != nullptr && impl_->feature_session->host->active() != nullptr) {
+        const auto graphs = impl_->feature_session->host->active_documents();
+        for (const auto& binding : impl_->feature_world_bindings) {
+            result = validate_editor_world_binding_candidate(binding, graphs, impl_->feature_session->registry,
+                impl_->scene_asset, impl_->edit_instance, *impl_->edit_scope);
+            if (!result) break;
+        }
+    }
     if (result) {
         impl_->reset_history(false);
         if (impl_->project_manager.loaded()) {
@@ -5639,6 +5562,7 @@ foundation::Result EditorSceneRuntime::open_scene(const std::filesystem::path& p
     } else {
         impl_->scene_asset = previous_asset;
         impl_->scene_path = previous_path;
+        impl_->feature_world_bindings = previous_bindings;
         impl_->selected_entities = previous_selection;
         impl_->selected_entity = previous_selected_entity;
         impl_->active_camera_scene = previous_camera;
@@ -5666,6 +5590,10 @@ foundation::Result EditorSceneRuntime::save_scene() {
     if (const Result result = impl_->commit_edit_commands(); !result) {
         return result;
     }
+    if (const Result result = validate_editor_world_binding_targets(impl_->feature_world_bindings,
+                                                                    impl_->scene_asset); !result) {
+        return result;
+    }
     serialization::BinaryWriter writer;
     if (const Result result = scene::SceneSerializer::serialize(impl_->scene_asset, writer); !result) {
         return result;
@@ -5678,6 +5606,9 @@ foundation::Result EditorSceneRuntime::save_scene() {
         impl_->scene_path = resolved.value;
     }
     if (const Result result = write_bytes_atomically(impl_->scene_path, writer.data()); !result) {
+        return result;
+    }
+    if (const Result result = write_editor_world_bindings(impl_->scene_path, impl_->feature_world_bindings); !result) {
         return result;
     }
     impl_->clean_history_cursor = impl_->history_cursor;
@@ -5710,6 +5641,7 @@ foundation::Result EditorSceneRuntime::save_scene_as(const std::filesystem::path
             return foundation::invalid_argument("Scene Save As path is invalid");
         }
     }
+    if (const auto result = reject_retired_scene_authoring(resolved_path); !result) return result;
     const std::filesystem::path previous_path = impl_->scene_path;
     impl_->scene_path = resolved_path;
     const Result result = save_scene();
@@ -5733,7 +5665,7 @@ foundation::Result EditorSceneRuntime::refresh_assets() {
     if (!result) {
         return result;
     }
-    if (const Result authoring = impl_->reload_project_pipeline_authoring(); !authoring) {
+    if (const Result authoring = impl_->reload_project_feature_authoring(); !authoring) {
         return authoring;
     }
     return impl_->synchronize_asset_pipeline();
@@ -5753,7 +5685,7 @@ foundation::Result EditorSceneRuntime::import_external_asset(const EditorAssetIm
     if (!imported) {
         return imported;
     }
-    if (const Result authoring = impl_->reload_project_pipeline_authoring(); !authoring) {
+    if (const Result authoring = impl_->reload_project_feature_authoring(); !authoring) {
         return authoring;
     }
     return impl_->synchronize_asset_pipeline();
@@ -5805,6 +5737,141 @@ foundation::Result EditorSceneRuntime::remove_asset(uint64_t id) {
     return impl_->asset_database.remove(id);
 }
 
+foundation::Result EditorSceneRuntime::set_feature_world_bindings(
+    std::span<const EditorFeatureWorldBinding> bindings) {
+    if (impl_ == nullptr || !impl_->initialized)
+        return foundation::invalid_state("Editor scene runtime is not initialized");
+    if (impl_->mode != Mode::kEdit)
+        return foundation::invalid_state("Feature World bindings can only change in Edit mode");
+    try {
+        std::vector<EditorFeatureWorldBinding> candidate(bindings.begin(), bindings.end());
+        if (!candidate.empty()) {
+            if (impl_->feature_session == nullptr || impl_->feature_session->host == nullptr ||
+                impl_->feature_session->host->active() == nullptr)
+                return foundation::not_ready("Publish an executable Feature graph before binding its World commands");
+            if (impl_->edit_scope == nullptr || impl_->active_scope != impl_->edit_scope.get())
+                return foundation::invalid_state("Editor Edit World is not the active World");
+            std::vector<feature::FeatureInstanceId> owners;
+            owners.reserve(candidate.size());
+            for (const auto& binding : candidate) {
+                const auto resolved = resolve_editor_world_binding(binding, *impl_->feature_session->host,
+                    impl_->scene_asset, impl_->edit_instance, *impl_->edit_scope);
+                if (!resolved) return resolved.result;
+                if (std::find(owners.begin(), owners.end(), resolved.value.instance) != owners.end())
+                    return foundation::invalid_argument("Editor World command owner has more than one explicit route");
+                owners.push_back(resolved.value.instance);
+            }
+        }
+        if (const auto result = write_editor_world_bindings(impl_->scene_path, candidate); !result) return result;
+        impl_->feature_world_bindings = std::move(candidate);
+        return Result::success();
+    } catch (const std::bad_alloc&) {
+        return foundation::out_of_memory("Editor World binding copy allocation failed");
+    }
+}
+
+std::span<const EditorFeatureWorldBinding> EditorSceneRuntime::feature_world_bindings() const noexcept {
+    return impl_ == nullptr ? std::span<const EditorFeatureWorldBinding>{}
+                            : std::span<const EditorFeatureWorldBinding>{impl_->feature_world_bindings};
+}
+
+foundation::Result EditorSceneRuntime::bind_feature_world_node(
+    std::string_view graph_asset_uuid, feature::FeatureNodeId node, scene::SceneEntityId scene_entity) {
+    if (impl_ == nullptr || !impl_->initialized)
+        return foundation::invalid_state("Editor scene runtime is not initialized");
+    if (graph_asset_uuid.empty() || !node.is_valid() || !scene_entity.is_valid())
+        return foundation::invalid_argument("Feature World route selection has an invalid authored identity");
+    if (impl_->feature_session == nullptr || impl_->feature_session->host == nullptr ||
+        impl_->feature_session->host->active() == nullptr)
+        return foundation::not_ready("Publish the selected FeatureGraph before creating a World route");
+    const auto execution = impl_->feature_session->host->inspect_execution(graph_asset_uuid);
+    if (!execution) return execution.result;
+    const runtime::FeatureRuntimeExecutionProvenance* attribution = nullptr;
+    for (const auto& candidate : execution.value.provenance) {
+        if (candidate.authored_node_id != node) continue;
+        if (attribution != nullptr)
+            return foundation::invalid_argument("Selected Feature node has multiple expanded owners; choose one exact owner route");
+        attribution = &candidate;
+    }
+    if (attribution == nullptr)
+        return foundation::not_found("Selected Feature node has no published execution owner");
+    const auto observed = impl_->feature_session->host->inspect_node(graph_asset_uuid, node);
+    if (!observed) return observed.result;
+    const auto owner = std::find_if(observed.value.owners.begin(), observed.value.owners.end(), [&](const auto& candidate) {
+        return candidate.owner.instance_id == attribution->runtime.instance_id;
+    });
+    if (owner == observed.value.owners.end())
+        return foundation::invalid_state("Selected Feature execution owner is not present in its node snapshot");
+    const auto effect = std::find_if(owner->contract.side_effects.begin(), owner->contract.side_effects.end(),
+        [](const feature::SideEffectContract& candidate) {
+            return candidate.id == feature::kWorldTransformCommandEffect &&
+                   candidate.version == feature::kWorldTransformCommandVersion &&
+                   candidate.kind == feature::SideEffectKind::kCommand &&
+                   candidate.commit == feature::CommitPolicy::kOutbox;
+        });
+    if (effect == owner->contract.side_effects.end())
+        return foundation::invalid_argument("Selected Feature contract does not declare the World.Transform outbox");
+    feature::PortId observation_port{};
+    for (const auto& port : owner->contract.ports) {
+        if (port.direction != feature::PortDirection::kInput ||
+            port.schema != feature::kWorldTransformInputSchema ||
+            port.version != feature::kWorldTransformInputVersion) continue;
+        if (observation_port.is_valid())
+            return foundation::invalid_argument("Selected Feature contract has multiple World.Transform input ports");
+        observation_port = port.id;
+    }
+
+    try {
+        std::vector<EditorFeatureWorldBinding> candidate(impl_->feature_world_bindings);
+        candidate.erase(std::remove_if(candidate.begin(), candidate.end(), [&](const auto& binding) {
+            return binding.graph_asset_uuid == graph_asset_uuid && binding.node_id == node;
+        }), candidate.end());
+        candidate.push_back({std::string(graph_asset_uuid), node, attribution->authored_instance_path,
+                             impl_->scene_asset.id(), scene_entity, effect->id, effect->version, observation_port});
+        return set_feature_world_bindings(candidate);
+    } catch (const std::bad_alloc&) {
+        return foundation::out_of_memory("Editor World route candidate allocation failed");
+    }
+}
+
+foundation::Result EditorSceneRuntime::clear_feature_world_node_binding(
+    std::string_view graph_asset_uuid, feature::FeatureNodeId node) {
+    if (impl_ == nullptr || !impl_->initialized)
+        return foundation::invalid_state("Editor scene runtime is not initialized");
+    if (graph_asset_uuid.empty() || !node.is_valid())
+        return foundation::invalid_argument("Feature World route removal has an invalid authored identity");
+    try {
+        std::vector<EditorFeatureWorldBinding> candidate(impl_->feature_world_bindings);
+        candidate.erase(std::remove_if(candidate.begin(), candidate.end(), [&](const auto& binding) {
+            return binding.graph_asset_uuid == graph_asset_uuid && binding.node_id == node;
+        }), candidate.end());
+        if (candidate.size() == impl_->feature_world_bindings.size()) return Result::success();
+        return set_feature_world_bindings(candidate);
+    } catch (const std::bad_alloc&) {
+        return foundation::out_of_memory("Editor World route removal allocation failed");
+    }
+}
+
+foundation::ResultValue<EditorWorldSnapshot> EditorSceneRuntime::inspect_active_world_snapshot() const {
+    if (impl_ == nullptr || !impl_->initialized)
+        return {foundation::invalid_state("Editor scene runtime is not initialized"), {}};
+    const bool edit = impl_->mode == Mode::kEdit;
+    world::WorldScope* scope = edit ? impl_->edit_scope.get() : impl_->runtime_scope.get();
+    const scene::SceneInstance& instance = edit ? impl_->edit_instance : impl_->runtime_instance;
+    if (scope == nullptr || impl_->active_scope != scope || !scope->is_initialized())
+        return {foundation::invalid_state("Editor active World lifecycle does not match its current mode"), {}};
+    const auto snapshot = scope->latest_snapshot();
+    if (!snapshot) return {snapshot.result, {}};
+    try {
+        EditorWorldSnapshot result{};
+        result.snapshot = snapshot.value;
+        result.entities.assign(instance.entities().begin(), instance.entities().end());
+        return {Result::success(), std::move(result)};
+    } catch (const std::bad_alloc&) {
+        return {foundation::out_of_memory("Editor active World snapshot diagnostics allocation failed"), {}};
+    }
+}
+
 foundation::Result EditorSceneRuntime::play() {
     if (impl_ == nullptr || impl_->edit_scope == nullptr) {
         return foundation::invalid_state("Editor edit World is not initialized");
@@ -5830,15 +5897,38 @@ foundation::Result EditorSceneRuntime::play() {
     impl_->runtime_scope.reset();
     impl_->runtime_state.reset();
     impl_->runtime_camera_runtime = {};
-    impl_->runtime_demo_time = 0.0f;
     if (const Result result =
             impl_->instantiate_world(impl_->scene_asset, impl_->runtime_state, impl_->runtime_scope,
                                      impl_->runtime_instance, impl_->runtime_camera_runtime, "Editor.RuntimeWorld");
         !result) {
         return result;
     }
+    const auto initial_snapshot = impl_->runtime_scope->commit(impl_->frame_context->frame_number());
+    if (!initial_snapshot) {
+        impl_->runtime_scope.reset();
+        impl_->runtime_state.reset();
+        return initial_snapshot.result;
+    }
+    std::unique_ptr<engine::detail::FeatureWorldCommandConsumer> candidate_consumer;
+    if (!impl_->feature_world_bindings.empty()) {
+        if (impl_->feature_session == nullptr || impl_->feature_session->host == nullptr) {
+            impl_->runtime_scope.reset();
+            impl_->runtime_state.reset();
+            return foundation::not_ready("Feature World bindings require an active executable Feature session");
+        }
+        auto created = make_editor_world_command_consumer(*impl_->feature_session->execution,
+            impl_->reflection_registry, *impl_->feature_session->host, impl_->feature_world_bindings,
+            impl_->scene_asset, impl_->runtime_instance, *impl_->runtime_scope);
+        if (!created) {
+            impl_->runtime_scope.reset();
+            impl_->runtime_state.reset();
+            return created.result;
+        }
+        candidate_consumer = std::move(created.value);
+    }
     impl_->mode = Mode::kPlay;
     impl_->active_scope = impl_->runtime_scope.get();
+    impl_->world_command_consumer = std::move(candidate_consumer);
     return impl_->create_orchestrator_for(*impl_->active_scope);
 }
 
@@ -5863,12 +5953,24 @@ foundation::Result EditorSceneRuntime::stop() {
         }
         return Result::success();
     }
-    impl_->transform_edit = {};
+    if (impl_->pending_feature_session != nullptr) {
+        if (const auto result = impl_->pending_feature_session->close(); !result) return result;
+        impl_->pending_feature_session.reset();
+    }
+    // The consumer borrows the current FeatureRuntime, and the orchestrator borrows the consumer.
     impl_->orchestrator.reset();
+    impl_->world_command_consumer.reset();
+    if (impl_->feature_session != nullptr) {
+        try {
+            if (const auto result = impl_->feature_session->reset_execution(); !result) return result;
+        } catch (const std::bad_alloc&) {
+            return foundation::out_of_memory("Scene Feature restart allocation failed");
+        }
+    }
+    impl_->transform_edit = {};
     impl_->runtime_scope.reset();
     impl_->runtime_state.reset();
     impl_->runtime_camera_runtime = {};
-    impl_->runtime_demo_time = 0.0f;
     impl_->mode = Mode::kEdit;
     impl_->active_scope = impl_->edit_scope.get();
     return impl_->create_orchestrator_for(*impl_->active_scope);

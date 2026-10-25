@@ -1,84 +1,36 @@
-#include <filesystem>
-#include <iostream>
-
-#include "editor_composition_test_support.hpp"
-#include "editor_composition_view.hpp"
+#include "editor_feature_definition_fixture.hpp"
 #include "editor_node_definition_service.hpp"
-#include "editor_project_pipeline_authoring.hpp"
-#include "pipeline_document_io.hpp"
-
-namespace {
-int failures = 0;
-void check(bool condition, const char* message) {
-    if (!condition) {
-        std::cerr << message << '\n';
-        ++failures;
-    }
-}
-}
-
+#include "editor_node_contract_storage.hpp"
+#include "feature_graph_io.hpp"
+#include <iostream>
 int main() {
     using namespace aeg;
-    namespace fs = std::filesystem;
-    const fs::path root = fs::temp_directory_path() / "aeg_editor_node_definition_end_to_end_smoke";
-    std::error_code error;
-    fs::remove_all(root, error);
-    fs::create_directories(root / "Assets", error);
-
-    tests::EditorCompositionFixture fixture;
-    application::EditorCompositionDocument editor{fixture.document, fixture.catalog};
-    const auto* source = editor.catalog().find({pipeline::AuthoringTypeKind::kFeature,
-                                                pipeline::FeatureId("Game.EditorFeature").value()});
-    check(source != nullptr, "end-to-end fixture feature is missing");
-    if (!source)
-        return 1;
-    application::NodeDefinitionDraft draft{};
-    draft.entry = *source;
-    draft.entry.ports.push_back({.id = 31,
-                                 .name = "OutputColor",
-                                 .direction = pipeline::PortDirection::kOutput,
-                                 .value_kind = pipeline::PortValueKind::kTexture,
-                                 .schema_id = 1,
-                                 .schema_version = 1,
-                                 .max_connections = 1,
-                                 .binding_id = 31,
-                                 .resource_constraints = {.resource_class = pipeline::ResourceClass::kTexture}});
-    draft.entry.parameters.push_back({.id = 41,
-                                      .name = "Exposure",
-                                      .display_name = "Exposure",
-                                      .kind = pipeline::ParameterKind::kFloat64,
-                                      .default_value = 1.0,
-                                      .minimum = 0.0,
-                                      .maximum = 4.0});
-    draft.source = application::NodeContractSource::kEditorDraft;
+    const auto root=std::filesystem::temp_directory_path() / "aeg_editor_node_definition_end_to_end_smoke";
+    std::error_code error; std::filesystem::remove_all(root,error); std::filesystem::create_directories(root / "Assets");
+    auto draft=tests::feature_definition_draft();
+    draft.entry.contract.execution=feature::ExecutionKind::kProcess; draft.entry.contract.state=feature::StatePolicy::kProcessState;
+    draft.entry.contract.state_payload={{7,2,1},65}; draft.entry.contract.has_continuation=true;
+    auto graph=tests::feature_graph(draft.entry); graph.edges.clear(); graph.nodes.resize(1);
+    auto value=feature::serialize_parameter_value(foundation::ParameterValue{1.5},feature::ParameterType::kDouble);
+    if (!value) return 1;
+    const std::array records{feature::FeatureParameterRecord{feature::ParameterId{21},1,value.value}};
+    const auto blob=feature::encode_feature_parameters(records,draft.entry.contract.parameters); if (!blob) return 2;
+    graph.nodes[0].parameter_blob=blob.value;
+    application::EditorFeatureGraphDocument editor{graph,tests::feature_catalog(draft.entry)};
     application::EditorNodeDefinitionService service;
-    const auto saved = service.save(editor, {draft, true, false}, root);
-    check(static_cast<bool>(saved) && saved.value.generated_stub, "end-to-end generated save failed");
-    check(fs::exists(root / "Source" / "FlowGraph" / "EditorFeature.flowgraph.contract.json"),
-          "generated contract was not persisted");
-    check(fs::exists(root / "Source" / "FlowGraph" / "EditorFeature.flowgraph.registration.cpp"),
-          "generated registration was not persisted");
-
-    check(static_cast<bool>(application::project::save_pipeline_document(root / "Assets" / "Graph.aegpipe",
-                                                            *editor.snapshot())),
-          "authoring graph was not persisted");
-    const auto loaded = application::load_editor_project_pipeline_authoring(root, root / "Source", root / "Assets");
-    check(static_cast<bool>(loaded) && loaded.value.contracts.size() == 1 && loaded.value.documents.size() == 1,
-          "project restart did not discover the generated contract and graph");
-    if (loaded) {
-        const auto key = draft.entry.key;
-        check(loaded.value.catalog.find(key) != nullptr, "custom contract disappeared after restart");
-        const auto& document = loaded.value.documents.front().document;
-        for (const auto address : {application::EditorGraphAddress{application::EditorGraphKind::kPipeline, {}, {}, {}},
-                                   application::EditorGraphAddress{application::EditorGraphKind::kFeature, "pipeline", "feature", {}},
-                                   application::EditorGraphAddress{application::EditorGraphKind::kPass, "pipeline", "feature", "render"}}) {
-            const auto projected = application::project_composition_graph(document, loaded.value.catalog, address);
-            check(static_cast<bool>(projected), "graph switch projection failed after restart");
-        }
-    }
-    fs::remove_all(root, error);
-    if (failures)
-        return 1;
-    std::cout << "Editor node definition end-to-end smoke passed\n";
-    return 0;
+    const auto saved=service.save(editor,{draft,true,false},root);
+    if (!saved) { std::cerr << saved.result.message << "\n"; return 3; }
+    if (!std::filesystem::exists(saved.value.generated.registration_target.path)) return 4;
+    const auto contract=application::read_editor_node_contract(saved.value.generated.files[3]);
+    if (!contract || contract.value.draft.entry.contract.parameters!=draft.entry.contract.parameters ||
+        contract.value.draft.entry.contract.state_payload!=draft.entry.contract.state_payload) return 5;
+    const auto path=root / "Assets/Graph.aegfeature";
+    if (!application::authoring::save_feature_graph_document(path,editor.snapshot())) return 6;
+    const auto loaded=application::authoring::load_feature_graph_document(path);
+    if (!loaded || loaded.value.nodes.size()!=1 || loaded.value.nodes[0].definition_id!=draft.entry.id ||
+        loaded.value.nodes[0].definition_version!=draft.entry.version || loaded.value.nodes[0].parameter_blob!=blob.value ||
+        loaded.value.contract_digest!=editor.catalog().contract_digest()) return 7;
+    const auto decoded=feature::decode_feature_parameters(loaded.value.nodes[0].parameter_blob,contract.value.draft.entry.contract.parameters);
+    if (!decoded || decoded.value.size()!=1 || decoded.value[0].payload!=value.value || decoded.value[0].version!=1) return 8;
+    std::filesystem::remove_all(root,error); std::cout << "Feature definition generate/save/reopen passed\n";
 }

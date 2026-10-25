@@ -56,7 +56,7 @@ int main() {
     aeg::application::EditorSceneRuntime runtime;
     if (!require(runtime.initialize(*device), "editor Inspector smoke initialization failed") ||
         !require(runtime.request_viewport_extent(96, 64), "editor Inspector smoke extent request failed") ||
-        !require(runtime.render_frame(0), "editor Inspector smoke initial frame failed")) {
+        !require(runtime.render_frame(0, 1.0 / 60.0), "editor Inspector smoke initial frame failed")) {
         return 2;
     }
 
@@ -116,7 +116,7 @@ int main() {
     }};
     if (!require(runtime.update_component_edit(second_updates), "editor Inspector smoke transaction update failed") ||
         !require(runtime.commit_component_edit(), "editor Inspector smoke transaction commit failed") ||
-        !require(runtime.render_frame(1), "editor Inspector smoke edited frame failed")) {
+        !require(runtime.render_frame(1, 1.0 / 60.0), "editor Inspector smoke edited frame failed")) {
         std::filesystem::remove(scene_path, remove_error);
         return 7;
     }
@@ -125,7 +125,7 @@ int main() {
     if (!require(committed_left != nullptr && same_vec3(committed_left->tint, updated_left.tint),
                  "editor Inspector smoke committed MeshRenderer value is wrong") ||
         !require(runtime.undo(), "editor Inspector smoke transaction undo failed") ||
-        !require(runtime.render_frame(2), "editor Inspector smoke undo frame failed")) {
+        !require(runtime.render_frame(2, 1.0 / 60.0), "editor Inspector smoke undo frame failed")) {
         std::filesystem::remove(scene_path, remove_error);
         return 8;
     }
@@ -134,7 +134,7 @@ int main() {
     if (!require(undone_left != nullptr && same_vec3(undone_left->tint, left_mesh->tint),
                  "editor Inspector smoke undo did not restore the original tint") ||
         !require(runtime.redo(), "editor Inspector smoke transaction redo failed") ||
-        !require(runtime.render_frame(3), "editor Inspector smoke redo frame failed")) {
+        !require(runtime.render_frame(3, 1.0 / 60.0), "editor Inspector smoke redo frame failed")) {
         std::filesystem::remove(scene_path, remove_error);
         return 9;
     }
@@ -180,17 +180,17 @@ int main() {
 
     const std::array<aeg::scene::SceneEntityId, 1> one_entity{{left_id}};
     if (!require(runtime.add_component(one_entity, camera_type), "editor Inspector smoke component add failed") ||
-        !require(runtime.render_frame(4), "editor Inspector smoke component add frame failed") ||
+        !require(runtime.render_frame(4, 1.0 / 60.0), "editor Inspector smoke component add frame failed") ||
         !require(runtime.component_value(left_id, camera_type) != nullptr,
                  "editor Inspector smoke added component is missing") ||
         !require(runtime.undo(), "editor Inspector smoke component add undo failed") ||
-        !require(runtime.render_frame(5), "editor Inspector smoke component add undo frame failed") ||
+        !require(runtime.render_frame(5, 1.0 / 60.0), "editor Inspector smoke component add undo frame failed") ||
         !require(runtime.component_value(left_id, camera_type) == nullptr,
                  "editor Inspector smoke component add undo did not remove the component") ||
         !require(runtime.redo(), "editor Inspector smoke component add redo failed") ||
-        !require(runtime.render_frame(6), "editor Inspector smoke component add redo frame failed") ||
+        !require(runtime.render_frame(6, 1.0 / 60.0), "editor Inspector smoke component add redo frame failed") ||
         !require(runtime.remove_component(one_entity, camera_type), "editor Inspector smoke component remove failed") ||
-        !require(runtime.render_frame(7), "editor Inspector smoke component remove frame failed") ||
+        !require(runtime.render_frame(7, 1.0 / 60.0), "editor Inspector smoke component remove frame failed") ||
         !require(runtime.component_value(left_id, camera_type) == nullptr,
                  "editor Inspector smoke removed component is still present")) {
         std::filesystem::remove(scene_path, remove_error);
@@ -204,7 +204,7 @@ int main() {
     }};
     if (!require(runtime.begin_component_edit(cancel_update), "editor Inspector smoke cancel begin failed") ||
         !require(runtime.cancel_component_edit(), "editor Inspector smoke cancel failed") ||
-        !require(runtime.render_frame(8), "editor Inspector smoke cancel frame failed")) {
+        !require(runtime.render_frame(8, 1.0 / 60.0), "editor Inspector smoke cancel frame failed")) {
         std::filesystem::remove(scene_path, remove_error);
         return 16;
     }
@@ -221,7 +221,7 @@ int main() {
         !require(!runtime.queue_component_update(left_id, mesh_type, bytes_of(cancel_value)),
                  "editor Inspector smoke allowed edit-world mutation in Play mode") ||
         !require(runtime.stop(), "editor Inspector smoke Stop failed") ||
-        !require(runtime.render_frame(5), "editor Inspector smoke Stop frame failed")) {
+        !require(runtime.render_frame(5, 1.0 / 60.0), "editor Inspector smoke Stop frame failed")) {
         std::filesystem::remove(scene_path, remove_error);
         return 18;
     }

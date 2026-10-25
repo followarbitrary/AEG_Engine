@@ -17,8 +17,23 @@
 #include "result.hpp"
 
 namespace aeg::concurrency {
-inline constexpr uint64_t kWaitIndefinitely = std::numeric_limits<uint64_t>::max();
-inline constexpr uint32_t kInvalidTaskIndex = std::numeric_limits<uint32_t>::max();
+inline constexpr uint64_t kWaitIndefinitely = (std::numeric_limits<uint64_t>::max)();
+inline constexpr uint32_t kInvalidTaskIndex = (std::numeric_limits<uint32_t>::max)();
+
+/** @brief Process-local thread identity; not an OS handle or a serialized ID. */
+struct ThreadId final {
+    uint64_t value{0};
+    [[nodiscard]] constexpr bool is_valid() const noexcept { return value != 0; }
+    friend constexpr bool operator==(ThreadId, ThreadId) = default;
+};
+
+[[nodiscard]] ThreadId current_thread_id() noexcept;
+/** @brief Engine-host identity shared with ThreadId; positive and never reused.
+ * Not persistent or an OS handle. Terminates on exhaustion rather than wrapping.
+ */
+[[nodiscard]] uint64_t allocate_unique_identity() noexcept;
+/** @brief Gives another runnable thread an opportunity to run. */
+void yield_current_thread() noexcept;
 
 /** @brief Logical execution lane used to select an executor. */
 enum class ExecutorDomain : uint8_t {
@@ -77,6 +92,11 @@ public:
 private:
     std::shared_ptr<CancellationToken::State> state_{};
 };
+
+/** @brief Blocks this thread for a finite duration; cancellation returns kCancelled.
+ * Not a coroutine timer: use Completion with CoroutineTask for nonblocking waits.
+ */
+[[nodiscard]] foundation::Result sleep_for(uint64_t duration_nanoseconds, CancellationToken cancellation = {});
 
 /** @brief Read-only view of the completion state of one asynchronous task. */
 class Completion final {

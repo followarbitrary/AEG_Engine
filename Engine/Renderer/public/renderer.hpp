@@ -1,6 +1,6 @@
 /**
  * @file renderer.hpp
- * @brief Backend-neutral render scene extraction and RenderPipeline contracts.
+ * @brief Backend-neutral render scene extraction and resource value contracts.
  */
 #pragma once
 
@@ -8,24 +8,30 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <shared_mutex>
 #include <span>
 #include <unordered_set>
 #include <vector>
 
 #include "ecs.hpp"
+#include "feature_render_intent.hpp"
+#include "feature_types.hpp"
 #include "math.hpp"
-#include "pipeline.hpp"
+#include "render_graph_types.hpp"
+#include "renderer_material_contract.hpp"
+#include "renderer_material_resource_contract.hpp"
+#include "renderer_profile_resource_contract.hpp"
+#include "renderer_shader_contract.hpp"
+#include "result.hpp"
 #include "rhi_struct.hpp"
+#include "stable_id.hpp"
 
 namespace aeg::world {
 class WorldFrameScope;
 }
 
-namespace aeg::pipeline {
-class RenderPassRegistry;
-}
-
+namespace aeg::rhi { class Device; }
 namespace aeg::renderer {
 struct RenderViewIdTag;
 struct RenderObjectIdTag;
@@ -35,16 +41,12 @@ struct MeshAssetIdTag;
 struct MaterialInstanceIdTag;
 struct RenderSceneSnapshot;
 
-using RenderViewId = pipeline::StableId<RenderViewIdTag>;
-using RenderObjectId = pipeline::StableId<RenderObjectIdTag>;
-using RenderLightId = pipeline::StableId<RenderLightIdTag>;
-using MeshAssetId = pipeline::StableId<MeshAssetIdTag>;
-using MaterialInstanceId = pipeline::StableId<MaterialInstanceIdTag>;
-using RenderExtractorId = pipeline::StableId<RenderExtractorIdTag>;
-
-inline constexpr pipeline::ArtifactId kRenderSceneSnapshotArtifactId{"RenderSceneSnapshot"};
-inline constexpr pipeline::ArtifactTypeId kRenderSceneSnapshotArtifactTypeId{"RenderSceneSnapshot"};
-inline constexpr uint32_t kRenderSceneSnapshotArtifactVersion = 1;
+using RenderViewId = foundation::StableId<RenderViewIdTag>;
+using RenderObjectId = foundation::StableId<RenderObjectIdTag>;
+using RenderLightId = foundation::StableId<RenderLightIdTag>;
+using MeshAssetId = foundation::StableId<MeshAssetIdTag>;
+using MaterialInstanceId = foundation::StableId<MaterialInstanceIdTag>;
+using RenderExtractorId = foundation::StableId<RenderExtractorIdTag>;
 
 /** @brief Creates a stable view identity for a numeric World view slot. */
 [[nodiscard]] constexpr RenderViewId make_render_view_id(uint32_t view_id) noexcept {
@@ -62,6 +64,14 @@ inline constexpr uint32_t kRenderSceneSnapshotArtifactVersion = 1;
     mix(world.generation);
     mix(view_id);
     return RenderViewId(value == 0 ? 1 : value);
+}
+
+/** @brief Returns a stable external resource identity scoped to one RenderView. */
+[[nodiscard]] constexpr feature::RenderResourceId make_view_scoped_render_resource_id(
+    feature::RenderResourceId base, RenderViewId view) noexcept {
+    uint64_t value = base.value();
+    value ^= view.value() + 0x9e3779b97f4a7c15ull + (value << 6u) + (value >> 2u);
+    return feature::RenderResourceId(value == 0 ? 1 : value);
 }
 
 /** @brief Creates a stable render-object identity from an ECS entity identity. */
@@ -85,17 +95,6 @@ struct RenderExtent final {
     friend constexpr bool operator==(RenderExtent, RenderExtent) = default;
 };
 
-/** @brief View-local procedural sky and HDR-to-output settings. Neutral defaults preserve linear output. */
-struct RenderPostProcessSettings final {
-    math::Vec3 sky_zenith{0.08f, 0.2f, 0.5f};
-    math::Vec3 sky_horizon{0.5f, 0.65f, 0.9f};
-    math::Vec3 sky_ground{0.025f, 0.025f, 0.025f};
-    float exposure{1.0f};
-    float gamma{1.0f};
-    bool sky_enabled{false};
-    bool tone_mapping{false};
-};
-
 /** @brief Camera matrices and clip-space parameters consumed by rendering. */
 struct RenderCamera final {
     math::Mat4 view{math::identity()};
@@ -114,16 +113,25 @@ struct RenderView final {
     ecs::WorldHandle world{};
     uint32_t view_id{0};
     RenderExtent output_extent{};
+    /** Optional independent directional shadow-map extent; zero means use output_extent. */
+    RenderExtent shadow_extent{0, 0};
     RenderCamera camera{};
     uint32_t visibility_mask{0xffffffffu};
-    pipeline::RenderResourceId color_target{};
-    pipeline::RenderResourceId depth_target{};
+    feature::RenderResourceId color_target{};
+    feature::RenderResourceId depth_target{};
     bool frustum_culling{false};
     /** @brief Resource usage required after the opaque color pass completes. */
     rhi::ResourceUsage color_target_final_usage{rhi::ResourceUsage::kColorAttachmentWrite};
-    RenderPostProcessSettings post_process{};
+    feature::RenderPostProcessSettings post_process{};
 
     [[nodiscard]] bool is_valid() const noexcept;
+};
+
+/** @brief Stable shadow view/value contract consumed by frame resource resolvers. */
+struct RenderShadowView final {
+    RenderView view{};
+    RenderShadowConstants constants{};
+    bool enabled{false};
 };
 
 /** @brief Reports view-local visibility filtering performed during extraction. */
@@ -197,22 +205,6 @@ struct RenderLightComponent final {
     bool enabled{true};
 };
 
-/** @brief Interleaved vertex attribute offsets and formats consumed by Opaque. */
-struct RenderMeshVertexLayout final {
-    /** @brief Byte offset of the float4 position within one interleaved vertex. */
-    uint32_t position_offset{0};
-    /** @brief Shader-facing format of the position attribute. */
-    rhi::Format position_format{rhi::Format::kRgba32Float};
-    /** @brief Byte offset of the float2 UV within one interleaved vertex. */
-    uint32_t uv_offset{sizeof(float) * 4u};
-    /** @brief Shader-facing format of the UV attribute. */
-    rhi::Format uv_format{rhi::Format::kRg32Float};
-    /** @brief Byte offset of the float3 normal within one interleaved vertex. */
-    uint32_t normal_offset{sizeof(float) * 6u};
-    /** @brief Shader-facing format of the normal attribute. */
-    rhi::Format normal_format{rhi::Format::kRgb32Float};
-};
-
 /** @brief GPU resources resolved for one mesh asset without exposing backend types. */
 struct RenderMeshResource final {
     /** @brief Vertex buffer containing the mesh's interleaved vertex records. */
@@ -234,65 +226,10 @@ struct RenderMeshResource final {
     /** @brief Interleaved vertex attribute offsets and formats consumed by Opaque. */
     RenderMeshVertexLayout vertex_layout{};
     /** @brief Optional graph-local handles supplied by a frame preparation upload. */
-    pipeline::RenderGraphBuffer vertex_resource{};
-    pipeline::RenderGraphBuffer index_resource{};
+    render_graph::RenderGraphBuffer vertex_resource{};
+    render_graph::RenderGraphBuffer index_resource{};
 
     /** @brief Reports whether this resource can be consumed by an indexed graphics draw. */
-    [[nodiscard]] bool is_valid() const noexcept;
-};
-
-/** @brief GPU resources resolved for one material instance. */
-struct RenderMaterialResource final {
-    /** @brief Graphics pipeline selected by this material instance. */
-    rhi::PipelineHandle pipeline{};
-    /** @brief Descriptor set exposing material textures and samplers. */
-    rhi::BindingSetHandle binding_set{};
-    /** @brief Pipeline layout group used when binding binding_set. */
-    uint32_t binding_group{1};
-    /** @brief Graph texture sampled by the material binding set. */
-    pipeline::RenderGraphTexture material_texture{};
-    /** @brief Uniform buffer containing material parameters. */
-    rhi::BufferHandle material_parameter_buffer{};
-    /** @brief Immutable creation contract for material_parameter_buffer. */
-    rhi::BufferDesc material_parameter_buffer_desc{};
-    /** @brief Graph buffer used to declare material parameter reads. */
-    pipeline::RenderGraphBuffer material_parameter_resource{};
-    /** @brief Byte offset of the material parameter range. */
-    uint64_t material_parameter_offset{0};
-    /** @brief Byte size of the material parameter range. */
-    uint64_t material_parameter_size{0};
-    /** @brief Optional graphics pipeline writing Albedo/Normal/Material GBuffer MRTs. */
-    rhi::PipelineHandle gbuffer_pipeline{};
-    /** @brief Optional depth-only graphics pipeline used by shadow/Z-prepass. */
-    rhi::PipelineHandle depth_pipeline{};
-    /** @brief Optional forward pipeline consuming the group-three shadow binding. */
-    rhi::PipelineHandle shadow_pipeline{};
-    /** @brief Forward pipeline consuming the tile light list and optional directional shadow. */
-    rhi::PipelineHandle clustered_pipeline{};
-
-    /** @brief Reports whether this material can issue a graphics draw. */
-    [[nodiscard]] bool is_valid() const noexcept;
-};
-
-/** @brief Object constants shared by the standard opaque vertex shader contract. */
-struct RenderObjectConstants final {
-    /** @brief Matrix that transforms local positions into clip space. */
-    math::Mat4 model_view_projection{math::identity()};
-    /** @brief Inverse-transpose matrix that transforms local normals into view space. */
-    math::Mat4 normal_matrix{math::identity()};
-};
-
-static_assert(sizeof(RenderObjectConstants) == sizeof(math::Mat4) * 2u);
-
-/** @brief Frame/view-local constants consumed by the minimal Lambert shader contract. */
-struct RenderLightingConstants final {
-    /** @brief View-space light direction and directional intensity in w. */
-    math::Vec4 directional_direction_intensity{0.0f, 0.0f, -1.0f, 0.0f};
-    /** @brief Linear directional light color; alpha is reserved and must remain one. */
-    math::Vec4 directional_color{0.0f, 0.0f, 0.0f, 1.0f};
-    /** @brief Linear environment contribution; alpha is reserved and must remain one. */
-    math::Vec4 ambient_color{0.05f, 0.05f, 0.05f, 1.0f};
-
     [[nodiscard]] bool is_valid() const noexcept;
 };
 
@@ -307,7 +244,7 @@ struct RenderLightingResource final {
     /** @brief Immutable creation contract for lighting_buffer. */
     rhi::BufferDesc lighting_buffer_desc{};
     /** @brief Graph buffer used to declare the fragment uniform read. */
-    pipeline::RenderGraphBuffer lighting_resource{};
+    render_graph::RenderGraphBuffer lighting_resource{};
     /** @brief Byte offset of the lighting constant range. */
     uint64_t lighting_offset{0};
     /** @brief Byte size of the lighting constant range. */
@@ -335,62 +272,6 @@ struct RenderObjectResource final {
 
     /** @brief Reports whether this object exposes a complete transform uniform binding. */
     [[nodiscard]] bool is_valid() const noexcept;
-};
-
-/** @brief GBuffer views and lighting range resolved after graph resource allocation. */
-struct RenderDeferredLightingInputs final {
-    rhi::TextureViewHandle albedo{};
-    rhi::TextureViewHandle normal{};
-    rhi::TextureViewHandle depth{};
-    rhi::BufferRange lighting{};
-    rhi::TextureViewHandle shadow_map{};
-    rhi::BufferRange shadow_constants{};
-};
-
-/**
- * @brief Host-owned fullscreen lighting resources for the current frame.
- * The callback prepares a fresh
- * group-zero descriptor set and retains it until
- * GPU frame completion. It must not modify a set referenced by an
- * earlier pass.
- */
-struct RenderDeferredLightingResource final {
-    rhi::PipelineHandle pipeline{};
-    std::function<foundation::ResultValue<rhi::BindingSetHandle>(const RenderDeferredLightingInputs&)> prepare_inputs{};
-    rhi::PipelineHandle shadow_pipeline{};
-
-    [[nodiscard]] bool is_valid() const noexcept { return pipeline.is_valid() && bool(prepare_inputs); }
-};
-
-struct RenderShadowView;
-/** @brief Frame-owned shadow constants and a lazy group-three input descriptor. */
-struct RenderShadowResource final {
-    rhi::BufferHandle buffer{};
-    rhi::BufferDesc buffer_desc{};
-    pipeline::RenderGraphBuffer graph_buffer{};
-    std::function<foundation::ResultValue<rhi::BindingSetHandle>(rhi::TextureViewHandle)> prepare_inputs{};
-};
-
-/** @brief Host-owned light culling resources, imported into the current graph by the feature. */
-struct RenderLightCullingResource final {
-    rhi::PipelineHandle pipeline{};
-    rhi::BufferHandle constants{}, lights{};
-    rhi::BufferDesc constants_desc{}, lights_desc{};
-    pipeline::RenderGraphBuffer constants_graph{}, lights_graph{};
-    uint32_t tile_count_x{0}, tile_count_y{0};
-    uint64_t cluster_bytes{0};
-    /** @brief Compute: scene depth/list buffer. Forward: shadow depth/list buffer. */
-    std::function<foundation::ResultValue<rhi::BindingSetHandle>(rhi::TextureViewHandle, rhi::BufferHandle)>
-        prepare_compute{}, prepare_forward{};
-};
-
-/** @brief Current-frame sky/postprocess shader, constants and fresh descriptor preparation. */
-struct RenderPostProcessResource final {
-    rhi::PipelineHandle pipeline{};
-    rhi::BufferHandle constants{};
-    rhi::BufferDesc constants_desc{};
-    std::function<foundation::ResultValue<rhi::BindingSetHandle>(rhi::TextureViewHandle, rhi::TextureViewHandle)>
-        prepare_inputs{};
 };
 
 /** @brief Resolves renderer asset identities to backend-neutral RHI resources. */
@@ -488,8 +369,8 @@ private:
     [[nodiscard]] foundation::Result validate_instance_resources(const RenderInstance& instance) const;
 
     RenderSceneSnapshot snapshot_{};
-    std::unordered_set<RenderObjectId, pipeline::StableIdHash<RenderObjectIdTag>> instance_ids_{};
-    std::unordered_set<RenderLightId, pipeline::StableIdHash<RenderLightIdTag>> light_ids_{};
+    std::unordered_set<RenderObjectId, foundation::StableIdHash<RenderObjectIdTag>> instance_ids_{};
+    std::unordered_set<RenderLightId, foundation::StableIdHash<RenderLightIdTag>> light_ids_{};
     const RenderResourceResolver* resource_resolver_{nullptr};
     bool require_resolved_resources_{false};
     math::Frustum frustum_{};
@@ -498,20 +379,6 @@ private:
 
     friend class Renderer;
 };
-
-/** @brief Runtime data made available to a RenderFeature while building its graph. */
-struct RenderFeatureContext final {
-    const RenderSceneSnapshot* scene_snapshot{nullptr};
-    const RenderResourceResolver* resource_resolver{nullptr};
-    void* user_data{nullptr};
-    /** Host registry borrowed during graph construction; graph retains each resolved pass. */
-    const pipeline::RenderPassRegistry* render_passes{nullptr};
-
-    [[nodiscard]] bool is_valid() const noexcept { return scene_snapshot != nullptr && scene_snapshot->is_valid(); }
-};
-
-/** @brief Returns the typed renderer context attached to a runtime RenderFeature builder. */
-[[nodiscard]] const RenderFeatureContext* render_feature_context(const pipeline::RenderGraphBuilder& builder) noexcept;
 
 /** @brief Owns registered extraction callbacks and produces frame snapshots. */
 class Renderer final {
@@ -535,7 +402,7 @@ public:
 
     /** @brief Validates a view and applies a default color output when needed. */
     [[nodiscard]] foundation::Result prepare_view(RenderView& view,
-                                                  pipeline::RenderResourceId default_color_target = {}) const;
+                                                  feature::RenderResourceId default_color_target = {}) const;
 
     /** @brief Extracts an immutable scene snapshot from a committed World snapshot. */
     [[nodiscard]] foundation::ResultValue<std::shared_ptr<const RenderSceneSnapshot>> extract(
@@ -546,12 +413,6 @@ public:
     /** @brief Extracts through a World-to-Frame bridge with explicit resource policy. */
     [[nodiscard]] foundation::ResultValue<std::shared_ptr<const RenderSceneSnapshot>> extract(
         const world::WorldFrameScope& frame_scope, const RenderView& view, const RenderExtractionDesc& desc) const;
-
-    /** @brief Installs the standard RenderSceneSnapshot contract on a Frame host. */
-    [[nodiscard]] foundation::Result install_frame_contract(pipeline::PipelineScopeHost& frame_host) const;
-    /** @brief Publishes one extracted snapshot into a Frame host artifact registry. */
-    [[nodiscard]] foundation::Result publish_frame_snapshot(pipeline::PipelineScopeHost& frame_host,
-                                                            std::shared_ptr<const RenderSceneSnapshot> snapshot) const;
 
 private:
     struct ExtractorRegistration final {
@@ -566,18 +427,4 @@ private:
     uint64_t next_extractor_id_{1};
 };
 
-/** @brief Standard frame-scoped RenderPipeline with public render FeaturePoints. */
-class RenderPipeline final : public pipeline::Pipeline {
-public:
-    RenderPipeline();
-
-    [[nodiscard]] const pipeline::PipelineDescriptor& descriptor() const noexcept override { return descriptor_; }
-    [[nodiscard]] foundation::Result build(pipeline::PipelineBuilder& builder) const override;
-
-private:
-    pipeline::PipelineDescriptor descriptor_{};
-};
-
-/** @brief Registers the standard RenderPipeline definition in a PipelineRegistry. */
-[[nodiscard]] foundation::Result register_render_pipeline(pipeline::PipelineRegistry& registry);
 }  // namespace aeg::renderer

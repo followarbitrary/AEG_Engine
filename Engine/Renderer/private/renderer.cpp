@@ -3,6 +3,10 @@
  * @brief Implements render scene extraction and the standard RenderPipeline.
  */
 #include "../public/renderer.hpp"
+#include "render_feature_context.hpp"
+#include "renderer_frame_contract.hpp"
+#include "renderer_variants_internal.hpp"
+#include "renderer_pipeline.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -143,34 +147,6 @@ void increment(uint32_t& value) noexcept {
     };
 }
 
-[[nodiscard]] pipeline::FeaturePointDescriptor make_feature_point(pipeline::FeaturePointId id, std::string_view name,
-                                                                  pipeline::StageId anchor_stage,
-                                                                  pipeline::FeaturePointFlags flags) {
-    return pipeline::FeaturePointDescriptor{
-        .id = id,
-        .name = name,
-        .pipeline = {},
-        .anchor_stage = anchor_stage,
-        .position = pipeline::FeaturePointPosition::kBefore,
-        .allowed_domains = pipeline::to_mask(pipeline::FeatureDomain::kRender),
-        .allowed_scopes = pipeline::to_mask(pipeline::PipelineScope::kFrame),
-        .flags = flags,
-    };
-}
-
-[[nodiscard]] foundation::Result add_stage_and_point(pipeline::PipelineBuilder& builder, pipeline::StageId stage_id,
-                                                     pipeline::FeaturePointId point_id, std::string_view point_name,
-                                                     pipeline::EnginePhase phase,
-                                                     pipeline::ExecutionDomain execution_domain,
-                                                     pipeline::FeaturePointFlags point_flags) {
-    const pipeline::PipelineStageHandle stage = builder.add_stage(make_stage(stage_id, phase, execution_domain));
-    if (!stage) {
-        return builder.status();
-    }
-    const pipeline::PipelineFeaturePointHandle point =
-        builder.add_feature_point(make_feature_point(point_id, point_name, stage_id, point_flags));
-    return point ? foundation::Result::success() : builder.status();
-}
 }  // namespace
 
 bool RenderMeshResource::is_valid() const noexcept {
@@ -187,7 +163,7 @@ bool RenderMeshResource::is_valid() const noexcept {
 }
 
 bool RenderMaterialResource::is_valid() const noexcept {
-    return pipeline.is_valid();
+    return pipeline.is_valid() && variant_cache_epoch != 0;
 }
 
 bool RenderLightingConstants::is_valid() const noexcept {
@@ -541,29 +517,26 @@ foundation::ResultValue<std::shared_ptr<const RenderSceneSnapshot>> Renderer::ex
     if (!frame_scope.is_valid()) {
         return {invalid_state("render extraction requires a valid WorldFrameScope"), {}};
     }
-    const foundation::ResultValue<pipeline::ArtifactView> artifact = frame_scope.read_snapshot();
-    if (!artifact) {
-        return {artifact.result, {}};
-    }
-    const ecs::WorldSnapshot* snapshot = artifact.value.as<ecs::WorldSnapshot>(world::kWorldSnapshotArtifactTypeId);
-    if (snapshot == nullptr) {
-        return {invalid_state("WorldFrameScope does not contain a WorldSnapshot"), {}};
+    const auto snapshot = frame_scope.read_snapshot();
+    if (!snapshot) {
+        return {snapshot.result, {}};
     }
     RenderExtractionDesc extraction_desc = desc;
     if (extraction_desc.frame_number == 0) {
         extraction_desc.frame_number = frame_scope.key().frame_number;
     }
-    return extract(*snapshot, view, extraction_desc);
+    return extract(snapshot.value, view, extraction_desc);
 }
 
 bool RenderView::is_valid() const noexcept {
-    return id.is_valid() && world.is_valid() && output_extent.is_valid() && math::is_finite(camera.view) &&
+    const bool shadow_extent_valid = (shadow_extent.width == 0 && shadow_extent.height == 0) || shadow_extent.is_valid();
+    return id.is_valid() && world.is_valid() && output_extent.is_valid() && shadow_extent_valid && math::is_finite(camera.view) &&
            math::is_finite(camera.projection) && math::is_finite(camera.position) &&
            math::is_finite(camera.near_plane) && math::is_finite(camera.far_plane) && camera.near_plane > 0.0f &&
            camera.far_plane > camera.near_plane;
 }
 
-foundation::Result Renderer::prepare_view(RenderView& view, pipeline::RenderResourceId default_color_target) const {
+foundation::Result Renderer::prepare_view(RenderView& view, feature::RenderResourceId default_color_target) const {
     if (!view.id.is_valid() && view.world.is_valid()) {
         view.id = make_render_view_id(view.world, view.view_id);
     }
@@ -577,13 +550,13 @@ foundation::Result Renderer::prepare_view(RenderView& view, pipeline::RenderReso
 }
 
 const RenderFeatureContext* render_feature_context(const pipeline::RenderGraphBuilder& builder) noexcept {
-    if (!builder.is_runtime() || builder.feature_data() == nullptr) {
+    if (!builder.is_runtime() || builder.context_data() == nullptr) {
         return nullptr;
     }
-    return static_cast<const RenderFeatureContext*>(builder.feature_data());
+    return static_cast<const RenderFeatureContext*>(builder.context_data());
 }
 
-foundation::Result Renderer::install_frame_contract(pipeline::PipelineScopeHost& frame_host) const {
+foundation::Result install_frame_contract(const Renderer&, pipeline::PipelineScopeHost& frame_host) noexcept {
     if (frame_host.scope() != pipeline::PipelineScope::kFrame) {
         return invalid_argument("RenderSceneSnapshot contract requires a Frame pipeline host");
     }
@@ -600,15 +573,15 @@ foundation::Result Renderer::install_frame_contract(pipeline::PipelineScopeHost&
     });
 }
 
-foundation::Result Renderer::publish_frame_snapshot(pipeline::PipelineScopeHost& frame_host,
-                                                    std::shared_ptr<const RenderSceneSnapshot> snapshot) const {
+foundation::Result publish_frame_snapshot(const Renderer& renderer, pipeline::PipelineScopeHost& frame_host,
+                                          std::shared_ptr<const RenderSceneSnapshot> snapshot) noexcept {
     if (frame_host.scope() != pipeline::PipelineScope::kFrame) {
         return invalid_argument("RenderSceneSnapshot publication requires a Frame pipeline host");
     }
     if (snapshot == nullptr || !snapshot->is_valid()) {
         return invalid_argument("render scene snapshot is invalid");
     }
-    if (const foundation::Result result = install_frame_contract(frame_host); !result) {
+    if (const foundation::Result result = install_frame_contract(renderer, frame_host); !result) {
         return result;
     }
     return frame_host.artifacts().publish(
@@ -616,17 +589,8 @@ foundation::Result Renderer::publish_frame_snapshot(pipeline::PipelineScopeHost&
         pipeline::ArtifactPayload::owned(kRenderSceneSnapshotArtifactTypeId, std::move(snapshot), false));
 }
 
-RenderPipeline::RenderPipeline() {
-    descriptor_.id = pipeline::PipelineId("RenderPipeline");
-    descriptor_.name = "RenderPipeline";
-    descriptor_.category = pipeline::PipelineCategory::kRendering;
-    descriptor_.supported_scopes = pipeline::to_mask(pipeline::PipelineScope::kFrame);
-    descriptor_.domains = pipeline::to_mask(pipeline::FeatureDomain::kRender);
-    descriptor_.default_execution_domain = pipeline::ExecutionDomain::kRenderThread;
-    descriptor_.default_time_policy = pipeline::TimePolicy::kFrame;
-}
-
-foundation::Result RenderPipeline::build(pipeline::PipelineBuilder& builder) const {
+namespace {
+foundation::Result declare_render_pipeline(pipeline::PipelineBuilder& builder) {
     const pipeline::PipelineStageHandle visibility_stage =
         builder.add_stage(make_stage(pipeline::StageId("RenderPipeline.Visibility"),
                                      pipeline::EnginePhase::kRenderExtract, pipeline::ExecutionDomain::kCpuWorker));
@@ -656,59 +620,53 @@ foundation::Result RenderPipeline::build(pipeline::PipelineBuilder& builder) con
 
     struct RenderStage final {
         pipeline::StageId stage;
-        pipeline::FeaturePointId point;
-        std::string_view name;
         pipeline::EnginePhase phase;
         pipeline::ExecutionDomain execution_domain;
-        pipeline::FeaturePointFlags flags;
     };
     const RenderStage stages[] = {
-        {pipeline::StageId("RenderPipeline.Shadow"), pipeline::FeaturePointId("RenderPipeline.Shadow"),
-         "RenderPipeline.Shadow", pipeline::EnginePhase::kRenderBuild, pipeline::ExecutionDomain::kRenderThread,
-         pipeline::FeaturePointFlags::kMayCreateArtifacts | pipeline::FeaturePointFlags::kMayCreateGraphicsPass |
-             pipeline::FeaturePointFlags::kMayCreateComputePass | pipeline::FeaturePointFlags::kMayUseDedicatedQueue},
-        {pipeline::StageId("RenderPipeline.Depth"), pipeline::FeaturePointId("RenderPipeline.Depth"),
-         "RenderPipeline.Depth", pipeline::EnginePhase::kRenderBuild, pipeline::ExecutionDomain::kRenderThread,
-         pipeline::FeaturePointFlags::kMayCreateArtifacts | pipeline::FeaturePointFlags::kMayCreateGraphicsPass |
-             pipeline::FeaturePointFlags::kMayCreateComputePass},
-        {pipeline::StageId("RenderPipeline.Opaque"), pipeline::FeaturePointId("RenderPipeline.Opaque"),
-         "RenderPipeline.Opaque", pipeline::EnginePhase::kRenderBuild, pipeline::ExecutionDomain::kRenderThread,
-         pipeline::FeaturePointFlags::kMayCreateArtifacts | pipeline::FeaturePointFlags::kMayCreateGraphicsPass |
-             pipeline::FeaturePointFlags::kMayCreateCopyPass | pipeline::FeaturePointFlags::kMayUseDedicatedQueue},
-        {pipeline::StageId("RenderPipeline.Lighting"), pipeline::FeaturePointId("RenderPipeline.Lighting"),
-         "RenderPipeline.Lighting", pipeline::EnginePhase::kRenderBuild, pipeline::ExecutionDomain::kRenderThread,
-         pipeline::FeaturePointFlags::kMayCreateArtifacts | pipeline::FeaturePointFlags::kMayCreateComputePass |
-             pipeline::FeaturePointFlags::kMayUseDedicatedQueue},
-        {pipeline::StageId("RenderPipeline.Transparent"), pipeline::FeaturePointId("RenderPipeline.Transparent"),
-         "RenderPipeline.Transparent", pipeline::EnginePhase::kRenderBuild, pipeline::ExecutionDomain::kRenderThread,
-         pipeline::FeaturePointFlags::kMayCreateArtifacts | pipeline::FeaturePointFlags::kMayCreateGraphicsPass},
-        {pipeline::StageId("RenderPipeline.PostProcess"), pipeline::FeaturePointId("RenderPipeline.PostProcess"),
-         "RenderPipeline.PostProcess", pipeline::EnginePhase::kRenderBuild, pipeline::ExecutionDomain::kRenderThread,
-         pipeline::FeaturePointFlags::kMayCreateArtifacts | pipeline::FeaturePointFlags::kMayCreateGraphicsPass |
-             pipeline::FeaturePointFlags::kMayCreateComputePass},
-        {pipeline::StageId("RenderPipeline.BeforePresent"), pipeline::FeaturePointId("RenderPipeline.BeforePresent"),
-         "RenderPipeline.BeforePresent", pipeline::EnginePhase::kPresent, pipeline::ExecutionDomain::kRenderThread,
-         pipeline::FeaturePointFlags::kMayCreateArtifacts | pipeline::FeaturePointFlags::kMayCreateGraphicsPass |
-             pipeline::FeaturePointFlags::kMayCreateComputePass | pipeline::FeaturePointFlags::kMayWriteFinalOutput},
+        {pipeline::StageId("RenderPipeline.Shadow"), pipeline::EnginePhase::kRenderBuild,
+         pipeline::ExecutionDomain::kRenderThread},
+        {pipeline::StageId("RenderPipeline.Depth"), pipeline::EnginePhase::kRenderBuild,
+         pipeline::ExecutionDomain::kRenderThread},
+        {pipeline::StageId("RenderPipeline.Opaque"), pipeline::EnginePhase::kRenderBuild,
+         pipeline::ExecutionDomain::kRenderThread},
+        {pipeline::StageId("RenderPipeline.Lighting"), pipeline::EnginePhase::kRenderBuild,
+         pipeline::ExecutionDomain::kRenderThread},
+        {pipeline::StageId("RenderPipeline.Transparent"), pipeline::EnginePhase::kRenderBuild,
+         pipeline::ExecutionDomain::kRenderThread},
+        {pipeline::StageId("RenderPipeline.PostProcess"), pipeline::EnginePhase::kRenderBuild,
+         pipeline::ExecutionDomain::kRenderThread},
+        {pipeline::StageId("RenderPipeline.BeforePresent"), pipeline::EnginePhase::kPresent,
+         pipeline::ExecutionDomain::kRenderThread},
     };
-    const pipeline::PipelineFeaturePointHandle visibility_point = builder.add_feature_point(make_feature_point(
-        pipeline::FeaturePointId("RenderPipeline.Visibility"), "RenderPipeline.Visibility",
-        pipeline::StageId("RenderPipeline.Visibility"),
-        pipeline::FeaturePointFlags::kMayCreateArtifacts | pipeline::FeaturePointFlags::kMayCreateComputePass));
-    if (!visibility_point) {
-        return builder.status();
-    }
     for (const RenderStage& stage : stages) {
-        if (const foundation::Result result = add_stage_and_point(builder, stage.stage, stage.point, stage.name,
-                                                                  stage.phase, stage.execution_domain, stage.flags);
-            !result) {
-            return result;
-        }
+        if (!builder.add_stage(make_stage(stage.stage, stage.phase, stage.execution_domain)))
+            return builder.status();
     }
     return foundation::Result::success();
 }
+}  // namespace
+
+foundation::ResultValue<pipeline::PipelineDefinition> make_render_pipeline_definition() {
+    pipeline::PipelineBuilder builder({
+        .id = pipeline::PipelineId("RenderPipeline"),
+        .name = "RenderPipeline",
+        .category = pipeline::PipelineCategory::kRendering,
+        .supported_scopes = pipeline::to_mask(pipeline::PipelineScope::kFrame),
+        .default_execution_domain = pipeline::ExecutionDomain::kRenderThread,
+        .default_time_policy = pipeline::TimePolicy::kFrame,
+    });
+    if (const auto declared = declare_render_pipeline(builder); !declared) {
+        return {declared, {}};
+    }
+    return builder.finish();
+}
 
 foundation::Result register_render_pipeline(pipeline::PipelineRegistry& registry) {
-    return registry.register_pipeline([] { return std::make_unique<RenderPipeline>(); });
+    auto definition = make_render_pipeline_definition();
+    if (!definition) {
+        return definition.result;
+    }
+    return registry.register_pipeline(std::move(definition.value));
 }
 }  // namespace aeg::renderer

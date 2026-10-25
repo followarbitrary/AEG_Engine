@@ -18,19 +18,17 @@
 #include "ecs.hpp"
 #include "editor_asset_database.hpp"
 #include "editor_project.hpp"
-#include "editor_project_pipeline_authoring.hpp"
-#include "engine_frame_orchestrator.hpp"
+#include "editor_project_feature_authoring.hpp"
+#include "feature_graph_runtime_host.hpp"
 #include "imgui_texture_registry.hpp"
-#include "pipeline.hpp"
 #include "reflection.hpp"
 #include "render_graph.hpp"
-#include "render_state_flow.hpp"
 #include "renderer.hpp"
 #include "rhi.hpp"
 #include "scene_asset.hpp"
-#include "world_scope.hpp"
 
 namespace aeg::application {
+struct EditorRenderGraphSnapshot;
 
 /** @brief Pixel position in the Scene Viewport image. */
 struct ViewportPoint final {
@@ -108,17 +106,36 @@ struct ComponentUpdateView final {
     std::span<const std::byte> bytes{};
 };
 
+/** @brief Explicit authored source-to-Scene entity route for World commands. */
+struct EditorFeatureWorldBinding final {
+    std::string graph_asset_uuid{};
+    feature::FeatureNodeId node_id{};
+    feature::OwnerPath owner_path{};
+    scene::SceneAssetId scene_asset{};
+    scene::SceneEntityId scene_entity{};
+    feature::SideEffectId effect{};
+    uint32_t version{0};
+    feature::PortId observation_port{};
+};
+
+/** @brief Owning immutable view of the Editor's current active World and stable Scene mapping. */
+struct EditorWorldSnapshot final {
+    std::shared_ptr<const ecs::WorldSnapshot> snapshot{};
+    std::vector<scene::SceneEntityBinding> entities{};
+};
+
 /** @brief Owns the minimum editor scene lifecycle and its offscreen Renderer preview. */
 class EditorSceneRuntime final {
 public:
-    enum class PipelineTarget : uint8_t {
-        kWorld,
-        kRenderer,
-    };
     enum class Mode : uint8_t {
         kEdit,
         kPlay,
         kPause,
+    };
+    /** Source of the complete graph batch when explicitly selecting an executable module. */
+    enum class FeatureGraphLoadPolicy : uint8_t {
+        kPreserveActive,
+        kSavedStartup,
     };
 
     EditorSceneRuntime();
@@ -132,39 +149,43 @@ public:
     [[nodiscard]] foundation::Result shutdown();
 
     /** @brief Renders the active World into the current viewport target. */
-    [[nodiscard]] foundation::Result render_frame(uint64_t frame_number);
-    /** @brief Exposes the engine renderer plan as this project's editable Renderer Pipeline. */
-    [[nodiscard]] foundation::Result create_project_renderer_pipeline();
-    /** Validates, activates and persists a project renderer document at a frame boundary. */
-    [[nodiscard]] foundation::Result activate_renderer_pipeline_document(const std::filesystem::path& path);
-    [[nodiscard]] const std::filesystem::path& active_renderer_pipeline_document() const noexcept;
-    /** Non-blocking project pipeline failure while the Editor default preview remains usable. */
-    [[nodiscard]] std::string_view renderer_pipeline_diagnostic() const noexcept;
-    /** Restores the compatible built-in renderer and removes the project renderer selection. */
-    [[nodiscard]] foundation::Result restore_default_renderer_pipeline();
-    [[nodiscard]] std::vector<std::pair<std::string, pipeline::PipelinePlanHandle>> pipeline_snapshots() const;
-    /** Authored project Pipeline documents, available before the game module has been built. */
-    [[nodiscard]] std::span<const EditorProjectPipelineDocument> authored_pipeline_documents() const noexcept;
-    [[nodiscard]] const pipeline::TypeCatalog& authored_pipeline_catalog() const noexcept;
-    [[nodiscard]] std::span<const NodeContractFile> authored_pipeline_drafts() const noexcept;
-    [[nodiscard]] std::span<const EditorProjectPipelineConflict> authored_pipeline_conflicts() const noexcept;
-    /** Persists one authored node's optional connection to the editor-owned Present consumer. */
-    [[nodiscard]] foundation::Result set_authored_present_connection(const std::filesystem::path& document_path,
-                                                                     std::string_view source_node, bool connected);
-    /** @brief Stages an Editor-authored ordering override for the selected live game pipeline. */
-    [[nodiscard]] foundation::Result add_pipeline_runtime_ordering(PipelineTarget target, uint32_t source_node,
-                                                                   uint32_t destination_node);
-    /** @brief Removes an Editor-authored ordering override from the selected live game pipeline. */
-    [[nodiscard]] foundation::Result remove_pipeline_runtime_ordering(PipelineTarget target, uint32_t source_node,
-                                                                      uint32_t destination_node);
-    /** Adds an editor-owned State Link without changing the compiled Pipeline schedule. */
-    [[nodiscard]] foundation::Result add_render_state_link(uint32_t source_node, uint32_t destination_node);
-    /** Masks either an editor-owned or a compiled State Link without changing task scheduling. */
-    [[nodiscard]] foundation::Result remove_render_state_link(uint32_t source_node, uint32_t destination_node);
-    [[nodiscard]] std::vector<render_graph::RenderStateLinkOverride> render_state_link_overrides() const;
-    /** Overrides the terminal blend of the RenderFeature owning this renderer-plan node. */
-    [[nodiscard]] foundation::Result set_render_state_blend(uint32_t node, pipeline::RenderStateBlendMode blend_mode);
-    [[nodiscard]] std::vector<render_graph::RenderStateBlendOverride> render_state_blend_overrides() const;
+    [[nodiscard]] foundation::Result render_frame(uint64_t frame_number, double elapsed_seconds);
+    /**
+     * Explicit executable selection; the complete candidate batch publishes at the next Scene frame.
+     * PreserveActive retains the published graphs when present. SavedStartup reads only the current
+     * project file's saved startup roots and requires a nonempty list; neither policy changes editor drafts.
+     */
+    [[nodiscard]] foundation::Result select_feature_module(const std::filesystem::path& manifest,
+                                                            std::string_view configuration,
+                                                            FeatureGraphLoadPolicy policy = FeatureGraphLoadPolicy::kPreserveActive);
+    /** Replaces one graph within the complete active batch at the next Scene frame. */
+    [[nodiscard]] foundation::Result queue_feature_graph(const feature::FeatureGraphDocument& graph);
+    [[nodiscard]] foundation::ResultValue<runtime::FeatureRuntimeNodeSnapshot> inspect_feature_node(
+        std::string_view asset_uuid, feature::FeatureNodeId node) const;
+    [[nodiscard]] foundation::ResultValue<runtime::FeatureRuntimeExecutionSnapshot> inspect_feature_execution(
+        std::string_view asset_uuid) const;
+    [[nodiscard]] foundation::ResultValue<std::shared_ptr<const EditorRenderGraphSnapshot>> inspect_render_graph() const;
+    /** Publishes the Engine-owned Preview Feature graph at an Edit frame boundary. */
+    [[nodiscard]] foundation::Result publish_renderer_feature_graph(const feature::FeatureGraphDocument& graph);
+    [[nodiscard]] foundation::ResultValue<runtime::FeatureRuntimeExecutionSnapshot> inspect_renderer_feature_execution() const;
+    [[nodiscard]] foundation::Result control_feature_process(const runtime::RuntimeProcessCommand& command);
+    [[nodiscard]] bool feature_publication_pending() const noexcept;
+    /** Restores the Engine-owned Opaque Preview Feature at an Edit frame boundary. */
+    [[nodiscard]] foundation::Result restore_default_renderer_feature();
+    /** Authored project FeatureGraph documents, available before the game module has been built. */
+    [[nodiscard]] std::span<const EditorProjectFeatureGraphDocument> authored_feature_graphs() const noexcept;
+    /** Feature definitions exported by module metadata for FeatureGraph authoring. */
+    [[nodiscard]] const feature::FeatureCatalog& authored_feature_catalog() const noexcept;
+    /** Metadata contract for the currently published executable module, if any. */
+    [[nodiscard]] const feature::FeatureCatalog* active_feature_module_catalog() const noexcept;
+    /** Validates a candidate bundle and returns only its immutable catalog metadata. */
+    [[nodiscard]] foundation::ResultValue<feature::FeatureCatalog> inspect_feature_module_catalog(
+        const std::filesystem::path& manifest) const;
+    [[nodiscard]] std::span<const feature::FeatureDefinitionId> authored_compiled_features() const noexcept;
+    [[nodiscard]] std::span<const NodeContractFile> authored_feature_drafts() const noexcept;
+    /** Catalog-matched editor display names and port labels; never executable metadata. */
+    [[nodiscard]] std::span<const NodeDefinitionDraft> authored_feature_presentations() const noexcept;
+    [[nodiscard]] std::span<const EditorProjectFeatureConflict> authored_feature_conflicts() const noexcept;
     /** @brief Schedules a GPU readback of the next rendered viewport frame. */
     [[nodiscard]] foundation::Result request_viewport_readback();
     /** @brief Returns the most recently requested viewport pixels in RGBA8 order. */
@@ -174,10 +195,8 @@ public:
 
     [[nodiscard]] editor::ImGuiTextureBinding viewport_binding() const noexcept;
     [[nodiscard]] bool viewport_ready() const noexcept;
-    /** @brief True when a render Feature can reach the active Renderer Pipeline Present stage. */
-    [[nodiscard]] bool viewport_present_connected() const noexcept;
     [[nodiscard]] bool viewport_resize_pending() const noexcept;
-    /** @brief Returns draw calls recorded by the current game project's viewport frame. */
+    /** @brief Actual Scene frame draws, including the default Preview before a project is opened. */
     [[nodiscard]] uint32_t draw_call_count() const noexcept;
 
     /** @brief Intersects the edit World mesh bounds with a camera ray. */
@@ -229,6 +248,7 @@ public:
     [[nodiscard]] bool project_loaded() const noexcept;
     [[nodiscard]] std::string_view project_name() const noexcept;
     [[nodiscard]] const std::filesystem::path& project_root() const noexcept;
+    [[nodiscard]] std::filesystem::path project_file() const;
 
     [[nodiscard]] foundation::Result new_scene();
     [[nodiscard]] foundation::Result open_scene(const std::filesystem::path& path);
@@ -252,6 +272,19 @@ public:
     [[nodiscard]] foundation::Result play();
     [[nodiscard]] foundation::Result pause();
     [[nodiscard]] foundation::Result stop();
+    /** Installs an explicit World route batch while in Edit mode; an empty batch clears it. */
+    [[nodiscard]] foundation::Result set_feature_world_bindings(
+        std::span<const EditorFeatureWorldBinding> bindings);
+    /** Returns the current Editor-private Scene routes without exposing mutable storage. */
+    [[nodiscard]] std::span<const EditorFeatureWorldBinding> feature_world_bindings() const noexcept;
+    /** Binds one uniquely published authored command owner to a stable Scene entity. */
+    [[nodiscard]] foundation::Result bind_feature_world_node(
+        std::string_view graph_asset_uuid, feature::FeatureNodeId node, scene::SceneEntityId scene_entity);
+    /** Removes all World routes associated with one authored graph node. */
+    [[nodiscard]] foundation::Result clear_feature_world_node_binding(
+        std::string_view graph_asset_uuid, feature::FeatureNodeId node);
+    /** Captures the committed active Edit/Play World without exposing its mutable ECS owner. */
+    [[nodiscard]] foundation::ResultValue<EditorWorldSnapshot> inspect_active_world_snapshot() const;
 
     /** @brief Undoes the latest committed Edit transaction. */
     [[nodiscard]] foundation::Result undo();

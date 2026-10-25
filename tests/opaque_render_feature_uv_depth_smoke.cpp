@@ -2,6 +2,8 @@
  * @file opaque_render_feature_uv_depth_smoke.cpp
  * @brief Verifies interpolated UV sampling, multi-material meshes, and depth ordering.
  */
+#include "feature_clock_test_fixture.hpp"
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -10,13 +12,23 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string_view>
 
 #include "engine_frame_orchestrator.hpp"
+#include "engine_frame_pipeline_host.hpp"
 #include "material.hpp"
-#include "opaque_render_feature.hpp"
+#include "render_feature_draw.hpp"
+#include "feature_render_test_fixture.hpp"
+#include "render_feature_runtime.hpp"
 #include "pipeline.hpp"
 #include "render_graph.hpp"
+
+#include "../Engine/RenderGraph/private/render_graph_execution.hpp"
+#include "../Engine/RenderGraph/private/render_graph_resource_access.hpp"
+#include "../Engine/Shader/private/shader_pipeline_layout_access.hpp"
 #include "renderer.hpp"
+#include "renderer_variants_internal.hpp"
+#include "render_pass_registry_execution.hpp"
 #include "resource_uploader.hpp"
 #include "rhi.hpp"
 #include "shader_contract.hpp"
@@ -25,10 +37,9 @@
 
 namespace {
 using aeg::foundation::Result;
-using aeg::pipeline::PipelineId;
-using aeg::pipeline::PipelineInstanceId;
+using aeg::feature::RenderDepthAttachment;
+using aeg::feature::RenderAttachmentLoad;
 using aeg::pipeline::PipelineRegistry;
-using aeg::pipeline::PipelineScope;
 using aeg::pipeline::RenderGraphBuffer;
 using aeg::pipeline::RenderGraphTexture;
 using aeg::pipeline::RenderResourceId;
@@ -74,7 +85,6 @@ using aeg::rhi::VertexInputRate;
 
 inline constexpr RenderResourceId kSceneColor{"OpaqueUvDepthSceneColor"};
 inline constexpr RenderResourceId kSceneDepth{"OpaqueUvDepthSceneDepth"};
-inline constexpr aeg::pipeline::FeatureId kReadbackFeatureId{"Renderer.OpaqueUvDepthReadback"};
 constexpr uint32_t kWidth = 96;
 constexpr uint32_t kHeight = 96;
 constexpr std::size_t kReadbackSize = static_cast<std::size_t>(kWidth) * kHeight * 4u;
@@ -83,6 +93,8 @@ constexpr uint32_t kMeshCount = 3;
 constexpr uint32_t kObjectCount = 4;
 constexpr uint32_t kBaseFrameCount = 3;
 constexpr uint32_t kNormalFrameCount = 8;
+// The fixture host owns PSO generation independently of ShaderManager's layout cache.
+constexpr uint64_t kHostMaterialVariantEpoch = 13;
 
 using ObjectResourceFrames =
     std::array<std::array<aeg::renderer::RenderObjectResource, kObjectCount>, kNormalFrameCount>;
@@ -225,70 +237,6 @@ bool require(const Value& condition, const char* message) {
     return {handle.index, handle.generation, handle.graph_id};
 }
 
-struct ReadbackFeature final : public aeg::pipeline::RenderFeature {
-    [[nodiscard]] const aeg::pipeline::FeatureDescriptor& descriptor() const noexcept override {
-        static const aeg::pipeline::FeatureDescriptor descriptor{
-            .id = kReadbackFeatureId,
-            .name = "Renderer.OpaqueUvDepthReadback",
-            .domain = aeg::pipeline::FeatureDomain::kRender,
-            .domain_mask = aeg::pipeline::to_mask(aeg::pipeline::FeatureDomain::kRender),
-            .supported_scopes = aeg::pipeline::to_mask(PipelineScope::kFrame),
-            .version = {1, 0, 0},
-        };
-        return descriptor;
-    }
-
-    [[nodiscard]] Result build_render_graph(aeg::pipeline::RenderGraphBuilder& builder) const override {
-        auto* state = static_cast<SmokeState*>(builder.user_data());
-        if (state == nullptr || state->current_readback >= kNormalFrameCount ||
-            !state->readbacks[state->current_readback].is_valid() ||
-            !state->readback_resources[state->current_readback].is_valid()) {
-            return aeg::foundation::invalid_state("UV/depth readback state is incomplete");
-        }
-        const auto target = builder.find_texture(kSceneColor);
-        if (!target) {
-            return target.result;
-        }
-        const FrameAllocation allocation = state->readbacks[state->current_readback];
-        const RenderGraphBuffer destination = state->readback_resources[state->current_readback];
-        const auto pass = builder.add_graphics_pass(
-            "ReadbackOpaqueUvDepth",
-            [target = target.value, destination, allocation](aeg::pipeline::RenderPassBuilder& pass_builder) {
-                if (const Result result =
-                        pass_builder.read(target, ResourceUsage::kCopySource, PipelineStage::kCopy, ShaderStage::kAll);
-                    !result) {
-                    return result;
-                }
-                if (const Result result = pass_builder.write(
-                        destination, ResourceUsage::kCopyDestination, PipelineStage::kCopy, ShaderStage::kAll,
-                        aeg::pipeline::RenderGraphBufferRange{allocation.offset, kReadbackSize});
-                    !result) {
-                    return result;
-                }
-                pass_builder.set_side_effects();
-                return Result::success();
-            },
-            [target = target.value, destination, allocation](aeg::pipeline::RenderPassExecutionContext& execution) {
-                return execution.copy_texture_to_buffer(
-                    target, TextureSubresourceLayers{aeg::rhi::Aspect::kColor, 0, 0, 1}, Offset3D{0, 0, 0},
-                    Extent3D{kWidth, kHeight, 1}, destination, allocation.offset, 0, 0);
-            });
-        return pass ? Result::success() : pass.result;
-    }
-
-protected:
-    [[nodiscard]] Result setup(aeg::pipeline::RenderGraphBuilder& builder) const override {
-        const auto stage = builder.add_stage({
-            .id = aeg::pipeline::StageId("Renderer.OpaqueUvDepthReadback.Build"),
-            .phase = aeg::pipeline::EnginePhase::kRenderBuild,
-            .execution_domain = aeg::pipeline::ExecutionDomain::kRenderThread,
-            .time_policy = aeg::pipeline::TimePolicy::kFrame,
-            .parallelizable = false,
-        });
-        return stage ? Result::success() : aeg::foundation::invalid_state("UV/depth readback stage failed");
-    }
-};
-
 class UvDepthResolver final : public aeg::renderer::RenderResourceResolver {
 public:
     UvDepthResolver(Device& device, std::array<aeg::renderer::RenderMeshResource, kMeshCount> meshes,
@@ -305,6 +253,7 @@ public:
     void set_invalid_normal(bool invalid) const noexcept { invalid_normal_ = invalid; }
     void set_missing_normal(bool missing) const noexcept { missing_normal_ = missing; }
     void set_invalid_parameters(bool invalid) const noexcept { invalid_parameters_ = invalid; }
+    void set_material_variant_case(uint32_t value) const noexcept { material_variant_case_ = value; }
     void set_lighting(aeg::renderer::RenderLightingResource resource) const noexcept { lighting_ = resource; }
 
     [[nodiscard]] aeg::foundation::ResultValue<aeg::renderer::RenderMeshResource> resolve_mesh(
@@ -341,6 +290,28 @@ public:
             auto resource = materials_[index];
             if (invalid_parameters_) {
                 resource.material_parameter_size = resource.material_parameter_buffer_desc.size + 4u;
+            }
+            if (material_variant_case_ == 1) resource.depth_attachment_variant.reset();
+            if (material_variant_case_ == 2)
+                resource.depth_attachment_variant->attachment_contract.color_format = Format::kBgra8Unorm;
+            if (material_variant_case_ == 3)
+                resource.attachment_contract = resource.depth_attachment_variant->attachment_contract;
+            if (material_variant_case_ == 4) resource.depth_attachment_variant->pipeline = {};
+            if (material_variant_case_ == 5) ++resource.shader_contract.version;
+            if (material_variant_case_ == 6) resource.shader_contract.layout_hash = 0;
+            if (material_variant_case_ == 7) resource.shader_contract.cache_epoch = 0;
+            if (material_variant_case_ == 8) ++resource.depth_attachment_variant->shader_contract.version;
+            if (material_variant_case_ == 9) resource.depth_attachment_variant->shader_contract.layout_hash = 0;
+            if (material_variant_case_ == 10) resource.depth_attachment_variant->shader_contract.cache_epoch = 0;
+            if (material_variant_case_ == 11) ++resource.depth_attachment_variant->shader_contract.cache_epoch;
+            if (material_variant_case_ == 12) resource.depth_attachment_variant->shader_contract.layout_hash ^= 1u;
+            if (material_variant_case_ == 13) ++resource.depth_attachment_variant->cache_epoch;
+            if (material_variant_case_ == 14) resource.variant_cache_epoch = 0;
+            if (material_variant_case_ == 15) resource.shader_contract.layout_hash ^= 1u;
+            if (material_variant_case_ == 16) ++resource.variant_cache_epoch;
+            if (material_variant_case_ == 17) {
+                resource.depth_attachment_variant->shader_contract = {};
+                resource.depth_attachment_variant->cache_epoch = 0;
             }
             ++material_resolve_count;
             return {Result::success(), resource};
@@ -389,6 +360,7 @@ private:
     mutable bool invalid_normal_{false};
     mutable bool missing_normal_{false};
     mutable bool invalid_parameters_{false};
+    mutable uint32_t material_variant_case_{0};
     mutable aeg::renderer::RenderLightingResource lighting_{};
 };
 
@@ -509,27 +481,12 @@ private:
 }
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool depth_load = argc == 2 && std::string_view(argv[1]) == "--depth-load";
+    const bool depth_clear_near = argc == 2 && std::string_view(argv[1]) == "--depth-clear-near";
     static_assert(sizeof(Vertex) == sizeof(float) * 9u);
 
     PipelineRegistry registry;
-    if (!require(aeg::renderer::register_render_pipeline(registry), "UV/depth RenderPipeline registration failed") ||
-        !require(aeg::renderer::register_opaque_render_feature(registry), "UV/depth Opaque registration failed") ||
-        !require(aeg::renderer::bind_opaque_render_feature(registry), "UV/depth Opaque binding failed") ||
-        !require(registry.register_feature([] { return std::make_unique<ReadbackFeature>(); }),
-                 "UV/depth readback feature registration failed") ||
-        !require(registry.bind_feature({
-                     .feature = kReadbackFeatureId,
-                     .pipeline = PipelineId("RenderPipeline"),
-                     .scope = PipelineScope::kFrame,
-                     .point = aeg::pipeline::FeaturePointId("RenderPipeline.Opaque"),
-                     .priority = 1,
-                     .enabled = true,
-                 }),
-                 "UV/depth readback feature binding failed")) {
-        return 1;
-    }
-
     aeg::ecs::WorldManager world_manager;
     const auto world_handle = world_manager.create_world({"OpaqueUvDepthWorld", true});
     if (!require(world_handle, "UV/depth World creation failed")) {
@@ -542,16 +499,10 @@ int main() {
         return 3;
     }
 
-    aeg::world::WorldScope world_scope(world_result.value, registry, {});
+    aeg::world::WorldScope world_scope(world_result.value);
     if (!require(world_scope.initialize(), "UV/depth WorldScope initialization failed")) {
         return 4;
     }
-    aeg::pipeline::PipelineScopeHost frame_host(PipelineScope::kFrame, PipelineInstanceId("OpaqueUvDepthFrame"));
-    if (!require(frame_host.bind_pipeline(PipelineId("RenderPipeline")), "UV/depth pipeline binding failed") ||
-        !require(frame_host.rebuild(registry), "UV/depth pipeline rebuild failed")) {
-        return 5;
-    }
-
     SmokeState smoke_state{};
     aeg::renderer::Renderer renderer;
     const auto extractor =
@@ -751,6 +702,22 @@ int main() {
         return 20;
     }
     PipelineHandle graphics_pipeline = pipeline_result.value;
+    auto color_state = graphics_state;
+    color_state.depth_test_enable = false;
+    color_state.depth_write_enable = false;
+    color_state.depth_stencil_format = Format::kUnknown;
+    const auto color_pipeline_result = shader_manager.create_pipeline(shader_program_result.value, shader_layout,
+        aeg::shader::ShaderPipelineDesc{PipelineType::kGraphics, color_state,
+            DebugName{"Renderer.OpaqueUvDepth.ColorPipeline"}});
+    if (!require(color_pipeline_result, "UV/depth color-only pipeline creation failed")) return 52;
+    const PipelineHandle color_pipeline = color_pipeline_result.value;
+    const aeg::renderer::RenderMaterialShaderContract material_shader_contract{
+        aeg::renderer::kRenderMaterialShaderContractVersion,
+        aeg::shader::detail::ShaderPipelineLayoutAccess::contract_hash(shader_layout),
+        aeg::shader::detail::ShaderPipelineLayoutAccess::cache_epoch(shader_layout)};
+    if (!require(material_shader_contract.is_valid() &&
+                 material_shader_contract.cache_epoch != kHostMaterialVariantEpoch,
+                 "UV/depth fixture requires independent valid Shader and host PSO epochs")) return 52;
 
     std::array<aeg::renderer::RenderMeshResource, kMeshCount> meshes{};
     for (uint32_t index = 0; index < kMeshCount; ++index) {
@@ -777,17 +744,20 @@ int main() {
     std::array<aeg::renderer::RenderMaterialResource, kMaterialCount> material_resources{};
     for (auto& material : material_resources) {
         material.pipeline = graphics_pipeline;
+        material.shader_contract = material_shader_contract;
+        material.variant_cache_epoch = kHostMaterialVariantEpoch;
     }
     UvDepthResolver resolver(*device, meshes, material_resources, object_resources, &smoke_state.frame_index);
 
-    aeg::pipeline::PipelineScheduler scheduler({1, 1, 1, 1});
+    aeg::pipeline::PipelineScheduler scheduler;
+    aeg::engine::EngineFramePipelineHost pipeline_host(registry, scheduler);
     auto frame_context = std::make_unique<aeg::render_graph::FrameContext>(
         *device, aeg::render_graph::FrameContextDesc{8, 4u * 1024u * 1024u, 4u * 1024u * 1024u, 256,
                                                      std::numeric_limits<uint64_t>::max()});
     aeg::render_graph::RenderGraph render_graph(*device);
     std::optional<aeg::engine::EngineFrameOrchestrator> orchestrator;
-    orchestrator.emplace(registry, scheduler, *frame_context, render_graph);
-    if (!require(orchestrator->register_world_frame(world_scope, frame_host, 1),
+    orchestrator.emplace(pipeline_host, *frame_context, render_graph);
+    if (!require(orchestrator->register_world_frame(world_scope, 1),
                  "UV/depth World frame registration failed") ||
         !require(orchestrator->initialize(), "UV/depth orchestrator initialization failed")) {
         return 21;
@@ -814,9 +784,9 @@ int main() {
         return {Result::success(), view};
     };
     frame_desc.render_feature_preparation = [&smoke_state, &resolver, device_ptr = device.get(), material_layout,
-                                             lighting_layout, graphics_pipeline, target_texture, target_view,
+                                             lighting_layout, graphics_pipeline, color_pipeline, target_texture, target_view,
                                              target_desc, depth_texture, depth_view,
-                                             depth_desc](const aeg::engine::EngineFramePreparationContext& context) {
+                                             depth_desc, material_shader_contract](const aeg::engine::EngineFramePreparationContext& context) {
         const auto color_resource =
             context.render_graph.import_texture(target_texture, target_view, target_desc, make_undefined_state());
         if (!color_resource) {
@@ -935,7 +905,7 @@ int main() {
             }
             resolver.set_material(index,
                                   aeg::renderer::RenderMaterialResource{
-                                      .pipeline = graphics_pipeline,
+                                      .pipeline = color_pipeline,
                                       .binding_set = smoke_state.materials[index].material.binding_set,
                                       .binding_group = 1,
                                       .material_texture = to_pipeline_handle(texture_resources[index]),
@@ -944,6 +914,12 @@ int main() {
                                       .material_parameter_resource = to_pipeline_handle(parameter_resources[index]),
                                       .material_parameter_offset = 0,
                                       .material_parameter_size = sizeof(aeg::resource::TextureMaterialParameters),
+                                      .attachment_contract = {Format::kRgba8Unorm, aeg::rhi::SampleCount::kX1, Format::kUnknown},
+                                      .depth_attachment_variant = aeg::renderer::RenderMaterialPipelineVariant{
+                                          graphics_pipeline, {Format::kRgba8Unorm, aeg::rhi::SampleCount::kX1, Format::kD32Float},
+                                          material_shader_contract, {}, kHostMaterialVariantEpoch},
+                                      .shader_contract = material_shader_contract,
+                                      .variant_cache_epoch = kHostMaterialVariantEpoch,
                                   });
         }
 
@@ -1026,6 +1002,198 @@ int main() {
         return Result::success();
     };
 
+    aeg::feature::FeatureRegistry feature_registry{aeg::feature::test::clock_test_host()};
+    aeg::pipeline::RenderPassRegistry native_passes;
+    if (!require(aeg::renderer::register_builtin_render_passes(native_passes), "native depth pass registration failed"))
+        return 50;
+    const aeg::render_graph::RenderPassExecutionHost pass_host{&native_passes,
+        aeg::pipeline::detail::RenderPassRegistryExecution::execution_epoch(native_passes)};
+    aeg::feature::FeatureRuntime feature_runtime(feature_registry);
+    auto source = render_feature_test::definition();
+    source.contract.permissions.capability_mask &= ~(aeg::feature::to_mask(aeg::feature::RenderIntentCapability::kCreateTransient) |
+        aeg::feature::to_mask(aeg::feature::RenderIntentCapability::kCreateHistory));
+    source.execute = [&smoke_state, depth_load, depth_clear_near](const aeg::feature::InvocationToken& token, const aeg::feature::StateSnapshot&,
+                                               std::span<const uint8_t>, std::span<const uint8_t>) {
+        using namespace aeg::feature;
+        const bool load = depth_load && smoke_state.frame_index == 0;
+        RenderDrawScene draw{{RenderResourceId("Depth.Scene"), 1}, {RenderResourceId(kSceneColor.value()), 1, true}};
+        draw.clear_color = {0.f, 0.f, 1.f, 1.f};
+        draw.depth = RenderDepthAttachment{{RenderResourceId(kSceneDepth.value()), 1, true},
+            load ? RenderAttachmentLoad::kLoad : RenderAttachmentLoad::kClear,
+            depth_clear_near && smoke_state.frame_index == 0 ? 0.1f : 1.f};
+        RenderIntent intent{};
+        intent.operations = {draw};
+        if (smoke_state.frame_index == 0 && !depth_load && !depth_clear_near) {
+            auto colour = draw;
+            colour.scene.id = RenderResourceId("BaseColour.Scene");
+            colour.depth.reset();
+            intent.operations.push_back(colour);
+        }
+        intent.final_output = draw.target;
+        StateDelta delta{token.state_version};
+        delta.render_intent = std::move(intent);
+        return aeg::foundation::ResultValue<StateDelta>{Result::success(), std::move(delta)};
+    };
+    if (!require(aeg::feature::test::register_clock_test_definition(feature_registry, source), "depth Feature registration failed")) return 50;
+    auto document = render_feature_test::document(source);
+    document.nodes.resize(1);
+    auto compiled = aeg::feature::FeatureGraphCompiler{}.compile(document, feature_registry);
+    if (!require(compiled, "depth Feature compile failed") ||
+        !require(feature_runtime.publish_graph(document, compiled.value), "depth Feature publication failed")) return 51;
+    frame_desc.render_feature_post_build = [&](const aeg::engine::EngineFramePostBuildContext& context) {
+        using namespace aeg::feature;
+        if (context.render_scenes.size() != 1) return aeg::foundation::invalid_state("depth scene missing");
+        if (const auto result = feature_runtime.tick(source.contract.clock.id); !result) return result;
+        const auto captured = feature_runtime.capture_render_outputs(compiled.value);
+        if (!captured) return captured.result;
+        auto base_colour_resolver = resolver;
+        base_colour_resolver.set_material_variant_case(17);
+        const std::array scenes{
+            aeg::renderer::RenderFeatureSceneBinding{RenderResourceId("Depth.Scene"), 1, {}, context.render_scenes.front(), &resolver},
+            aeg::renderer::RenderFeatureSceneBinding{RenderResourceId("BaseColour.Scene"), 1, {}, context.render_scenes.front(), &base_colour_resolver}};
+        aeg::renderer::RenderFeatureDrawLowerer lowerer(scenes, pass_host);
+        const auto depth_binding = std::find_if(context.feature_textures.begin(), context.feature_textures.end(),
+            [](const auto& binding) { return binding.id == kSceneDepth; });
+        const auto color_binding = std::find_if(context.feature_textures.begin(), context.feature_textures.end(),
+            [](const auto& binding) { return binding.id == kSceneColor; });
+        if (depth_binding == context.feature_textures.end() || color_binding == context.feature_textures.end())
+            return aeg::foundation::invalid_state("depth fixture binding missing");
+        if (smoke_state.frame_index == 0) {
+            // Native allocation is unnecessary: rejected descriptors never reach graph execution.
+            std::array<aeg::render_graph::RenderGraphTexture, 7> incompatible_depths{};
+            for (uint32_t index = 0; index < incompatible_depths.size(); ++index) {
+                auto description = depth_desc;
+                switch (index) {
+                    case 0: description.format = Format::kRgba8Unorm;
+                            description.capabilities = TextureCapability::kColorAttachment; break;
+                    case 1: description.capabilities = TextureCapability::kTransferDestination; break;
+                    case 2: description.mip_levels = 2; break;
+                    case 3: description.array_layers = 2; break;
+                    case 4: description.samples = aeg::rhi::SampleCount::kX4; break;
+                    case 5: ++description.extent.width; break;
+                    case 6: description.dimension = aeg::rhi::TextureDimension::kTex3D;
+                            description.extent.depth = 2; break;
+                }
+                const auto texture = context.render_graph.create_texture(description);
+                if (!texture) return texture.result;
+                incompatible_depths[index] = texture.value;
+            }
+            if (const auto r = context.render_graph.compile(); !r) return r;
+            const auto baseline = aeg::render_graph::detail::RenderGraphExecution::compile_info(context.render_graph);
+            for (uint32_t case_index = 0; case_index < 36; ++case_index) {
+                const uint32_t test_case = case_index < 12 ? case_index + 24 : case_index - 12;
+                auto rejected_outputs = captured.value;
+                auto& output = rejected_outputs.front();
+                auto draw = std::get<RenderDrawScene>(output.intent.operations.front());
+                draw.depth->target.id = RenderResourceId("Invalid.Depth");
+                auto bindings = std::vector<aeg::render_graph::RenderGraphFeatureTextureBinding>(
+                    context.feature_textures.begin(), context.feature_textures.end());
+                bindings.push_back({aeg::pipeline::RenderResourceId(draw.depth->target.id.value()), depth_binding->texture});
+                auto invalid_resolver = resolver;
+                auto invalid_scenes = std::vector<aeg::renderer::RenderFeatureSceneBinding>(scenes.begin(), scenes.end());
+                const auto material_case = test_case >= 19 && test_case < 23 ? test_case - 18
+                    : test_case >= 24 ? test_case - 19 : 0;
+                if (material_case != 0) {
+                    invalid_resolver.set_material_variant_case(material_case);
+                    draw.scene.id = RenderResourceId("Invalid.Material.Scene");
+                    invalid_scenes.push_back({draw.scene.id, 1, {}, context.render_scenes.front(), &invalid_resolver});
+                }
+                switch (test_case) {
+                    case 0: bindings.pop_back(); break;
+                    case 1: ++draw.depth->target.version; break;
+                    case 2: bindings.back().owner = FeatureInstanceId(output.instance_id.value() + 100); break;
+                    case 3: bindings.push_back(bindings.back()); break;
+                    case 4: draw.depth->target.id = draw.target.id; break;
+                    case 5: draw.depth->target.external = false; break;
+                    case 6: draw.depth->clear_depth = -0.1f; break;
+                    case 7: draw.depth->clear_depth = std::numeric_limits<float>::quiet_NaN(); break;
+                    case 8: draw.depth->clear_depth = 1.1f; break;
+                    case 9: draw.depth->load = static_cast<RenderAttachmentLoad>(99); break;
+                    case 10: output.contract.permissions.capability_mask &= ~to_mask(RenderIntentCapability::kWriteExternal); break;
+                    case 11: output.contract.permissions.capability_mask &= ~to_mask(RenderIntentCapability::kReadExternal);
+                             draw.depth->load = RenderAttachmentLoad::kLoad; break;
+                    default:
+                        if (test_case < 19) bindings.back().texture = incompatible_depths[test_case - 12];
+                        else if (test_case == 23) bindings.back().texture = color_binding->texture;
+                        break;
+                }
+                output.intent.operations.push_back(draw);
+                aeg::renderer::RenderFeatureDrawLowerer invalid_lowerer(invalid_scenes, pass_host);
+                const auto mesh_calls = invalid_resolver.mesh_resolve_count;
+                const auto object_calls = invalid_resolver.object_resolve_count;
+                const auto rejected = aeg::render_graph::build_render_graph_features(context.render_graph,
+                    std::make_shared<const std::vector<RenderFeatureOutput>>(std::move(rejected_outputs)),
+                    {.textures = bindings, .draw_lowerer = &invalid_lowerer}, context.frame_context.frame_number());
+                if (rejected) {
+                    std::cerr << "depth invalid case accepted: " << test_case << '\n';
+                    return aeg::foundation::invalid_state("depth draw accepted an incompatible binding or material");
+                }
+                if (material_case != 0 &&
+                    (invalid_resolver.mesh_resolve_count != mesh_calls || invalid_resolver.object_resolve_count != object_calls)) {
+                    std::cerr << "invalid material selection consumed mesh/object resources: " << material_case << '\n';
+                    return aeg::foundation::invalid_state("rejected material selection caused resource resolution");
+                }
+                if (const auto r = context.render_graph.compile(); !r) return r;
+                if (aeg::render_graph::detail::RenderGraphExecution::compile_info(context.render_graph).pass_count != baseline.pass_count ||
+                    aeg::render_graph::detail::RenderGraphExecution::compile_info(context.render_graph).resource_count != baseline.resource_count)
+                    return aeg::foundation::invalid_state("rejected depth draw leaked partial graph changes");
+            }
+        }
+        const bool load = depth_load && smoke_state.frame_index == 0;
+        if (load) {
+            const auto seed = context.render_graph.add_pass("Host.SeedDepth", QueueClass::kGraphics,
+                [target = depth_binding->texture](aeg::render_graph::PassBuilder& pass) {
+                    return pass.use_depth_stencil_attachment(target, aeg::rhi::LoadOp::kClear,
+                        aeg::rhi::StoreOp::kStore, 0.1f);
+                }, [](aeg::render_graph::PassExecutionContext& command) {
+                    if (const auto r = command.begin_rendering(); !r) return r;
+                    return command.end_rendering();
+                });
+            if (!seed) return seed.result;
+        }
+        const auto outputs = std::make_shared<const std::vector<RenderFeatureOutput>>(captured.value);
+        if (const auto r = aeg::render_graph::build_render_graph_features(context.render_graph, outputs,
+            {.textures = context.feature_textures, .draw_lowerer = &lowerer}, context.frame_context.frame_number()); !r) return r;
+        if (const auto r = context.render_graph.compile(); !r) return r;
+        bool tagged_draw = false;
+        bool live_base_colour = false;
+        bool depth_discard = false;
+        for (const auto& pass : aeg::render_graph::detail::RenderGraphExecution::plan(context.render_graph).pass_plans) {
+            if (!pass.feature_work) continue;
+            const auto& work = *pass.feature_work;
+            const auto& output = outputs->front();
+            if (work.feature_definition_id != source.id || work.node_id != output.node_id ||
+                work.instance_id != output.instance_id || work.invocation.invocation_id != output.invocation.invocation_id ||
+                work.owner_module != source.owner_module || work.frame_index != context.frame_context.frame_number())
+                return aeg::foundation::invalid_state("depth Draw provenance missing");
+            tagged_draw = true;
+            live_base_colour |= pass.live && work.operation_index == 1;
+            for (const auto& barrier : pass.barriers)
+                if (barrier.resource_kind == aeg::render_graph::RenderGraphResourceKind::kTexture &&
+                    barrier.resource_index == depth_binding->texture.index)
+                    depth_discard |= barrier.discard_contents;
+        }
+        if (!tagged_draw || (load && depth_discard))
+            return aeg::foundation::invalid_state("depth Draw provenance or Load preservation missing");
+        if (smoke_state.frame_index == 0 && !depth_load && !depth_clear_near && !live_base_colour)
+            return aeg::foundation::invalid_state("base colour draw with an unused invalid optional variant was not live");
+        const auto allocation = smoke_state.readbacks[smoke_state.current_readback];
+        const auto destination = smoke_state.readback_resources[smoke_state.current_readback];
+        const aeg::render_graph::RenderGraphBuffer buffer{destination.index, destination.generation, destination.graph_id};
+        const auto pass = context.render_graph.add_pass("ReadbackFeatureDepth", QueueClass::kGraphics,
+            [target = color_binding->texture, buffer, allocation](aeg::render_graph::PassBuilder& pass) {
+                if (const auto r = pass.read(target, ResourceUsage::kCopySource, PipelineStage::kCopy); !r) return r;
+                if (const auto r = pass.write(buffer, ResourceUsage::kCopyDestination, PipelineStage::kCopy,
+                    ShaderStage::kAll, {allocation.offset, kReadbackSize}); !r) return r;
+                pass.set_side_effects();
+                return Result::success();
+            }, [target = color_binding->texture, buffer, allocation](aeg::render_graph::PassExecutionContext& command) {
+                return command.copy_texture_to_buffer(target, {aeg::rhi::Aspect::kColor, 0, 0, 1}, {},
+                    {kWidth, kHeight, 1}, buffer, allocation.offset, 0, 0);
+            });
+        return pass.result;
+    };
+
     for (uint32_t frame = 0; frame < kBaseFrameCount; ++frame) {
         smoke_state.frame_index = frame;
         const Result frame_result = orchestrator->run_frame(frame_desc);
@@ -1048,7 +1216,11 @@ int main() {
         }
     }
     const std::array<std::pair<uint32_t, uint32_t>, 4> quad_probe_positions{{{14, 16}, {34, 16}, {14, 36}, {34, 36}}};
-    for (uint32_t probe = 0; probe < quad_probe_positions.size(); ++probe) {
+    if ((depth_load || depth_clear_near) && count_rgb(pixels[0], 0, kWidth, 0, kHeight, {0, 0, 255}) != kWidth * kHeight) {
+        std::cerr << "neutral depth Load/Clear did not use the specified near depth\n";
+        return 52;
+    }
+    for (uint32_t probe = 0; !depth_load && !depth_clear_near && probe < quad_probe_positions.size(); ++probe) {
         const auto [x, y] = quad_probe_positions[probe];
         const std::array<uint32_t, 4> normal_texels{2, 3, 0, 1};
         if (!require(near_rgb(pixel_rgb(pixels[0], x, y + 48), expected_material_pixel(0, probe)),
@@ -1120,7 +1292,8 @@ int main() {
         return 34;
     }
     render_graph.reset();
-    if (!require(!render_graph.contains_texture(stale_resource.value), "UV/depth stale handle was accepted")) {
+    if (!require(!aeg::render_graph::detail::RenderGraphResourceAccess::contains_texture(render_graph, stale_resource.value),
+                 "UV/depth stale handle was accepted")) {
         return 35;
     }
 
@@ -1214,6 +1387,7 @@ int main() {
     }
     (void)device->destroy_buffer(index_buffer);
     (void)device->destroy_pipeline(graphics_pipeline);
+    (void)device->destroy_pipeline(color_pipeline);
     (void)device->destroy_texture_view(depth_view);
     (void)device->destroy_texture(depth_texture);
     (void)device->destroy_texture_view(target_view);

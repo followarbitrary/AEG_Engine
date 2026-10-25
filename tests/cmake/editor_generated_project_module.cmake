@@ -1,0 +1,128 @@
+cmake_minimum_required(VERSION 3.25)
+if(NOT DEFINED FIXTURE OR NOT DEFINED ENGINE_DIR OR NOT DEFINED TEST_ROOT)
+    message(FATAL_ERROR "Generated project module verification requires FIXTURE, ENGINE_DIR and TEST_ROOT")
+endif()
+get_filename_component(ENGINE_DIR "${ENGINE_DIR}" ABSOLUTE)
+get_filename_component(TEST_ROOT "${TEST_ROOT}" ABSOLUTE)
+get_filename_component(root_name "${TEST_ROOT}" NAME)
+if(NOT root_name STREQUAL "editor-generated-project-module")
+    message(FATAL_ERROR "Unexpected generated project module fixture root: ${TEST_ROOT}")
+endif()
+# Only the explicitly named absolute fixture root is removed; existing cold
+# suite fixtures and engine source remain outside this directory.
+file(REMOVE_RECURSE "${TEST_ROOT}")
+file(MAKE_DIRECTORY "${TEST_ROOT}")
+set(PROJECT_ROOT "${TEST_ROOT}/Source Project")
+set(BUILD_ROOT "${TEST_ROOT}/Build")
+execute_process(COMMAND "${FIXTURE}" --write-project "${TEST_ROOT}"
+    RESULT_VARIABLE written OUTPUT_VARIABLE writer_output ERROR_VARIABLE writer_error TIMEOUT 30)
+file(WRITE "${TEST_ROOT}/writer.log" "${writer_output}\n${writer_error}")
+if(NOT "${written}" STREQUAL "0" OR NOT writer_output MATCHES "GENERATED_PROJECT_UI_WRITTEN" OR
+   EXISTS "${PROJECT_ROOT}/ModuleBundle" OR EXISTS "${BUILD_ROOT}")
+    message(FATAL_ERROR "Actual UI did not generate a fresh source-only project: ${written}\n${writer_output}\n${writer_error}")
+endif()
+file(GLOB generated_files LIST_DIRECTORIES true "${PROJECT_ROOT}/Source/FlowGraph/*")
+list(LENGTH generated_files generated_count)
+if(NOT generated_count EQUAL 4)
+    message(FATAL_ERROR "Actual UI must leave exactly four generated outputs, got ${generated_count}")
+endif()
+file(GLOB_RECURSE protected_files LIST_DIRECTORIES false RELATIVE "${PROJECT_ROOT}"
+    "${PROJECT_ROOT}/Source/*" "${PROJECT_ROOT}/*.aegproj")
+list(APPEND protected_files CMakeLists.txt)
+list(SORT protected_files)
+foreach(source IN LISTS protected_files)
+    file(SHA256 "${PROJECT_ROOT}/${source}" before_${source})
+endforeach()
+set(ENV{CMAKE_BUILD_PARALLEL_LEVEL} "4")
+execute_process(COMMAND "${CMAKE_COMMAND}" -S "${PROJECT_ROOT}" -B "${BUILD_ROOT}"
+        "-DENGINE_DIR=${ENGINE_DIR}" -DAEG_BUILD_EDITOR=OFF -DAEG_BUILD_TESTS=OFF -DAEG_BUILD_TOOLS=ON
+        -DCMAKE_BUILD_TYPE=Debug
+    RESULT_VARIABLE configured OUTPUT_VARIABLE configure_output ERROR_VARIABLE configure_error TIMEOUT 180)
+file(WRITE "${TEST_ROOT}/configure.log" "${configure_output}\n${configure_error}")
+if(NOT "${configured}" STREQUAL "0")
+    message(FATAL_ERROR "Actual generated GameSDK project configure failed: ${configured}\n${configure_output}\n${configure_error}")
+endif()
+execute_process(COMMAND "${CMAKE_COMMAND}" --build "${BUILD_ROOT}" --config Debug
+        --target GeneratedProjectModuleTarget --parallel 4
+    RESULT_VARIABLE built OUTPUT_VARIABLE build_output ERROR_VARIABLE build_error TIMEOUT 300)
+file(WRITE "${TEST_ROOT}/build.log" "${build_output}\n${build_error}")
+if(NOT "${built}" STREQUAL "0")
+    message(FATAL_ERROR "Actual generated GameSDK DLL build failed: ${built}\n${build_output}\n${build_error}")
+endif()
+set(BUNDLE "${PROJECT_ROOT}/ModuleBundle")
+foreach(required module.manifest.json module.metadata.json)
+    if(NOT EXISTS "${BUNDLE}/${required}")
+        message(FATAL_ERROR "Generated project Module bundle is incomplete: ${required}")
+    endif()
+endforeach()
+file(READ "${BUNDLE}/module.manifest.json" manifest)
+string(JSON binary_name GET "${manifest}" binary_path)
+string(JSON metadata_name GET "${manifest}" metadata_path)
+string(JSON binary_digest GET "${manifest}" binary_sha256)
+string(JSON metadata_digest GET "${manifest}" metadata_sha256)
+if(IS_ABSOLUTE "${binary_name}" OR binary_name MATCHES "(^|[/\\])\.\.([/\\]|$)" OR
+   IS_ABSOLUTE "${metadata_name}" OR metadata_name MATCHES "(^|[/\\])\.\.([/\\]|$)" OR
+   NOT EXISTS "${BUNDLE}/${binary_name}" OR NOT EXISTS "${BUNDLE}/${metadata_name}")
+    message(FATAL_ERROR "Generated project manifest must reference its own staged DLL and metadata")
+endif()
+file(SHA256 "${BUNDLE}/${binary_name}" actual_binary_digest)
+file(SHA256 "${BUNDLE}/${metadata_name}" actual_metadata_digest)
+file(SHA256 "${BUNDLE}/module.manifest.json" good_manifest_digest)
+if(NOT actual_binary_digest STREQUAL binary_digest OR NOT actual_metadata_digest STREQUAL metadata_digest)
+    message(FATAL_ERROR "Generated project staged content does not match the official manifest digests")
+endif()
+set(METADATA_TOOL "")
+foreach(candidate "${BUILD_ROOT}/aeg-engine/Debug/aeg_module_metadata_tool.exe"
+        "${BUILD_ROOT}/aeg-engine/aeg_module_metadata_tool.exe"
+        "${BUILD_ROOT}/aeg-engine/aeg_module_metadata_tool")
+    if(EXISTS "${candidate}")
+        set(METADATA_TOOL "${candidate}")
+        break()
+    endif()
+endforeach()
+if(METADATA_TOOL STREQUAL "")
+    message(FATAL_ERROR "Cold GameSDK build did not produce the official metadata tool")
+endif()
+# The negative bundle is separately published by the production metadata tool.
+# It uses the exact successful DLL and internally valid, different contracts.
+set(NEGATIVE_ROOT "${TEST_ROOT}/MismatchBundle")
+file(MAKE_DIRECTORY "${NEGATIVE_ROOT}")
+get_filename_component(binary_filename "${binary_name}" NAME)
+file(COPY "${BUNDLE}/${binary_name}" DESTINATION "${NEGATIVE_ROOT}")
+execute_process(COMMAND "${METADATA_TOOL}" --module "${NEGATIVE_ROOT}/${binary_filename}"
+        --metadata "${PROJECT_ROOT}/Source/MismatchedModule.metadata.json"
+        --output "${NEGATIVE_ROOT}/module.metadata.json" --manifest "${NEGATIVE_ROOT}/module.manifest.json"
+        --build-id generated-ui --target GeneratedProjectModuleFixture --config Debug
+    RESULT_VARIABLE mismatched OUTPUT_VARIABLE mismatch_output ERROR_VARIABLE mismatch_error TIMEOUT 30)
+file(WRITE "${TEST_ROOT}/mismatched-metadata.log" "${mismatch_output}\n${mismatch_error}")
+if(NOT "${mismatched}" STREQUAL "0")
+    message(FATAL_ERROR "Official negative metadata publication failed: ${mismatched}\n${mismatch_output}\n${mismatch_error}")
+endif()
+execute_process(COMMAND "${FIXTURE}" --verify-module "${TEST_ROOT}"
+    WORKING_DIRECTORY "${TEST_ROOT}"
+    RESULT_VARIABLE verified OUTPUT_VARIABLE verify_output ERROR_VARIABLE verify_error TIMEOUT 30)
+file(WRITE "${TEST_ROOT}/verify.log" "${verify_output}\n${verify_error}")
+if(NOT "${verified}" STREQUAL "0" OR NOT verify_output MATCHES "GENERATED_PROJECT_MODULE_COMPLETE")
+    message(FATAL_ERROR "Actual generated DLL import/callback verification failed: ${verified}\n${verify_output}\n${verify_error}")
+endif()
+file(GLOB_RECURSE after_files LIST_DIRECTORIES false RELATIVE "${PROJECT_ROOT}"
+    "${PROJECT_ROOT}/Source/*" "${PROJECT_ROOT}/*.aegproj")
+list(APPEND after_files CMakeLists.txt)
+list(SORT after_files)
+if(NOT after_files STREQUAL protected_files)
+    message(FATAL_ERROR "Generated project source inventory changed during cold build or DLL verification")
+endif()
+foreach(source IN LISTS protected_files)
+    file(SHA256 "${PROJECT_ROOT}/${source}" actual_source_digest)
+    if(NOT "${before_${source}}" STREQUAL "${actual_source_digest}")
+        message(FATAL_ERROR "Generated project source changed during build/verification: ${source}")
+    endif()
+endforeach()
+file(SHA256 "${BUNDLE}/module.manifest.json" final_manifest_digest)
+file(SHA256 "${BUNDLE}/${metadata_name}" final_metadata_digest)
+file(SHA256 "${BUNDLE}/${binary_name}" final_binary_digest)
+if(NOT good_manifest_digest STREQUAL final_manifest_digest OR NOT metadata_digest STREQUAL final_metadata_digest OR
+   NOT binary_digest STREQUAL final_binary_digest)
+    message(FATAL_ERROR "Negative verification changed the successful generated Module bundle")
+endif()
+message(STATUS "Actual UI generated a project-owned Feature; explicit CMake/registration/metadata built a cold GameSDK DLL with identical contracts and a rejected mismatch")

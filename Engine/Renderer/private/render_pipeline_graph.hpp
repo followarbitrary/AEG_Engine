@@ -2,6 +2,7 @@
 #pragma once
 
 #include "pipeline.hpp"
+#include "render_feature_context.hpp"
 #include "renderer.hpp"
 
 namespace aeg::renderer {

@@ -8,6 +8,8 @@
 
 #include "frame_context.hpp"
 #include "render_graph.hpp"
+
+#include "../Engine/RenderGraph/private/render_graph_execution.hpp"
 #include "rhi.hpp"
 
 namespace {
@@ -199,9 +201,9 @@ int main() {
         });
     assert(ordinary_present_pass_result);
     assert(ordinary_present_graph.compile());
-    assert(ordinary_present_graph.plan().batches.size() == 1);
-    assert(!ordinary_present_graph.plan().batches.front().submits_frame);
-    assert(!ordinary_present_graph.plan().batches.front().waits_for_acquire);
+    assert(aeg::render_graph::detail::RenderGraphExecution::plan(ordinary_present_graph).batches.size() == 1);
+    assert(!aeg::render_graph::detail::RenderGraphExecution::plan(ordinary_present_graph).batches.front().submits_frame);
+    assert(!aeg::render_graph::detail::RenderGraphExecution::plan(ordinary_present_graph).batches.front().waits_for_acquire);
 
     first_graph.reset();
     second_graph.reset();

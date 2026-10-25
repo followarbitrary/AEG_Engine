@@ -3,7 +3,9 @@ project(AEG_Engine LANGUAGES CXX)
 enable_language(C)
 if (MSVC)
     add_compile_options(/FS)
-    set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /FS" CACHE STRING "" FORCE)
+    if (NOT CMAKE_CXX_FLAGS_DEBUG MATCHES "(^|[ \t])/FS($|[ \t])")
+        set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /FS" CACHE STRING "" FORCE)
+    endif()
 endif()
 
 # Standalone engine builds retain the historical developer-friendly defaults.
@@ -32,8 +34,6 @@ option(AEG_VULKAN_ENABLE_VALIDATION "Compile Vulkan validation-layer support" ${
 option(AEG_VULKAN_ENABLE_DEBUG_UTILS "Compile Vulkan debug-utils support" ${AEG_RHI_ENABLE_DEBUG})
 option(AEG_VULKAN_ENABLE_DEBUG_NAMES "Compile Vulkan object debug-name support" ${AEG_RHI_ENABLE_DEBUG_NAMES})
 option(AEG_MATH_ENABLE_SIMD "Enable the x86 SSE2 math implementation when available" ON)
-option(AEG_EDITOR_ENABLE_BUILTIN_PIPELINE_DEBUG
-    "Expose the editable Built-in / Editor UI pipeline in an explicit Debug build" ON)
 
 set(AEG_LOG_COMPILE_LEVEL "Auto" CACHE STRING
     "Compile-time minimum log level (Auto, Trace, Debug, Info, Notice, Warning, Error, Critical, Off)")
@@ -203,7 +203,11 @@ target_link_libraries(aeg_math_smoke PRIVATE aeg_math)
 endif()
 
 add_library(aeg_foundation STATIC
+    Engine/Foundation/public/asset_identity.hpp
+    Engine/Foundation/public/parameter_value.hpp
+    Engine/Foundation/public/stable_id.hpp
     Engine/Foundation/private/result.cpp
+    Engine/Foundation/private/asset_identity.cpp
 )
 target_compile_features(aeg_foundation PUBLIC cxx_std_20)
 target_include_directories(aeg_foundation
@@ -263,20 +267,37 @@ add_custom_command(
 )
 add_custom_target(aeg_cooked_asset_schema DEPENDS "${AEG_COOKED_ASSET_GENERATED_HEADER}")
 
+add_library(aeg_application_authoring STATIC
+    Application/Authoring/public/feature_graph_io.hpp
+    Application/Authoring/private/feature_graph_io.cpp
+    Application/Authoring/private/feature_graph_source_storage.cpp
+)
+target_compile_features(aeg_application_authoring PUBLIC cxx_std_20)
+target_include_directories(aeg_application_authoring
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/Application/Authoring/public
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Feature/public
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/toml11/include
+)
+target_link_libraries(aeg_application_authoring PUBLIC aeg_foundation aeg_feature)
+
+if (MSVC)
+    target_compile_options(aeg_application_authoring PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(aeg_application_authoring PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
 add_library(aeg_application_project STATIC
     Application/Project/private/project_context.cpp
     Application/Project/private/project_scaffold.cpp
-    Application/Project/private/pipeline_document_io.cpp
 )
 target_compile_features(aeg_application_project PUBLIC cxx_std_20)
 target_include_directories(aeg_application_project
-    PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}/Application/Project/public
-    PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Pipeline/public
-        ${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/toml11/include
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/Application/Project/public
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/toml11/include
 )
-target_link_libraries(aeg_application_project PUBLIC aeg_foundation aeg_pipeline)
+target_link_libraries(aeg_application_project PUBLIC aeg_foundation)
 target_compile_definitions(aeg_application_project PRIVATE
     AEG_PROJECT_TEMPLATE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/Application/Project/templates/game")
 
@@ -302,115 +323,187 @@ if (AEG_BUILD_TESTS)
 add_executable(aeg_project_scaffold_smoke
     tests/project_scaffold_smoke.cpp
 )
-target_link_libraries(aeg_project_scaffold_smoke PRIVATE aeg_application_project aeg_scene)
-add_executable(aeg_pipeline_document_io_smoke
-    tests/pipeline_document_io_smoke.cpp
-)
-target_link_libraries(aeg_pipeline_document_io_smoke PRIVATE aeg_application_project)
+target_link_libraries(aeg_project_scaffold_smoke PRIVATE aeg_application_project aeg_application_authoring aeg_scene)
 if (MSVC)
     target_compile_options(aeg_project_scaffold_smoke PRIVATE /W4 /permissive-)
-    target_compile_options(aeg_pipeline_document_io_smoke PRIVATE /W4 /permissive-)
 else()
     target_compile_options(aeg_project_scaffold_smoke PRIVATE -Wall -Wextra -Wpedantic)
-    target_compile_options(aeg_pipeline_document_io_smoke PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 endif()
 endif()
 
 if (AEG_BUILD_TOOLS OR AEG_BUILD_EDITOR)
-add_library(aeg_editor_composition_model STATIC
-    Application/Editor/private/composition/editor_composition_document.cpp
-    Application/Editor/private/composition/editor_composition_catalog.cpp
-    Application/Editor/private/composition/editor_composition_view.cpp
-    Application/Editor/private/composition/editor_composition_commands.cpp
-    Application/Editor/private/composition/editor_composition_storage.cpp
-    Application/Editor/private/composition/editor_composition_operations.cpp
-    Application/Editor/private/composition/editor_composition_preview.cpp
+add_library(aeg_editor_feature_model STATIC
+    Application/Editor/private/feature_process_editor.hpp
+    Application/Editor/private/feature_process_editor.cpp
+    Application/Editor/private/composition/editor_feature_graph_model.cpp
+    Application/Editor/private/composition/editor_feature_graph_preview.hpp
+    Application/Editor/private/composition/editor_feature_graph_preview.cpp
+    Application/Editor/private/composition/editor_feature_catalog_diff.cpp
+    Application/Editor/private/composition/editor_feature_graph_document.cpp
+    Application/Editor/private/composition/editor_feature_graph_panel.cpp
+    Application/Editor/private/composition/editor_feature_graph_canvas.hpp
+    Application/Editor/private/composition/editor_feature_graph_canvas.cpp
+    Application/Editor/private/composition/editor_feature_graph_layout.hpp
+    Application/Editor/private/composition/editor_feature_graph_layout.cpp
+    Application/Editor/private/composition/editor_process_graph_canvas.cpp
+    Application/Editor/private/composition/editor_render_graph_inspection.cpp
+    Application/Editor/private/composition/editor_feature_definition_panel.cpp
+    Application/Editor/private/composition/editor_feature_implementation_resolver.cpp
+    Application/Editor/private/composition/editor_parameter_widget.hpp
     Application/Editor/private/composition/editor_custom_node_workflow.cpp
     Application/Editor/private/composition/editor_node_definition.cpp
     Application/Editor/private/composition/editor_node_contract_storage.cpp
     Application/Editor/private/composition/editor_node_definition_service.cpp
 )
-target_compile_features(aeg_editor_composition_model PUBLIC cxx_std_20)
-target_include_directories(aeg_editor_composition_model
-    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private/composition
-           ${CMAKE_CURRENT_SOURCE_DIR}/Application/EditorFramework/public
+target_compile_features(aeg_editor_feature_model PUBLIC cxx_std_20)
+target_include_directories(aeg_editor_feature_model
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/Application/EditorFramework/public
            ${CMAKE_CURRENT_SOURCE_DIR}/Application/Tooling/public
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Pipeline/public)
-target_include_directories(aeg_editor_composition_model PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/nlohmann/json/include)
-target_link_libraries(aeg_editor_composition_model PUBLIC aeg_application_project aeg_pipeline aeg_engine)
+           ${CMAKE_CURRENT_SOURCE_DIR}/Application/Authoring/public
+           ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Feature/public)
+target_include_directories(aeg_editor_feature_model PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private/composition
+    ${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/nlohmann/json/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Runtime/private)
+target_link_libraries(aeg_editor_feature_model PUBLIC aeg_application_project aeg_application_authoring aeg_feature aeg_feature_runtime_host)
+target_link_libraries(aeg_editor_feature_model PRIVATE aeg_render_graph)
 if (MSVC)
-    target_compile_options(aeg_editor_composition_model PRIVATE /W4 /permissive-)
+    target_compile_options(aeg_editor_feature_model PRIVATE /W4 /permissive-)
 else()
-    target_compile_options(aeg_editor_composition_model PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(aeg_editor_feature_model PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
 if (AEG_BUILD_TESTS)
-add_executable(aeg_editor_composition_history_smoke tests/editor_composition_history_smoke.cpp)
-target_link_libraries(aeg_editor_composition_history_smoke PRIVATE aeg_editor_composition_model)
-add_executable(aeg_editor_composition_palette_smoke tests/editor_composition_palette_smoke.cpp)
-target_link_libraries(aeg_editor_composition_palette_smoke PRIVATE aeg_editor_composition_model)
-add_executable(aeg_editor_composition_view_smoke tests/editor_composition_view_smoke.cpp)
-target_link_libraries(aeg_editor_composition_view_smoke PRIVATE aeg_editor_composition_model)
-add_executable(aeg_editor_composition_commands_smoke tests/editor_composition_commands_smoke.cpp)
-target_link_libraries(aeg_editor_composition_commands_smoke PRIVATE aeg_editor_composition_model)
-add_executable(aeg_editor_composition_storage_smoke tests/editor_composition_storage_smoke.cpp)
-target_link_libraries(aeg_editor_composition_storage_smoke PRIVATE aeg_editor_composition_model)
-add_executable(aeg_editor_composition_operations_smoke tests/editor_composition_operations_smoke.cpp)
-target_link_libraries(aeg_editor_composition_operations_smoke PRIVATE aeg_editor_composition_model)
-add_executable(aeg_editor_composition_preview_smoke tests/editor_composition_preview_smoke.cpp)
-target_link_libraries(aeg_editor_composition_preview_smoke PRIVATE aeg_editor_composition_model)
+add_executable(aeg_editor_feature_graph_smoke tests/editor_feature_graph_smoke.cpp)
+add_executable(aeg_editor_feature_graph_preview_smoke tests/editor_feature_graph_preview_smoke.cpp)
+target_link_libraries(aeg_editor_feature_graph_preview_smoke PRIVATE aeg_editor_feature_model aeg_feature)
+target_include_directories(aeg_editor_feature_graph_preview_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private/composition)
+add_executable(aeg_editor_feature_palette_clock_smoke tests/editor_feature_palette_clock_smoke.cpp)
+target_link_libraries(aeg_editor_feature_palette_clock_smoke PRIVATE aeg_editor_feature_model aeg_feature)
+target_include_directories(aeg_editor_feature_palette_clock_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private/composition)
+add_executable(aeg_editor_feature_palette_clock_ui_smoke tests/editor_feature_palette_clock_ui_smoke.cpp)
+target_link_libraries(aeg_editor_feature_palette_clock_ui_smoke PRIVATE aeg_editor_feature_model aeg_feature)
+target_include_directories(aeg_editor_feature_palette_clock_ui_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private/composition
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Runtime/private)
+add_executable(aeg_editor_feature_edge_constraints_ui_smoke tests/editor_feature_edge_constraints_ui_smoke.cpp)
+
+target_link_libraries(aeg_editor_feature_edge_constraints_ui_smoke PRIVATE aeg_editor_feature_model aeg_feature)
+
+target_include_directories(aeg_editor_feature_edge_constraints_ui_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private/composition
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Runtime/private)
+add_executable(aeg_editor_feature_graph_native_scroll_smoke tests/editor_feature_graph_native_scroll_smoke.cpp)
+target_link_libraries(aeg_editor_feature_graph_native_scroll_smoke PRIVATE aeg_editor_feature_model aeg_feature)
+target_include_directories(aeg_editor_feature_graph_native_scroll_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private/composition
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Runtime/private)
+add_executable(aeg_editor_feature_execution_ui_smoke tests/editor_feature_execution_ui_smoke.cpp)
+target_link_libraries(aeg_editor_feature_execution_ui_smoke PRIVATE
+    aeg_editor_feature_model aeg_feature_runtime_host aeg_feature aeg_renderer aeg_render_graph)
+target_include_directories(aeg_editor_feature_execution_ui_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private/composition
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Runtime/private)
+add_executable(aeg_feature_execution_inspection_smoke tests/feature_execution_inspection_smoke.cpp)
+target_link_libraries(aeg_feature_execution_inspection_smoke PRIVATE
+    aeg_editor_feature_model aeg_feature_runtime_host aeg_application_runtime aeg_renderer
+    aeg_engine aeg_scene aeg_editor_framework)
+target_include_directories(aeg_feature_execution_inspection_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Runtime/private
+    ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Runtime/private)
+add_executable(aeg_editor_process_canvas_smoke tests/editor_process_canvas_smoke.cpp)
+add_executable(aeg_editor_feature_graph_canvas_ui_smoke tests/editor_feature_graph_canvas_ui_smoke.cpp)
+add_executable(aeg_editor_feature_graph_orchestration_ui_smoke tests/editor_feature_graph_orchestration_ui_smoke.cpp)
+target_link_libraries(aeg_editor_feature_graph_orchestration_ui_smoke PRIVATE aeg_editor_feature_model aeg_feature)
+target_include_directories(aeg_editor_feature_graph_orchestration_ui_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private/composition
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Runtime/private)
+add_executable(aeg_editor_feature_graph_transactions_smoke tests/editor_feature_graph_transactions_smoke.cpp)
+target_link_libraries(aeg_editor_feature_graph_transactions_smoke PRIVATE aeg_editor_feature_model aeg_feature)
+target_include_directories(aeg_editor_feature_graph_transactions_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private/composition)
+add_executable(aeg_editor_feature_implementation_resolver_smoke tests/editor_feature_implementation_resolver_smoke.cpp)
+add_executable(aeg_editor_feature_definition_navigation_ui_smoke tests/editor_feature_definition_navigation_ui_smoke.cpp)
+foreach(flow_navigation_test IN ITEMS aeg_editor_feature_implementation_resolver_smoke aeg_editor_feature_definition_navigation_ui_smoke)
+    target_link_libraries(${flow_navigation_test} PRIVATE aeg_editor_feature_model)
+    target_include_directories(${flow_navigation_test} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private/composition)
+endforeach()
+target_link_libraries(aeg_editor_feature_graph_canvas_ui_smoke PRIVATE aeg_editor_feature_model aeg_feature)
+target_include_directories(aeg_editor_feature_graph_canvas_ui_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private/composition
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Runtime/private)
+target_link_libraries(aeg_editor_process_canvas_smoke PRIVATE aeg_editor_feature_model aeg_feature)
+target_include_directories(aeg_editor_process_canvas_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private/composition
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Runtime/private)
+add_executable(aeg_editor_process_layout_smoke tests/editor_process_layout_smoke.cpp)
+target_link_libraries(aeg_editor_process_layout_smoke PRIVATE aeg_editor_feature_model aeg_feature)
+target_include_directories(aeg_editor_process_layout_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private/composition)
+target_link_libraries(aeg_editor_feature_graph_smoke PRIVATE aeg_editor_feature_model aeg_feature)
+target_include_directories(aeg_editor_feature_graph_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private/composition
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Runtime/private)
+add_executable(aeg_editor_process_layout_boundary_smoke
+    tests/editor_process_layout_boundary_smoke.cpp)
+target_link_libraries(aeg_editor_process_layout_boundary_smoke PRIVATE aeg_editor_feature_model)
+add_executable(aeg_editor_composition_boundary_smoke
+    tests/editor_composition_boundary_smoke.cpp)
+target_link_libraries(aeg_editor_composition_boundary_smoke PRIVATE aeg_editor_feature_model)
 add_executable(aeg_editor_custom_node_workflow_smoke tests/editor_custom_node_workflow_smoke.cpp)
-target_link_libraries(aeg_editor_custom_node_workflow_smoke PRIVATE aeg_editor_composition_model)
+target_link_libraries(aeg_editor_custom_node_workflow_smoke PRIVATE aeg_editor_feature_model)
+target_include_directories(aeg_editor_custom_node_workflow_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private/composition)
+add_executable(aeg_editor_feature_definition_ui_smoke tests/editor_feature_definition_ui_smoke.cpp)
+target_link_libraries(aeg_editor_feature_definition_ui_smoke PRIVATE aeg_editor_feature_model)
+target_include_directories(aeg_editor_feature_definition_ui_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private/composition)
+add_executable(aeg_editor_generated_project_module_smoke tests/editor_generated_project_module_smoke.cpp)
+target_link_libraries(aeg_editor_generated_project_module_smoke PRIVATE aeg_editor_feature_model aeg_module)
+target_include_directories(aeg_editor_generated_project_module_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private/composition)
 add_executable(aeg_editor_node_definition_model_smoke tests/editor_node_definition_model_smoke.cpp)
-target_link_libraries(aeg_editor_node_definition_model_smoke PRIVATE aeg_editor_composition_model)
+target_link_libraries(aeg_editor_node_definition_model_smoke PRIVATE aeg_editor_feature_model)
+target_include_directories(aeg_editor_node_definition_model_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private/composition)
 add_executable(aeg_editor_node_contract_storage_smoke
     tests/editor_node_contract_storage_smoke.cpp
-    Application/Editor/private/editor_project_pipeline_authoring.cpp)
-target_link_libraries(aeg_editor_node_contract_storage_smoke PRIVATE aeg_editor_composition_model)
+    Application/Editor/private/editor_project_feature_authoring.cpp)
+target_link_libraries(aeg_editor_node_contract_storage_smoke PRIVATE aeg_editor_feature_model aeg_renderer)
 target_include_directories(aeg_editor_node_contract_storage_smoke PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private)
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private/composition)
 add_executable(aeg_editor_node_definition_generation_smoke tests/editor_node_definition_generation_smoke.cpp)
-target_link_libraries(aeg_editor_node_definition_generation_smoke PRIVATE aeg_editor_composition_model)
+target_link_libraries(aeg_editor_node_definition_generation_smoke PRIVATE aeg_editor_feature_model)
+target_include_directories(aeg_editor_node_definition_generation_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private/composition)
 add_executable(aeg_editor_node_definition_service_smoke tests/editor_node_definition_service_smoke.cpp)
-target_link_libraries(aeg_editor_node_definition_service_smoke PRIVATE aeg_editor_composition_model)
+target_link_libraries(aeg_editor_node_definition_service_smoke PRIVATE aeg_editor_feature_model)
+target_include_directories(aeg_editor_node_definition_service_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private/composition)
 add_executable(aeg_editor_node_definition_end_to_end_smoke
     tests/editor_node_definition_end_to_end_smoke.cpp
-    Application/Editor/private/editor_project_pipeline_authoring.cpp)
-target_link_libraries(aeg_editor_node_definition_end_to_end_smoke PRIVATE aeg_editor_composition_model)
+    Application/Editor/private/editor_project_feature_authoring.cpp)
+target_link_libraries(aeg_editor_node_definition_end_to_end_smoke PRIVATE aeg_editor_feature_model aeg_renderer)
 target_include_directories(aeg_editor_node_definition_end_to_end_smoke PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private)
-set(AEG_FLOWGRAPH_TEST_ROOT ${CMAKE_CURRENT_BINARY_DIR}/generated/flowgraph-nodes)
-set(AEG_FLOWGRAPH_TEST_SOURCE ${AEG_FLOWGRAPH_TEST_ROOT}/Source/FlowGraph)
-set(AEG_FLOWGRAPH_GENERATED_SOURCES)
-set(AEG_FLOWGRAPH_GENERATED_FILES)
-foreach(AEG_FLOWGRAPH_TEST_NODE EditorPipelineNode EditorFeatureNode EditorPassNode)
-    list(APPEND AEG_FLOWGRAPH_GENERATED_SOURCES
-        ${AEG_FLOWGRAPH_TEST_SOURCE}/${AEG_FLOWGRAPH_TEST_NODE}.flowgraph.cpp
-        ${AEG_FLOWGRAPH_TEST_SOURCE}/${AEG_FLOWGRAPH_TEST_NODE}.flowgraph.registration.cpp)
-    list(APPEND AEG_FLOWGRAPH_GENERATED_FILES
-        ${AEG_FLOWGRAPH_TEST_SOURCE}/${AEG_FLOWGRAPH_TEST_NODE}.flowgraph.hpp
-        ${AEG_FLOWGRAPH_TEST_SOURCE}/${AEG_FLOWGRAPH_TEST_NODE}.flowgraph.cpp
-        ${AEG_FLOWGRAPH_TEST_SOURCE}/${AEG_FLOWGRAPH_TEST_NODE}.flowgraph.registration.cpp
-        ${AEG_FLOWGRAPH_TEST_SOURCE}/${AEG_FLOWGRAPH_TEST_NODE}.flowgraph.contract.json)
-endforeach()
-add_custom_command(OUTPUT ${AEG_FLOWGRAPH_GENERATED_FILES}
-    COMMAND $<TARGET_FILE:aeg_editor_custom_node_workflow_smoke> --generate ${AEG_FLOWGRAPH_TEST_ROOT}
-    DEPENDS aeg_editor_custom_node_workflow_smoke
-    VERBATIM)
-add_executable(aeg_generated_flowgraph_nodes_smoke
-    tests/generated_flowgraph_nodes_smoke.cpp ${AEG_FLOWGRAPH_GENERATED_SOURCES})
-target_include_directories(aeg_generated_flowgraph_nodes_smoke PRIVATE ${AEG_FLOWGRAPH_TEST_SOURCE})
-target_link_libraries(aeg_generated_flowgraph_nodes_smoke PRIVATE aeg_module)
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private/composition)
 if (MSVC)
-    target_compile_options(aeg_editor_composition_history_smoke PRIVATE /W4 /permissive-)
-    target_compile_options(aeg_editor_composition_palette_smoke PRIVATE /W4 /permissive-)
-    target_compile_options(aeg_editor_composition_view_smoke PRIVATE /W4 /permissive-)
-    target_compile_options(aeg_editor_composition_commands_smoke PRIVATE /W4 /permissive-)
-    target_compile_options(aeg_editor_composition_storage_smoke PRIVATE /W4 /permissive-)
-    target_compile_options(aeg_editor_composition_operations_smoke PRIVATE /W4 /permissive-)
-    target_compile_options(aeg_editor_composition_preview_smoke PRIVATE /W4 /permissive-)
     target_compile_options(aeg_editor_custom_node_workflow_smoke PRIVATE /W4 /permissive-)
     target_compile_options(aeg_editor_node_definition_model_smoke PRIVATE /W4 /permissive-)
     target_compile_options(aeg_editor_node_contract_storage_smoke PRIVATE /W4 /permissive-)
@@ -418,13 +511,6 @@ if (MSVC)
     target_compile_options(aeg_editor_node_definition_service_smoke PRIVATE /W4 /permissive-)
     target_compile_options(aeg_editor_node_definition_end_to_end_smoke PRIVATE /W4 /permissive-)
 else()
-    target_compile_options(aeg_editor_composition_history_smoke PRIVATE -Wall -Wextra -Wpedantic)
-    target_compile_options(aeg_editor_composition_palette_smoke PRIVATE -Wall -Wextra -Wpedantic)
-    target_compile_options(aeg_editor_composition_view_smoke PRIVATE -Wall -Wextra -Wpedantic)
-    target_compile_options(aeg_editor_composition_commands_smoke PRIVATE -Wall -Wextra -Wpedantic)
-    target_compile_options(aeg_editor_composition_storage_smoke PRIVATE -Wall -Wextra -Wpedantic)
-    target_compile_options(aeg_editor_composition_operations_smoke PRIVATE -Wall -Wextra -Wpedantic)
-    target_compile_options(aeg_editor_composition_preview_smoke PRIVATE -Wall -Wextra -Wpedantic)
     target_compile_options(aeg_editor_custom_node_workflow_smoke PRIVATE -Wall -Wextra -Wpedantic)
     target_compile_options(aeg_editor_node_definition_model_smoke PRIVATE -Wall -Wextra -Wpedantic)
     target_compile_options(aeg_editor_node_contract_storage_smoke PRIVATE -Wall -Wextra -Wpedantic)
@@ -444,42 +530,45 @@ add_library(aeg_application_tooling STATIC
     Application/Tooling/private/stb_texture_importer.cpp
     Application/Tooling/private/material_asset_importer.cpp
     Application/Tooling/private/font_importer.cpp
+    Application/Tooling/private/feature_graph_asset_importer.cpp
     Application/Tooling/private/cooked_asset.cpp
     Application/Tooling/private/cooked_asset_encoder.cpp
     Application/Tooling/private/cooked_artifact_store.cpp
     Application/Tooling/private/project_operation.cpp
-    Application/Tooling/private/project_operation_pipeline.cpp
+    Application/Tooling/private/project_module_agreement.cpp
+    Application/Tooling/private/project_operation_feature.cpp
     Application/Tooling/private/project_process.cpp
     Application/Tooling/private/project_cooker.cpp
-    Application/Tooling/private/pipeline_asset_encoder.cpp
-    Application/Tooling/private/pipeline_asset_importer.cpp
 )
 target_compile_features(aeg_application_tooling PUBLIC cxx_std_20)
 target_include_directories(aeg_application_tooling
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/Application/Tooling/public
-        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Pipeline/public
+        ${CMAKE_CURRENT_SOURCE_DIR}/Application/Authoring/public
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Feature/public
         ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Asset/public
         ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Module/public
         ${CMAKE_CURRENT_SOURCE_DIR}/Application/Project/public
-        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Concurrency/public
         ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Scene/public
         ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Serialization/public
     PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Concurrency/public
         ${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/toml11/include
         ${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/cgltf
         ${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/stb
         ${AEG_COOKED_ASSET_GENERATED_DIR}
 )
-target_link_libraries(aeg_application_tooling PUBLIC aeg_foundation aeg_pipeline aeg_asset aeg_module aeg_application_project flatbuffers)
+target_link_libraries(aeg_application_tooling PUBLIC aeg_foundation aeg_feature aeg_asset aeg_module aeg_application_project aeg_application_authoring flatbuffers PRIVATE aeg_concurrency aeg_feature_world_protocol)
 add_dependencies(aeg_application_tooling aeg_cooked_asset_schema)
 
-# The composition operation controller is implemented in the editor model but
-# delegates execution to the shared tooling service.  Keep that dependency on
-# the model target so every editor composition consumer gets the service
-# implementation, including the operations smoke test.
-if (TARGET aeg_editor_composition_model)
-    target_link_libraries(aeg_editor_composition_model PUBLIC aeg_application_tooling)
+if (AEG_BUILD_TESTS)
+    add_executable(aeg_feature_graph_editor_layout_cook_smoke tests/feature_graph_editor_layout_cook_smoke.cpp)
+    target_link_libraries(aeg_feature_graph_editor_layout_cook_smoke PRIVATE aeg_application_tooling aeg_asset)
+endif()
+
+# Feature definition generation delegates project operations to the shared tooling service.
+if (TARGET aeg_editor_feature_model)
+    target_link_libraries(aeg_editor_feature_model PUBLIC aeg_application_tooling)
 endif()
 
 if (MSVC)
@@ -496,7 +585,7 @@ target_link_libraries(aeg_asset_metadata_smoke PRIVATE aeg_application_tooling)
 add_executable(aeg_project_operation_smoke
     tests/project_operation_smoke.cpp
 )
-target_link_libraries(aeg_project_operation_smoke PRIVATE aeg_application_tooling)
+target_link_libraries(aeg_project_operation_smoke PRIVATE aeg_application_tooling aeg_concurrency)
 add_executable(aeg_project_cooker_smoke tests/project_cooker_smoke.cpp)
 target_link_libraries(aeg_project_cooker_smoke PRIVATE aeg_application_tooling)
 
@@ -623,9 +712,10 @@ if (WIN32 AND (AEG_BUILD_EDITOR OR AEG_BUILD_TOOLS))
     enable_language(RC)
 
     add_library(aeg_application_platform STATIC
-        Application/Platform/private/win32/win32_console_interrupt.cpp
-        Application/Platform/private/win32/win32_system_fonts.cpp
-        Application/Platform/private/win32/win32_startup_splash.cpp
+        Application/Platform/private/application/application_platform_win32.cpp
+        Application/Platform/private/application/win32_console_interrupt.cpp
+        Application/Platform/private/application/win32_system_fonts.cpp
+        Application/Platform/private/application/win32_startup_splash.cpp
         Application/Platform/private/win32/win32_window.cpp
         Application/Platform/private/win32/win32_window_system.cpp
     )
@@ -736,6 +826,7 @@ target_include_directories(aeg_editor_framework
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/Application/EditorFramework/public
         ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Input/public
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Feature/public
         ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Platform/public
         ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RHI/public
     PRIVATE
@@ -744,16 +835,10 @@ target_include_directories(aeg_editor_framework
 target_link_libraries(aeg_editor_framework PUBLIC aeg_foundation aeg_platform aeg_input)
 target_link_libraries(aeg_editor_framework PUBLIC aeg_imgui_core aeg_imgui_freetype)
 
-if (AEG_BUILD_EDITOR AND TARGET aeg_editor_composition_model)
-    target_sources(aeg_editor_composition_model PRIVATE
-        Application/Editor/private/composition/editor_flowgraph_panel.cpp)
-    target_include_directories(aeg_editor_composition_model PRIVATE
+if (AEG_BUILD_EDITOR AND TARGET aeg_editor_feature_model)
+    target_include_directories(aeg_editor_feature_model PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/ImGui)
-    target_link_libraries(aeg_editor_composition_model PUBLIC aeg_imgui_core)
-    if (AEG_BUILD_TESTS)
-        add_executable(aeg_editor_flowgraph_history_ui_smoke tests/editor_flowgraph_history_ui_smoke.cpp)
-        target_link_libraries(aeg_editor_flowgraph_history_ui_smoke PRIVATE aeg_editor_composition_model)
-    endif()
+    target_link_libraries(aeg_editor_feature_model PUBLIC aeg_imgui_core)
 endif()
 
 if (MSVC)
@@ -823,7 +908,7 @@ endif()
 add_executable(aeg_editor_workspace_smoke
     tests/editor_workspace_smoke.cpp
 )
-target_link_libraries(aeg_editor_workspace_smoke PRIVATE aeg_editor_framework)
+target_link_libraries(aeg_editor_workspace_smoke PRIVATE aeg_editor_framework aeg_editor_feature_model)
 if (WIN32)
     target_compile_definitions(aeg_editor_workspace_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
@@ -952,6 +1037,8 @@ if (WIN32)
 endif()
 endif() # AEG_BUILD_TESTS
 
+# Shared API between engine implementation targets only. It is deliberately
+# absent from the compile interface of AEG::GameSDK and AEG::GameRuntime.
 add_library(aeg_concurrency STATIC
     Engine/Concurrency/private/concurrency.cpp
 )
@@ -985,8 +1072,10 @@ target_compile_features(aeg_ecs PUBLIC cxx_std_20)
 target_include_directories(aeg_ecs
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/Engine/ECS/public
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Concurrency/public
 )
-target_link_libraries(aeg_ecs PUBLIC aeg_foundation aeg_reflection)
+target_link_libraries(aeg_ecs PUBLIC aeg_foundation aeg_reflection PRIVATE aeg_concurrency)
 
 if (MSVC)
     target_compile_options(aeg_ecs PRIVATE /W4 /permissive-)
@@ -998,28 +1087,97 @@ if (AEG_BUILD_TESTS)
 add_executable(aeg_ecs_smoke
     tests/ecs_smoke.cpp
 )
-target_link_libraries(aeg_ecs_smoke PRIVATE aeg_ecs)
+target_link_libraries(aeg_ecs_smoke PRIVATE aeg_ecs aeg_concurrency)
 if (WIN32)
     target_compile_definitions(aeg_ecs_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 endif() # AEG_BUILD_TESTS
 
+add_library(aeg_feature_world_protocol STATIC
+    Engine/Feature/public/feature_world_transform.hpp
+    Engine/Feature/private/feature_world_transform.cpp
+    Engine/Runtime/private/world_transform_schema.cpp)
+target_compile_features(aeg_feature_world_protocol PUBLIC cxx_std_20)
+target_include_directories(aeg_feature_world_protocol
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Feature/public
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Runtime/public)
+target_link_libraries(aeg_feature_world_protocol PUBLIC aeg_foundation
+    PRIVATE aeg_serialization aeg_reflection aeg_math)
+
+add_library(aeg_feature STATIC
+    Engine/Feature/private/feature_execution.cpp
+    Engine/Feature/private/feature_render_intent.cpp
+    Engine/Feature/public/feature_types.hpp
+    Engine/Feature/public/feature_time.hpp
+    Engine/Feature/private/feature_time_source.hpp
+    Engine/Feature/public/feature_contract.hpp
+    Engine/Feature/public/feature_parameters.hpp
+    Engine/Feature/public/feature_registry.hpp
+    Engine/Feature/public/feature_runtime.hpp
+    Engine/Feature/public/feature_graph.hpp
+    Engine/Feature/public/feature_catalog.hpp
+    Engine/Feature/public/feature_contract_json.hpp
+    Engine/Feature/private/feature_contract_json.cpp
+    Engine/Feature/public/feature_port_router.hpp
+    Engine/Feature/public/feature_resource_bus.hpp
+    Engine/Feature/public/feature_contract_metadata.hpp
+    Engine/Feature/public/feature_process.hpp
+    Engine/Feature/private/feature_contract.cpp
+    Engine/Feature/private/feature_parameters.cpp
+    Engine/Feature/private/feature_registry.cpp
+    Engine/Feature/private/feature_clock_admission.hpp
+    Engine/Feature/public/feature_clock_host.hpp
+    Engine/Feature/private/feature_clock_admission.cpp
+    Engine/Feature/private/feature_runtime.cpp
+    Engine/Feature/private/feature_input.cpp
+    Engine/Feature/private/feature_outbox.hpp
+    Engine/Feature/public/render_intent_plan.hpp
+    Engine/Feature/private/render_intent_planner.hpp
+    Engine/Feature/private/render_intent_plan.cpp
+    Engine/Feature/private/render_intent_evidence.hpp
+    Engine/Feature/private/feature_graph.cpp
+    Engine/Feature/private/feature_catalog.cpp
+    Engine/Feature/private/feature_port_router.cpp
+    Engine/Feature/private/feature_resource_bus.cpp
+    Engine/Feature/private/feature_contract_metadata.cpp
+    Engine/Feature/private/feature_process.cpp
+)
+target_compile_features(aeg_feature PUBLIC cxx_std_20)
+target_include_directories(aeg_feature
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Feature/public
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/nlohmann/json/include
+)
+target_link_libraries(aeg_feature PUBLIC aeg_foundation PRIVATE aeg_serialization aeg_concurrency)
+if (MSVC)
+    target_compile_options(aeg_feature PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(aeg_feature PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
 add_library(aeg_pipeline STATIC
-    Engine/Pipeline/public/pipeline_builder_backend.hpp
+    Engine/Pipeline/private/render_pass_builder_backend.hpp
+    Engine/Pipeline/private/render_pass_execution_context_backend.hpp
+    Engine/Pipeline/private/render_graph_builder_backend.hpp
+    Engine/Pipeline/private/render_pass_registry_execution.hpp
+    Engine/Pipeline/private/phase_registry_execution.hpp
+    Engine/Pipeline/private/pipeline_compiler_execution.hpp
+    Engine/Pipeline/private/pipeline_scope_host_execution.hpp
     Engine/Pipeline/private/pipeline.cpp
-    Engine/Pipeline/private/pipeline_authoring.cpp
-    Engine/Pipeline/private/flowgraph_input.cpp
     Engine/Pipeline/private/render_pass.cpp
-    Engine/Pipeline/private/pipeline_document.cpp
+    Engine/Pipeline/private/render_pass_execution.hpp
 )
 target_compile_features(aeg_pipeline PUBLIC cxx_std_20)
 target_include_directories(aeg_pipeline
-    PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Pipeline/public
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RenderGraph/public
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Pipeline/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Module/public
         ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RHI/public
         ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Concurrency/public
 )
-target_link_libraries(aeg_pipeline PUBLIC aeg_foundation aeg_concurrency Threads::Threads)
+target_link_libraries(aeg_pipeline PRIVATE aeg_foundation aeg_feature)
 
 if (MSVC)
     target_compile_options(aeg_pipeline PRIVATE /W4 /permissive-)
@@ -1028,17 +1186,19 @@ else()
 endif()
 
 add_library(aeg_asset STATIC
-    Engine/Asset/private/asset_identity.cpp
+    Engine/Asset/public/feature_graph_asset.hpp
+    Engine/Asset/public/world_command_routes.hpp
     Engine/Asset/private/cooked_asset.cpp
     Engine/Asset/private/asset_package_reader.cpp
     Engine/Asset/private/asset_handle_table.cpp
     Engine/Asset/private/game_build_manifest.cpp
+    Engine/Asset/private/world_command_routes.cpp
     Engine/Asset/private/mesh_payload.cpp
     Engine/Asset/private/texture_payload.cpp
     Engine/Asset/private/material_payload.cpp
     Engine/Asset/private/font_payload.cpp
     Engine/Asset/private/scene_payload.cpp
-    Engine/Asset/private/pipeline_asset.cpp
+    Engine/Asset/private/feature_graph_asset.cpp
 )
 target_compile_features(aeg_asset PUBLIC cxx_std_20)
 target_include_directories(aeg_asset
@@ -1046,11 +1206,31 @@ target_include_directories(aeg_asset
     PRIVATE ${AEG_COOKED_ASSET_GENERATED_DIR}
 )
 add_dependencies(aeg_asset aeg_cooked_asset_schema)
-target_link_libraries(aeg_asset PUBLIC aeg_foundation aeg_pipeline flatbuffers)
+target_link_libraries(aeg_asset PUBLIC aeg_foundation aeg_feature aeg_serialization flatbuffers)
 if (MSVC)
     target_compile_options(aeg_asset PRIVATE /W4 /permissive-)
 else()
     target_compile_options(aeg_asset PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+add_library(aeg_feature_runtime_host STATIC
+    Application/Runtime/private/runtime_feature_control.hpp
+    Application/Runtime/private/feature_graph_runtime_host.hpp
+    Application/Runtime/private/feature_graph_runtime_host.cpp
+)
+target_compile_features(aeg_feature_runtime_host PUBLIC cxx_std_20)
+target_include_directories(aeg_feature_runtime_host
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Feature/public
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Asset/public
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/Application/Runtime/private
+)
+target_link_libraries(aeg_feature_runtime_host PUBLIC aeg_feature aeg_asset)
+if (MSVC)
+    target_compile_options(aeg_feature_runtime_host PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(aeg_feature_runtime_host PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
 if (AEG_BUILD_TESTS)
@@ -1062,28 +1242,143 @@ if (WIN32)
     target_compile_definitions(aeg_pipeline_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
-add_executable(aeg_pipeline_extension_smoke
-    tests/pipeline_extension_smoke.cpp
+add_executable(aeg_feature_contract_smoke
+    tests/feature_contract_smoke.cpp
 )
-target_link_libraries(aeg_pipeline_extension_smoke PRIVATE aeg_pipeline)
+target_link_libraries(aeg_feature_contract_smoke PRIVATE aeg_feature)
+add_executable(aeg_feature_clock_contract_smoke tests/feature_clock_contract_smoke.cpp)
+target_link_libraries(aeg_feature_clock_contract_smoke PRIVATE aeg_feature)
+target_include_directories(aeg_feature_clock_contract_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/nlohmann/json/include)
+add_executable(aeg_feature_clock_deadline_smoke tests/feature_clock_deadline_smoke.cpp)
+target_link_libraries(aeg_feature_clock_deadline_smoke PRIVATE aeg_feature aeg_concurrency)
+target_include_directories(aeg_feature_clock_deadline_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/nlohmann/json/include)
+add_executable(aeg_feature_clock_admission_smoke tests/feature_clock_admission_smoke.cpp)
+target_link_libraries(aeg_feature_clock_admission_smoke PRIVATE aeg_feature aeg_module)
 if (WIN32)
-    target_compile_definitions(aeg_pipeline_extension_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+    target_link_libraries(aeg_feature_clock_admission_smoke PRIVATE dbghelp)
+endif()
+target_include_directories(aeg_feature_clock_admission_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Feature/private)
+add_executable(aeg_feature_clock_runtime_admission_smoke tests/feature_clock_runtime_admission_smoke.cpp)
+target_link_libraries(aeg_feature_clock_runtime_admission_smoke PRIVATE aeg_feature_runtime_host)
+target_include_directories(aeg_feature_clock_runtime_admission_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Feature/private
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Runtime/private)
+if (WIN32)
+    target_compile_definitions(aeg_feature_contract_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
-add_executable(aeg_pipeline_authoring_catalog_smoke
-    tests/pipeline_authoring_catalog_smoke.cpp
+add_executable(aeg_feature_outbox_smoke tests/feature_outbox_smoke.cpp)
+target_link_libraries(aeg_feature_outbox_smoke PRIVATE aeg_feature aeg_concurrency)
+
+add_executable(aeg_feature_process_transition_order_smoke tests/feature_process_transition_order_smoke.cpp)
+target_link_libraries(aeg_feature_process_transition_order_smoke PRIVATE aeg_feature aeg_concurrency)
+
+add_executable(aeg_feature_runtime_smoke
+    tests/feature_runtime_smoke.cpp
 )
-target_link_libraries(aeg_pipeline_authoring_catalog_smoke PRIVATE aeg_pipeline)
+target_link_libraries(aeg_feature_runtime_smoke PRIVATE aeg_feature)
 if (WIN32)
-    target_compile_definitions(aeg_pipeline_authoring_catalog_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+    target_compile_definitions(aeg_feature_runtime_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
-add_executable(aeg_flowgraph_input_contract_smoke
-    tests/flowgraph_input_contract_smoke.cpp
+add_executable(aeg_feature_asset_parameters_smoke tests/feature_asset_parameters_smoke.cpp)
+target_link_libraries(aeg_feature_asset_parameters_smoke PRIVATE aeg_feature aeg_application_tooling)
+
+add_executable(aeg_feature_runtime_regression_smoke
+    tests/feature_runtime_regression_smoke.cpp
 )
-target_link_libraries(aeg_flowgraph_input_contract_smoke PRIVATE aeg_pipeline)
+target_link_libraries(aeg_feature_runtime_regression_smoke PRIVATE aeg_feature)
 if (WIN32)
-    target_compile_definitions(aeg_flowgraph_input_contract_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+    target_compile_definitions(aeg_feature_runtime_regression_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
+add_executable(aeg_feature_async_execution_smoke tests/feature_async_execution_smoke.cpp)
+target_link_libraries(aeg_feature_async_execution_smoke PRIVATE aeg_feature aeg_concurrency)
+target_include_directories(aeg_feature_async_execution_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Feature/private)
+
+add_executable(aeg_feature_transport_smoke
+    tests/feature_transport_smoke.cpp
+)
+target_link_libraries(aeg_feature_transport_smoke PRIVATE aeg_feature)
+if (WIN32)
+    target_compile_definitions(aeg_feature_transport_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
+add_executable(aeg_feature_transport_semantics_smoke
+    tests/feature_transport_semantics_smoke.cpp
+)
+target_link_libraries(aeg_feature_transport_semantics_smoke PRIVATE aeg_feature)
+if (WIN32)
+    target_compile_definitions(aeg_feature_transport_semantics_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
+add_executable(aeg_feature_graph_authoring_smoke
+    tests/feature_graph_authoring_smoke.cpp
+)
+target_link_libraries(aeg_feature_graph_authoring_smoke PRIVATE aeg_feature)
+if (WIN32)
+    target_compile_definitions(aeg_feature_graph_authoring_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
+add_executable(aeg_feature_graph_runtime_e2e_smoke
+    tests/feature_graph_runtime_e2e_smoke.cpp
+)
+target_link_libraries(aeg_feature_graph_runtime_e2e_smoke PRIVATE aeg_feature_runtime_host)
+target_include_directories(aeg_feature_graph_runtime_e2e_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Runtime/private
+    ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Module/abi
+)
+if (WIN32)
+    target_compile_definitions(aeg_feature_graph_runtime_e2e_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
+add_executable(aeg_feature_graph_document_io_smoke
+    tests/feature_graph_document_io_smoke.cpp
+)
+target_link_libraries(aeg_feature_graph_document_io_smoke PRIVATE aeg_application_authoring aeg_concurrency)
+target_include_directories(aeg_feature_graph_document_io_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Authoring/private)
+add_executable(aeg_feature_authoring_boundary_smoke tests/feature_authoring_boundary_smoke.cpp)
+target_link_libraries(aeg_feature_authoring_boundary_smoke PRIVATE aeg_application_authoring)
+if (WIN32)
+    target_compile_definitions(aeg_feature_graph_document_io_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
+add_executable(aeg_feature_render_projection_smoke
+    tests/feature_render_projection_smoke.cpp
+)
+target_link_libraries(aeg_feature_render_projection_smoke PRIVATE aeg_render_graph)
+target_include_directories(aeg_feature_render_projection_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RenderGraph/private
+    ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Feature/private)
+add_executable(aeg_feature_render_execution_smoke tests/feature_render_execution_smoke.cpp)
+target_link_libraries(aeg_feature_render_execution_smoke PRIVATE aeg_render_graph aeg_rhi)
+target_include_directories(aeg_feature_render_execution_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RenderGraph/private)
+add_executable(aeg_feature_render_history_smoke tests/feature_render_history_smoke.cpp)
+target_link_libraries(aeg_feature_render_history_smoke PRIVATE aeg_render_graph aeg_rhi)
+target_include_directories(aeg_feature_render_history_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RenderGraph/private)
+add_executable(aeg_render_feature_history_boundary_smoke
+    tests/render_feature_history_boundary_smoke.cpp)
+target_link_libraries(aeg_render_feature_history_boundary_smoke PRIVATE aeg_render_graph)
+if (WIN32 AND TARGET aeg_application_platform)
+    target_link_libraries(aeg_feature_render_execution_smoke PRIVATE aeg_application_platform)
+    target_compile_definitions(aeg_feature_render_execution_smoke PRIVATE AEG_TEST_FEATURE_PRESENT)
+endif()
+if (WIN32)
+    target_compile_definitions(aeg_feature_render_projection_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
+add_executable(aeg_feature_no_legacy_identity_smoke
+    tests/feature_no_legacy_identity_smoke.cpp
+)
+if (WIN32)
+    target_compile_definitions(aeg_feature_no_legacy_identity_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
 add_executable(aeg_module_authoring_smoke
@@ -1094,14 +1389,6 @@ if (WIN32)
     target_compile_definitions(aeg_module_authoring_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
-add_executable(aeg_pipeline_document_validation_smoke
-    tests/pipeline_document_validation_smoke.cpp
-)
-target_link_libraries(aeg_pipeline_document_validation_smoke PRIVATE aeg_pipeline)
-add_executable(aeg_pipeline_asset_codec_smoke
-    tests/pipeline_asset_codec_smoke.cpp
-)
-target_link_libraries(aeg_pipeline_asset_codec_smoke PRIVATE aeg_application_tooling)
 add_executable(aeg_runtime_asset_package_smoke
     tests/runtime_asset_package_smoke.cpp
 )
@@ -1109,17 +1396,12 @@ target_include_directories(aeg_runtime_asset_package_smoke PRIVATE ${AEG_COOKED_
 target_link_libraries(aeg_runtime_asset_package_smoke PRIVATE aeg_asset flatbuffers)
 add_executable(aeg_game_build_manifest_smoke tests/game_build_manifest_smoke.cpp)
 target_link_libraries(aeg_game_build_manifest_smoke PRIVATE aeg_asset)
-add_executable(aeg_cooked_mesh_layout_smoke
-    tests/cooked_mesh_layout_smoke.cpp
-)
-target_link_libraries(aeg_cooked_mesh_layout_smoke PRIVATE aeg_asset)
+add_executable(aeg_world_command_routes_smoke tests/world_command_routes_smoke.cpp)
+target_link_libraries(aeg_world_command_routes_smoke PRIVATE aeg_asset)
 add_executable(aeg_cooked_scene_dependencies_smoke
     tests/cooked_scene_dependencies_smoke.cpp
 )
 target_link_libraries(aeg_cooked_scene_dependencies_smoke PRIVATE aeg_asset)
-if (WIN32)
-    target_compile_definitions(aeg_pipeline_document_validation_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
-endif()
 
 add_executable(aeg_render_pass_authoring_smoke tests/render_pass_authoring_smoke.cpp)
 target_link_libraries(aeg_render_pass_authoring_smoke PRIVATE aeg_pipeline)
@@ -1131,20 +1413,6 @@ add_executable(aeg_pipeline_instance_configuration_smoke tests/pipeline_instance
 target_link_libraries(aeg_pipeline_instance_configuration_smoke PRIVATE aeg_pipeline)
 if (WIN32)
     target_compile_definitions(aeg_pipeline_instance_configuration_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
-endif()
-
-add_executable(aeg_pipeline_composition_runtime_smoke tests/pipeline_composition_runtime_smoke.cpp)
-target_link_libraries(aeg_pipeline_composition_runtime_smoke PRIVATE aeg_engine)
-if (WIN32)
-    target_compile_definitions(aeg_pipeline_composition_runtime_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
-endif()
-
-add_executable(aeg_pipeline_conformance_smoke
-    tests/pipeline_conformance_smoke.cpp
-)
-target_link_libraries(aeg_pipeline_conformance_smoke PRIVATE aeg_pipeline)
-if (WIN32)
-    target_compile_definitions(aeg_pipeline_conformance_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
 add_executable(aeg_pipeline_runtime_smoke
@@ -1181,15 +1449,21 @@ add_library(aeg_module STATIC
     Engine/Module/private/module_context_table.cpp
     Engine/Module/private/dynamic_library.cpp
     Engine/Module/private/dynamic_module.cpp
+    Engine/Module/private/feature_callback_codec.hpp
+    Engine/Module/private/feature_callback_codec.cpp
+    Engine/Module/private/feature_module_export.cpp
+    Engine/Module/public/feature_module_export.hpp
 )
 if (AEG_BUILD_TESTS)
     add_executable(aeg_module_abi_header tests/module_abi_header.c)
     add_executable(aeg_module_abi_smoke tests/module_abi_smoke.cpp)
     target_link_libraries(aeg_module_abi_smoke PRIVATE aeg_module)
+    add_executable(aeg_module_feature_callback_codec_smoke tests/module_feature_callback_codec_smoke.cpp)
+    target_link_libraries(aeg_module_feature_callback_codec_smoke PRIVATE aeg_module)
     add_executable(aeg_module_metadata_smoke tests/module_metadata_smoke.cpp)
     target_link_libraries(aeg_module_metadata_smoke PRIVATE aeg_module)
     add_executable(aeg_module_dynamic_lifetime_smoke tests/module_dynamic_lifetime_smoke.cpp)
-    target_link_libraries(aeg_module_dynamic_lifetime_smoke PRIVATE aeg_module)
+    target_link_libraries(aeg_module_dynamic_lifetime_smoke PRIVATE aeg_module aeg_render_graph aeg_rhi aeg_concurrency)
     add_executable(aeg_module_context_table_smoke tests/module_context_table_smoke.cpp)
     target_link_libraries(aeg_module_context_table_smoke PRIVATE aeg_module)
     if (AEG_BUILD_TOOLS OR AEG_BUILD_EDITOR)
@@ -1201,10 +1475,12 @@ target_compile_features(aeg_module PUBLIC cxx_std_20)
 target_include_directories(aeg_module
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Module/public
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Module/abi
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Feature/public
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/nlohmann/json/include
 )
-target_link_libraries(aeg_module PUBLIC aeg_foundation aeg_pipeline aeg_reflection)
+target_link_libraries(aeg_module PUBLIC aeg_foundation aeg_reflection aeg_feature PRIVATE aeg_serialization)
 
 if (MSVC)
     target_compile_options(aeg_module PRIVATE /W4 /permissive-)
@@ -1222,8 +1498,20 @@ if (WIN32)
 endif()
 endif() # AEG_BUILD_TESTS
 
+if (AEG_BUILD_TESTS)
+add_executable(aeg_module_feature_registration_smoke
+    tests/module_feature_registration_smoke.cpp
+)
+target_link_libraries(aeg_module_feature_registration_smoke PRIVATE aeg_module)
+if (WIN32)
+    target_compile_definitions(aeg_module_feature_registration_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+endif()
+
 add_library(aeg_world STATIC
     Engine/World/private/world_scope.cpp
+    Engine/World/private/world_snapshot_execution.hpp
+    Engine/World/private/world_generation_access.hpp
     Engine/World/private/world_serializer.cpp
 )
 target_compile_features(aeg_world PUBLIC cxx_std_20)
@@ -1231,7 +1519,7 @@ target_include_directories(aeg_world
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/Engine/World/public
 )
-target_link_libraries(aeg_world PUBLIC aeg_ecs aeg_pipeline aeg_serialization)
+target_link_libraries(aeg_world PUBLIC aeg_ecs aeg_serialization PRIVATE aeg_pipeline)
 
 if (MSVC)
     target_compile_options(aeg_world PRIVATE /W4 /permissive-)
@@ -1244,6 +1532,8 @@ add_executable(aeg_world_scope_smoke
     tests/world_scope_smoke.cpp
 )
 target_link_libraries(aeg_world_scope_smoke PRIVATE aeg_world)
+add_executable(aeg_world_public_boundary_smoke tests/world_public_boundary_smoke.cpp)
+target_link_libraries(aeg_world_public_boundary_smoke PRIVATE aeg_world)
 if (WIN32)
     target_compile_definitions(aeg_world_scope_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
@@ -1254,6 +1544,25 @@ add_executable(aeg_world_serialization_smoke
 target_link_libraries(aeg_world_serialization_smoke PRIVATE aeg_world)
 if (WIN32)
     target_compile_definitions(aeg_world_serialization_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
+add_executable(aeg_feature_module_authoring_smoke
+    tests/feature_module_authoring_smoke.cpp
+)
+target_link_libraries(aeg_feature_module_authoring_smoke PRIVATE aeg_module)
+if (WIN32)
+    target_compile_definitions(aeg_feature_module_authoring_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
+add_executable(aeg_feature_module_header_only_smoke
+    tests/feature_module_header_only_smoke.cpp
+)
+target_include_directories(aeg_feature_module_header_only_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Module/public
+    ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Feature/public
+    ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Foundation/public)
+if (WIN32)
+    target_compile_definitions(aeg_feature_module_header_only_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 endif() # AEG_BUILD_TESTS
 
@@ -1288,7 +1597,16 @@ endif()
 add_executable(aeg_world_frame_orchestrator_smoke
     tests/world_frame_orchestrator_smoke.cpp
 )
-target_link_libraries(aeg_world_frame_orchestrator_smoke PRIVATE aeg_engine aeg_world aeg_rhi)
+target_link_libraries(aeg_world_frame_orchestrator_smoke PRIVATE aeg_engine aeg_world aeg_rhi aeg_feature)
+add_executable(aeg_world_feature_commands_smoke tests/world_feature_commands_smoke.cpp)
+target_link_libraries(aeg_world_feature_commands_smoke PRIVATE aeg_engine aeg_feature aeg_concurrency)
+add_executable(aeg_world_raw_pipeline_rejection_smoke tests/world_raw_pipeline_rejection_smoke.cpp)
+target_link_libraries(aeg_world_raw_pipeline_rejection_smoke PRIVATE aeg_engine aeg_rhi)
+target_include_directories(aeg_world_raw_pipeline_rejection_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Runtime/private)
+target_include_directories(aeg_world_frame_orchestrator_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Runtime/private
+    ${CMAKE_CURRENT_SOURCE_DIR}/Engine/World/private)
 if (WIN32)
     target_compile_definitions(aeg_world_frame_orchestrator_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
@@ -1297,12 +1615,20 @@ add_executable(aeg_world_multi_view_smoke
     tests/world_multi_view_smoke.cpp
 )
 target_link_libraries(aeg_world_multi_view_smoke PRIVATE aeg_engine aeg_world aeg_rhi)
+target_include_directories(aeg_world_multi_view_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Runtime/private
+    ${CMAKE_CURRENT_SOURCE_DIR}/Engine/World/private)
 if (WIN32)
     target_compile_definitions(aeg_world_multi_view_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 endif() # AEG_BUILD_TESTS
 
 add_library(aeg_renderer STATIC
+    Engine/Renderer/private/render_feature_context.hpp
+    Engine/Renderer/private/native_scene_pass_source.hpp
+    Engine/Renderer/private/light_culling_origin.hpp
+    Engine/Renderer/private/clustered_forward.cpp
+    Engine/Renderer/private/render_feature_draw.cpp
     Engine/Renderer/private/post_process.cpp
     Engine/Renderer/private/light_culling.cpp
     Engine/Renderer/private/shadow_rendering.cpp
@@ -1310,7 +1636,7 @@ add_library(aeg_renderer STATIC
     Engine/Renderer/private/deferred_lighting_resources.cpp
     Engine/Renderer/private/builtin_render_passes.cpp
     Engine/Renderer/private/render_pipeline_graph.cpp
-    Engine/Renderer/private/renderer_authoring.cpp
+    Engine/Renderer/private/renderer_feature_profiles.cpp
     Engine/Renderer/private/opaque_render_feature.cpp
     Engine/Renderer/private/renderer.cpp
     Engine/Renderer/private/render_pipeline_variants.cpp
@@ -1319,16 +1645,22 @@ target_compile_features(aeg_renderer PUBLIC cxx_std_20)
 target_include_directories(aeg_renderer
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Renderer/public
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RenderGraph/public
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RenderGraph/private
 )
 target_link_libraries(aeg_renderer
     PUBLIC
         aeg_ecs
         aeg_math
-        aeg_pipeline
+        aeg_feature
+        aeg_rhi_core
     PRIVATE
+        aeg_pipeline
         aeg_world
         aeg_shader
         aeg_render_graph
+        aeg_feature
 )
 
 if (MSVC)
@@ -1422,13 +1754,15 @@ else()
 endif()
 
 add_library(aeg_shader STATIC
+    Engine/Shader/private/shader_pipeline_layout_access.hpp
     Engine/Shader/private/shader_manager.cpp
 )
 target_compile_features(aeg_shader PUBLIC cxx_std_20)
 target_include_directories(aeg_shader
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Shader/public
-        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Pipeline/public
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Feature/public
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Module/public
 )
 target_link_libraries(aeg_shader PUBLIC aeg_foundation aeg_rhi_core)
 
@@ -1452,14 +1786,27 @@ add_library(aeg_render_graph STATIC
     Engine/RenderGraph/private/frame_context.cpp
     Engine/RenderGraph/private/render_graph.cpp
     Engine/RenderGraph/private/render_feature_runtime.cpp
-    Engine/RenderGraph/private/render_state_flow.cpp
+    Engine/RenderGraph/private/render_feature_projection.cpp
+    Engine/RenderGraph/private/render_feature_history.cpp
+    Engine/RenderGraph/private/render_feature_history.hpp
+    Engine/RenderGraph/private/render_feature_history_access.hpp
+    Engine/RenderGraph/private/render_graph_submission.hpp
+    Engine/RenderGraph/private/render_graph_upload_submission.hpp
+    Engine/RenderGraph/private/render_graph_feature_access.hpp
+    Engine/RenderGraph/private/render_graph_upload_access.hpp
+    Engine/RenderGraph/private/render_graph_execution.hpp
+    Engine/RenderGraph/private/render_graph_resource_access.hpp
+    Engine/RenderGraph/private/render_scene_lowerer.hpp
+    Engine/RenderGraph/private/render_feature_projector.hpp
+    Engine/RenderGraph/public/render_feature_projection.hpp
 )
 target_compile_features(aeg_render_graph PUBLIC cxx_std_20)
 target_include_directories(aeg_render_graph
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RenderGraph/public
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Feature/public
 )
-target_link_libraries(aeg_render_graph PUBLIC aeg_foundation aeg_rhi_core aeg_pipeline)
+target_link_libraries(aeg_render_graph PUBLIC aeg_foundation aeg_rhi_core aeg_feature PRIVATE aeg_pipeline)
 
 if (MSVC)
     target_compile_options(aeg_render_graph PRIVATE /W4 /permissive-)
@@ -1469,7 +1816,12 @@ endif()
 
 add_library(aeg_engine STATIC
     Engine/Runtime/private/engine_frame_orchestrator.cpp
-    Engine/Runtime/private/pipeline_composition_runtime.cpp
+    Engine/Runtime/private/feature_world_commands.cpp
+    Engine/Runtime/private/feature_world_commands.hpp
+    Engine/Runtime/private/engine_frame_inspection.hpp
+    Engine/Runtime/private/engine_frame_world_commands.hpp
+    Engine/Runtime/private/engine_frame_pipeline_host.hpp
+    Engine/Runtime/private/engine_frame_pipeline_registration.hpp
     Engine/Runtime/private/runtime_components.cpp
     Engine/Runtime/private/runtime_session.cpp
 )
@@ -1477,8 +1829,13 @@ target_compile_features(aeg_engine PUBLIC cxx_std_20)
 target_include_directories(aeg_engine
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Runtime/public
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/World/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Renderer/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RenderGraph/private
 )
-target_link_libraries(aeg_engine PUBLIC aeg_foundation aeg_pipeline aeg_render_graph aeg_world aeg_renderer)
+target_link_libraries(aeg_engine PUBLIC aeg_foundation aeg_render_graph aeg_world aeg_renderer
+    PRIVATE aeg_pipeline aeg_feature aeg_feature_world_protocol aeg_serialization)
 
 if (MSVC)
     target_compile_options(aeg_engine PRIVATE /W4 /permissive-)
@@ -1491,6 +1848,7 @@ endif()
 add_library(aeg_application_runtime STATIC
     Application/Runtime/private/runtime_asset_resolver.cpp
     Application/Runtime/private/runtime_asset_cache.cpp
+    Application/Runtime/private/runtime_mesh_vertex.cpp
     Application/Runtime/private/runtime_bootstrap.cpp
     Application/Runtime/private/runtime_scene_loader.cpp
 )
@@ -1498,23 +1856,31 @@ target_compile_features(aeg_application_runtime PUBLIC cxx_std_20)
 target_include_directories(aeg_application_runtime
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/Application/Runtime/public
-        ${CMAKE_CURRENT_SOURCE_DIR}/Application/Runtime/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Foundation/public
         ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Asset/public
         ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Module/public
-        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Renderer/public
-        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Resource/public
-        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RenderGraph/public
         ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Input/public
         ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Platform/public
-        ${CMAKE_CURRENT_SOURCE_DIR}/Application/Platform/public
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Feature/public
     PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Pipeline/public
+        ${CMAKE_CURRENT_SOURCE_DIR}/Application/Runtime/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Application/Platform/public
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Pipeline/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Runtime/public
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Runtime/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Renderer/public
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Renderer/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Resource/public
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RenderGraph/public
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RenderGraph/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RHI/public
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Shader/public
         ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Module/abi
 )
-target_link_libraries(aeg_application_runtime PUBLIC
-    aeg_asset aeg_module aeg_scene aeg_engine aeg_renderer aeg_resource aeg_input aeg_shader aeg_rhi)
+target_link_libraries(aeg_application_runtime PRIVATE
+    aeg_asset aeg_feature aeg_feature_runtime_host aeg_module aeg_scene aeg_engine aeg_renderer aeg_resource aeg_input aeg_shader aeg_rhi)
 if (WIN32 AND TARGET aeg_application_platform)
-    target_link_libraries(aeg_application_runtime PUBLIC aeg_application_platform)
+    target_link_libraries(aeg_application_runtime PRIVATE aeg_application_platform)
 endif()
 if (MSVC)
     target_compile_options(aeg_application_runtime PRIVATE /W4 /permissive-)
@@ -1522,20 +1888,127 @@ else()
     target_compile_options(aeg_application_runtime PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
+add_executable(aeg_cooked_mesh_layout_smoke
+    tests/cooked_mesh_layout_smoke.cpp
+)
+target_link_libraries(aeg_cooked_mesh_layout_smoke PRIVATE aeg_application_runtime)
+
+if (AEG_BUILD_TESTS)
+add_executable(aeg_engine_public_boundary_smoke tests/engine_public_boundary_smoke.cpp)
+add_executable(aeg_frame_task_owner_boundary_smoke tests/frame_task_owner_boundary_smoke.cpp)
+target_link_libraries(aeg_frame_task_owner_boundary_smoke PRIVATE aeg_engine aeg_rhi)
+target_include_directories(aeg_frame_task_owner_boundary_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Runtime/private)
+add_executable(aeg_pipeline_registration_owner_boundary_smoke tests/pipeline_registration_owner_boundary_smoke.cpp)
+target_link_libraries(aeg_pipeline_registration_owner_boundary_smoke PRIVATE aeg_engine aeg_rhi)
+target_include_directories(aeg_pipeline_registration_owner_boundary_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Runtime/private)
+add_executable(aeg_pipeline_value_validation_smoke tests/pipeline_value_validation_smoke.cpp)
+target_link_libraries(aeg_pipeline_value_validation_smoke PRIVATE aeg_pipeline)
+add_executable(aeg_render_graph_pass_inspection_smoke tests/render_graph_pass_inspection_smoke.cpp)
+target_link_libraries(aeg_render_graph_pass_inspection_smoke PRIVATE aeg_render_graph aeg_rhi)
+target_include_directories(aeg_render_graph_pass_inspection_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RenderGraph/private)
+target_link_libraries(aeg_engine_public_boundary_smoke PRIVATE aeg_engine aeg_application_tooling)
+if (AEG_BUILD_EDITOR)
+    target_link_libraries(aeg_engine_public_boundary_smoke PRIVATE aeg_editor_framework)
+    target_compile_definitions(aeg_engine_public_boundary_smoke PRIVATE AEG_PUBLIC_EDITOR_CONSUMER=1)
+endif()
+endif()
+
 # Public consumer-facing SDK names. The aliases keep game CMake files stable
 # while the implementation target names remain private to the engine build.
 if (NOT TARGET AEG::GameSDK)
     add_library(aeg_game_sdk INTERFACE)
-    target_link_libraries(aeg_game_sdk INTERFACE aeg_module aeg_pipeline)
+    target_compile_features(aeg_game_sdk INTERFACE cxx_std_20)
+    # Game authors consume only the Feature/Module authoring facade.  The
+    # implementation library is link-only so Pipeline, Runtime, and
+    # Concurrency usage requirements never become game compile requirements.
+    target_include_directories(aeg_game_sdk INTERFACE
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Foundation/public
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Feature/public
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Module/public
+    )
+    target_link_libraries(aeg_game_sdk INTERFACE "$<LINK_ONLY:aeg_module>" "$<LINK_ONLY:aeg_feature_world_protocol>")
     add_library(AEG::GameSDK ALIAS aeg_game_sdk)
 endif()
 if (NOT TARGET AEG::GameRuntime)
     add_library(aeg_game_runtime INTERFACE)
-    target_link_libraries(aeg_game_runtime INTERFACE aeg_application_runtime aeg_engine)
+    # The game host sees the narrow startup facade only.  Runtime and Engine
+    # remain link-only implementation dependencies and do not propagate their
+    # public Pipeline/Concurrency include directories to game sources.
+    target_include_directories(aeg_game_runtime INTERFACE
+        ${CMAKE_CURRENT_SOURCE_DIR}/Application/Runtime/public/game
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Input/public
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Platform/public
+        ${CMAKE_CURRENT_SOURCE_DIR}/Application/Platform/public
+    )
+    target_link_libraries(aeg_game_runtime INTERFACE
+        aeg_game_sdk
+        "$<LINK_ONLY:aeg_application_runtime>"
+        "$<LINK_ONLY:aeg_engine>"
+    )
     add_library(AEG::GameRuntime ALIAS aeg_game_runtime)
 endif()
 
 if (AEG_BUILD_TESTS)
+if (TARGET aeg_editor_custom_node_workflow_smoke)
+    set(AEG_GENERATED_FEATURE_FIXTURE_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated_feature_sdk_fixture")
+    set(AEG_GENERATED_FEATURE_FIXTURE_FILES "")
+    foreach(name EditorCompositeNode EditorFeatureNode0 EditorFeatureNode1 EditorFeatureNode2 EditorFeatureNode3 EditorFeatureNode4)
+        foreach(suffix hpp cpp registration.cpp contract.json)
+            list(APPEND AEG_GENERATED_FEATURE_FIXTURE_FILES "${AEG_GENERATED_FEATURE_FIXTURE_DIR}/Source/FlowGraph/${name}.flowgraph.${suffix}")
+        endforeach()
+    endforeach()
+    add_custom_command(OUTPUT ${AEG_GENERATED_FEATURE_FIXTURE_FILES}
+        COMMAND $<TARGET_FILE:aeg_editor_custom_node_workflow_smoke> --generate "${AEG_GENERATED_FEATURE_FIXTURE_DIR}"
+        DEPENDS aeg_editor_custom_node_workflow_smoke
+        VERBATIM)
+    add_executable(aeg_editor_generated_feature_sdk_smoke
+        tests/editor_generated_feature_sdk_smoke.cpp ${AEG_GENERATED_FEATURE_FIXTURE_FILES})
+    target_include_directories(aeg_editor_generated_feature_sdk_smoke PRIVATE
+        "${AEG_GENERATED_FEATURE_FIXTURE_DIR}/Source/FlowGraph")
+    target_link_libraries(aeg_editor_generated_feature_sdk_smoke PRIVATE AEG::GameSDK)
+endif()
+add_library(aeg_module_dynamic_lifetime_fixture SHARED tests/module_dynamic_lifetime_fixture.cpp)
+target_link_libraries(aeg_module_dynamic_lifetime_fixture PRIVATE AEG::GameSDK)
+add_library(aeg_module_dynamic_lifetime_fixture_v2 SHARED tests/module_dynamic_lifetime_fixture.cpp)
+target_compile_definitions(aeg_module_dynamic_lifetime_fixture_v2 PRIVATE AEG_DYNAMIC_FIXTURE_REVISION=2)
+target_link_libraries(aeg_module_dynamic_lifetime_fixture_v2 PRIVATE AEG::GameSDK)
+add_library(aeg_module_world_motion_fixture SHARED tests/module_world_motion_fixture.cpp)
+# Only the internal test gate uses Concurrency; the game-facing SDK is unchanged.
+target_link_libraries(aeg_module_world_motion_fixture PRIVATE AEG::GameSDK aeg_concurrency)
+add_library(aeg_demo_game_module SHARED DemoProject/Source/GameModule.cpp)
+set_target_properties(aeg_demo_game_module PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+target_include_directories(aeg_demo_game_module PRIVATE DemoProject/Source)
+target_link_libraries(aeg_demo_game_module PRIVATE AEG::GameSDK)
+add_dependencies(aeg_module_dynamic_lifetime_smoke aeg_module_dynamic_lifetime_fixture aeg_module_dynamic_lifetime_fixture_v2)
+add_dependencies(aeg_project_operation_smoke aeg_module_dynamic_lifetime_fixture)
+add_dependencies(aeg_project_cooker_smoke aeg_module_dynamic_lifetime_fixture)
+if (TARGET aeg_editor_feature_model)
+    add_executable(aeg_feature_end_to_end_smoke tests/feature_end_to_end_smoke.cpp)
+    target_include_directories(aeg_feature_end_to_end_smoke PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/Application/Runtime/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private/composition)
+    target_link_libraries(aeg_feature_end_to_end_smoke PRIVATE
+        aeg_editor_feature_model
+        aeg_application_tooling
+        aeg_application_runtime
+        aeg_render_graph
+        aeg_rhi
+        aeg_concurrency)
+    add_dependencies(aeg_feature_end_to_end_smoke aeg_module_dynamic_lifetime_fixture)
+    if (WIN32)
+        target_compile_definitions(aeg_feature_end_to_end_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+    endif()
+endif()
+add_executable(aeg_game_sdk_boundary_smoke tests/game_sdk_boundary_smoke.cpp)
+target_link_libraries(aeg_game_sdk_boundary_smoke PRIVATE AEG::GameRuntime)
+add_executable(aeg_runtime_feature_inspect_boundary_smoke
+    tests/runtime_feature_inspect_boundary_smoke.cpp)
+target_link_libraries(aeg_runtime_feature_inspect_boundary_smoke PRIVATE aeg_feature_runtime_host)
+add_executable(aeg_runtime_upload_host_boundary_smoke tests/runtime_upload_host_boundary_smoke.cpp)
+target_link_libraries(aeg_runtime_upload_host_boundary_smoke PRIVATE aeg_application_runtime)
 add_executable(aeg_runtime_frame_clock_smoke tests/runtime_frame_clock_smoke.cpp)
 target_include_directories(aeg_runtime_frame_clock_smoke PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/Application/Tooling/public)
 target_link_libraries(aeg_runtime_frame_clock_smoke PRIVATE aeg_application_runtime aeg_application_tooling)
@@ -1546,40 +2019,65 @@ add_executable(aeg_runtime_window_host_smoke tests/runtime_window_host_smoke.cpp
 target_include_directories(aeg_runtime_window_host_smoke PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/Application/Tooling/public)
 target_link_libraries(aeg_runtime_window_host_smoke PRIVATE aeg_application_runtime aeg_application_tooling)
 add_executable(aeg_runtime_boot_smoke tests/runtime_boot_smoke.cpp)
+add_executable(aeg_runtime_world_commands_smoke tests/runtime_world_commands_smoke.cpp)
+add_executable(aeg_world_transform_protocol_smoke tests/world_transform_protocol_smoke.cpp)
+add_executable(aeg_feature_host_input_smoke tests/feature_host_input_smoke.cpp)
+target_link_libraries(aeg_feature_host_input_smoke PRIVATE aeg_feature aeg_concurrency)
+target_include_directories(aeg_feature_host_input_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Feature/private)
+target_link_libraries(aeg_world_transform_protocol_smoke PRIVATE
+    aeg_engine aeg_feature_world_protocol aeg_serialization)
+target_include_directories(aeg_world_transform_protocol_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Runtime/private)
+target_link_libraries(aeg_runtime_world_commands_smoke PRIVATE
+    aeg_application_runtime aeg_application_tooling aeg_engine aeg_feature aeg_concurrency aeg_rhi)
+target_include_directories(aeg_runtime_world_commands_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Tooling/public
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Runtime/private)
 target_include_directories(aeg_runtime_boot_smoke PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/Application/Tooling/public)
-target_link_libraries(aeg_runtime_boot_smoke PRIVATE aeg_application_runtime aeg_application_tooling)
+    target_link_libraries(aeg_runtime_boot_smoke PRIVATE
+        aeg_application_runtime aeg_application_tooling aeg_concurrency aeg_rhi
+        aeg_engine aeg_scene aeg_renderer aeg_resource aeg_render_graph aeg_shader)
 if (WIN32 AND AEG_BUILD_EDITOR)
     add_executable(aeg_runtime_owned_host_boot_smoke tests/runtime_owned_host_boot_smoke.cpp)
     target_include_directories(aeg_runtime_owned_host_boot_smoke PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/Application/Tooling/public)
-    target_link_libraries(aeg_runtime_owned_host_boot_smoke PRIVATE aeg_application_runtime aeg_application_tooling)
+        ${CMAKE_CURRENT_SOURCE_DIR}/Application/Tooling/public
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Renderer/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RenderGraph/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Application/Runtime/private)
+    target_link_libraries(aeg_runtime_owned_host_boot_smoke PRIVATE
+        aeg_application_runtime aeg_application_tooling aeg_engine aeg_scene aeg_renderer
+        aeg_resource aeg_render_graph aeg_shader aeg_rhi aeg_concurrency)
     target_compile_definitions(aeg_runtime_owned_host_boot_smoke PRIVATE
         AEG_OPAQUE_UNLIT_SHADER_PACKAGE_PATH="${AEG_OPAQUE_UNLIT_SHADER_PACKAGE}")
-    add_executable(aeg_runtime_authored_scene_readback_smoke tests/runtime_authored_scene_readback_smoke.cpp)
-    target_include_directories(aeg_runtime_authored_scene_readback_smoke PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/Application/Tooling/public)
-    target_link_libraries(aeg_runtime_authored_scene_readback_smoke PRIVATE
-        aeg_application_runtime aeg_application_tooling)
 endif()
 add_executable(aeg_runtime_scene_boot_smoke tests/runtime_scene_boot_smoke.cpp)
-target_link_libraries(aeg_runtime_scene_boot_smoke PRIVATE aeg_application_runtime aeg_application_tooling)
+target_link_libraries(aeg_runtime_scene_boot_smoke PRIVATE
+    aeg_application_runtime aeg_application_tooling aeg_engine aeg_scene aeg_renderer
+    aeg_resource aeg_render_graph aeg_shader)
 add_executable(aeg_runtime_asset_resolution_smoke tests/runtime_asset_resolution_smoke.cpp)
-target_link_libraries(aeg_runtime_asset_resolution_smoke PRIVATE aeg_application_runtime aeg_application_tooling)
+target_link_libraries(aeg_runtime_asset_resolution_smoke PRIVATE
+    aeg_application_runtime aeg_application_tooling aeg_renderer aeg_resource aeg_render_graph aeg_shader aeg_rhi)
 add_executable(aeg_runtime_font_cache_smoke tests/runtime_font_cache_smoke.cpp)
 target_link_libraries(aeg_runtime_font_cache_smoke PRIVATE aeg_application_runtime aeg_application_tooling)
 add_executable(aeg_shader_contract_smoke tests/shader_contract_smoke.cpp)
 target_link_libraries(aeg_shader_contract_smoke PRIVATE aeg_shader)
+add_executable(aeg_shader_cache_epoch_smoke tests/shader_cache_epoch_smoke.cpp)
+target_link_libraries(aeg_shader_cache_epoch_smoke PRIVATE aeg_shader aeg_rhi)
 add_executable(aeg_runtime_material_contract_smoke tests/runtime_material_contract_smoke.cpp)
-target_link_libraries(aeg_runtime_material_contract_smoke PRIVATE aeg_application_runtime aeg_application_tooling)
+target_link_libraries(aeg_runtime_material_contract_smoke PRIVATE
+    aeg_application_runtime aeg_application_tooling aeg_renderer aeg_resource aeg_render_graph aeg_shader aeg_rhi)
 add_executable(aeg_runtime_deferred_contract_smoke tests/runtime_deferred_contract_smoke.cpp)
-target_link_libraries(aeg_runtime_deferred_contract_smoke PRIVATE aeg_application_runtime aeg_application_tooling)
+target_link_libraries(aeg_runtime_deferred_contract_smoke PRIVATE
+    aeg_application_runtime aeg_application_tooling aeg_renderer aeg_resource aeg_render_graph aeg_shader aeg_rhi)
 add_executable(aeg_runtime_renderer_resource_contract_smoke
     tests/runtime_renderer_resource_contract_smoke.cpp)
 target_link_libraries(aeg_runtime_renderer_resource_contract_smoke PRIVATE
-    aeg_application_runtime aeg_application_tooling)
+    aeg_application_runtime aeg_application_tooling aeg_renderer aeg_resource aeg_render_graph aeg_shader aeg_rhi)
 
 add_executable(aeg_runtime_object_vulkan_smoke tests/runtime_object_vulkan_smoke.cpp)
-target_link_libraries(aeg_runtime_object_vulkan_smoke PRIVATE aeg_application_runtime aeg_renderer aeg_render_graph aeg_rhi aeg_engine)
+target_link_libraries(aeg_runtime_object_vulkan_smoke PRIVATE
+    aeg_application_runtime aeg_renderer aeg_render_graph aeg_rhi aeg_engine aeg_resource aeg_shader)
 if (MSVC)
     target_compile_options(aeg_runtime_boot_smoke PRIVATE /W4 /permissive-)
 else()
@@ -1592,6 +2090,8 @@ add_executable(aeg_engine_frame_orchestrator_smoke
     tests/engine_frame_orchestrator_smoke.cpp
 )
 target_link_libraries(aeg_engine_frame_orchestrator_smoke PRIVATE aeg_engine aeg_rhi)
+target_include_directories(aeg_engine_frame_orchestrator_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Runtime/private)
 if (WIN32)
     target_compile_definitions(aeg_engine_frame_orchestrator_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
@@ -1606,6 +2106,10 @@ add_executable(aeg_runtime_component_orchestrator_smoke
     tests/runtime_component_orchestrator_smoke.cpp
 )
 target_link_libraries(aeg_runtime_component_orchestrator_smoke PRIVATE aeg_engine aeg_renderer aeg_rhi)
+target_include_directories(aeg_runtime_component_orchestrator_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Renderer/private
+    ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RenderGraph/private
+    ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Runtime/private)
 if (WIN32)
     target_compile_definitions(aeg_runtime_component_orchestrator_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
@@ -1613,6 +2117,19 @@ add_executable(aeg_renderer_smoke
     tests/renderer_smoke.cpp
 )
 target_link_libraries(aeg_renderer_smoke PRIVATE aeg_engine aeg_renderer aeg_rhi)
+target_include_directories(aeg_renderer_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Renderer/private
+    ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RenderGraph/private
+    ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Runtime/private)
+add_executable(aeg_renderer_feature_context_boundary_smoke
+    tests/renderer_feature_context_boundary_smoke.cpp)
+target_link_libraries(aeg_renderer_feature_context_boundary_smoke PRIVATE aeg_renderer)
+add_executable(aeg_renderer_shader_contract_boundary_smoke
+    tests/renderer_shader_contract_boundary_smoke.cpp)
+target_link_libraries(aeg_renderer_shader_contract_boundary_smoke PRIVATE aeg_renderer)
+add_executable(aeg_renderer_profile_contract_smoke
+    tests/renderer_profile_contract_smoke.cpp)
+target_link_libraries(aeg_renderer_profile_contract_smoke PRIVATE aeg_renderer)
 if (WIN32)
     target_compile_definitions(aeg_renderer_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
@@ -1620,34 +2137,55 @@ add_executable(aeg_renderer_pipeline_variants_smoke
     tests/renderer_pipeline_variants_smoke.cpp
 )
 target_link_libraries(aeg_renderer_pipeline_variants_smoke PRIVATE aeg_engine aeg_renderer aeg_rhi)
+target_include_directories(aeg_renderer_pipeline_variants_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Renderer/private)
 if (WIN32)
     target_compile_definitions(aeg_renderer_pipeline_variants_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 add_executable(aeg_renderer_builtin_pass_smoke tests/renderer_builtin_pass_smoke.cpp)
 add_executable(aeg_renderer_shadow_view_smoke tests/renderer_shadow_view_smoke.cpp)
-target_link_libraries(aeg_renderer_shadow_view_smoke PRIVATE aeg_renderer)
+target_link_libraries(aeg_renderer_shadow_view_smoke PRIVATE aeg_renderer aeg_render_graph)
+target_include_directories(aeg_renderer_shadow_view_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Renderer/private
+    ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RenderGraph/private
+    ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RenderGraph/public)
 target_link_libraries(aeg_renderer_builtin_pass_smoke PRIVATE aeg_engine aeg_renderer aeg_rhi)
+target_include_directories(aeg_renderer_builtin_pass_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Renderer/private)
 if (WIN32)
     target_compile_definitions(aeg_renderer_builtin_pass_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 add_executable(aeg_renderer_authoring_smoke tests/renderer_authoring_smoke.cpp)
+add_executable(aeg_renderer_feature_profiles_smoke tests/renderer_feature_profiles_smoke.cpp)
+target_link_libraries(aeg_renderer_feature_profiles_smoke PRIVATE aeg_renderer aeg_feature aeg_render_graph)
+add_executable(aeg_editor_renderer_feature_host_smoke tests/editor_renderer_feature_host_smoke.cpp)
+target_sources(aeg_editor_renderer_feature_host_smoke PRIVATE
+    Application/Editor/private/editor_renderer_feature_host.cpp)
+target_include_directories(aeg_editor_renderer_feature_host_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private
+    ${CMAKE_CURRENT_SOURCE_DIR}/Application/Runtime/private
+    ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Renderer/private)
+target_link_libraries(aeg_editor_renderer_feature_host_smoke PRIVATE
+    aeg_renderer aeg_feature_runtime_host aeg_feature)
 add_executable(aeg_renderer_pipeline_graph_smoke tests/renderer_pipeline_graph_smoke.cpp)
 target_link_libraries(aeg_renderer_pipeline_graph_smoke PRIVATE aeg_engine aeg_renderer aeg_rhi)
-target_link_libraries(aeg_renderer_authoring_smoke PRIVATE aeg_engine aeg_renderer aeg_rhi)
+target_include_directories(aeg_renderer_pipeline_graph_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Renderer/private
+    ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RenderGraph/private)
+target_link_libraries(aeg_renderer_authoring_smoke PRIVATE aeg_renderer aeg_feature aeg_render_graph aeg_application_authoring)
+target_include_directories(aeg_renderer_authoring_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Renderer/private)
 if (WIN32)
     target_compile_definitions(aeg_renderer_authoring_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
-add_executable(aeg_render_feature_runtime_smoke tests/render_feature_runtime_smoke.cpp)
 add_executable(aeg_frame_retention_smoke tests/frame_retention_smoke.cpp)
 target_link_libraries(aeg_frame_retention_smoke PRIVATE aeg_render_graph aeg_rhi)
 add_executable(aeg_render_graph_context_contract_smoke tests/render_graph_context_contract_smoke.cpp)
 target_link_libraries(aeg_render_graph_context_contract_smoke PRIVATE aeg_render_graph)
 add_executable(aeg_render_graph_imported_texture_state_smoke tests/render_graph_imported_texture_state_smoke.cpp)
 target_link_libraries(aeg_render_graph_imported_texture_state_smoke PRIVATE aeg_render_graph aeg_rhi)
-target_link_libraries(aeg_render_feature_runtime_smoke PRIVATE aeg_render_graph aeg_rhi)
-if (WIN32)
-    target_compile_definitions(aeg_render_feature_runtime_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
-endif()
+add_executable(aeg_render_graph_imported_buffer_smoke tests/render_graph_imported_buffer_smoke.cpp)
+target_link_libraries(aeg_render_graph_imported_buffer_smoke PRIVATE aeg_render_graph aeg_rhi)
 endif() # AEG_BUILD_TESTS
 
 set(AEG_RESOURCE_PUBLIC_DIR
@@ -1665,6 +2203,8 @@ target_compile_features(aeg_resource PUBLIC cxx_std_20)
 target_include_directories(aeg_resource
     PUBLIC
         ${AEG_RESOURCE_PUBLIC_DIR}
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RenderGraph/private
 )
 target_link_libraries(aeg_resource PUBLIC aeg_foundation aeg_render_graph)
 
@@ -1694,7 +2234,7 @@ target_include_directories(aeg_editor_assets
 target_compile_definitions(aeg_editor_assets PUBLIC
     AEG_ENGINE_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
 )
-target_link_libraries(aeg_editor_assets PUBLIC aeg_foundation aeg_application_project)
+target_link_libraries(aeg_editor_assets PUBLIC aeg_foundation aeg_application_project aeg_concurrency)
 if (AEG_BUILD_TESTS)
 add_executable(aeg_editor_asset_pipeline_recovery_smoke tests/editor_asset_pipeline_recovery_smoke.cpp)
 target_link_libraries(aeg_editor_asset_pipeline_recovery_smoke PRIVATE aeg_editor_assets)
@@ -1707,11 +2247,12 @@ endif()
 
 target_sources(aeg_editor_framework PRIVATE
     Application/EditorFramework/private/imgui/imgui_renderer.cpp
+    Application/EditorFramework/public/imgui_render_execution.hpp
 )
 target_include_directories(aeg_editor_framework PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Math/public
 )
-target_link_libraries(aeg_editor_framework PUBLIC aeg_resource aeg_rhi aeg_shader)
+target_link_libraries(aeg_editor_framework PUBLIC aeg_rhi PRIVATE aeg_resource aeg_shader aeg_pipeline aeg_render_graph)
 # imgui_renderer.cpp consumes the public math contract directly. Keep the
 # dependency explicit so the framework does not rely on aeg_engine/Renderer's
 # transitive link order for symbols implemented by Engine/Math.
@@ -1776,6 +2317,9 @@ if (WIN32 AND (AEG_BUILD_EDITOR OR AEG_BUILD_TOOLS))
         ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Module/public
         ${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/nlohmann/json/include)
     target_link_libraries(aeg_module_metadata_tool PRIVATE aeg_module)
+    add_executable(aeg_feature_authoring_metadata_generator tools/feature_authoring_metadata_generator.cpp)
+    target_link_libraries(aeg_feature_authoring_metadata_generator PRIVATE
+        aeg_module aeg_feature aeg_feature_world_protocol aeg_application_authoring)
     if (MSVC)
         target_compile_options(aeg_module_metadata_tool PRIVATE /W4 /permissive-)
     else()
@@ -1789,7 +2333,9 @@ if (WIN32 AND (AEG_BUILD_EDITOR OR AEG_BUILD_TOOLS))
     target_include_directories(aeg_shader_contract_tool
         PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Shader/public
-            ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Pipeline/public
+            ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Pipeline/private
+            ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Feature/public
+            ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Module/public
             ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Foundation/public
             ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RHI/public
     )
@@ -1913,6 +2459,14 @@ if (AEG_BUILD_EDITOR)
             "fragment|ps_6_0|${CMAKE_CURRENT_SOURCE_DIR}/shaders/core/lighting/forward_clustered.frag.hlsl"
         PACKAGE_OUTPUT_VARIABLE AEG_FORWARD_CLUSTERED_SHADER_PACKAGE)
     aeg_add_hlsl_gameplay_shader_program(
+        TARGET aeg_core_shaders NAME forward_clustered_unshadowed
+        OUTPUT_DIRECTORY "${AEG_SHADER_OUTPUT_DIR}/core_contract" CONTRACT_TOOL aeg_shader_contract_tool
+        DEPENDENCIES "${CMAKE_CURRENT_SOURCE_DIR}/shaders/core/shadow/visibility.hlsli"
+        STAGES
+            "vertex|vs_6_0|${CMAKE_CURRENT_SOURCE_DIR}/shaders/core/opaque/unlit_mesh.vert.hlsl"
+            "fragment|ps_6_0|${CMAKE_CURRENT_SOURCE_DIR}/shaders/core/lighting/forward_clustered.frag.hlsl|main_unshadowed"
+        PACKAGE_OUTPUT_VARIABLE AEG_FORWARD_CLUSTERED_UNSHADOWED_SHADER_PACKAGE)
+    aeg_add_hlsl_gameplay_shader_program(
         TARGET aeg_core_shaders NAME deferred_shadow
         DEPENDENCIES "${CMAKE_CURRENT_SOURCE_DIR}/shaders/core/shadow/visibility.hlsli"
         OUTPUT_DIRECTORY "${AEG_SHADER_OUTPUT_DIR}/core_contract" CONTRACT_TOOL aeg_shader_contract_tool
@@ -1929,7 +2483,9 @@ if (AEG_BUILD_EDITOR)
         PACKAGE_OUTPUT_VARIABLE AEG_POST_PROCESS_SHADER_PACKAGE)
     if (TARGET aeg_renderer_pipeline_graph_smoke)
         target_compile_definitions(aeg_renderer_pipeline_graph_smoke PRIVATE
-            AEG_POST_PROCESS_SHADER_PACKAGE_PATH="${AEG_POST_PROCESS_SHADER_PACKAGE}")
+            AEG_POST_PROCESS_SHADER_PACKAGE_PATH="${AEG_POST_PROCESS_SHADER_PACKAGE}"
+            AEG_LIGHT_CULLING_SHADER_PACKAGE_PATH="${AEG_LIGHT_CULLING_SHADER_PACKAGE}"
+            AEG_DEFERRED_LIGHTING_SHADER_PACKAGE_PATH="${AEG_DEFERRED_LIGHTING_SHADER_PACKAGE}")
         add_dependencies(aeg_renderer_pipeline_graph_smoke aeg_core_shaders)
     endif()
     set(AEG_STATE_COMPOSITE_SHADER_PACKAGE
@@ -1951,6 +2507,7 @@ if (AEG_BUILD_EDITOR)
         AEG_FORWARD_SHADOW_SHADER_PACKAGE_PATH="${AEG_FORWARD_SHADOW_SHADER_PACKAGE}"
         AEG_LIGHT_CULLING_SHADER_PACKAGE_PATH="${AEG_LIGHT_CULLING_SHADER_PACKAGE}"
         AEG_FORWARD_CLUSTERED_SHADER_PACKAGE_PATH="${AEG_FORWARD_CLUSTERED_SHADER_PACKAGE}"
+        AEG_FORWARD_CLUSTERED_UNSHADOWED_SHADER_PACKAGE_PATH="${AEG_FORWARD_CLUSTERED_UNSHADOWED_SHADER_PACKAGE}"
         AEG_POST_PROCESS_SHADER_PACKAGE_PATH="${AEG_POST_PROCESS_SHADER_PACKAGE}"
         AEG_DEFERRED_SHADOW_SHADER_PACKAGE_PATH="${AEG_DEFERRED_SHADOW_SHADER_PACKAGE}"
         AEG_DEPTH_MESH_SHADER_PACKAGE_PATH="${AEG_DEPTH_MESH_SHADER_PACKAGE}"
@@ -1962,6 +2519,7 @@ if (AEG_BUILD_EDITOR)
         AEG_FORWARD_SHADOW_SHADER_PACKAGE_PATH="${AEG_FORWARD_SHADOW_SHADER_PACKAGE}"
         AEG_LIGHT_CULLING_SHADER_PACKAGE_PATH="${AEG_LIGHT_CULLING_SHADER_PACKAGE}"
         AEG_FORWARD_CLUSTERED_SHADER_PACKAGE_PATH="${AEG_FORWARD_CLUSTERED_SHADER_PACKAGE}"
+        AEG_FORWARD_CLUSTERED_UNSHADOWED_SHADER_PACKAGE_PATH="${AEG_FORWARD_CLUSTERED_UNSHADOWED_SHADER_PACKAGE}"
         AEG_DEFERRED_LIGHTING_SHADER_PACKAGE_PATH="${AEG_DEFERRED_LIGHTING_SHADER_PACKAGE}"
         AEG_DEFERRED_SHADOW_SHADER_PACKAGE_PATH="${AEG_DEFERRED_SHADOW_SHADER_PACKAGE}"
         AEG_POST_PROCESS_SHADER_PACKAGE_PATH="${AEG_POST_PROCESS_SHADER_PACKAGE}")
@@ -1969,20 +2527,26 @@ if (AEG_BUILD_EDITOR)
     if (TARGET aeg_runtime_owned_host_boot_smoke)
         add_dependencies(aeg_runtime_owned_host_boot_smoke aeg_core_shaders)
     endif()
-    if (TARGET aeg_runtime_authored_scene_readback_smoke)
-        add_dependencies(aeg_runtime_authored_scene_readback_smoke aeg_core_shaders)
-    endif()
     add_dependencies(aeg_editor_framework aeg_core_shaders)
 
 if (AEG_BUILD_TESTS)
     add_executable(aeg_editor_imgui_renderer_smoke
         tests/editor_imgui_renderer_smoke.cpp
     )
+    add_executable(aeg_editor_imgui_shared_texture_smoke tests/editor_imgui_shared_texture_smoke.cpp)
+    target_link_libraries(aeg_editor_imgui_shared_texture_smoke PRIVATE
+        aeg_editor_framework aeg_render_graph aeg_resource aeg_rhi aeg_core_shaders)
+    add_executable(aeg_editor_imgui_execution_boundary_smoke
+        tests/editor_imgui_execution_boundary_smoke.cpp)
+    target_link_libraries(aeg_editor_imgui_execution_boundary_smoke PRIVATE aeg_editor_framework)
     target_link_libraries(aeg_editor_imgui_renderer_smoke PRIVATE
         aeg_editor_framework
         aeg_renderer
         aeg_core_shaders
     )
+    target_include_directories(aeg_editor_imgui_renderer_smoke PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Renderer/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RenderGraph/private)
     target_compile_definitions(aeg_editor_imgui_renderer_smoke PRIVATE
         _CRT_SECURE_NO_WARNINGS
     )
@@ -1993,12 +2557,15 @@ if (AEG_BUILD_TESTS)
     add_executable(aeg_runtime_material_vulkan_smoke
         tests/runtime_material_vulkan_smoke.cpp
     )
+    target_include_directories(aeg_runtime_material_vulkan_smoke PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Renderer/private)
     add_executable(aeg_runtime_lighting_vulkan_smoke
         tests/runtime_lighting_vulkan_smoke.cpp
     )
     target_link_libraries(aeg_runtime_material_vulkan_smoke PRIVATE
         aeg_application_runtime
         aeg_application_tooling
+        aeg_renderer
         aeg_resource
         aeg_render_graph
         aeg_rhi
@@ -2006,8 +2573,13 @@ if (AEG_BUILD_TESTS)
         aeg_core_shaders
     )
     target_compile_definitions(aeg_runtime_material_vulkan_smoke PRIVATE
+        AEG_DEPTH_MESH_SHADER_PACKAGE_PATH="${AEG_DEPTH_MESH_SHADER_PACKAGE}"
+        AEG_FORWARD_SHADOW_SHADER_PACKAGE_PATH="${AEG_FORWARD_SHADOW_SHADER_PACKAGE}"
+        AEG_FORWARD_CLUSTERED_SHADER_PACKAGE_PATH="${AEG_FORWARD_CLUSTERED_SHADER_PACKAGE}"
+        AEG_FORWARD_CLUSTERED_UNSHADOWED_SHADER_PACKAGE_PATH="${AEG_FORWARD_CLUSTERED_UNSHADOWED_SHADER_PACKAGE}"
         _CRT_SECURE_NO_WARNINGS
         AEG_OPAQUE_UNLIT_SHADER_PACKAGE_PATH="${AEG_OPAQUE_UNLIT_SHADER_PACKAGE}"
+        AEG_GBUFFER_MESH_SHADER_PACKAGE_PATH="${AEG_GBUFFER_MESH_SHADER_PACKAGE}"
     )
     add_dependencies(aeg_runtime_material_vulkan_smoke aeg_core_shaders)
     target_link_libraries(aeg_runtime_lighting_vulkan_smoke PRIVATE
@@ -2016,15 +2588,28 @@ if (AEG_BUILD_TESTS)
         aeg_render_graph
         aeg_rhi
         aeg_renderer
+        aeg_shader
     )
     add_executable(aeg_renderer_depth_pass_smoke tests/renderer_depth_pass_smoke.cpp)
+    target_include_directories(aeg_renderer_depth_pass_smoke PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Renderer/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RenderGraph/private)
     add_executable(aeg_renderer_shadow_gpu_smoke tests/renderer_shadow_gpu_smoke.cpp)
+    target_include_directories(aeg_renderer_shadow_gpu_smoke PRIVATE
+        Engine/Renderer/private Engine/RenderGraph/private)
     add_executable(aeg_renderer_light_culling_smoke tests/renderer_light_culling_smoke.cpp)
+    target_include_directories(aeg_renderer_light_culling_smoke PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Renderer/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RenderGraph/private)
     target_link_libraries(aeg_renderer_light_culling_smoke PRIVATE aeg_renderer aeg_render_graph aeg_shader aeg_rhi aeg_core_shaders)
     target_compile_definitions(aeg_renderer_light_culling_smoke PRIVATE
+        AEG_FORWARD_CLUSTERED_SHADER_PACKAGE_PATH="${AEG_FORWARD_CLUSTERED_SHADER_PACKAGE}"
+        AEG_FORWARD_CLUSTERED_UNSHADOWED_SHADER_PACKAGE_PATH="${AEG_FORWARD_CLUSTERED_UNSHADOWED_SHADER_PACKAGE}"
         AEG_LIGHT_CULLING_SHADER_PACKAGE_PATH="${AEG_LIGHT_CULLING_SHADER_PACKAGE}")
     add_dependencies(aeg_renderer_light_culling_smoke aeg_core_shaders)
-    target_link_libraries(aeg_renderer_shadow_gpu_smoke PRIVATE aeg_renderer aeg_render_graph aeg_shader aeg_rhi aeg_core_shaders)
+    target_link_libraries(aeg_renderer_shadow_gpu_smoke PRIVATE
+        aeg_renderer aeg_render_graph aeg_shader aeg_rhi aeg_core_shaders aeg_application_runtime
+        aeg_resource aeg_concurrency)
     target_compile_definitions(aeg_renderer_shadow_gpu_smoke PRIVATE
         AEG_OPAQUE_UNLIT_SHADER_PACKAGE_PATH="${AEG_OPAQUE_UNLIT_SHADER_PACKAGE}"
         AEG_GBUFFER_MESH_SHADER_PACKAGE_PATH="${AEG_GBUFFER_MESH_SHADER_PACKAGE}"
@@ -2033,10 +2618,12 @@ if (AEG_BUILD_TESTS)
         AEG_FORWARD_SHADOW_SHADER_PACKAGE_PATH="${AEG_FORWARD_SHADOW_SHADER_PACKAGE}"
         AEG_LIGHT_CULLING_SHADER_PACKAGE_PATH="${AEG_LIGHT_CULLING_SHADER_PACKAGE}"
         AEG_FORWARD_CLUSTERED_SHADER_PACKAGE_PATH="${AEG_FORWARD_CLUSTERED_SHADER_PACKAGE}"
+        AEG_FORWARD_CLUSTERED_UNSHADOWED_SHADER_PACKAGE_PATH="${AEG_FORWARD_CLUSTERED_UNSHADOWED_SHADER_PACKAGE}"
         AEG_POST_PROCESS_SHADER_PACKAGE_PATH="${AEG_POST_PROCESS_SHADER_PACKAGE}"
         AEG_DEFERRED_SHADOW_SHADER_PACKAGE_PATH="${AEG_DEFERRED_SHADOW_SHADER_PACKAGE}")
     add_dependencies(aeg_renderer_shadow_gpu_smoke aeg_core_shaders)
-    target_link_libraries(aeg_renderer_depth_pass_smoke PRIVATE aeg_renderer aeg_render_graph aeg_shader aeg_rhi aeg_core_shaders)
+    target_link_libraries(aeg_renderer_depth_pass_smoke PRIVATE
+        aeg_renderer aeg_render_graph aeg_shader aeg_rhi aeg_core_shaders aeg_application_runtime aeg_resource)
     target_compile_definitions(aeg_renderer_depth_pass_smoke PRIVATE
         AEG_DEPTH_MESH_SHADER_PACKAGE_PATH="${AEG_DEPTH_MESH_SHADER_PACKAGE}")
     add_dependencies(aeg_renderer_depth_pass_smoke aeg_core_shaders)
@@ -2045,10 +2632,16 @@ if (AEG_BUILD_TESTS)
         aeg_renderer
         aeg_resource
         aeg_editor_assets
+        aeg_application_runtime
+        aeg_application_tooling
         aeg_rhi
         aeg_shader
         aeg_core_shaders
     )
+    target_include_directories(aeg_opaque_render_feature_smoke PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Renderer/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Runtime/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RenderGraph/private)
     target_compile_definitions(aeg_opaque_render_feature_smoke PRIVATE
         _CRT_SECURE_NO_WARNINGS
         AEG_OPAQUE_UNLIT_SHADER_PACKAGE_PATH="${AEG_OPAQUE_UNLIT_SHADER_PACKAGE}"
@@ -2058,6 +2651,7 @@ if (AEG_BUILD_TESTS)
         AEG_FORWARD_SHADOW_SHADER_PACKAGE_PATH="${AEG_FORWARD_SHADOW_SHADER_PACKAGE}"
         AEG_LIGHT_CULLING_SHADER_PACKAGE_PATH="${AEG_LIGHT_CULLING_SHADER_PACKAGE}"
         AEG_FORWARD_CLUSTERED_SHADER_PACKAGE_PATH="${AEG_FORWARD_CLUSTERED_SHADER_PACKAGE}"
+        AEG_FORWARD_CLUSTERED_UNSHADOWED_SHADER_PACKAGE_PATH="${AEG_FORWARD_CLUSTERED_UNSHADOWED_SHADER_PACKAGE}"
         AEG_POST_PROCESS_SHADER_PACKAGE_PATH="${AEG_POST_PROCESS_SHADER_PACKAGE}"
         AEG_DEFERRED_SHADOW_SHADER_PACKAGE_PATH="${AEG_DEFERRED_SHADOW_SHADER_PACKAGE}"
     )
@@ -2075,6 +2669,10 @@ if (AEG_BUILD_TESTS)
         aeg_shader
         aeg_core_shaders
     )
+    target_include_directories(aeg_opaque_render_feature_multiframe_smoke PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Renderer/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RenderGraph/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Runtime/private)
     target_compile_definitions(aeg_opaque_render_feature_multiframe_smoke PRIVATE
         _CRT_SECURE_NO_WARNINGS
         AEG_OPAQUE_UNLIT_SHADER_PACKAGE_PATH="${AEG_OPAQUE_UNLIT_SHADER_PACKAGE}"
@@ -2093,6 +2691,10 @@ if (AEG_BUILD_TESTS)
         aeg_shader
         aeg_core_shaders
     )
+    target_include_directories(aeg_opaque_render_feature_uv_depth_smoke PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Renderer/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Runtime/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RenderGraph/private)
     target_compile_definitions(aeg_opaque_render_feature_uv_depth_smoke PRIVATE
         _CRT_SECURE_NO_WARNINGS
         AEG_OPAQUE_UNLIT_SHADER_PACKAGE_PATH="${AEG_OPAQUE_UNLIT_SHADER_PACKAGE}"
@@ -2123,40 +2725,53 @@ if (AEG_BUILD_TESTS)
         target_compile_definitions(aeg_editor_project_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
     endif()
 
-    add_executable(aeg_editor_project_pipeline_authoring_smoke
-        tests/editor_project_pipeline_authoring_smoke.cpp
-        Application/Editor/private/editor_project_pipeline_authoring.cpp
+    add_executable(aeg_editor_project_feature_authoring_smoke
+        tests/editor_project_feature_authoring_smoke.cpp
+        Application/Project/templates/game/Source/GameModule.cpp
+        Application/Editor/private/editor_project_feature_authoring.cpp
+        Application/Editor/private/composition/editor_feature_catalog_diff.cpp
         Application/Editor/private/composition/editor_node_definition.cpp
         Application/Editor/private/composition/editor_node_contract_storage.cpp
     )
-    target_include_directories(aeg_editor_project_pipeline_authoring_smoke PRIVATE
+    target_include_directories(aeg_editor_project_feature_authoring_smoke PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Application/Project/templates/game/Source
         ${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/nlohmann/json/include
     )
-    target_link_libraries(aeg_editor_project_pipeline_authoring_smoke PRIVATE
+    target_link_libraries(aeg_editor_project_feature_authoring_smoke PRIVATE
+        aeg_editor_feature_model
         aeg_foundation
         aeg_pipeline
         aeg_module
         aeg_application_project
+        aeg_application_authoring
         aeg_renderer
     )
+    target_compile_definitions(aeg_editor_project_feature_authoring_smoke PRIVATE AEG_FEATURE_CONTRACT_EXPORTER=1)
     if (WIN32)
-        target_compile_definitions(aeg_editor_project_pipeline_authoring_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+        target_compile_definitions(aeg_editor_project_feature_authoring_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
     endif()
 
 endif() # AEG_BUILD_TESTS
 
+    add_library(aeg_editor_project_operations STATIC
+        Application/Editor/private/editor_project_operations.cpp)
+    target_compile_features(aeg_editor_project_operations PUBLIC cxx_std_20)
+    target_link_libraries(aeg_editor_project_operations PUBLIC aeg_application_tooling PRIVATE aeg_editor_framework)
     add_executable(aeg_editor_application
         Application/Editor/private/editor_application.cpp
         Application/Editor/private/editor_asset_database.cpp
         Application/Editor/private/editor_project.cpp
-        Application/Editor/private/editor_project_pipeline_authoring.cpp
+        Application/Editor/private/editor_project_feature_authoring.cpp
         Application/Platform/private/win32/aether_editor_resources.rc
         Application/Editor/private/editor_scene_runtime.cpp
-        Application/Editor/private/editor_project_pipeline_authoring.cpp
+        Application/Editor/private/editor_renderer_feature_host.cpp
         Application/Editor/private/font/editor_system_font_catalog.cpp
     )
     target_link_libraries(aeg_editor_application PRIVATE
+        aeg_editor_project_operations
+        aeg_feature_runtime_host
+        aeg_application_tooling
         aeg_application_platform
         aeg_engine
         aeg_scene
@@ -2166,18 +2781,25 @@ endif() # AEG_BUILD_TESTS
         aeg_resource
         aeg_editor_assets
         aeg_application_project
-        aeg_editor_composition_model
+        aeg_application_authoring
+        aeg_editor_feature_model
         aeg_module
         aeg_rhi
         aeg_core_shaders
     )
     target_include_directories(aeg_editor_application PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Renderer/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RenderGraph/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Runtime/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Feature/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Application/Runtime/private
     )
     set_target_properties(aeg_editor_application PROPERTIES OUTPUT_NAME "AetherEngine")
 target_compile_definitions(aeg_editor_application PRIVATE
         _CRT_SECURE_NO_WARNINGS
-        AEG_EDITOR_ENABLE_BUILTIN_PIPELINE_DEBUG=$<AND:$<BOOL:${AEG_EDITOR_ENABLE_BUILTIN_PIPELINE_DEBUG}>,$<CONFIG:Debug>>
+        AEG_ENGINE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+        AEG_CMAKE_EXECUTABLE="${CMAKE_COMMAND}"
         AEG_EDITOR_IMGUI_SHADER_PACKAGE_PATH="${AEG_EDITOR_IMGUI_SHADER_PACKAGE}"
         AEG_OPAQUE_UNLIT_SHADER_PACKAGE_PATH="${AEG_OPAQUE_UNLIT_SHADER_PACKAGE}"
         AEG_GBUFFER_MESH_SHADER_PACKAGE_PATH="${AEG_GBUFFER_MESH_SHADER_PACKAGE}"
@@ -2185,6 +2807,7 @@ target_compile_definitions(aeg_editor_application PRIVATE
         AEG_FORWARD_SHADOW_SHADER_PACKAGE_PATH="${AEG_FORWARD_SHADOW_SHADER_PACKAGE}"
         AEG_LIGHT_CULLING_SHADER_PACKAGE_PATH="${AEG_LIGHT_CULLING_SHADER_PACKAGE}"
         AEG_FORWARD_CLUSTERED_SHADER_PACKAGE_PATH="${AEG_FORWARD_CLUSTERED_SHADER_PACKAGE}"
+        AEG_FORWARD_CLUSTERED_UNSHADOWED_SHADER_PACKAGE_PATH="${AEG_FORWARD_CLUSTERED_UNSHADOWED_SHADER_PACKAGE}"
         AEG_POST_PROCESS_SHADER_PACKAGE_PATH="${AEG_POST_PROCESS_SHADER_PACKAGE}"
         AEG_DEFERRED_SHADOW_SHADER_PACKAGE_PATH="${AEG_DEFERRED_SHADOW_SHADER_PACKAGE}"
         AEG_DEPTH_MESH_SHADER_PACKAGE_PATH="${AEG_DEPTH_MESH_SHADER_PACKAGE}"
@@ -2192,14 +2815,39 @@ target_compile_definitions(aeg_editor_application PRIVATE
     )
     add_dependencies(aeg_editor_application aeg_core_shaders)
 if (AEG_BUILD_TESTS)
+    target_sources(aeg_editor_application PRIVATE tests/editor_main_feature_workflow_probe.cpp)
+    target_include_directories(aeg_editor_application PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests")
+    target_compile_definitions(aeg_editor_application PRIVATE AEG_EDITOR_WORKFLOW_TESTS=1)
     add_executable(aeg_editor_application_identity_smoke
         tests/editor_application_identity_smoke.cpp
     )
     target_compile_definitions(aeg_editor_application_identity_smoke PRIVATE
         AEG_EDITOR_APPLICATION_PATH="$<TARGET_FILE:aeg_editor_application>"
     )
-    target_link_libraries(aeg_editor_application_identity_smoke PRIVATE user32)
+    target_link_libraries(aeg_editor_application_identity_smoke PRIVATE user32 aeg_concurrency)
     add_dependencies(aeg_editor_application_identity_smoke aeg_editor_application)
+    add_executable(aeg_editor_project_operations_smoke tests/editor_project_operations_smoke.cpp)
+    target_include_directories(aeg_editor_project_operations_smoke PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Application/Runtime/private)
+    target_link_libraries(aeg_editor_project_operations_smoke PRIVATE
+        aeg_editor_project_operations aeg_application_tooling aeg_application_runtime aeg_editor_framework aeg_engine aeg_scene aeg_concurrency)
+    add_dependencies(aeg_editor_project_operations_smoke aeg_module_dynamic_lifetime_fixture)
+    add_test(NAME aeg_editor_project_operations_smoke COMMAND aeg_editor_project_operations_smoke
+        $<TARGET_FILE:aeg_module_dynamic_lifetime_fixture> "${CMAKE_COMMAND}" "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME aeg_editor_application_project_operations COMMAND "${CMAKE_COMMAND}"
+        "-DEDITOR=$<TARGET_FILE:aeg_editor_application>"
+        "-DFIXTURE_WRITER=$<TARGET_FILE:aeg_editor_project_operations_smoke>"
+        "-DMODULE_FIXTURE=$<TARGET_FILE:aeg_module_dynamic_lifetime_fixture>"
+        "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/editor-project-operations"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/editor_project_operations.cmake")
+    set_tests_properties(aeg_editor_application_project_operations PROPERTIES RUN_SERIAL TRUE)
+    add_test(NAME aeg_editor_application_feature_workflow COMMAND "${CMAKE_COMMAND}"
+        "-DEDITOR=$<TARGET_FILE:aeg_editor_application>"
+        "-DFIXTURE_WRITER=$<TARGET_FILE:aeg_editor_project_operations_smoke>"
+        "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/editor-feature-workflow"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/editor_feature_workflow.cmake")
+    set_tests_properties(aeg_editor_application_feature_workflow PROPERTIES RUN_SERIAL TRUE TIMEOUT 420)
 endif() # AEG_BUILD_TESTS
 
     add_custom_command(TARGET aeg_editor_application POST_BUILD
@@ -2220,6 +2868,7 @@ endif() # AEG_BUILD_TESTS
     )
     install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/DemoProject"
         DESTINATION .
+        PATTERN "*.aegpipe.bak" EXCLUDE
     )
     install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/Assets/Branding/aether-engine-graph-mark.png"
         DESTINATION branding
@@ -2261,22 +2910,39 @@ if (AEG_BUILD_TESTS)
         Application/Editor/private/editor_asset_database.cpp
         Application/Editor/private/editor_project.cpp
         Application/Editor/private/editor_scene_runtime.cpp
-        Application/Editor/private/editor_project_pipeline_authoring.cpp
+        Application/Editor/private/editor_renderer_feature_host.cpp
+        Application/Editor/private/editor_project_feature_authoring.cpp
+        Application/Editor/private/composition/editor_node_contract_storage.cpp
+        Application/Editor/private/composition/editor_node_definition.cpp
     )
     target_include_directories(aeg_editor_scene_runtime_smoke PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Application/Authoring/public
+        ${CMAKE_CURRENT_SOURCE_DIR}/DemoProject/Source
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Renderer/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RenderGraph/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Runtime/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Application/Runtime/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/nlohmann/json/include
     )
     target_link_libraries(aeg_editor_scene_runtime_smoke PRIVATE
+        aeg_concurrency
+        aeg_editor_feature_model
+        aeg_feature_runtime_host
+        aeg_application_runtime
+        aeg_application_tooling
         aeg_engine
         aeg_scene
         aeg_editor_framework
         aeg_renderer
         aeg_resource
         aeg_editor_assets
+        aeg_application_authoring
         aeg_application_project
         aeg_module
         aeg_rhi
         aeg_core_shaders
+        AEG::GameSDK
     )
     target_compile_definitions(aeg_editor_scene_runtime_smoke PRIVATE
         _CRT_SECURE_NO_WARNINGS
@@ -2286,20 +2952,28 @@ if (AEG_BUILD_TESTS)
         AEG_FORWARD_SHADOW_SHADER_PACKAGE_PATH="${AEG_FORWARD_SHADOW_SHADER_PACKAGE}"
         AEG_LIGHT_CULLING_SHADER_PACKAGE_PATH="${AEG_LIGHT_CULLING_SHADER_PACKAGE}"
         AEG_FORWARD_CLUSTERED_SHADER_PACKAGE_PATH="${AEG_FORWARD_CLUSTERED_SHADER_PACKAGE}"
+        AEG_FORWARD_CLUSTERED_UNSHADOWED_SHADER_PACKAGE_PATH="${AEG_FORWARD_CLUSTERED_UNSHADOWED_SHADER_PACKAGE}"
         AEG_POST_PROCESS_SHADER_PACKAGE_PATH="${AEG_POST_PROCESS_SHADER_PACKAGE}"
         AEG_DEFERRED_SHADOW_SHADER_PACKAGE_PATH="${AEG_DEFERRED_SHADOW_SHADER_PACKAGE}"
         AEG_DEPTH_MESH_SHADER_PACKAGE_PATH="${AEG_DEPTH_MESH_SHADER_PACKAGE}"
         AEG_STATE_COMPOSITE_SHADER_PACKAGE_PATH="${AEG_STATE_COMPOSITE_SHADER_PACKAGE}"
     )
-    add_dependencies(aeg_editor_scene_runtime_smoke aeg_core_shaders)
+    add_dependencies(aeg_editor_scene_runtime_smoke aeg_core_shaders aeg_module_dynamic_lifetime_fixture aeg_module_dynamic_lifetime_fixture_v2 aeg_module_world_motion_fixture aeg_demo_game_module)
 
     get_target_property(AEG_SCENE_TEST_SOURCES aeg_editor_scene_runtime_smoke SOURCES)
     list(REMOVE_ITEM AEG_SCENE_TEST_SOURCES tests/editor_scene_runtime_smoke.cpp)
     get_target_property(AEG_SCENE_TEST_LIBRARIES aeg_editor_scene_runtime_smoke LINK_LIBRARIES)
     get_target_property(AEG_SCENE_TEST_DEFINITIONS aeg_editor_scene_runtime_smoke COMPILE_DEFINITIONS)
     add_executable(aeg_editor_renderer_pipeline_smoke tests/editor_renderer_pipeline_smoke.cpp ${AEG_SCENE_TEST_SOURCES})
-    target_include_directories(aeg_editor_renderer_pipeline_smoke PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private)
-    target_link_libraries(aeg_editor_renderer_pipeline_smoke PRIVATE ${AEG_SCENE_TEST_LIBRARIES})
+    target_include_directories(aeg_editor_renderer_pipeline_smoke PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Renderer/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RenderGraph/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Runtime/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Application/Runtime/private)
+    target_include_directories(aeg_editor_renderer_pipeline_smoke PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/nlohmann/json/include)
+    target_link_libraries(aeg_editor_renderer_pipeline_smoke PRIVATE ${AEG_SCENE_TEST_LIBRARIES} aeg_application_authoring aeg_concurrency)
     target_compile_definitions(aeg_editor_renderer_pipeline_smoke PRIVATE ${AEG_SCENE_TEST_DEFINITIONS})
     add_dependencies(aeg_editor_renderer_pipeline_smoke aeg_core_shaders)
 
@@ -2308,18 +2982,31 @@ if (AEG_BUILD_TESTS)
         Application/Editor/private/editor_asset_database.cpp
         Application/Editor/private/editor_project.cpp
         Application/Editor/private/editor_scene_runtime.cpp
-        Application/Editor/private/editor_project_pipeline_authoring.cpp
+        Application/Editor/private/editor_renderer_feature_host.cpp
+        Application/Editor/private/editor_project_feature_authoring.cpp
+        Application/Editor/private/composition/editor_node_contract_storage.cpp
+        Application/Editor/private/composition/editor_node_definition.cpp
     )
     target_include_directories(aeg_editor_external_assets_smoke PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Application/Authoring/public
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Renderer/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RenderGraph/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Runtime/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Application/Runtime/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/nlohmann/json/include
     )
     target_link_libraries(aeg_editor_external_assets_smoke PRIVATE
+        aeg_editor_feature_model
+        aeg_feature_runtime_host
+        aeg_application_tooling
         aeg_engine
         aeg_scene
         aeg_editor_framework
         aeg_renderer
         aeg_resource
         aeg_editor_assets
+        aeg_application_authoring
         aeg_application_project
         aeg_module
         aeg_rhi
@@ -2337,18 +3024,31 @@ if (AEG_BUILD_TESTS)
         Application/Editor/private/editor_asset_database.cpp
         Application/Editor/private/editor_project.cpp
         Application/Editor/private/editor_scene_runtime.cpp
-        Application/Editor/private/editor_project_pipeline_authoring.cpp
+        Application/Editor/private/editor_renderer_feature_host.cpp
+        Application/Editor/private/editor_project_feature_authoring.cpp
+        Application/Editor/private/composition/editor_node_contract_storage.cpp
+        Application/Editor/private/composition/editor_node_definition.cpp
     )
     target_include_directories(aeg_editor_viewport_interaction_smoke PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Application/Authoring/public
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Renderer/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RenderGraph/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Runtime/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Application/Runtime/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/nlohmann/json/include
     )
     target_link_libraries(aeg_editor_viewport_interaction_smoke PRIVATE
+        aeg_editor_feature_model
+        aeg_feature_runtime_host
+        aeg_application_tooling
         aeg_engine
         aeg_scene
         aeg_editor_framework
         aeg_renderer
         aeg_resource
         aeg_editor_assets
+        aeg_application_authoring
         aeg_application_project
         aeg_module
         aeg_rhi
@@ -2366,18 +3066,31 @@ if (AEG_BUILD_TESTS)
         Application/Editor/private/editor_asset_database.cpp
         Application/Editor/private/editor_project.cpp
         Application/Editor/private/editor_scene_runtime.cpp
-        Application/Editor/private/editor_project_pipeline_authoring.cpp
+        Application/Editor/private/editor_renderer_feature_host.cpp
+        Application/Editor/private/editor_project_feature_authoring.cpp
+        Application/Editor/private/composition/editor_node_contract_storage.cpp
+        Application/Editor/private/composition/editor_node_definition.cpp
     )
     target_include_directories(aeg_editor_history_smoke PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Application/Authoring/public
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Renderer/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RenderGraph/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Runtime/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Application/Runtime/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/nlohmann/json/include
     )
     target_link_libraries(aeg_editor_history_smoke PRIVATE
+        aeg_editor_feature_model
+        aeg_feature_runtime_host
+        aeg_application_tooling
         aeg_engine
         aeg_scene
         aeg_editor_framework
         aeg_renderer
         aeg_resource
         aeg_editor_assets
+        aeg_application_authoring
         aeg_application_project
         aeg_module
         aeg_rhi
@@ -2395,18 +3108,31 @@ if (AEG_BUILD_TESTS)
         Application/Editor/private/editor_asset_database.cpp
         Application/Editor/private/editor_project.cpp
         Application/Editor/private/editor_scene_runtime.cpp
-        Application/Editor/private/editor_project_pipeline_authoring.cpp
+        Application/Editor/private/editor_renderer_feature_host.cpp
+        Application/Editor/private/editor_project_feature_authoring.cpp
+        Application/Editor/private/composition/editor_node_contract_storage.cpp
+        Application/Editor/private/composition/editor_node_definition.cpp
     )
     target_include_directories(aeg_editor_hierarchy_smoke PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Application/Authoring/public
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Renderer/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RenderGraph/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Runtime/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Application/Runtime/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/nlohmann/json/include
     )
     target_link_libraries(aeg_editor_hierarchy_smoke PRIVATE
+        aeg_editor_feature_model
+        aeg_feature_runtime_host
+        aeg_application_tooling
         aeg_engine
         aeg_scene
         aeg_editor_framework
         aeg_renderer
         aeg_resource
         aeg_editor_assets
+        aeg_application_authoring
         aeg_application_project
         aeg_module
         aeg_rhi
@@ -2424,18 +3150,31 @@ if (AEG_BUILD_TESTS)
         Application/Editor/private/editor_asset_database.cpp
         Application/Editor/private/editor_project.cpp
         Application/Editor/private/editor_scene_runtime.cpp
-        Application/Editor/private/editor_project_pipeline_authoring.cpp
+        Application/Editor/private/editor_renderer_feature_host.cpp
+        Application/Editor/private/editor_project_feature_authoring.cpp
+        Application/Editor/private/composition/editor_node_contract_storage.cpp
+        Application/Editor/private/composition/editor_node_definition.cpp
     )
     target_include_directories(aeg_editor_inspector_smoke PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/Application/Editor/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Application/Authoring/public
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Renderer/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RenderGraph/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Runtime/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/Application/Runtime/private
+        ${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/nlohmann/json/include
     )
     target_link_libraries(aeg_editor_inspector_smoke PRIVATE
+        aeg_editor_feature_model
+        aeg_feature_runtime_host
+        aeg_application_tooling
         aeg_engine
         aeg_scene
         aeg_editor_framework
         aeg_renderer
         aeg_resource
         aeg_editor_assets
+        aeg_application_authoring
         aeg_application_project
         aeg_module
         aeg_rhi
@@ -2447,6 +3186,15 @@ if (AEG_BUILD_TESTS)
         AEG_STATE_COMPOSITE_SHADER_PACKAGE_PATH="${AEG_STATE_COMPOSITE_SHADER_PACKAGE}"
     )
     add_dependencies(aeg_editor_inspector_smoke aeg_core_shaders)
+
+    foreach(target IN ITEMS
+            aeg_editor_scene_runtime_smoke aeg_editor_renderer_pipeline_smoke
+            aeg_editor_external_assets_smoke aeg_editor_viewport_interaction_smoke
+            aeg_editor_history_smoke aeg_editor_hierarchy_smoke aeg_editor_inspector_smoke)
+        if (TARGET ${target})
+            target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Feature/private)
+        endif()
+    endforeach()
 
     add_executable(aeg_triangle
         tests/triangle.cpp
@@ -2480,7 +3228,84 @@ endif() # AEG_BUILD_TESTS
 endif() # AEG_BUILD_EDITOR
 endif() # WIN32 AND (AEG_BUILD_EDITOR OR AEG_BUILD_TOOLS)
 
+if (TARGET aeg_editor_imgui_renderer_smoke)
+    target_link_libraries(aeg_editor_imgui_renderer_smoke PRIVATE aeg_resource aeg_shader)
+endif()
+
+# Engine execution assembly is internal. Public consumers receive no legacy
+# Pipeline include path; only implementation targets and native fixtures get it.
+foreach(aeg_execution_impl IN ITEMS aeg_application_runtime aeg_world aeg_renderer aeg_render_graph aeg_engine aeg_editor_framework aeg_editor_application)
+    if (TARGET ${aeg_execution_impl})
+        target_link_libraries(${aeg_execution_impl} PRIVATE aeg_feature aeg_rhi_core aeg_concurrency)
+        target_include_directories(${aeg_execution_impl} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Pipeline/private
+            ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Module/public
+            ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RenderGraph/public)
+    endif()
+endforeach()
+if (AEG_BUILD_TESTS)
+    foreach(aeg_execution_fixture IN ITEMS
+        aeg_pipeline_smoke aeg_module_authoring_smoke aeg_render_pass_authoring_smoke
+        aeg_pipeline_instance_configuration_smoke aeg_pipeline_runtime_smoke
+        aeg_pipeline_hot_swap_smoke aeg_pipeline_phase_scheduler_smoke aeg_pipeline_value_validation_smoke aeg_frame_retention_smoke)
+        target_link_libraries(${aeg_execution_fixture} PRIVATE aeg_feature)
+        target_include_directories(${aeg_execution_fixture} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Pipeline/private
+            ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Module/public
+            ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RenderGraph/public
+            ${CMAKE_CURRENT_SOURCE_DIR}/Engine/RHI/public
+            ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Concurrency/public
+            ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Feature/public
+            ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Foundation/public)
+    endforeach()
+    get_property(aeg_native_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+    foreach(aeg_native_fixture IN LISTS aeg_native_targets)
+        if (NOT aeg_native_fixture MATCHES "_smoke$")
+            continue()
+        endif()
+        get_target_property(aeg_native_fixture_dirs ${aeg_native_fixture} INCLUDE_DIRECTORIES)
+        if (aeg_native_fixture_dirs MATCHES "Engine/(Renderer|RenderGraph|Runtime|World)/private")
+            target_link_libraries(${aeg_native_fixture} PRIVATE aeg_feature aeg_rhi_core aeg_concurrency)
+            target_include_directories(${aeg_native_fixture} PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Pipeline/private
+                ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Module/public
+                ${CMAKE_CURRENT_SOURCE_DIR}/Engine/Concurrency/public)
+        endif()
+    endforeach()
+endif()
 if (BUILD_TESTING AND AEG_BUILD_TESTS)
+    # Runtime upload and scene resolver headers are implementation seams. Keep
+    # them off the target's propagated include surface and grant access only to
+    # focused host tests that exercise the native upload contract directly.
+    foreach(aeg_runtime_private_consumer IN ITEMS
+        aeg_runtime_boot_smoke
+        aeg_runtime_owned_host_boot_smoke
+        aeg_runtime_scene_boot_smoke
+        aeg_runtime_asset_resolution_smoke
+        aeg_runtime_material_contract_smoke
+        aeg_runtime_deferred_contract_smoke
+        aeg_runtime_renderer_resource_contract_smoke
+        aeg_runtime_object_vulkan_smoke
+        aeg_runtime_lighting_vulkan_smoke
+        aeg_runtime_material_vulkan_smoke
+        aeg_opaque_render_feature_smoke
+        aeg_renderer_depth_pass_smoke
+        aeg_renderer_shadow_gpu_smoke
+        aeg_feature_end_to_end_smoke
+        aeg_feature_graph_runtime_e2e_smoke
+        aeg_editor_application
+        aeg_editor_scene_runtime_smoke
+        aeg_editor_renderer_pipeline_smoke
+        aeg_editor_external_assets_smoke
+        aeg_editor_viewport_interaction_smoke
+        aeg_editor_history_smoke
+        aeg_editor_hierarchy_smoke
+        aeg_editor_inspector_smoke)
+        if (TARGET ${aeg_runtime_private_consumer})
+            target_include_directories(${aeg_runtime_private_consumer} PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/Application/Runtime/private)
+        endif()
+    endforeach()
     add_test(NAME aeg_extensibility_embed
         COMMAND "${CMAKE_COMMAND}"
             "-DENGINE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
@@ -2507,29 +3332,153 @@ if (BUILD_TESTING AND AEG_BUILD_TESTS)
     add_test(NAME aeg_result_smoke COMMAND aeg_result_smoke)
     add_test(NAME aeg_project_smoke COMMAND aeg_project_smoke)
     add_test(NAME aeg_project_scaffold_smoke COMMAND aeg_project_scaffold_smoke)
-    add_test(NAME aeg_pipeline_document_io_smoke COMMAND aeg_pipeline_document_io_smoke)
+    add_test(NAME aeg_feature_contract_smoke COMMAND aeg_feature_contract_smoke)
+    add_test(NAME aeg_feature_clock_contract_smoke COMMAND aeg_feature_clock_contract_smoke)
+    add_test(NAME aeg_feature_clock_admission_smoke COMMAND aeg_feature_clock_admission_smoke)
+    add_test(NAME aeg_feature_clock_runtime_admission_smoke COMMAND aeg_feature_clock_runtime_admission_smoke)
+    add_test(NAME aeg_feature_clock_deadline_smoke COMMAND aeg_feature_clock_deadline_smoke)
+    set_tests_properties(aeg_feature_clock_deadline_smoke PROPERTIES TIMEOUT 30)
+    add_test(NAME aeg_feature_outbox_smoke COMMAND aeg_feature_outbox_smoke)
+    add_test(NAME aeg_feature_process_transition_order_smoke COMMAND aeg_feature_process_transition_order_smoke)
+    set_tests_properties(aeg_feature_process_transition_order_smoke PROPERTIES TIMEOUT 30)
+    add_test(NAME aeg_feature_runtime_smoke COMMAND aeg_feature_runtime_smoke)
+    add_test(NAME aeg_feature_asset_parameters_smoke COMMAND aeg_feature_asset_parameters_smoke)
+    add_test(NAME aeg_feature_runtime_regression_smoke COMMAND aeg_feature_runtime_regression_smoke)
+    add_test(NAME aeg_feature_async_execution_smoke COMMAND aeg_feature_async_execution_smoke)
+    set_tests_properties(aeg_feature_async_execution_smoke PROPERTIES TIMEOUT 30)
+    add_test(NAME aeg_feature_transport_smoke COMMAND aeg_feature_transport_smoke)
+    add_test(NAME aeg_feature_transport_semantics_smoke COMMAND aeg_feature_transport_semantics_smoke)
+    add_test(NAME aeg_feature_graph_authoring_smoke COMMAND aeg_feature_graph_authoring_smoke)
+    if (TARGET aeg_editor_feature_graph_smoke)
+        add_test(NAME aeg_editor_feature_graph_smoke COMMAND aeg_editor_feature_graph_smoke)
+        add_test(NAME aeg_editor_feature_graph_preview_smoke COMMAND aeg_editor_feature_graph_preview_smoke)
+        add_test(NAME aeg_editor_feature_palette_clock_smoke COMMAND aeg_editor_feature_palette_clock_smoke)
+        add_test(NAME aeg_editor_feature_palette_clock_ui_smoke COMMAND aeg_editor_feature_palette_clock_ui_smoke)
+        add_test(NAME aeg_editor_feature_edge_constraints_ui_smoke COMMAND aeg_editor_feature_edge_constraints_ui_smoke)
+        add_test(NAME aeg_editor_feature_graph_native_scroll_smoke COMMAND aeg_editor_feature_graph_native_scroll_smoke)
+        add_test(NAME aeg_feature_execution_inspection_smoke COMMAND aeg_feature_execution_inspection_smoke)
+        add_test(NAME aeg_editor_feature_execution_ui_smoke COMMAND aeg_editor_feature_execution_ui_smoke)
+        add_test(NAME aeg_editor_process_canvas_smoke COMMAND aeg_editor_process_canvas_smoke)
+        add_test(NAME aeg_editor_feature_graph_canvas_ui_smoke COMMAND aeg_editor_feature_graph_canvas_ui_smoke)
+        add_test(NAME aeg_editor_feature_graph_orchestration_ui_smoke COMMAND aeg_editor_feature_graph_orchestration_ui_smoke)
+        add_test(NAME aeg_editor_feature_graph_transactions_smoke COMMAND aeg_editor_feature_graph_transactions_smoke)
+        add_test(NAME aeg_editor_feature_implementation_resolver_smoke COMMAND aeg_editor_feature_implementation_resolver_smoke)
+        add_test(NAME aeg_editor_feature_definition_navigation_ui_smoke COMMAND aeg_editor_feature_definition_navigation_ui_smoke)
+        add_test(NAME aeg_editor_process_layout_smoke COMMAND aeg_editor_process_layout_smoke)
+    endif()
+    add_test(NAME aeg_feature_graph_runtime_e2e_smoke COMMAND aeg_feature_graph_runtime_e2e_smoke)
+    add_test(NAME aeg_feature_graph_document_io_smoke COMMAND aeg_feature_graph_document_io_smoke)
+    add_test(NAME aeg_feature_graph_source_crash_smoke
+        COMMAND ${CMAKE_COMMAND}
+            -DPROBE=$<TARGET_FILE:aeg_feature_graph_document_io_smoke>
+            -DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/feature-graph-source-crash
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/feature_graph_source_crash.cmake)
+    add_test(NAME aeg_feature_contract_exporter_smoke
+        COMMAND ${CMAKE_COMMAND}
+            -DENGINE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+            -DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/feature-contract-exporter
+            "-DGENERATOR=${CMAKE_GENERATOR}"
+            "-DGENERATOR_PLATFORM=${CMAKE_GENERATOR_PLATFORM}"
+            "-DGENERATOR_TOOLSET=${CMAKE_GENERATOR_TOOLSET}"
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/feature_contract_exporter.cmake)
+    set_tests_properties(aeg_feature_contract_exporter_smoke PROPERTIES TIMEOUT 900)
+    add_test(NAME aeg_feature_module_publication_smoke
+        COMMAND ${CMAKE_COMMAND}
+            -DENGINE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+            -DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/feature-module-publication
+            "-DGENERATOR=${CMAKE_GENERATOR}"
+            "-DGENERATOR_PLATFORM=${CMAKE_GENERATOR_PLATFORM}"
+            "-DGENERATOR_TOOLSET=${CMAKE_GENERATOR_TOOLSET}"
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/feature_module_publication.cmake)
+    set_tests_properties(aeg_feature_module_publication_smoke PROPERTIES TIMEOUT 1200)
+    add_test(NAME aeg_configuration_idempotence_smoke
+        COMMAND ${CMAKE_COMMAND}
+            -DENGINE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+            -DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/configuration-idempotence
+            "-DGENERATOR=${CMAKE_GENERATOR}"
+            "-DGENERATOR_PLATFORM=${CMAKE_GENERATOR_PLATFORM}"
+            "-DGENERATOR_TOOLSET=${CMAKE_GENERATOR_TOOLSET}"
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/configuration_idempotence.cmake)
+    add_test(NAME aeg_feature_authoring_boundary_smoke COMMAND aeg_feature_authoring_boundary_smoke)
+    if (TARGET aeg_feature_graph_editor_layout_cook_smoke)
+        add_test(NAME aeg_feature_graph_editor_layout_cook_smoke COMMAND aeg_feature_graph_editor_layout_cook_smoke)
+    endif()
+    add_test(NAME aeg_feature_render_projection_smoke COMMAND aeg_feature_render_projection_smoke)
+    add_test(NAME aeg_feature_render_execution_smoke COMMAND aeg_feature_render_execution_smoke)
+    add_test(NAME aeg_feature_render_history_smoke COMMAND aeg_feature_render_history_smoke)
+    add_test(NAME aeg_render_feature_history_boundary_smoke
+        COMMAND aeg_render_feature_history_boundary_smoke)
+    set_tests_properties(aeg_feature_render_history_smoke PROPERTIES TIMEOUT 30
+        FAIL_REGULAR_EXPRESSION "Vulkan validation \\[ERROR\\]")
+    set_tests_properties(aeg_feature_render_execution_smoke PROPERTIES TIMEOUT 30
+        FAIL_REGULAR_EXPRESSION "Vulkan validation \\[ERROR\\]")
+    add_test(NAME aeg_feature_no_legacy_identity_smoke COMMAND aeg_feature_no_legacy_identity_smoke)
+    set_tests_properties(aeg_feature_no_legacy_identity_smoke PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME aeg_module_feature_registration_smoke COMMAND aeg_module_feature_registration_smoke)
+    add_test(NAME aeg_feature_module_authoring_smoke COMMAND aeg_feature_module_authoring_smoke)
+    add_test(NAME aeg_feature_module_header_only_smoke COMMAND aeg_feature_module_header_only_smoke)
     if (AEG_BUILD_TOOLS OR AEG_BUILD_EDITOR)
     add_test(NAME aeg_asset_metadata_smoke COMMAND aeg_asset_metadata_smoke)
-    add_test(NAME aeg_project_operation_smoke COMMAND aeg_project_operation_smoke)
-    add_test(NAME aeg_project_cooker_smoke COMMAND aeg_project_cooker_smoke)
+    add_test(NAME aeg_project_operation_smoke COMMAND aeg_project_operation_smoke
+        $<TARGET_FILE:aeg_module_dynamic_lifetime_fixture> "${CMAKE_COMMAND}")
+    add_test(NAME aeg_project_cooker_smoke COMMAND aeg_project_cooker_smoke $<TARGET_FILE:aeg_module_dynamic_lifetime_fixture>)
     add_test(NAME aeg_runtime_asset_package_smoke COMMAND aeg_runtime_asset_package_smoke)
     add_test(NAME aeg_runtime_asset_resolution_smoke COMMAND aeg_runtime_asset_resolution_smoke)
     add_test(NAME aeg_runtime_font_cache_smoke COMMAND aeg_runtime_font_cache_smoke)
     add_test(NAME aeg_shader_contract_smoke COMMAND aeg_shader_contract_smoke)
+    add_test(NAME aeg_shader_cache_epoch_smoke COMMAND aeg_shader_cache_epoch_smoke)
     add_test(NAME aeg_runtime_material_contract_smoke COMMAND aeg_runtime_material_contract_smoke)
     add_test(NAME aeg_runtime_deferred_contract_smoke COMMAND aeg_runtime_deferred_contract_smoke)
     add_test(NAME aeg_runtime_renderer_resource_contract_smoke
         COMMAND aeg_runtime_renderer_resource_contract_smoke)
     add_test(NAME aeg_runtime_object_vulkan_smoke COMMAND aeg_runtime_object_vulkan_smoke)
     add_test(NAME aeg_game_build_manifest_smoke COMMAND aeg_game_build_manifest_smoke)
+    add_test(NAME aeg_world_command_routes_smoke COMMAND aeg_world_command_routes_smoke)
     add_test(NAME aeg_runtime_boot_smoke COMMAND aeg_runtime_boot_smoke)
+    add_test(NAME aeg_runtime_world_commands_smoke COMMAND aeg_runtime_world_commands_smoke)
+    add_test(NAME aeg_runtime_world_observation_smoke COMMAND aeg_runtime_world_commands_smoke --motion-observation)
+    add_test(NAME aeg_runtime_world_motion_smoke COMMAND aeg_runtime_world_commands_smoke --motion-observation-ordinary)
+    add_test(NAME aeg_runtime_world_motion_loop_smoke COMMAND aeg_runtime_world_commands_smoke --motion-run-loop)
+    add_test(NAME aeg_world_transform_protocol_smoke COMMAND aeg_world_transform_protocol_smoke)
+    add_test(NAME aeg_feature_host_input_smoke COMMAND aeg_feature_host_input_smoke)
+    set_tests_properties(aeg_runtime_world_commands_smoke PROPERTIES
+        FAIL_REGULAR_EXPRESSION "Vulkan validation \\[ERROR\\]")
+    set_tests_properties(aeg_runtime_boot_smoke PROPERTIES FAIL_REGULAR_EXPRESSION "Vulkan validation \\[ERROR\\]")
     add_test(NAME aeg_runtime_scene_boot_smoke COMMAND aeg_runtime_scene_boot_smoke)
     add_test(NAME aeg_runtime_window_host_smoke COMMAND aeg_runtime_window_host_smoke)
+    set_tests_properties(aeg_runtime_window_host_smoke PROPERTIES RESOURCE_LOCK runtime_task1_fixture)
     if (WIN32 AND AEG_BUILD_EDITOR)
         add_test(NAME aeg_runtime_owned_host_boot_smoke COMMAND aeg_runtime_owned_host_boot_smoke)
-        set_tests_properties(aeg_runtime_owned_host_boot_smoke PROPERTIES TIMEOUT 120)
-        add_test(NAME aeg_runtime_authored_scene_readback_smoke COMMAND aeg_runtime_authored_scene_readback_smoke)
-        set_tests_properties(aeg_runtime_authored_scene_readback_smoke PROPERTIES TIMEOUT 180)
+        add_test(NAME aeg_runtime_owned_host_no_scene_smoke COMMAND aeg_runtime_owned_host_boot_smoke --no-scene)
+        add_test(NAME aeg_runtime_owned_host_depth_smoke COMMAND aeg_runtime_owned_host_boot_smoke --depth)
+        add_test(NAME aeg_runtime_owned_host_depth_only_smoke COMMAND aeg_runtime_owned_host_boot_smoke --depth-only)
+        add_test(NAME aeg_runtime_owned_host_shadow_depth_smoke COMMAND aeg_runtime_owned_host_boot_smoke --shadow-depth)
+        add_test(NAME aeg_runtime_owned_host_shadow_draw_smoke COMMAND aeg_runtime_owned_host_boot_smoke --shadow-draw)
+        add_test(NAME aeg_runtime_owned_host_gbuffer_smoke COMMAND aeg_runtime_owned_host_boot_smoke --gbuffer)
+        add_test(NAME aeg_runtime_owned_host_deferred_lighting_smoke COMMAND aeg_runtime_owned_host_boot_smoke --deferred-lighting)
+        add_test(NAME aeg_runtime_owned_host_post_process_smoke COMMAND aeg_runtime_owned_host_boot_smoke --feature-post-process)
+        add_test(NAME aeg_runtime_owned_host_clustered_publication_smoke
+            COMMAND aeg_runtime_owned_host_boot_smoke --feature-clustered-publication)
+        add_test(NAME aeg_runtime_owned_host_clustered_process_smoke
+            COMMAND aeg_runtime_owned_host_boot_smoke --feature-clustered-process)
+        add_test(NAME aeg_runtime_owned_host_clustered_cancel_smoke
+            COMMAND aeg_runtime_owned_host_boot_smoke --feature-clustered-cancel)
+        add_test(NAME aeg_runtime_owned_host_clustered_shadow_publication_smoke
+            COMMAND aeg_runtime_owned_host_boot_smoke --feature-clustered-shadow-publication)
+        add_test(NAME aeg_runtime_owned_host_clustered_shadow_process_smoke
+            COMMAND aeg_runtime_owned_host_boot_smoke --feature-clustered-shadow-process)
+        add_test(NAME aeg_runtime_owned_host_clustered_shadow_cancel_smoke
+            COMMAND aeg_runtime_owned_host_boot_smoke --feature-clustered-shadow-cancel)
+        set_tests_properties(aeg_runtime_owned_host_boot_smoke aeg_runtime_owned_host_no_scene_smoke
+            aeg_runtime_owned_host_depth_smoke aeg_runtime_owned_host_depth_only_smoke aeg_runtime_owned_host_shadow_depth_smoke
+            aeg_runtime_owned_host_shadow_draw_smoke aeg_runtime_owned_host_gbuffer_smoke
+            aeg_runtime_owned_host_deferred_lighting_smoke aeg_runtime_owned_host_post_process_smoke
+            aeg_runtime_owned_host_clustered_publication_smoke aeg_runtime_owned_host_clustered_process_smoke
+            aeg_runtime_owned_host_clustered_cancel_smoke aeg_runtime_owned_host_clustered_shadow_publication_smoke
+            aeg_runtime_owned_host_clustered_shadow_process_smoke aeg_runtime_owned_host_clustered_shadow_cancel_smoke PROPERTIES TIMEOUT 120
+            RESOURCE_LOCK runtime_task1_fixture
+            FAIL_REGULAR_EXPRESSION "Vulkan validation \\[ERROR\\]")
     endif()
     add_test(NAME aeg_cooked_mesh_layout_smoke COMMAND aeg_cooked_mesh_layout_smoke)
     add_test(NAME aeg_cooked_scene_dependencies_smoke COMMAND aeg_cooked_scene_dependencies_smoke)
@@ -2565,67 +3514,97 @@ if (BUILD_TESTING AND AEG_BUILD_TESTS)
     endif()
     add_test(NAME aeg_reflection_smoke COMMAND aeg_reflection_smoke)
     add_test(NAME aeg_serialization_smoke COMMAND aeg_serialization_smoke)
+    add_test(NAME aeg_concurrency_boundary
+        COMMAND ${CMAKE_COMMAND}
+            -DAEG_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/concurrency_boundary.cmake)
+    add_test(NAME aeg_game_sdk_boundary_smoke COMMAND aeg_game_sdk_boundary_smoke)
+    add_test(NAME aeg_runtime_feature_inspect_boundary_smoke COMMAND aeg_runtime_feature_inspect_boundary_smoke)
+    add_test(NAME aeg_runtime_upload_host_boundary_smoke COMMAND aeg_runtime_upload_host_boundary_smoke)
+    if (TARGET aeg_editor_generated_feature_sdk_smoke)
+        add_test(NAME aeg_editor_generated_feature_sdk_smoke COMMAND aeg_editor_generated_feature_sdk_smoke)
+    endif()
     add_test(NAME aeg_concurrency_smoke COMMAND aeg_concurrency_smoke)
     add_test(NAME aeg_ecs_smoke COMMAND aeg_ecs_smoke)
     add_test(NAME aeg_pipeline_smoke COMMAND aeg_pipeline_smoke)
-    add_test(NAME aeg_pipeline_extension_smoke COMMAND aeg_pipeline_extension_smoke)
-    add_test(NAME aeg_pipeline_authoring_catalog_smoke COMMAND aeg_pipeline_authoring_catalog_smoke)
-    add_test(NAME aeg_flowgraph_input_contract_smoke COMMAND aeg_flowgraph_input_contract_smoke)
     add_test(NAME aeg_module_authoring_smoke COMMAND aeg_module_authoring_smoke)
-    add_test(NAME aeg_pipeline_document_validation_smoke COMMAND aeg_pipeline_document_validation_smoke)
-    add_test(NAME aeg_pipeline_asset_codec_smoke COMMAND aeg_pipeline_asset_codec_smoke)
     add_test(NAME aeg_render_pass_authoring_smoke COMMAND aeg_render_pass_authoring_smoke)
     add_test(NAME aeg_pipeline_instance_configuration_smoke COMMAND aeg_pipeline_instance_configuration_smoke)
-    add_test(NAME aeg_pipeline_composition_runtime_smoke COMMAND aeg_pipeline_composition_runtime_smoke)
-    add_test(NAME aeg_pipeline_conformance_smoke COMMAND aeg_pipeline_conformance_smoke)
     add_test(NAME aeg_pipeline_runtime_smoke COMMAND aeg_pipeline_runtime_smoke)
     add_test(NAME aeg_pipeline_hot_swap_smoke COMMAND aeg_pipeline_hot_swap_smoke)
     add_test(NAME aeg_pipeline_phase_scheduler_smoke COMMAND aeg_pipeline_phase_scheduler_smoke)
     add_test(NAME aeg_module_smoke COMMAND aeg_module_smoke)
     add_test(NAME aeg_module_abi_header COMMAND aeg_module_abi_header)
     add_test(NAME aeg_module_abi_smoke COMMAND aeg_module_abi_smoke)
+    add_test(NAME aeg_module_feature_callback_codec_smoke COMMAND aeg_module_feature_callback_codec_smoke)
     add_test(NAME aeg_module_metadata_smoke COMMAND aeg_module_metadata_smoke)
-    add_test(NAME aeg_module_dynamic_lifetime_smoke COMMAND aeg_module_dynamic_lifetime_smoke)
+    add_test(NAME aeg_module_dynamic_lifetime_smoke COMMAND aeg_module_dynamic_lifetime_smoke
+        $<TARGET_FILE:aeg_module_dynamic_lifetime_fixture> $<TARGET_FILE:aeg_module_dynamic_lifetime_fixture_v2>)
+    if (TARGET aeg_feature_end_to_end_smoke)
+        add_test(NAME aeg_feature_end_to_end_smoke COMMAND aeg_feature_end_to_end_smoke
+            $<TARGET_FILE:aeg_module_dynamic_lifetime_fixture>)
+        set_tests_properties(aeg_feature_end_to_end_smoke PROPERTIES
+            FAIL_REGULAR_EXPRESSION "Vulkan validation \\[ERROR\\]")
+    endif()
     add_test(NAME aeg_module_context_table_smoke COMMAND aeg_module_context_table_smoke)
     if (AEG_BUILD_TOOLS OR AEG_BUILD_EDITOR)
         add_test(NAME aeg_editor_composition_catalog_smoke COMMAND aeg_editor_composition_catalog_smoke)
-        add_test(NAME aeg_editor_composition_history_smoke COMMAND aeg_editor_composition_history_smoke)
-        add_test(NAME aeg_editor_composition_palette_smoke COMMAND aeg_editor_composition_palette_smoke)
-        add_test(NAME aeg_editor_composition_view_smoke COMMAND aeg_editor_composition_view_smoke)
-        add_test(NAME aeg_editor_composition_commands_smoke COMMAND aeg_editor_composition_commands_smoke)
-        add_test(NAME aeg_editor_composition_storage_smoke COMMAND aeg_editor_composition_storage_smoke)
-        add_test(NAME aeg_editor_composition_operations_smoke COMMAND aeg_editor_composition_operations_smoke)
-        add_test(NAME aeg_editor_composition_preview_smoke COMMAND aeg_editor_composition_preview_smoke)
+        add_test(NAME aeg_editor_process_layout_boundary_smoke
+            COMMAND aeg_editor_process_layout_boundary_smoke)
+        add_test(NAME aeg_editor_composition_boundary_smoke
+            COMMAND aeg_editor_composition_boundary_smoke)
         add_test(NAME aeg_editor_custom_node_workflow_smoke COMMAND aeg_editor_custom_node_workflow_smoke)
         add_test(NAME aeg_editor_node_definition_model_smoke COMMAND aeg_editor_node_definition_model_smoke)
+        add_test(NAME aeg_editor_feature_definition_ui_smoke COMMAND aeg_editor_feature_definition_ui_smoke)
+        add_test(NAME aeg_editor_generated_project_module
+            COMMAND ${CMAKE_COMMAND}
+                -DFIXTURE=$<TARGET_FILE:aeg_editor_generated_project_module_smoke>
+                -DENGINE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+                -DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/editor-generated-project-module
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/editor_generated_project_module.cmake)
+        set_tests_properties(aeg_editor_generated_project_module PROPERTIES RUN_SERIAL TRUE TIMEOUT 600)
         add_test(NAME aeg_editor_node_contract_storage_smoke COMMAND aeg_editor_node_contract_storage_smoke)
         add_test(NAME aeg_editor_node_definition_generation_smoke COMMAND aeg_editor_node_definition_generation_smoke)
         add_test(NAME aeg_editor_node_definition_service_smoke COMMAND aeg_editor_node_definition_service_smoke)
         add_test(NAME aeg_editor_node_definition_end_to_end_smoke COMMAND aeg_editor_node_definition_end_to_end_smoke)
-        if (TARGET aeg_editor_flowgraph_history_ui_smoke)
-            add_test(NAME aeg_editor_flowgraph_history_ui_smoke COMMAND aeg_editor_flowgraph_history_ui_smoke)
-        endif()
-        add_test(NAME aeg_generated_flowgraph_nodes_smoke COMMAND aeg_generated_flowgraph_nodes_smoke)
     endif()
     add_test(NAME aeg_world_scope_smoke COMMAND aeg_world_scope_smoke)
+    add_test(NAME aeg_world_public_boundary_smoke COMMAND aeg_world_public_boundary_smoke)
+    add_test(NAME aeg_engine_public_boundary_smoke COMMAND aeg_engine_public_boundary_smoke)
+    add_test(NAME aeg_frame_task_owner_boundary_smoke COMMAND aeg_frame_task_owner_boundary_smoke)
+    add_test(NAME aeg_pipeline_registration_owner_boundary_smoke COMMAND aeg_pipeline_registration_owner_boundary_smoke)
+    add_test(NAME aeg_pipeline_value_validation_smoke COMMAND aeg_pipeline_value_validation_smoke)
+    add_test(NAME aeg_render_graph_pass_inspection_smoke COMMAND aeg_render_graph_pass_inspection_smoke)
     add_test(NAME aeg_world_serialization_smoke COMMAND aeg_world_serialization_smoke)
     add_test(NAME aeg_scene_asset_smoke COMMAND aeg_scene_asset_smoke)
     add_test(NAME aeg_world_frame_orchestrator_smoke COMMAND aeg_world_frame_orchestrator_smoke)
+    add_test(NAME aeg_world_feature_commands_smoke COMMAND aeg_world_feature_commands_smoke)
+    add_test(NAME aeg_world_raw_pipeline_rejection_smoke COMMAND aeg_world_raw_pipeline_rejection_smoke)
     add_test(NAME aeg_world_multi_view_smoke COMMAND aeg_world_multi_view_smoke)
     add_test(NAME aeg_engine_frame_orchestrator_smoke COMMAND aeg_engine_frame_orchestrator_smoke)
     add_test(NAME aeg_runtime_components_scene_smoke COMMAND aeg_runtime_components_scene_smoke)
     add_test(NAME aeg_runtime_component_orchestrator_smoke COMMAND aeg_runtime_component_orchestrator_smoke)
     add_test(NAME aeg_renderer_smoke COMMAND aeg_renderer_smoke)
+    add_test(NAME aeg_renderer_feature_context_boundary_smoke
+        COMMAND aeg_renderer_feature_context_boundary_smoke)
+    add_test(NAME aeg_renderer_shader_contract_boundary_smoke
+        COMMAND aeg_renderer_shader_contract_boundary_smoke)
+    add_test(NAME aeg_renderer_profile_contract_smoke
+        COMMAND aeg_renderer_profile_contract_smoke)
     add_test(NAME aeg_renderer_pipeline_variants_smoke COMMAND aeg_renderer_pipeline_variants_smoke)
     add_test(NAME aeg_renderer_builtin_pass_smoke COMMAND aeg_renderer_builtin_pass_smoke)
     add_test(NAME aeg_renderer_shadow_view_smoke COMMAND aeg_renderer_shadow_view_smoke)
     add_test(NAME aeg_renderer_authoring_smoke COMMAND aeg_renderer_authoring_smoke)
+    add_test(NAME aeg_renderer_feature_profiles_smoke COMMAND aeg_renderer_feature_profiles_smoke)
+    add_test(NAME aeg_editor_renderer_feature_host_smoke COMMAND aeg_editor_renderer_feature_host_smoke)
     add_test(NAME aeg_renderer_pipeline_graph_smoke COMMAND aeg_renderer_pipeline_graph_smoke)
     set_tests_properties(aeg_renderer_pipeline_graph_smoke PROPERTIES SKIP_RETURN_CODE 77)
-    add_test(NAME aeg_render_feature_runtime_smoke COMMAND aeg_render_feature_runtime_smoke)
     add_test(NAME aeg_frame_retention_smoke COMMAND aeg_frame_retention_smoke)
     add_test(NAME aeg_render_graph_context_contract_smoke COMMAND aeg_render_graph_context_contract_smoke)
     add_test(NAME aeg_render_graph_imported_texture_state_smoke COMMAND aeg_render_graph_imported_texture_state_smoke)
+    add_test(NAME aeg_render_graph_imported_buffer_smoke COMMAND aeg_render_graph_imported_buffer_smoke)
+    set_tests_properties(aeg_render_graph_imported_buffer_smoke PROPERTIES
+        FAIL_REGULAR_EXPRESSION "Vulkan validation \\[ERROR\\]")
     add_test(NAME aeg_rhi_smoke COMMAND aeg_rhi_smoke)
     add_test(NAME aeg_logging_smoke COMMAND aeg_logging_smoke)
     if (WIN32 AND AEG_BUILD_EDITOR)
@@ -2633,7 +3612,14 @@ if (BUILD_TESTING AND AEG_BUILD_TESTS)
     endif()
     if (WIN32 AND AEG_BUILD_EDITOR)
         add_test(NAME aeg_editor_imgui_renderer_smoke COMMAND aeg_editor_imgui_renderer_smoke)
+        add_test(NAME aeg_editor_imgui_shared_texture_smoke COMMAND aeg_editor_imgui_shared_texture_smoke)
+        add_test(NAME aeg_editor_imgui_execution_boundary_smoke COMMAND aeg_editor_imgui_execution_boundary_smoke)
         add_test(NAME aeg_opaque_render_feature_smoke COMMAND aeg_opaque_render_feature_smoke)
+        add_test(NAME aeg_feature_scene_draw_smoke COMMAND aeg_opaque_render_feature_smoke --neutral)
+        add_test(NAME aeg_feature_registered_scene_draw_smoke COMMAND aeg_opaque_render_feature_smoke --neutral-registered)
+        add_test(NAME aeg_feature_scene_draw_clear_smoke COMMAND aeg_opaque_render_feature_smoke --neutral-clear)
+        add_test(NAME aeg_feature_scene_draw_cold_smoke COMMAND aeg_opaque_render_feature_smoke --neutral-cold)
+        add_test(NAME aeg_feature_scene_draw_retry_smoke COMMAND aeg_opaque_render_feature_smoke --neutral-retry)
         add_test(NAME aeg_runtime_material_vulkan_smoke COMMAND aeg_runtime_material_vulkan_smoke)
         add_test(NAME aeg_runtime_lighting_vulkan_smoke COMMAND aeg_runtime_lighting_vulkan_smoke)
         add_test(NAME aeg_forward_render_feature_smoke COMMAND aeg_opaque_render_feature_smoke --forward)
@@ -2645,6 +3631,32 @@ if (BUILD_TESTING AND AEG_BUILD_TESTS)
             FAIL_REGULAR_EXPRESSION "Vulkan validation \\[ERROR\\]")
         add_test(NAME aeg_renderer_depth_pass_smoke COMMAND aeg_renderer_depth_pass_smoke)
         add_test(NAME aeg_forward_shadow_smoke COMMAND aeg_renderer_shadow_gpu_smoke)
+        add_test(NAME aeg_clustered_shader_reflection_smoke COMMAND aeg_renderer_shadow_gpu_smoke --clustered-reflection)
+        add_test(NAME aeg_clustered_unshadowed_smoke COMMAND aeg_renderer_shadow_gpu_smoke --clustered-unshadowed)
+        add_test(NAME aeg_feature_clustered_smoke COMMAND aeg_renderer_shadow_gpu_smoke --feature-clustered)
+        add_test(NAME aeg_feature_clustered_shadow_smoke COMMAND aeg_renderer_shadow_gpu_smoke --feature-clustered-shadow)
+        set_tests_properties(aeg_feature_clustered_shadow_smoke PROPERTIES FAIL_REGULAR_EXPRESSION "Vulkan validation \\[ERROR\\]")
+        add_test(NAME aeg_feature_clustered_shadow_publication_smoke COMMAND aeg_renderer_shadow_gpu_smoke --feature-clustered-shadow-publication)
+        add_test(NAME aeg_feature_clustered_shadow_process_suspend_smoke COMMAND aeg_renderer_shadow_gpu_smoke --feature-clustered-shadow-process-suspend)
+        add_test(NAME aeg_feature_clustered_shadow_process_cancel_smoke COMMAND aeg_renderer_shadow_gpu_smoke --feature-clustered-shadow-process-cancel)
+        set_tests_properties(aeg_feature_clustered_shadow_publication_smoke aeg_feature_clustered_shadow_process_suspend_smoke
+            aeg_feature_clustered_shadow_process_cancel_smoke PROPERTIES FAIL_REGULAR_EXPRESSION "Vulkan validation \\[ERROR\\]")
+        add_test(NAME aeg_feature_clustered_two_producers_smoke COMMAND aeg_renderer_shadow_gpu_smoke --feature-clustered-two-producers)
+        set_tests_properties(aeg_feature_clustered_two_producers_smoke PROPERTIES FAIL_REGULAR_EXPRESSION "Vulkan validation \\[ERROR\\]")
+        add_test(NAME aeg_feature_clustered_publication_smoke COMMAND aeg_renderer_shadow_gpu_smoke --feature-clustered-publication)
+        add_test(NAME aeg_feature_clustered_process_suspend_smoke COMMAND aeg_renderer_shadow_gpu_smoke --feature-clustered-process-suspend)
+        add_test(NAME aeg_feature_clustered_process_cancel_smoke COMMAND aeg_renderer_shadow_gpu_smoke --feature-clustered-process-cancel)
+        set_tests_properties(aeg_feature_clustered_process_suspend_smoke aeg_feature_clustered_process_cancel_smoke PROPERTIES
+            FAIL_REGULAR_EXPRESSION "Vulkan validation \\[ERROR\\]")
+        set_tests_properties(aeg_feature_clustered_publication_smoke PROPERTIES FAIL_REGULAR_EXPRESSION "Vulkan validation \\[ERROR\\]")
+        set_tests_properties(aeg_feature_clustered_smoke PROPERTIES FAIL_REGULAR_EXPRESSION "Vulkan validation \\[ERROR\\]")
+        set_tests_properties(aeg_clustered_unshadowed_smoke PROPERTIES FAIL_REGULAR_EXPRESSION "Vulkan validation \\[ERROR\\]")
+        add_test(NAME aeg_feature_scene_shadow_smoke COMMAND aeg_renderer_shadow_gpu_smoke --feature-intent)
+        add_test(NAME aeg_feature_scene_gbuffer_smoke COMMAND aeg_renderer_shadow_gpu_smoke --feature-gbuffer)
+        add_test(NAME aeg_feature_deferred_lighting_smoke COMMAND aeg_renderer_shadow_gpu_smoke --feature-deferred)
+        add_test(NAME aeg_feature_post_process_smoke COMMAND aeg_renderer_shadow_gpu_smoke --feature-post-process)
+        set_tests_properties(aeg_feature_scene_gbuffer_smoke aeg_feature_deferred_lighting_smoke aeg_feature_post_process_smoke PROPERTIES
+            FAIL_REGULAR_EXPRESSION "Vulkan validation \\[ERROR\\]")
         add_test(NAME aeg_renderer_light_culling_smoke COMMAND aeg_renderer_light_culling_smoke)
         set_tests_properties(aeg_renderer_light_culling_smoke PROPERTIES
             FAIL_REGULAR_EXPRESSION "Vulkan validation \\[ERROR\\]")
@@ -2656,17 +3668,25 @@ if (BUILD_TESTING AND AEG_BUILD_TESTS)
             FAIL_REGULAR_EXPRESSION "Vulkan validation \\[ERROR\\]")
         set_tests_properties(aeg_forward_local_lights_smoke PROPERTIES
             FAIL_REGULAR_EXPRESSION "Vulkan validation \\[ERROR\\]")
-        set_tests_properties(aeg_forward_shadow_smoke aeg_deferred_shadow_smoke PROPERTIES
+        set_tests_properties(aeg_forward_shadow_smoke aeg_deferred_shadow_smoke aeg_feature_scene_shadow_smoke PROPERTIES
             FAIL_REGULAR_EXPRESSION "Vulkan validation \\[ERROR\\]")
         set_tests_properties(aeg_renderer_depth_pass_smoke PROPERTIES
             FAIL_REGULAR_EXPRESSION "Vulkan validation \\[ERROR\\]")
         add_test(NAME aeg_opaque_render_feature_multiframe_smoke COMMAND aeg_opaque_render_feature_multiframe_smoke)
         add_test(NAME aeg_opaque_render_feature_uv_depth_smoke COMMAND aeg_opaque_render_feature_uv_depth_smoke)
-        add_test(NAME aeg_editor_scene_runtime_smoke COMMAND aeg_editor_scene_runtime_smoke)
+        add_test(NAME aeg_feature_scene_depth_load_smoke COMMAND aeg_opaque_render_feature_uv_depth_smoke --depth-load)
+        add_test(NAME aeg_feature_scene_depth_clear_smoke COMMAND aeg_opaque_render_feature_uv_depth_smoke --depth-clear-near)
+        add_test(NAME aeg_editor_scene_runtime_smoke COMMAND aeg_editor_scene_runtime_smoke
+            $<TARGET_FILE:aeg_module_dynamic_lifetime_fixture> $<TARGET_FILE:aeg_module_dynamic_lifetime_fixture_v2>)
+        add_test(NAME aeg_editor_world_api_smoke COMMAND aeg_editor_scene_runtime_smoke --world-api)
+        add_test(NAME aeg_editor_world_binding_smoke COMMAND aeg_editor_scene_runtime_smoke --world-feature
+            $<TARGET_FILE:aeg_module_world_motion_fixture>)
+        add_test(NAME aeg_editor_demo_motion_smoke COMMAND aeg_editor_scene_runtime_smoke --demo-motion
+            $<TARGET_FILE:aeg_demo_game_module> "${CMAKE_CURRENT_SOURCE_DIR}/DemoProject")
         add_test(NAME aeg_editor_renderer_pipeline_smoke COMMAND aeg_editor_renderer_pipeline_smoke)
         set_tests_properties(aeg_editor_renderer_pipeline_smoke PROPERTIES
             FAIL_REGULAR_EXPRESSION "Vulkan validation \\[ERROR\\]")
-        add_test(NAME aeg_editor_project_pipeline_authoring_smoke COMMAND aeg_editor_project_pipeline_authoring_smoke)
+        add_test(NAME aeg_editor_project_feature_authoring_smoke COMMAND aeg_editor_project_feature_authoring_smoke)
         add_test(NAME aeg_editor_external_assets_smoke COMMAND aeg_editor_external_assets_smoke)
         add_test(NAME aeg_editor_viewport_interaction_smoke COMMAND aeg_editor_viewport_interaction_smoke)
         add_test(NAME aeg_editor_history_smoke COMMAND aeg_editor_history_smoke)
@@ -2689,9 +3709,18 @@ if (BUILD_TESTING AND AEG_BUILD_TESTS)
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/editor_pipeline_recovery.cmake")
         set_tests_properties(aeg_editor_application_pipeline_recovery PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
         add_test(NAME aeg_editor_application_missing_project
-                 COMMAND aeg_editor_application --frames 2 --project "${CMAKE_CURRENT_BINARY_DIR}/missing-recovery-project/project.aegproject")
-        set_tests_properties(aeg_editor_imgui_renderer_smoke aeg_opaque_render_feature_smoke
+                 COMMAND aeg_editor_application --frames 2 --project "${CMAKE_CURRENT_BINARY_DIR}/missing-recovery-project/Project.aegproj")
+        # Win32 focus/activation is a shared desktop resource, including the
+        # native Runtime host fixtures already protected by this resource.
+        set_tests_properties(aeg_application_platform_win32_smoke
+            aeg_editor_application_identity_smoke aeg_editor_application
+            aeg_editor_application_preferences aeg_editor_application_native_viewports
+            aeg_editor_application_missing_project
+            PROPERTIES RESOURCE_LOCK runtime_task1_fixture)
+        set_tests_properties(aeg_editor_imgui_renderer_smoke aeg_opaque_render_feature_smoke aeg_feature_scene_draw_smoke aeg_feature_registered_scene_draw_smoke aeg_feature_scene_draw_clear_smoke
+                aeg_feature_scene_draw_cold_smoke aeg_feature_scene_draw_retry_smoke
                 aeg_opaque_render_feature_multiframe_smoke aeg_opaque_render_feature_uv_depth_smoke
+                aeg_feature_scene_depth_load_smoke aeg_feature_scene_depth_clear_smoke
                 aeg_editor_scene_runtime_smoke aeg_editor_external_assets_smoke aeg_editor_viewport_interaction_smoke
                 aeg_editor_history_smoke aeg_editor_hierarchy_smoke aeg_editor_inspector_smoke
                 aeg_editor_asset_database_smoke aeg_editor_project_smoke aeg_editor_application
@@ -2716,7 +3745,7 @@ if (BUILD_TESTING AND AEG_BUILD_TESTS)
                 aeg_editor_workspace_smoke aeg_editor_font_smoke aeg_editor_font_validation_smoke
                 aeg_editor_preferences_smoke aeg_editor_imgui_renderer_smoke aeg_math_smoke aeg_result_smoke
                 aeg_reflection_smoke aeg_serialization_smoke aeg_concurrency_smoke aeg_ecs_smoke aeg_pipeline_smoke
-                aeg_pipeline_extension_smoke aeg_pipeline_conformance_smoke aeg_pipeline_runtime_smoke
+                aeg_pipeline_runtime_smoke
                 aeg_pipeline_hot_swap_smoke aeg_pipeline_phase_scheduler_smoke aeg_module_smoke aeg_world_scope_smoke
                 aeg_world_serialization_smoke aeg_scene_asset_smoke aeg_world_frame_orchestrator_smoke
                 aeg_world_multi_view_smoke aeg_engine_frame_orchestrator_smoke aeg_runtime_components_scene_smoke
@@ -2724,11 +3753,11 @@ if (BUILD_TESTING AND AEG_BUILD_TESTS)
                 aeg_opaque_render_feature_multiframe_smoke aeg_opaque_render_feature_uv_depth_smoke
                 aeg_editor_scene_runtime_smoke aeg_editor_external_assets_smoke aeg_editor_viewport_interaction_smoke
                 aeg_editor_history_smoke aeg_editor_hierarchy_smoke aeg_editor_inspector_smoke
-                aeg_editor_asset_database_smoke aeg_editor_project_smoke aeg_render_feature_runtime_smoke
+                aeg_editor_asset_database_smoke aeg_editor_project_smoke
                 aeg_frame_retention_smoke aeg_rhi_smoke aeg_logging_smoke aeg_triangle
                 aeg_editor_application_identity_smoke aeg_editor_application aeg_editor_application_preferences
                 aeg_editor_application_native_viewports
                 aeg_editor_application_missing_project aeg_editor_error_smoke aeg_editor_asset_pipeline_recovery_smoke
-                aeg_render_graph_imported_texture_state_smoke)
+                aeg_render_graph_imported_texture_state_smoke aeg_render_graph_imported_buffer_smoke)
     endif()
 endif()

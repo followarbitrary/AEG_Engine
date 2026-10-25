@@ -4,13 +4,14 @@
  */
 #include "../public/ecs.hpp"
 
+#include "concurrency.hpp"
+
 #include <atomic>
 #include <deque>
 #include <mutex>
 #include <new>
 #include <shared_mutex>
 #include <string>
-#include <thread>
 #include <unordered_map>
 #include <utility>
 
@@ -64,7 +65,7 @@ struct World::Impl final {
     WorldHandle handle{};
     std::string name{};
     bool enforce_owner_thread{true};
-    std::thread::id owner_thread{};
+    concurrency::ThreadId owner_thread{};
     std::atomic<uint64_t> revision{0};
     std::vector<EntityRecord> entities{};
     std::vector<uint32_t> free_entities{};
@@ -271,7 +272,7 @@ World::World(WorldHandle handle, const WorldDesc& desc) : impl_(std::make_unique
     impl_->handle = handle;
     impl_->name = desc.name;
     impl_->enforce_owner_thread = desc.enforce_owner_thread;
-    impl_->owner_thread = std::this_thread::get_id();
+    impl_->owner_thread = concurrency::current_thread_id();
 }
 
 World::~World() = default;
@@ -285,14 +286,15 @@ std::string_view World::name() const noexcept {
 }
 
 bool World::is_owner_thread() const noexcept {
-    return impl_ != nullptr && (!impl_->enforce_owner_thread || impl_->owner_thread == std::this_thread::get_id());
+    return impl_ != nullptr &&
+           (!impl_->enforce_owner_thread || impl_->owner_thread == concurrency::current_thread_id());
 }
 
 foundation::Result World::claim_owner_thread() noexcept {
     if (impl_ == nullptr) {
         return invalid_state("world is not initialized");
     }
-    impl_->owner_thread = std::this_thread::get_id();
+    impl_->owner_thread = concurrency::current_thread_id();
     return foundation::Result::success();
 }
 
@@ -315,7 +317,7 @@ foundation::Result World::validate_owner_access() const noexcept {
     if (impl_ == nullptr) {
         return invalid_state("world is not initialized");
     }
-    if (impl_->enforce_owner_thread && impl_->owner_thread != std::this_thread::get_id()) {
+    if (impl_->enforce_owner_thread && impl_->owner_thread != concurrency::current_thread_id()) {
         return invalid_state("world mutable state is accessed from a non-owner thread");
     }
     return foundation::Result::success();

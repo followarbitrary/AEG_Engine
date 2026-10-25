@@ -3,7 +3,7 @@
 #include <iostream>
 #include <vector>
 
-#include "pipeline_document_io.hpp"
+#include "feature_graph_io.hpp"
 #include "project_context.hpp"
 #include "project_scaffold.hpp"
 #include "scene_asset.hpp"
@@ -18,27 +18,40 @@ int main() {
         return 1;
     const auto loaded = aeg::application::project::ProjectFileCodec{}.load(result.value);
     if (!loaded || loaded.value.config.name != "Outline 示例" || loaded.value.config.module.target != "GameModule" ||
-        loaded.value.config.startup_pipelines.size() != 1U || loaded.value.config.project_uuid.size() != 36U)
+        loaded.value.config.startup_feature_graphs.size() != 1U || loaded.value.config.project_uuid.size() != 36U)
         return 2;
     for (const auto& path :
-         {fs::path("Assets/Pipelines/Default.aegpipe"), fs::path("Source/GameModule.cpp"),
-          fs::path("Source/GameModule.metadata.json"), fs::path("Source/Render/Features/CustomOutlineFeature.cpp"),
-          fs::path("Source/Render/Passes/VolumetricFogPass.cpp")}) {
+         {fs::path("Assets/Features/Default.aegfeature"), fs::path("Source/GameModule.cpp"),
+          fs::path("Source/GameModule.metadata.json")}) {
         if (!fs::exists(root / path))
             return 3;
     }
     for (const auto& path :
-         {fs::path("Assets/Pipelines/Default.aegpipe.meta"), fs::path("Assets/Scenes/Main.aegscene.meta")}) {
+         {fs::path("Assets/Features/Default.aegfeature.meta"), fs::path("Assets/Scenes/Main.aegscene.meta")}) {
         if (!fs::exists(root / path))
             return 10;
     }
-    const auto pipeline = aeg::application::project::load_pipeline_document(root / "Assets/Pipelines/Default.aegpipe");
-    if (!pipeline || pipeline.value.pipeline_nodes.size() != 1 || pipeline.value.feature_nodes.size() != 1 ||
-        pipeline.value.pass_nodes.size() != 1 || pipeline.value.edges.size() != 1)
+    const auto feature_graph = aeg::application::authoring::load_feature_graph_document(
+        root / "Assets/Features/Default.aegfeature");
+    if (!feature_graph || feature_graph.value.nodes.size() != 1 || !feature_graph.value.edges.empty() ||
+        feature_graph.value.nodes.front().definition_id != aeg::feature::FeatureDefinitionId{"Game.Logic.Gameplay"} ||
+        feature_graph.value.process_subgraphs.size() != 1)
         return 8;
+    const auto& process = feature_graph.value.process_subgraphs.front();
+    if (process.owner_node != feature_graph.value.nodes.front().node_id ||
+        process.states != std::vector<std::string>{"Ready", "Running", "Done"} ||
+        process.transitions != std::vector<std::string>{"Ready->Running", "Running->Done"} ||
+        process.initial_state != "Ready" || process.terminal_states != std::vector<std::string>{"Done"})
+        return 11;
     if (!fs::is_directory(root / "Build") || !fs::is_directory(root / "Cache") ||
         !fs::exists(root / "Assets" / "Scenes"))
         return 4;
+    for (const auto* directory : {"Build", "Binaries", "Cache", "Saved", ".aeg"}) {
+        if (!fs::is_directory(root / directory) || !fs::is_empty(root / directory)) {
+            std::cerr << "Scaffold copied generated template state: " << directory << '\n';
+            return 12;
+        }
+    }
     if (!fs::exists(root / ".gitignore"))
         return 9;
     std::ifstream scene_stream(root / "Assets" / "Scenes" / "Main.aegscene", std::ios::binary);

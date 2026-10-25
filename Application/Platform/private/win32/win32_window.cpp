@@ -320,8 +320,8 @@ void Win32Window::sync_state_from_native() noexcept {
         state_.position = platform::WindowPosition{window_rect.left, window_rect.top};
     }
     if (GetClientRect(hwnd_, &client_rect) != FALSE) {
-        const LONG width = std::max<LONG>(client_rect.right - client_rect.left, 1);
-        const LONG height = std::max<LONG>(client_rect.bottom - client_rect.top, 1);
+        const LONG width = std::max<LONG>(client_rect.right - client_rect.left, 0);
+        const LONG height = std::max<LONG>(client_rect.bottom - client_rect.top, 0);
         state_.extent = platform::WindowExtent{static_cast<uint32_t>(width), static_cast<uint32_t>(height)};
     }
     state_.visible = IsWindowVisible(hwnd_) != FALSE;
@@ -559,7 +559,8 @@ LRESULT Win32Window::handle_message(UINT message, WPARAM w_param, LPARAM l_param
             const uint32_t height = static_cast<uint32_t>(HIWORD(l_param));
             state_.minimized = w_param == SIZE_MINIMIZED;
             state_.maximized = w_param == SIZE_MAXIMIZED;
-            state_.extent = platform::WindowExtent{width == 0 ? 1u : width, height == 0 ? 1u : height};
+            // A zero client extent suspends drawing until a restore/resize event.
+            state_.extent = platform::WindowExtent{width, height};
             WindowEvent event{WindowEventType::kWindowResized};
             event.extent = state_.extent;
             emit_event(event);

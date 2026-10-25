@@ -64,21 +64,6 @@ struct SceneComponentKeyHash final {
     return writer.write_u64(id.low());
 }
 
-[[nodiscard]] foundation::Result write_string(serialization::BinaryWriter& writer, std::string_view value,
-                                              const SceneSerializationOptions& options) {
-    if (value.size() > options.max_name_bytes || value.size() > std::numeric_limits<uint32_t>::max()) {
-        return invalid_state("Scene string exceeds the configured size limit");
-    }
-    if (const foundation::Result result = writer.write_u32(static_cast<uint32_t>(value.size())); !result) {
-        return result;
-    }
-    if (value.empty()) {
-        return foundation::Result::success();
-    }
-    const auto bytes = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(value.data()), value.size());
-    return writer.write_bytes(bytes);
-}
-
 [[nodiscard]] foundation::ResultValue<SceneEntityId> read_guid(serialization::BinaryReader& reader) {
     const auto high = reader.read_u64();
     const auto low = reader.read_u64();
@@ -95,30 +80,6 @@ struct SceneComponentKeyHash final {
         return {invalid_argument("Scene archive asset identity is truncated"), {}};
     }
     return {foundation::Result::success(), SceneAssetId{high.value, low.value}};
-}
-
-[[nodiscard]] foundation::ResultValue<std::string> read_string(serialization::BinaryReader& reader,
-                                                               const SceneSerializationOptions& options) {
-    const auto size = reader.read_u32();
-    if (!size) {
-        return {invalid_argument("Scene archive string size is truncated"), {}};
-    }
-    if (size.value > options.max_name_bytes) {
-        return {invalid_state("Scene archive string exceeds the configured size limit"), {}};
-    }
-    const auto bytes = reader.read_bytes(size.value);
-    if (!bytes) {
-        return {bytes.result, {}};
-    }
-    try {
-        if (bytes.value.empty()) {
-            return {foundation::Result::success(), {}};
-        }
-        return {foundation::Result::success(),
-                std::string(reinterpret_cast<const char*>(bytes.value.data()), bytes.value.size())};
-    } catch (const std::bad_alloc&) {
-        return {out_of_memory("Scene archive string allocation failed"), {}};
-    }
 }
 
 [[nodiscard]] foundation::ResultValue<SceneEntityIndex> build_entity_index(const SceneAsset& asset) {
@@ -220,10 +181,10 @@ struct HierarchyLists final {
     if (const foundation::Result result = writer.write_u32(static_cast<uint32_t>(entity.flags)); !result) {
         return result;
     }
-    if (const foundation::Result result = write_string(writer, entity.name, options); !result) {
+    if (const foundation::Result result = writer.write_string(entity.name, options.max_name_bytes); !result) {
         return result;
     }
-    return write_string(writer, entity.tag, options);
+    return writer.write_string(entity.tag, options.max_name_bytes);
 }
 
 [[nodiscard]] foundation::Result write_component(serialization::BinaryWriter& writer,
@@ -831,7 +792,7 @@ foundation::Result SceneSerializer::serialize(const SceneAsset& asset, serializa
         if (const foundation::Result result = encoded.write_u32(asset.version()); !result) {
             return result;
         }
-        if (const foundation::Result result = write_string(encoded, asset.name(), options); !result) {
+        if (const foundation::Result result = encoded.write_string(asset.name(), options.max_name_bytes); !result) {
             return result;
         }
         if (const foundation::Result result = encoded.write_u32(static_cast<uint32_t>(asset.entities().size()));
@@ -903,7 +864,7 @@ foundation::ResultValue<SceneAsset> SceneSerializer::deserialize(serialization::
         if (!asset_id.value.is_valid() || asset_version.value == 0) {
             return {invalid_state("Scene archive asset metadata is invalid"), {}};
         }
-        const auto name = read_string(reader, options);
+        const auto name = reader.read_string(options.max_name_bytes);
         const auto entity_count = reader.read_u32();
         const auto component_count = reader.read_u32();
         if (!name || !entity_count || !component_count) {
@@ -924,13 +885,13 @@ foundation::ResultValue<SceneAsset> SceneSerializer::deserialize(serialization::
             if (!entity_id.value.is_valid() || (flags.value & ~kKnownSceneEntityFlags) != 0) {
                 return {invalid_state("Scene archive entity record is invalid"), {}};
             }
-            const auto entity_name = read_string(reader, options);
+            const auto entity_name = reader.read_string(options.max_name_bytes);
             if (!entity_name) {
                 return {entity_name.result, {}};
             }
             std::string entity_tag;
             if (format_version.value >= 2u) {
-                const auto tag = read_string(reader, options);
+                const auto tag = reader.read_string(options.max_name_bytes);
                 if (!tag) {
                     return {tag.result, {}};
                 }

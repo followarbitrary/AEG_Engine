@@ -5,7 +5,7 @@
 
 namespace aeg::application::runtime {
 namespace {
-foundation::Result kind_error(asset::AssetKind expected, asset::AssetKind actual) {
+foundation::Result kind_error(foundation::AssetKind expected, foundation::AssetKind actual) {
     return foundation::invalid_argument("Runtime asset kind mismatch: expected " +
                                         std::to_string(static_cast<unsigned>(expected)) + ", got " +
                                         std::to_string(static_cast<unsigned>(actual)));
@@ -21,7 +21,7 @@ std::size_t RuntimeAssetCache::KeyHash::operator()(const Key& key) const noexcep
     return static_cast<std::size_t>(value ^ (value >> 32u));
 }
 
-uint64_t RuntimeAssetCache::handle_value(asset::AssetId id, asset::AssetKind kind) noexcept {
+uint64_t RuntimeAssetCache::handle_value(foundation::AssetId id, foundation::AssetKind kind) noexcept {
     (void)id;
     (void)kind;
     if (next_handle_ == 0)
@@ -36,7 +36,7 @@ foundation::Result RuntimeAssetCache::mount(asset::AssetPackageReader package) n
     return foundation::Result::success();
 }
 
-foundation::ResultValue<RuntimeAssetCache::Entry*> RuntimeAssetCache::begin(asset::AssetId id, asset::AssetKind kind) {
+foundation::ResultValue<RuntimeAssetCache::Entry*> RuntimeAssetCache::begin(foundation::AssetId id, foundation::AssetKind kind) {
     if (!package_)
         return {foundation::invalid_state("Runtime asset package is not mounted"), {}};
     auto [iterator, inserted] = entries_.try_emplace(Key{id, kind});
@@ -50,8 +50,8 @@ foundation::ResultValue<RuntimeAssetCache::Entry*> RuntimeAssetCache::begin(asse
     return {foundation::Result::success(), &entry};
 }
 
-foundation::ResultValue<RuntimeMeshAsset> RuntimeAssetCache::load_mesh(asset::AssetId id) {
-    auto started = begin(id, asset::AssetKind::kMesh);
+foundation::ResultValue<RuntimeMeshAsset> RuntimeAssetCache::load_mesh(foundation::AssetId id) {
+    auto started = begin(id, foundation::AssetKind::kMesh);
     if (!started)
         return {started.result, {}};
     Entry& entry = *started.value;
@@ -63,9 +63,9 @@ foundation::ResultValue<RuntimeMeshAsset> RuntimeAssetCache::load_mesh(asset::As
         entry.error = cooked.result;
         return {entry.error, {}};
     }
-    if (cooked.value.kind != asset::AssetKind::kMesh) {
+    if (cooked.value.kind != foundation::AssetKind::kMesh) {
         entry.state = RuntimeAssetState::kFailed;
-        entry.error = kind_error(asset::AssetKind::kMesh, cooked.value.kind);
+        entry.error = kind_error(foundation::AssetKind::kMesh, cooked.value.kind);
         return {entry.error, {}};
     }
     auto payload = asset::decode_mesh_payload(cooked.value.payload);
@@ -86,8 +86,8 @@ foundation::ResultValue<RuntimeMeshAsset> RuntimeAssetCache::load_mesh(asset::As
     return {foundation::Result::success(), RuntimeMeshAsset{entry.handle, entry.state, entry.mesh, entry.vertices}};
 }
 
-foundation::ResultValue<RuntimeTextureAsset> RuntimeAssetCache::load_texture(asset::AssetId id) {
-    auto started = begin(id, asset::AssetKind::kTexture);
+foundation::ResultValue<RuntimeTextureAsset> RuntimeAssetCache::load_texture(foundation::AssetId id) {
+    auto started = begin(id, foundation::AssetKind::kTexture);
     if (!started)
         return {started.result, {}};
     Entry& entry = *started.value;
@@ -99,9 +99,9 @@ foundation::ResultValue<RuntimeTextureAsset> RuntimeAssetCache::load_texture(ass
         entry.error = cooked.result;
         return {entry.error, {}};
     }
-    if (cooked.value.kind != asset::AssetKind::kTexture) {
+    if (cooked.value.kind != foundation::AssetKind::kTexture) {
         entry.state = RuntimeAssetState::kFailed;
-        entry.error = kind_error(asset::AssetKind::kTexture, cooked.value.kind);
+        entry.error = kind_error(foundation::AssetKind::kTexture, cooked.value.kind);
         return {entry.error, {}};
     }
     auto payload = asset::decode_texture_payload(cooked.value.payload);
@@ -115,8 +115,8 @@ foundation::ResultValue<RuntimeTextureAsset> RuntimeAssetCache::load_texture(ass
     return {foundation::Result::success(), RuntimeTextureAsset{entry.handle, entry.state, entry.texture}};
 }
 
-foundation::ResultValue<RuntimeFontAsset> RuntimeAssetCache::load_font(asset::AssetId id) {
-    auto started = begin(id, asset::AssetKind::kFont);
+foundation::ResultValue<RuntimeFontAsset> RuntimeAssetCache::load_font(foundation::AssetId id) {
+    auto started = begin(id, foundation::AssetKind::kFont);
     if (!started)
         return {started.result, {}};
     Entry& entry = *started.value;
@@ -128,9 +128,9 @@ foundation::ResultValue<RuntimeFontAsset> RuntimeAssetCache::load_font(asset::As
         entry.error = cooked.result;
         return {entry.error, {}};
     }
-    if (cooked.value.kind != asset::AssetKind::kFont) {
+    if (cooked.value.kind != foundation::AssetKind::kFont) {
         entry.state = RuntimeAssetState::kFailed;
-        entry.error = kind_error(asset::AssetKind::kFont, cooked.value.kind);
+        entry.error = kind_error(foundation::AssetKind::kFont, cooked.value.kind);
         return {entry.error, {}};
     }
     auto payload = asset::decode_font_payload(cooked.value.payload);
@@ -144,8 +144,8 @@ foundation::ResultValue<RuntimeFontAsset> RuntimeAssetCache::load_font(asset::As
     return {foundation::Result::success(), RuntimeFontAsset{entry.handle, entry.state, entry.font}};
 }
 
-foundation::ResultValue<RuntimeMaterialAsset> RuntimeAssetCache::load_material(asset::AssetId id) {
-    auto started = begin(id, asset::AssetKind::kMaterial);
+foundation::ResultValue<RuntimeMaterialAsset> RuntimeAssetCache::load_material(foundation::AssetId id) {
+    auto started = begin(id, foundation::AssetKind::kMaterial);
     if (!started)
         return {started.result, {}};
     Entry& entry = *started.value;
@@ -157,9 +157,9 @@ foundation::ResultValue<RuntimeMaterialAsset> RuntimeAssetCache::load_material(a
         entry.error = cooked.result;
         return {entry.error, {}};
     }
-    if (cooked.value.kind != asset::AssetKind::kMaterial) {
+    if (cooked.value.kind != foundation::AssetKind::kMaterial) {
         entry.state = RuntimeAssetState::kFailed;
-        entry.error = kind_error(asset::AssetKind::kMaterial, cooked.value.kind);
+        entry.error = kind_error(foundation::AssetKind::kMaterial, cooked.value.kind);
         return {entry.error, {}};
     }
     auto payload = asset::decode_material_payload(cooked.value.payload);
@@ -180,7 +180,7 @@ foundation::ResultValue<RuntimeMaterialAsset> RuntimeAssetCache::load_material(a
     return {foundation::Result::success(), RuntimeMaterialAsset{entry.handle, entry.state, entry.material}};
 }
 
-foundation::Result RuntimeAssetCache::retry(asset::AssetId id, asset::AssetKind kind) noexcept {
+foundation::Result RuntimeAssetCache::retry(foundation::AssetId id, foundation::AssetKind kind) noexcept {
     const auto found = entries_.find(Key{id, kind});
     if (found != entries_.end() && found->second.state == RuntimeAssetState::kFailed)
         entries_.erase(found);

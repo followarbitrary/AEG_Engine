@@ -2,8 +2,8 @@
  * @file ecs_smoke.cpp
  * @brief Exercises World entity generations, component pools, commands, and snapshots.
  */
+#include <concurrency.hpp>
 #include <ecs.hpp>
-#include <thread>
 
 namespace {
 struct Position final {
@@ -107,9 +107,16 @@ int main() {
         commands.size() != 1) {
         return 6;
     }
-    std::thread producer(
-        [&commands, entity = first_entity.value] { static_cast<void>(commands.enqueue_remove<Position>(entity)); });
-    producer.join();
+    aeg::concurrency::WorkerExecutor producer_executor(
+        {aeg::concurrency::ExecutorDomain::kCpuWorker, 1, true});
+    aeg::concurrency::TaskDesc producer_task{};
+    producer_task.execute = [&commands, entity = first_entity.value](const aeg::concurrency::TaskContext&) {
+        return commands.enqueue_remove<Position>(entity);
+    };
+    const auto producer_submission = producer_executor.submit(std::move(producer_task));
+    if (!producer_submission || !producer_submission.value.wait(5'000'000'000ull)) {
+        return 7;
+    }
     if (commands.size() != 2 || !first->apply_commands(commands) || !commands.empty() ||
         first->has<Position>(first_entity.value)) {
         return 7;

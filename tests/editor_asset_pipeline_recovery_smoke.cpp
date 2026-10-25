@@ -2,10 +2,10 @@
 #include <array>
 #include <chrono>
 #include <cstring>
+#include <concurrency.hpp>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
-#include <thread>
 
 #include "editor_asset_pipeline.hpp"
 
@@ -37,7 +37,9 @@ bool await_completion(EditorAssetPipeline& pipeline, bool success) {
                 return true;
             }
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        if (!aeg::concurrency::sleep_for(10'000'000ull)) {
+            return false;
+        }
     }
     return false;
 }
@@ -120,6 +122,17 @@ int main() {
         return 7;
     }
     pipeline.shutdown();
+
+    // Recreate both long-lived IO loops after shutdown. This catches stale
+    // cancellation, executor ownership, and watcher lifetime regressions.
+    for (int cycle = 0; cycle < 3; ++cycle) {
+        if (!pipeline.initialize(root) || !pipeline.synchronize(std::span{&valid, 1}) ||
+            !await_completion(pipeline, true)) {
+            std::cerr << "Asset pipeline did not recover after reinitialize\n";
+            return 8;
+        }
+        pipeline.shutdown();
+    }
     std::filesystem::remove_all(root);
     return 0;
 }

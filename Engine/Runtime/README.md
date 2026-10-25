@@ -69,14 +69,14 @@ Runtime 组件只通过该公共 Snapshot 回调适配相机，Engine 编排器�
 应显式设置实际目标尺寸。这样 Runtime 的 View 解析逻辑无需了解外部 Texture 或具体 RHI
 后端。
 
-`EngineFrameDesc::render_feature_preparation` 运行在 RenderBuild 的 Feature 构图之前，适合
-导入帧内外部目标、分配 Readback 或准备 Upload。回调可先通过
+`EngineFrameDesc::render_feature_preparation` 在 RenderBuild 阶段准备帧内资源，也可加入固定
+native 技术工作，适合导入外部目标、分配 Readback 或准备 Upload。回调可先通过
 `EngineFramePreparationContext::render_graph` 导入 Texture，再调用
 `bind_feature_texture(RenderResourceId, RenderGraphTexture)` 把稳定逻辑资源身份提供给后续
-RenderFeature。该绑定只在当前活跃帧且 Feature 构图前有效；重复身份必须指向同一 Texture，
+现代 Feature 投影。该绑定只在当前活跃帧的 preparation 期间有效；重复身份必须指向同一 Texture，
 Context、FrameAllocation 和 RenderGraph Handle 都不得跨帧保存。
 
-Opaque RenderFeature 的网格资源还必须声明 `RenderMeshVertexLayout`：interleaved Vertex
+Opaque native 绘制的网格资源还必须声明 `RenderMeshVertexLayout`：interleaved Vertex
 Buffer 至少包含 Position `float4`、UV `float2` 和 Normal `float3`，并且 stride、offset、
 format 必须与当前 Shader Contract 一致。Object Uniform 使用 `RenderObjectConstants`，
 包含 Clip-space MVP 和用于法线变换的 inverse-transpose Matrix，Buffer 范围必须覆盖完整
@@ -93,7 +93,7 @@ Directional Light 的方向、颜色、强度和环境光，使用 Lambert 项
 
 光照常量和 BindingSet 按帧生成。更新材质或光照时，调用方应通过 `FrameContext` 的上传
 与延迟销毁接口保留旧资源直到提交完成，不得依赖每帧 `wait_idle()`，也不得修改 GPU 仍
-在使用的持久 Descriptor。RenderFeature 只借用当前帧资源，不取得其所有权。
+在使用的持久 Descriptor。native 绘制只借用当前帧资源，实际 owner 按帧提交与退休。
 
 ## 最小编辑器闭环
 
@@ -109,22 +109,108 @@ Editor 以 `SceneAsset` 作为稳定文档身份，以 `SceneInstance` 维护场
 不能使编辑器进程崩溃。
 
 Scene Viewport 是离屏 RenderGraph 输出的借用者。编辑器每帧应先导入当前尺寸的 Color/Depth
-目标，再运行 Runtime View 提取和 Opaque Feature，最后将颜色目标转换到采样态供 ImGui 使用。
+目标，再运行 Runtime View 提取和现代 Scene Feature 的 native 投影，最后将颜色目标转换到采样态供 ImGui 使用。
 任何 RenderGraph Handle、FrameContext 分配或持久 BindingSet 都不得跨越其声明的生命周期。
 
 ## 依赖边界
 
-Runtime 可以依赖 Foundation、Math、ECS、Reflection、Serialization、Pipeline、World、
-RenderGraph 和 Renderer 的公共接口，但不得包含它们的 private 头文件，也不得直接暴露
-Vulkan、Win32 或其他 native API。Scene 依赖 Runtime 组件公开的数据契约和 Reflection
+Runtime 的公共边界使用 Foundation、Math、ECS、Reflection、Serialization、Pipeline、World、
+RenderGraph 和 Renderer 的稳定契约，不传播 private 实现或 Vulkan、Win32 等 native API。
+实现文件通过显式 private adapter 使用引擎内部执行服务。Scene 依赖 Runtime 组件公开的数据契约和 Reflection
 schema，不反向要求 Runtime 依赖 Scene。
 # Pipeline composition runtime
 
 `PipelineCompositionRuntime` 负责把多个 `PipelineScopeHost` 绑定成一个可切换组合。
+其公共头只声明组合所需的轻量执行身份和 Host/PreparedDocument 引用；配置快照、待应用
+队列和计数器均位于 `Engine/Runtime/private` 的 PIMPL 中，避免把 Pipeline authoring
+实现容器通过 Runtime 公共头传播给上层。Editor 使用该桥接时必须显式 include 自己需要
+的 Pipeline authoring 头。
 组合先通过 `stage()` 校验 Host 数量、Owner 和唯一名称，再在安全帧边界调用 `apply_pending()`
 进行整体交换。任何 staging 失败都不会修改当前 active 组合，也不会逐 Host 发布部分状态。
 停止预览时调用 `stop_and_retire()`；它在同一安全边界停用仍处于 active 状态的 Host，
 并清空待应用及当前组合，避免编辑器停止后继续执行旧 Plan。
 
-Host 的 Pipeline/Feature 实例配置使用不可变快照；RenderPass 只能通过现有 RenderGraph
+Host 的技术 Pipeline/Feature 声明配置使用不可变快照；RenderPass 通过现有 RenderGraph
 构图入口加入执行图。模块卸载必须等待组合、帧和回调引用全部退休后进行。
+
+EngineFramePostBuildContext 提供本帧 preparation 已解析的纹理绑定，只在回调期间借用。
+Application Runtime 在此边界把 owner 已提交的 RenderIntent 快照展开到同一个 RenderGraph，
+随后调用原有 readback 回调。Frame profile 的基础设施继续复用；五域 Feature 的业务身份
+由每个实际 Pass 的 Feature/Node/Instance/Invocation/Frame 来源追踪。
+
+FeatureGraph 的 World view 可通过无 Pipeline host 的 register_world_frame 重用 WorldFrameScope
+和 Renderer 提取路径。post-build context 同时借用当前帧 owning 场景快照 span 与资源解析器，
+供 Renderer 中立绘制降级使用；快照租约由 RenderGraph 转交 FrameContext 退休。技术 Frame host
+继续使用同一个注册/桥接 helper，避免重复构建场景。
+
+Application 的纯 FeatureGraph 入口按已接受的 Draw 意图请求场景提取；没有 Draw 的帧
+不要求 Camera，也不解析不需要的场景资源。
+
+GBuffer 场景意图也请求同一场景提取路径。owned-host 按已接受意图需求为
+Renderer.GBuffer.Albedo/Normal/Material 绑定 View 尺寸的临时附件，复用深度附件的
+分配/绑定函数和现有 Renderer.SceneDepth。宿主从同一个真实 MRT PSO 创建描述发布
+完整附件契约；RuntimeAssetResolver 每次解析转发当前句柄和契约，暖材质复用描述符
+及参数缓冲。游戏侧只持有 Feature 资源引用，不持有分配器、PSO 或原生纹理。
+
+DeferredLighting 也触发同一场景提取；owned-host 按意图需求通过现有绑定函数提供
+Renderer.SceneLighting HDR 槽及被读取的 GBuffer/阴影槽，不另建分配器。现有光照
+缓存以帧编号、View ID、完整已验证常量为键；同帧不同场景的 GPU 数据保持不可变，
+上传收据使用同一身份，清空未提交工作后在原分配上重录。仍由宿主显式退休缓存，
+不以此宣称有界逐帧驱逐。Deferred PSO 附件合同随 live resource 一起转发。
+## 中立后处理
+
+RenderPostProcessScene 按需使用现有 SceneLighting 外部 HDR 槽和场景深度，复用 owned
+宿主附件分配/绑定函数与 post_process_resolver。作者可在 Feature 中指定纯值设置；
+宿主沿用真实 PSO 合同、帧常量和退休服务。非空打包 smoke 验证 Scene UUID 重定位与
+GBuffer→Deferred→PostProcess→最终读回，不用独立清屏作为几何成功证据。
+
+现代 Scene Feature 输出由 Application 的 post-build 路径调用 Renderer lowerer，并传入实际
+native PassRegistry 及其当前 execution epoch。Orchestrator 不再遍历 pinned Pipeline instance
+构建旧 RenderFeature，不再读取该 registry 的 epoch 或扩展 authored pass，也不缓存旧
+`RenderFeatureContext`。`EngineFrameDesc::render_feature_buffers` 和 `render_feature_state`
+以及对应 buffer/state forwarding 已删除。
+
+技术 Pipeline Registry 与 Scheduler 由 Runtime-private `EngineFramePipelineHost` 借用。
+Runtime Bootstrap 和 Editor Scene Runtime 在整个 orchestrator 生命周期内保持该 host，
+因此 Runtime public 构造边界只传递 opaque host 引用，不传播 Pipeline service references。
+
+Frame 技术 host 注册通过 Runtime-private `EngineFramePipelineRegistration` 适配器
+完成；该入口明确拒绝原始 World Pipeline。World 通过公开的 aggregate 注册进入
+命令应用、WorldCommit 和只读快照捕获。`EngineFrameOrchestrator` 的 registration API 不要求调用方直接传递
+`PipelineScopeHost`；typed host 只在 private implementation 解包，注册重复检查和回滚语义
+保持原有路径。
+
+公开 Orchestrator 采用 PImpl；技术计划 pin、Pipeline host、Artifact bridge 与 phase registry
+位于实现文件中。构造能力值使用 uint64_t，资源身份来自 Feature，
+公开的场景与资源句柄来自 Renderer/RenderGraph。原 abort、release、deactivate、clear
+清理顺序和 World/View 回滚保持。`EngineFrameDesc::user_data` 仍传入实际 Renderer extraction
+并用于 Stage inspection 的身份观测；`render_resource_resolver` 仍参与提取并借给 post-build
+中的 Scene 投影。它们不再转发到旧 instance RenderFeature context。
+Pipeline 不再承载 CPU callback/Task/worker。编排器只访问技术 Stage 计划，帧资源/RG 构建
+按原生命周期运行。内部 engine_frame_inspection.hpp 提供按需启用的 owning Stage trace，
+记录真实 phase/host/frame/userdata identity、WorldFrameKey、typed snapshot 与实际 host
+Artifact bridge。默认不累计，活跃帧不能切换，capture 副本在帧清理后仍持有旧不可变值；
+这里没有任意 observation callback。真实业务由 FeatureRuntime 的调用/提交结果驱动，
+固定 World.Transform typed outbox 由下面的生产适配器消费；demo/callback 归属继续迁移。
+
+Frame 技术计划的 Registry 接收拥有的静态声明值，不再执行 factory、virtual build 或
+collect/setup。实际 snapshot Stage 和 Artifact 记录由固定 compiler 展开，plan pin 保
+真正不可变 declaration owner；编译失败不产生部分计划或执行业务写入。Frame Stage、Artifact
+bridge、plan pin 与 RenderGraph execution leases 继续负责技术执行和生命周期，不提供业务
+invocation 来源。项目仍沿原 FeatureGraph compile/publish、FeatureRuntime commit/capture 与
+post-build 投影路径执行；World typed outbox 与业务 callback 归属要求继续保留，
+声明 owner 不能替代现代 invocation 来源。
+
+`private/feature_world_commands.hpp/.cpp` 提供固定 `World.Transform` v1 codec 和 consumer。
+对象使用真实 `Game.Transform` schema1 和既有 Reflection Serialization，payload 包含预期
+World revision、expected Transform 与 replacement Transform。严格 canonical record 和
+finite 值检查拒绝缺字段、重复/未知字段、错误版本及尾部字节，不复制 Vec3 padding。
+绑定保存 canonical Feature source 与 World 私有的实际生命周期 weak lease，实体仅来自
+显式 route。组件 schema/存储、owner 线程、World 代次、revision 和 typed expected-before
+全部检查后，一次 noexcept 赋值进入 Feature consume/Applied 确认。未通过预检的条目保
+Pending；不同成功提交的旧 pending 仍按源顺序交付。重复 source/protocol route 拒绝。
+
+Engine-only `EngineFrameWorldCommands` 在帧间借用该 consumer，`commit_worlds` 在每个
+World snapshot commit 前消费。真实 snapshot copy 失败可以留下 Applied 命令和旧 snapshot，
+重试仅重新发布 snapshot，不重放已应用命令。无 renderer 的 Bootstrap 使用同一 consumer。
+World 不反向依赖 Runtime 组件，公开 Orchestrator 和 GameSDK 不暴露此执行接口。

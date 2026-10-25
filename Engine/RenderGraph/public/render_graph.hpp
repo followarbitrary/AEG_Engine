@@ -10,71 +10,18 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <utility>
 #include <vector>
 
 #include "frame_context.hpp"
+#include "render_graph_types.hpp"
 #include "result.hpp"
+#include "render_feature_projection.hpp"
 
 namespace aeg::render_graph {
-/** @brief Sentinel used for invalid render-graph handle indices. */
-inline constexpr uint32_t kInvalidHandleIndex = std::numeric_limits<uint32_t>::max();
-
-/**
- * @brief Opaque handle for a logical render-graph texture.
- *
- * Handles are valid only for the graph instance and resource generation
- * that created them. They are invalidated by reset().
- */
-struct RenderGraphTexture {
-    uint32_t index{kInvalidHandleIndex};
-    uint32_t generation{0};
-    uint64_t graph_id{0};
-
-    [[nodiscard]] constexpr bool is_valid() const noexcept {
-        return index != kInvalidHandleIndex && generation != 0 && graph_id != 0;
-    }
-
-    constexpr explicit operator bool() const noexcept { return is_valid(); }
-    friend constexpr bool operator==(RenderGraphTexture, RenderGraphTexture) = default;
-};
-
-/** @brief Opaque handle for a logical render-graph buffer. */
-struct RenderGraphBuffer {
-    uint32_t index{kInvalidHandleIndex};
-    uint32_t generation{0};
-    uint64_t graph_id{0};
-
-    [[nodiscard]] constexpr bool is_valid() const noexcept {
-        return index != kInvalidHandleIndex && generation != 0 && graph_id != 0;
-    }
-
-    constexpr explicit operator bool() const noexcept { return is_valid(); }
-    friend constexpr bool operator==(RenderGraphBuffer, RenderGraphBuffer) = default;
-};
-
-/** @brief Opaque handle for a render-graph pass declaration. */
-struct RenderGraphPass {
-    uint32_t index{kInvalidHandleIndex};
-    uint32_t generation{0};
-    uint64_t graph_id{0};
-
-    [[nodiscard]] constexpr bool is_valid() const noexcept {
-        return index != kInvalidHandleIndex && generation != 0 && graph_id != 0;
-    }
-
-    constexpr explicit operator bool() const noexcept { return is_valid(); }
-    friend constexpr bool operator==(RenderGraphPass, RenderGraphPass) = default;
-};
-
-/** @brief Byte range of a logical buffer used by one pass. */
-struct RenderGraphBufferRange {
-    uint64_t offset{0};
-    uint64_t size{std::numeric_limits<uint64_t>::max()};
-};
-
 /** @brief Determines how the graph allocates and owns a logical resource. */
 enum class ResourceLifetime : uint8_t { kTransient, kPersistent, kImported };
 /** @brief Declares whether a pass reads, writes, or both reads and writes a resource. */
@@ -124,6 +71,8 @@ struct RenderGraphPassPlan {
     uint32_t topological_index{kInvalidHandleIndex};
     bool live{false};
     std::vector<RenderGraphBarrierPlan> barriers{};
+    /** Feature provenance is absent for frame infrastructure work. */
+    std::optional<RenderWorkItem> feature_work{};
 };
 
 /** @brief Audited dependency between two queue submission batches. */
@@ -180,6 +129,17 @@ struct RenderGraphCompileInfo {
 };
 
 /**
+ * @brief Owning diagnostic values from one successful graph compilation.
+ *
+ * The copied plan remains usable after graph changes or destruction. It
+ * contains no backend resources, command callbacks, or submission access.
+ */
+struct RenderGraphInspection {
+    RenderGraphCompileInfo compilation{};
+    RenderGraphPlan plan{};
+};
+
+/**
  * @brief Shared ownership retained until the frame consuming a graph completes.
  *
  * The lease is borrowed while RenderGraph::execute() runs. The shared
@@ -232,7 +192,12 @@ class RenderGraph;
 class PassBuilder;
 class RenderPassCommandContext;
 using PassExecutionContext = RenderPassCommandContext;
-class RenderGraphFeatureRuntime;
+namespace detail {
+struct RenderGraphFeatureGraphAccess;
+struct RenderGraphExecution;
+struct RenderGraphResourceAccess;
+struct RenderGraphUploadAccess;
+}
 
 /** @brief Callback that declares resource usage for a pass. */
 using PassSetupCallback = std::function<foundation::Result(PassBuilder&)>;
@@ -429,8 +394,6 @@ public:
     RenderGraph(RenderGraph&&) = delete;
     RenderGraph& operator=(RenderGraph&&) = delete;
 
-    [[nodiscard]] rhi::Device& device() const noexcept { return device_; }
-
     /**
      * @brief Clears passes and all graph-owned logical resources.
      *
@@ -452,19 +415,14 @@ public:
     [[nodiscard]] foundation::ResultValue<RenderGraphTexture> create_texture(
         const rhi::TextureDesc& desc, ResourceLifetime lifetime = ResourceLifetime::kTransient);
 
-    /** @brief Tests whether a buffer handle belongs to this graph instance. */
-    [[nodiscard]] bool contains_buffer(RenderGraphBuffer resource) const noexcept;
-    /** @brief Tests whether a texture handle belongs to this graph instance. */
-    [[nodiscard]] bool contains_texture(RenderGraphTexture resource) const noexcept;
-
-    /** @brief Imports an externally owned buffer into the graph. */
+    /** @brief Imports an externally owned buffer; compatible repeated imports share one graph identity. */
     [[nodiscard]] foundation::ResultValue<RenderGraphBuffer> import_buffer(
         rhi::BufferHandle buffer, const rhi::BufferDesc& desc, const rhi::ResourceState& initial_state = {});
     /** @brief Imports an externally owned texture and default view. */
     [[nodiscard]] foundation::ResultValue<RenderGraphTexture> import_texture(
         rhi::TextureHandle texture, rhi::TextureViewHandle default_view, const rhi::TextureDesc& desc,
-        const rhi::ResourceState& initial_state = {});
-    /** @brief Replaces the native buffer attached to an imported resource. */
+        const rhi::ResourceState& initial_state = {}, std::shared_ptr<const void> texture_owner = {});
+    /** @brief Replaces an imported buffer; a native handle already imported by another resource is rejected. */
     [[nodiscard]] foundation::Result update_imported_buffer(RenderGraphBuffer resource, rhi::BufferHandle buffer,
                                                             const rhi::ResourceState& initial_state = {});
     /** @brief Replaces the native texture attached to an imported resource. */
@@ -490,15 +448,14 @@ public:
     [[nodiscard]] foundation::ResultValue<RenderGraphPass> add_pass(std::string_view name, rhi::QueueClass queue,
                                                                     PassSetupCallback setup,
                                                                     PassExecuteCallback execute);
+
     /** @brief Requires the source pass to finish before the destination pass begins. */
     [[nodiscard]] foundation::Result add_dependency(RenderGraphPass source, RenderGraphPass destination);
 
     /** @brief Analyzes dependencies, allocates transient resources, and emits barriers. */
     [[nodiscard]] foundation::Result compile();
-    /** @brief Returns statistics from the last successful compile(). */
-    [[nodiscard]] const RenderGraphCompileInfo& compile_info() const noexcept { return compile_info_; }
-    /** @brief Returns the backend-neutral plan from the last successful compile(). */
-    [[nodiscard]] const RenderGraphPlan& plan() const noexcept;
+    /** @brief Copies compiled diagnostics; returns not-ready until the current graph compiles successfully. */
+    [[nodiscard]] foundation::ResultValue<RenderGraphInspection> inspect() const;
     /** @brief Executes the last successful compilation in a frame context. */
     [[nodiscard]] foundation::ResultValue<RenderGraphExecutionResult> execute(FrameContext& frame_context,
                                                                               const RenderGraphExecuteDesc& desc = {});
@@ -506,12 +463,10 @@ public:
 private:
     friend class PassBuilder;
     friend class RenderPassCommandContext;
-    friend class RenderGraphFeatureRuntime;
-
-    [[nodiscard]] foundation::Result begin_feature_build_transaction();
-    [[nodiscard]] foundation::Result retain_execution_owner(std::shared_ptr<const void> owner);
-    void commit_feature_build_transaction() noexcept;
-    void rollback_feature_build_transaction() noexcept;
+    friend struct detail::RenderGraphFeatureGraphAccess;
+    friend struct detail::RenderGraphExecution;
+    friend struct detail::RenderGraphResourceAccess;
+    friend struct detail::RenderGraphUploadAccess;
 
     /** @brief Opaque implementation containing graph compiler and runtime state. */
     struct Impl;

@@ -598,20 +598,61 @@ EditorAssetPipeline::~EditorAssetPipeline() {
 
 foundation::Result EditorAssetPipeline::initialize(const std::filesystem::path& project_root) {
     shutdown();
-    std::error_code error;
-    project_root_ = std::filesystem::weakly_canonical(project_root, error);
-    if (error) {
-        project_root_ = std::filesystem::absolute(project_root, error);
-    }
-    derived_root_ = project_root_ / ".aeg" / "DerivedData";
-    std::filesystem::create_directories(derived_root_, error);
-    if (error) {
-        return Result::failure(ResultCode::kUnknown, "Cannot create project DerivedData directory");
-    }
+    try {
+        std::error_code error;
+        project_root_ = std::filesystem::weakly_canonical(project_root, error);
+        if (error) {
+            project_root_ = std::filesystem::absolute(project_root, error);
+        }
+        derived_root_ = project_root_ / ".aeg" / "DerivedData";
+        std::filesystem::create_directories(derived_root_, error);
+        if (error) {
+            return Result::failure(ResultCode::kUnknown, "Cannot create project DerivedData directory");
+        }
     stopping_ = false;
-    worker_ = std::thread([this] { worker_loop(); });
-    watcher_ = std::thread([this] { watcher_loop(); });
-    return Result::success();
+    background_failure_.store(false, std::memory_order_release);
+        cancellation_ = concurrency::CancellationSource{};
+        // The import and watcher loops are both long-lived. Keep them in one
+        // explicitly sized IO executor so neither loop can starve the other.
+        io_executor_ = std::make_shared<concurrency::WorkerExecutor>(
+            concurrency::WorkerExecutorDesc{concurrency::ExecutorDomain::kIoWorker, 2, false});
+        const concurrency::CancellationToken cancellation = cancellation_.token();
+        concurrency::TaskDesc worker_task{};
+        worker_task.domain = concurrency::ExecutorDomain::kIoWorker;
+        worker_task.execute = [this, cancellation](const concurrency::TaskContext&) {
+            worker_loop(cancellation);
+            return Result::success();
+        };
+        const auto worker_submission = io_executor_->submit(std::move(worker_task));
+        if (!worker_submission) {
+            shutdown();
+            return worker_submission.result;
+        }
+        worker_completion_ = worker_submission.value;
+
+        concurrency::TaskDesc watcher_task{};
+        watcher_task.domain = concurrency::ExecutorDomain::kIoWorker;
+        watcher_task.execute = [this, cancellation](const concurrency::TaskContext&) {
+            watcher_loop(cancellation);
+            return Result::success();
+        };
+        const auto watcher_submission = io_executor_->submit(std::move(watcher_task));
+        if (!watcher_submission) {
+            shutdown();
+            return watcher_submission.result;
+        }
+        watcher_completion_ = watcher_submission.value;
+        return Result::success();
+    } catch (const std::bad_alloc&) {
+        shutdown();
+        return foundation::out_of_memory("Asset pipeline initialization allocation failed");
+    } catch (const std::exception& exception) {
+        shutdown();
+        return foundation::unknown_exception(exception);
+    } catch (...) {
+        shutdown();
+        return Result::failure(ResultCode::kUnknown, "Asset pipeline initialization failed");
+    }
 }
 
 foundation::Result EditorAssetPipeline::synchronize(std::span<const EditorAssetRecord> records) {
@@ -710,14 +751,19 @@ foundation::Result EditorAssetPipeline::poll(std::vector<CpuAsset>& completed) {
 }
 
 void EditorAssetPipeline::shutdown() noexcept {
-    stopping_ = true;
+    {
+        // Updating the wait predicate under the queue mutex prevents a stop
+        // notification from being lost between predicate inspection and wait.
+        std::scoped_lock lock(mutex_);
+        stopping_ = true;
+    }
+    static_cast<void>(cancellation_.cancel());
     condition_.notify_all();
-    if (worker_.joinable()) {
-        worker_.join();
-    }
-    if (watcher_.joinable()) {
-        watcher_.join();
-    }
+    if (io_executor_ != nullptr)
+        static_cast<void>(io_executor_->wait_idle());
+    worker_completion_ = {};
+    watcher_completion_ = {};
+    io_executor_.reset();
     std::scoped_lock lock(mutex_);
     records_.clear();
     work_.clear();
@@ -725,14 +771,16 @@ void EditorAssetPipeline::shutdown() noexcept {
     latest_revisions_.clear();
 }
 
-void EditorAssetPipeline::worker_loop() {
-    while (!stopping_) {
+void EditorAssetPipeline::worker_loop(concurrency::CancellationToken cancellation) {
+    while (!stopping_ && !cancellation.is_cancellation_requested()) {
         try {
             WorkItem item{};
             {
                 std::unique_lock lock(mutex_);
-                condition_.wait(lock, [this] { return stopping_ || !work_.empty(); });
-                if (stopping_) {
+                condition_.wait(lock, [this, cancellation] {
+                    return stopping_ || cancellation.is_cancellation_requested() || !work_.empty();
+                });
+                if (stopping_ || cancellation.is_cancellation_requested()) {
                     return;
                 }
                 item = std::move(work_.front());
@@ -796,11 +844,10 @@ void EditorAssetPipeline::worker_loop() {
     }
 }
 
-void EditorAssetPipeline::watcher_loop() {
-    while (!stopping_) {
+void EditorAssetPipeline::watcher_loop(concurrency::CancellationToken cancellation) {
+    while (!stopping_ && !cancellation.is_cancellation_requested()) {
         try {
-            std::this_thread::sleep_for(std::chrono::milliseconds(120));
-            if (stopping_) {
+            if (concurrency::sleep_for(120'000'000ull, cancellation).code == ResultCode::kCancelled || stopping_) {
                 return;
             }
             std::vector<EditorAssetRecord> changed;

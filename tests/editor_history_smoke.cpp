@@ -60,7 +60,7 @@ int main() {
     aeg::application::EditorSceneRuntime runtime;
     if (!require(runtime.initialize(*device), "editor history smoke initialization failed") ||
         !require(runtime.request_viewport_extent(96, 64), "editor history smoke extent request failed") ||
-        !require(runtime.render_frame(0), "editor history smoke initial frame failed")) {
+        !require(runtime.render_frame(0, 1.0 / 60.0), "editor history smoke initial frame failed")) {
         return 2;
     }
 
@@ -96,7 +96,7 @@ int main() {
                  "editor history smoke first edit queue failed") ||
         !require(runtime.dirty() && runtime.can_undo() && !runtime.can_redo(),
                  "editor history smoke first edit history state is invalid") ||
-        !require(runtime.render_frame(1), "editor history smoke first edit commit failed")) {
+        !require(runtime.render_frame(1, 1.0 / 60.0), "editor history smoke first edit commit failed")) {
         std::filesystem::remove(scene_path, remove_error);
         return 6;
     }
@@ -109,7 +109,7 @@ int main() {
     }
     if (!require(runtime.undo(), "editor history smoke first undo failed") ||
         !require(runtime.can_redo() && !runtime.dirty(), "editor history smoke undo checkpoint state is invalid") ||
-        !require(runtime.render_frame(2), "editor history smoke undo commit failed")) {
+        !require(runtime.render_frame(2, 1.0 / 60.0), "editor history smoke undo commit failed")) {
         std::filesystem::remove(scene_path, remove_error);
         return 8;
     }
@@ -119,7 +119,7 @@ int main() {
                  "editor history smoke undo did not restore the initial Transform") ||
         !require(runtime.redo(), "editor history smoke first redo failed") ||
         !require(runtime.dirty(), "editor history smoke redo did not restore dirty state") ||
-        !require(runtime.render_frame(3), "editor history smoke redo commit failed")) {
+        !require(runtime.render_frame(3, 1.0 / 60.0), "editor history smoke redo commit failed")) {
         std::filesystem::remove(scene_path, remove_error);
         return 9;
     }
@@ -130,12 +130,12 @@ int main() {
     third_edit.translation.y += 0.15f;
     if (!require(runtime.queue_component_update(left_id, transform_type, bytes_of(second_edit)),
                  "editor history smoke second edit queue failed") ||
-        !require(runtime.render_frame(4), "editor history smoke second edit commit failed") ||
+        !require(runtime.render_frame(4, 1.0 / 60.0), "editor history smoke second edit commit failed") ||
         !require(runtime.queue_component_update(left_id, transform_type, bytes_of(third_edit)),
                  "editor history smoke third edit queue failed") ||
-        !require(runtime.render_frame(5), "editor history smoke third edit commit failed") ||
+        !require(runtime.render_frame(5, 1.0 / 60.0), "editor history smoke third edit commit failed") ||
         !require(runtime.undo(), "editor history smoke consecutive undo failed") ||
-        !require(runtime.render_frame(6), "editor history smoke consecutive undo commit failed")) {
+        !require(runtime.render_frame(6, 1.0 / 60.0), "editor history smoke consecutive undo commit failed")) {
         std::filesystem::remove(scene_path, remove_error);
         return 10;
     }
@@ -151,7 +151,7 @@ int main() {
     if (!require(runtime.queue_component_update(left_id, transform_type, bytes_of(branched_edit)),
                  "editor history smoke branch edit queue failed") ||
         !require(!runtime.can_redo(), "editor history smoke redo branch was not truncated") ||
-        !require(runtime.render_frame(7), "editor history smoke branch edit commit failed") ||
+        !require(runtime.render_frame(7, 1.0 / 60.0), "editor history smoke branch edit commit failed") ||
         !require(runtime.save_scene(), "editor history smoke branch checkpoint failed") ||
         !require(!runtime.dirty(), "editor history smoke branch checkpoint remained dirty")) {
         std::filesystem::remove(scene_path, remove_error);
@@ -175,7 +175,7 @@ int main() {
                      {gizmo_projection.value.x_axis.x + 16.0f, gizmo_projection.value.x_axis.y}, 96, 64),
                  "editor history smoke second Gizmo update failed") ||
         !require(runtime.commit_transform_edit(), "editor history smoke Gizmo transaction commit failed") ||
-        !require(runtime.render_frame(8), "editor history smoke Gizmo commit frame failed")) {
+        !require(runtime.render_frame(8, 1.0 / 60.0), "editor history smoke Gizmo commit frame failed")) {
         std::filesystem::remove(scene_path, remove_error);
         return 14;
     }
@@ -184,7 +184,7 @@ int main() {
     if (!require(after_gizmo != nullptr && !same_transform(*after_gizmo, branched_edit),
                  "editor history smoke Gizmo did not change the Transform") ||
         !require(runtime.undo(), "editor history smoke Gizmo undo failed") ||
-        !require(runtime.render_frame(9), "editor history smoke Gizmo undo frame failed")) {
+        !require(runtime.render_frame(9, 1.0 / 60.0), "editor history smoke Gizmo undo frame failed")) {
         std::filesystem::remove(scene_path, remove_error);
         return 15;
     }
@@ -227,7 +227,7 @@ int main() {
         {right_id, transform_type, bytes_of(right_batch)},
     }};
     if (!require(runtime.queue_component_updates(batch_updates), "editor history smoke batch edit queue failed") ||
-        !require(runtime.render_frame(10), "editor history smoke batch edit commit failed")) {
+        !require(runtime.render_frame(10, 1.0 / 60.0), "editor history smoke batch edit commit failed")) {
         std::filesystem::remove(scene_path, remove_error);
         return 19;
     }
@@ -239,7 +239,7 @@ int main() {
                      same_transform(*left_after_batch, left_batch) && same_transform(*right_after_batch, right_batch),
                  "editor history smoke batch edit did not update both entities") ||
         !require(runtime.undo(), "editor history smoke batch undo failed") ||
-        !require(runtime.render_frame(11), "editor history smoke batch undo commit failed")) {
+        !require(runtime.render_frame(11, 1.0 / 60.0), "editor history smoke batch undo commit failed")) {
         std::filesystem::remove(scene_path, remove_error);
         return 20;
     }
@@ -252,7 +252,7 @@ int main() {
                      same_transform(*right_after_batch_undo, right_before_batch),
                  "editor history smoke batch undo was not atomic") ||
         !require(runtime.redo(), "editor history smoke batch redo failed") ||
-        !require(runtime.render_frame(12), "editor history smoke batch redo commit failed") ||
+        !require(runtime.render_frame(12, 1.0 / 60.0), "editor history smoke batch redo commit failed") ||
         !require(runtime.save_scene(), "editor history smoke batch checkpoint failed") ||
         !require(!runtime.dirty(), "editor history smoke saved batch remained dirty")) {
         std::filesystem::remove(scene_path, remove_error);
@@ -266,7 +266,7 @@ int main() {
         !require(runtime.play(), "editor history smoke Play failed") ||
         !require(!runtime.can_undo() && !runtime.can_redo(), "editor history smoke Play exposed Edit history") ||
         !require(!runtime.undo(), "editor history smoke Undo unexpectedly succeeded in Play mode") ||
-        !require(runtime.render_frame(13), "editor history smoke Play frame failed") ||
+        !require(runtime.render_frame(13, 1.0 / 60.0), "editor history smoke Play frame failed") ||
         !require(runtime.stop(), "editor history smoke Stop failed") ||
         !require(runtime.can_undo() == can_undo_before_play,
                  "editor history smoke Stop changed the Edit history availability")) {

@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <string_view>
 
@@ -36,6 +37,7 @@ namespace aeg::resource {
         uint64_t destination_offset{0};
         uint64_t size{0};
         uint64_t transfer_size{0};
+        std::shared_ptr<const void> submission{};
 
         [[nodiscard]] bool is_valid() const noexcept {
             return staging.is_valid() && destination.is_valid() && source.is_valid() && target.is_valid() &&
@@ -53,6 +55,7 @@ namespace aeg::resource {
         GpuMesh mesh{};
         render_graph::RenderGraphBuffer vertex_resource{};
         render_graph::RenderGraphBuffer index_resource{};
+        std::shared_ptr<const void> submission{};
 
         [[nodiscard]] bool is_valid() const noexcept {
             return mesh.is_valid() && vertex_resource.is_valid() && index_resource.is_valid();
@@ -72,15 +75,15 @@ namespace aeg::resource {
         explicit ResourceUploader(rhi::Device& device) noexcept : device_(device) {
         }
 
-        /** @brief Creates a destination buffer and records a copy from staging data. */
+        /** @brief Records staging data into a new or caller-owned replay destination. */
         [[nodiscard]] foundation::ResultValue<BufferUpload> upload_buffer(
                 render_graph::FrameContext& frame_context, render_graph::RenderGraph& graph,
-                const BufferUploadDesc& desc);
+                const BufferUploadDesc& desc, rhi::BufferHandle reuse_destination = {});
 
-        /** @brief Creates vertex/index buffers and records an indexed mesh upload. */
+        /** @brief Records an indexed mesh upload, optionally reusing matching caller-owned buffers. */
         [[nodiscard]] foundation::ResultValue<MeshUpload> upload_mesh(
                 render_graph::FrameContext& frame_context, render_graph::RenderGraph& graph,
-                const MeshData& mesh, std::string_view name = {});
+                const MeshData& mesh, std::string_view name = {}, const GpuMesh* reuse_destination = nullptr);
 
         /** @brief Defers destruction of mesh buffers until the frame is reusable. */
         [[nodiscard]] foundation::Result defer_destroy_mesh(

@@ -1,8 +1,10 @@
 /** @brief Frame-owned sky/postprocess constants, descriptors and restricted fullscreen commands. */
 #include "post_process.hpp"
+#include "render_feature_graph_builders.hpp"
 
 #include "builtin_render_passes.hpp"
 #include "frame_context.hpp"
+#include "../../Shader/private/shader_pipeline_layout_access.hpp"
 #include "shader_contract.hpp"
 
 namespace aeg::renderer {
@@ -24,19 +26,11 @@ struct PostProcessResources::Impl final {
     shader::ShaderManager shaders;
     rhi::PipelineHandle pipeline{};
     rhi::BindingLayoutHandle layout{};
+    RenderMaterialAttachmentContract attachment_contract{};
+    RendererProfilePsoContract profile_contract{};
 };
 PostProcessResources::PostProcessResources() = default;
 PostProcessResources::~PostProcessResources() = default;
-
-foundation::Result validate_post_process_settings(const RenderPostProcessSettings& settings) {
-    for (const auto color : {settings.sky_zenith, settings.sky_horizon, settings.sky_ground})
-        if (!math::is_finite(color) || color.x < 0 || color.y < 0 || color.z < 0)
-            return foundation::invalid_argument("Sky colors must be finite and non-negative");
-    if (!math::is_finite(settings.exposure) || settings.exposure < 0 || !math::is_finite(settings.gamma) ||
-        settings.gamma <= 0 || !math::is_finite(1.0f / settings.gamma))
-        return foundation::invalid_argument("Postprocess requires non-negative exposure and positive finite gamma");
-    return foundation::Result::success();
-}
 
 foundation::Result PostProcessResources::initialize(rhi::Device& device, const std::filesystem::path& package,
                                                     rhi::Format output_format) try {
@@ -64,6 +58,13 @@ foundation::Result PostProcessResources::initialize(rhi::Device& device, const s
         return pipeline.result;
     state->pipeline = pipeline.value;
     state->layout = inputs.value;
+    state->attachment_contract = {graphics.color_formats.front(), graphics.samples, graphics.depth_stencil_format};
+    state->profile_contract = {
+        {kRendererProfileContractVersion, RendererProfile::kPostProcess,
+         shader::detail::ShaderPipelineLayoutAccess::contract_hash(layout.value),
+         shader::detail::ShaderPipelineLayoutAccess::cache_epoch(layout.value)},
+        state->attachment_contract,
+        shader::detail::ShaderPipelineLayoutAccess::cache_epoch(layout.value)};
     impl_ = std::move(state);
     return foundation::Result::success();
 } catch (const std::bad_alloc&) {
@@ -71,25 +72,29 @@ foundation::Result PostProcessResources::initialize(rhi::Device& device, const s
 }
 
 foundation::ResultValue<RenderPostProcessResource> PostProcessResources::for_frame(
-    render_graph::FrameContext& frame, const RenderView& view, const RenderPostProcessSettings& settings) const try {
+    render_graph::FrameContext& frame, const RenderView& view, const feature::RenderPostProcessSettings& settings) const try {
     using namespace foundation;
     if (!impl_ || !frame.is_frame_active())
         return {invalid_state("Postprocess requires an active frame"), {}};
-    if (const auto r = validate_post_process_settings(settings); !r)
+    if (&frame.device() != &impl_->device)
+        return {invalid_state("Postprocess FrameContext belongs to a different RHI device"), {}};
+    if (const auto r = feature::validate_post_process_settings(settings); !r)
         return {r, {}};
     PostProcessConstants constants{};
     if (!view.output_extent.is_valid() || !math::try_inverse(view.camera.projection, constants.inverse_projection) ||
         !math::try_inverse(view.camera.view, constants.inverse_view))
         return {invalid_argument("Postprocess view extent or camera is invalid"), {}};
-    constants.sky_zenith = {settings.sky_zenith.x, settings.sky_zenith.y, settings.sky_zenith.z, 1};
-    constants.sky_horizon = {settings.sky_horizon.x, settings.sky_horizon.y, settings.sky_horizon.z, 1};
-    constants.sky_ground = {settings.sky_ground.x, settings.sky_ground.y, settings.sky_ground.z, 1};
+    constants.sky_zenith = {settings.sky_zenith[0], settings.sky_zenith[1], settings.sky_zenith[2], 1};
+    constants.sky_horizon = {settings.sky_horizon[0], settings.sky_horizon[1], settings.sky_horizon[2], 1};
+    constants.sky_ground = {settings.sky_ground[0], settings.sky_ground[1], settings.sky_ground[2], 1};
     constants.parameters = {settings.exposure, 1.0f / settings.gamma, settings.tone_mapping ? 1.0f : 0.0f,
                             settings.sky_enabled ? 1.0f : 0.0f};
     constants.viewport = {float(view.output_extent.width), float(view.output_extent.height),
                           view.camera.clip_space_convention.reversed_z ? 1.0f : 0.0f, 0};
     RenderPostProcessResource resource{};
     resource.pipeline = impl_->pipeline;
+    resource.attachment_contract = impl_->attachment_contract;
+    resource.profile_contract = impl_->profile_contract;
     resource.constants_desc.size = sizeof(constants);
     resource.constants_desc.memory = rhi::MemoryClass::kUpload;
     resource.constants_desc.capabilities = rhi::BufferCapability::kUniform;
@@ -145,37 +150,52 @@ foundation::ResultValue<RenderPostProcessResource> PostProcessResources::for_fra
 foundation::Result build_post_process_render_graph(
     pipeline::RenderGraphBuilder& builder, const RenderFeatureContext& context, pipeline::RenderGraphTexture color,
     pipeline::RenderGraphTexture depth, pipeline::RenderGraphTexture output, rhi::ResourceUsage final_usage,
-    pipeline::RenderPassInstanceId authored_instance) {
+    pipeline::RenderPassInstanceId authored_instance, const PostProcessDrawOptions* draw_options) {
     using namespace foundation;
-    if (!builder.is_runtime() || !context.is_valid() || render_feature_context(builder) != &context ||
-        !context.resource_resolver || !color.is_valid() || !depth.is_valid() || !output.is_valid() || color == output)
+    if (!builder.is_runtime() || !context.is_valid() || (!draw_options && render_feature_context(builder) != &context) ||
+        !context.resource_resolver || !color.is_valid() || !depth.is_valid() || !output.is_valid() ||
+        color == output || depth == output || color == depth)
         return invalid_argument("Skybox/postprocess graph inputs are invalid");
-    const auto resource = context.resource_resolver->resolve_post_process(context.scene_snapshot->view);
+    auto view = context.scene_snapshot->view;
+    if (draw_options && draw_options->settings) view.post_process = *draw_options->settings;
+    if (const auto result = feature::validate_post_process_settings(view.post_process); !result) return result;
+    const auto resource = context.resource_resolver->resolve_post_process(view);
     if (!resource)
         return resource.result;
     if (!resource.value.pipeline.is_valid() || !resource.value.prepare_inputs || !resource.value.constants.is_valid() ||
-        resource.value.constants_desc.size < sizeof(PostProcessConstants))
+        resource.value.constants_desc.size < sizeof(PostProcessConstants) ||
+        !rhi::has_flag(resource.value.constants_desc.capabilities, rhi::BufferCapability::kUniform))
         return invalid_state("Skybox/postprocess resource is incomplete");
-    const auto constants = builder.import_buffer(pipeline::RenderResourceId("Renderer.PostProcess.Constants"),
-                                                 resource.value.constants, resource.value.constants_desc);
+    if (!resource.value.profile_contract.is_valid(RendererProfile::kPostProcess))
+        return invalid_state("Skybox/postprocess shader/PSO contract is invalid");
+    if (resource.value.profile_contract.attachment != resource.value.attachment_contract)
+        return invalid_state("Postprocess profile attachment contract is inconsistent");
+    if (draw_options && resource.value.attachment_contract != draw_options->attachment_contract)
+        return invalid_argument("Postprocess pipeline attachment contract is incompatible");
+    const auto constants = find_or_import_buffer(builder,
+        make_resource_id(pipeline::RenderResourceId("Renderer.PostProcess.Constants").value(), resource.value.constants.value),
+        resource.value.constants, resource.value.constants_desc);
     if (!constants)
         return constants.result;
     const auto extent = context.scene_snapshot->view.output_extent;
-    const auto pass = detail::add_builtin_render_pass(
-        builder, context, kSkyboxPostProcessPassTypeId,
-        [color, depth, output, constants = constants.value, final_usage](pipeline::RenderPassBuilder& pass) {
+    const auto setup = [color, depth, output, constants = constants.value, final_usage,
+                        options = draw_options ? *draw_options : PostProcessDrawOptions{}, neutral = draw_options != nullptr]
+                        (pipeline::RenderPassBuilder& pass) {
             for (auto texture : {color, depth})
                 if (const auto r = pass.read(texture, rhi::ResourceUsage::kSampledRead,
                                              rhi::PipelineStage::kFragmentShader, rhi::ShaderStage::kFragment);
                     !r)
                     return r;
             if (const auto r = pass.read(constants, rhi::ResourceUsage::kUniformRead,
-                                         rhi::PipelineStage::kFragmentShader, rhi::ShaderStage::kFragment);
+                                         rhi::PipelineStage::kFragmentShader, rhi::ShaderStage::kFragment,
+                                         {0, sizeof(PostProcessConstants)});
                 !r)
                 return r;
-            pass.set_side_effects();
-            return pass.use_color_attachment(output, rhi::LoadOp::kClear, rhi::StoreOp::kStore, {}, final_usage);
-        },
+            if (!neutral) pass.set_side_effects();
+            return pass.use_color_attachment(output, options.preserve_color ? rhi::LoadOp::kLoad : rhi::LoadOp::kClear,
+                rhi::StoreOp::kStore, options.clear_color, final_usage);
+        };
+    const auto execute =
         [color, depth, resource = resource.value, extent](pipeline::RenderPassExecutionContext& command) {
             const auto color_view = command.texture_view(color);
             const auto depth_view =
@@ -202,8 +222,11 @@ foundation::Result build_post_process_render_graph(
             }();
             const auto ended = command.end_rendering();
             return drawn ? ended : drawn;
-        },
-        authored_instance);
+        };
+    const auto pass = (context.registered_native || !draw_options)
+                          ? detail::add_builtin_render_pass(builder, context, kSkyboxPostProcessPassTypeId, setup,
+                                                            execute, authored_instance)
+                          : builder.add_graphics_pass("Renderer.PostProcess", setup, execute);
     return pass ? Result::success() : pass.result;
 }
 }  // namespace aeg::renderer

@@ -3,13 +3,13 @@
  * @brief Implements module registration transactions and unload ordering.
  */
 #include "../public/module.hpp"
+#include "../../Feature/private/feature_clock_admission.hpp"
 
 #include <algorithm>
 #include <mutex>
 #include <new>
+#include <span>
 #include <string>
-
-#include "../../Pipeline/public/render_pass.hpp"
 
 namespace aeg::module {
 namespace {
@@ -32,175 +32,84 @@ template <typename Type>
     }
     return foundation::Result::success();
 }
+[[nodiscard]] foundation::Result unregister_definitions(
+    feature::FeatureRegistry& feature_registry, reflection::TypeRegistry* reflection_registry,
+    std::span<const feature::FeatureDefinitionId> features, std::span<const reflection::TypeId> types) noexcept try {
+    foundation::Result first_error = foundation::Result::success();
+    // A Composite may precede its child in registration order. Remove every
+    // currently removable definition, then retry its remaining dependencies.
+    size_t remaining = features.size();
+    while (remaining != 0) {
+        bool progress = false;
+        foundation::Result last_error = foundation::Result::success();
+        for (auto iterator = features.rbegin(); iterator != features.rend(); ++iterator) {
+            if (feature_registry.find_definition(*iterator) == nullptr) continue;
+            const auto result = feature_registry.unregister_definition(*iterator);
+            if (result) {
+                progress = true;
+            } else {
+                last_error = result;
+            }
+        }
+        remaining = static_cast<size_t>(std::count_if(features.begin(), features.end(), [&](auto id) {
+            return feature_registry.find_definition(id) != nullptr;
+        }));
+        if (!progress) {
+            first_error = last_error;
+            break;
+        }
+    }
+    if (reflection_registry != nullptr) {
+        for (auto iterator = types.rbegin(); iterator != types.rend(); ++iterator) {
+            const auto result = reflection_registry->unregister_type(*iterator);
+            if (!result && first_error) first_error = result;
+        }
+    }
+    return first_error;
+} catch (const std::bad_alloc&) {
+    // Rollback must not terminate while reporting an allocation failure.
+    return foundation::Result{foundation::ResultCode::kOutOfMemory, {}};
+}
 }  // namespace
 
-foundation::Result ModuleRegistrationContext::register_phase(const pipeline::PhaseDescriptor& descriptor) {
-    if (descriptor.id.is_valid() == false) {
-        return invalid_argument("module phase id is invalid");
+foundation::Result ModuleRegistrationContext::register_feature(feature::FeatureDefinition definition) {
+    if (definition.contract.definition_id != definition.id || !definition.id.is_valid()) {
+        return invalid_argument("module Feature definition identity is invalid");
     }
-    const foundation::Result result = pipeline_registry_.phase_registry().register_phase(descriptor);
-    if (!result) {
-        return result;
+    if (definition.owner_module != module_id_) {
+        return invalid_argument("Feature owner module does not match registration context");
     }
-    if (const foundation::Result record_result =
-            push_id(phases_, descriptor.id, "module phase ownership allocation failed");
-        !record_result) {
-        static_cast<void>(pipeline_registry_.phase_registry().unregister_phase(descriptor.id));
-        return record_result;
-    }
-    return foundation::Result::success();
-}
-
-foundation::Result ModuleRegistrationContext::register_pipeline(pipeline::PipelineFactory factory) {
-    if (!factory) {
-        return invalid_argument("module pipeline factory is empty");
-    }
-
-    std::unique_ptr<pipeline::Pipeline> preview;
+    const auto id = definition.id;
     try {
-        preview = factory();
-    } catch (const std::exception& exception) {
-        return foundation::Result::failure(foundation::ResultCode::kUnknown,
-                                           std::string("module pipeline factory threw: ") + exception.what());
-    } catch (...) {
-        return foundation::Result::failure(foundation::ResultCode::kUnknown,
-                                           "module pipeline factory threw an unknown exception");
+        // Reserve every ownership record before granting any new capability.
+        feature_definitions_.reserve(feature_definitions_.size() + 1);
+        new_clock_bindings_.reserve(new_clock_bindings_.size() + 1);
+    } catch (const std::bad_alloc&) {
+        return out_of_memory("module Feature ownership reservation failed");
     }
-    if (!preview) {
-        return invalid_argument("module pipeline factory returned null");
-    }
-    const pipeline::PipelineDescriptor descriptor = preview->descriptor();
-    if (descriptor.owner_module != module_id_) {
-        return invalid_argument("pipeline owner module does not match registration context");
-    }
-
-    const auto preview_holder = std::make_shared<std::unique_ptr<pipeline::Pipeline>>(std::move(preview));
-    const auto factory_holder = std::make_shared<pipeline::PipelineFactory>(std::move(factory));
-    const foundation::Result result = pipeline_registry_.register_pipeline(
-        [preview_holder, factory_holder]() mutable -> std::unique_ptr<pipeline::Pipeline> {
-            if (*preview_holder != nullptr) {
-                return std::move(*preview_holder);
-            }
-            return (*factory_holder)();
-        });
-    if (!result) {
-        return result;
-    }
-    if (const foundation::Result record_result =
-            push_id(pipelines_, descriptor.id, "module pipeline ownership allocation failed");
-        !record_result) {
-        static_cast<void>(pipeline_registry_.unregister_pipeline(descriptor.id));
-        return record_result;
-    }
-    return foundation::Result::success();
-}
-
-foundation::Result ModuleRegistrationContext::register_feature(pipeline::FeatureFactory factory) {
-    if (!factory) {
-        return invalid_argument("module feature factory is empty");
-    }
-
-    std::unique_ptr<pipeline::PipelineFeature> preview;
+    feature::detail::ClockBindingChange approval{};
+    const auto undo_approval = [&]() {
+        if (!approval.inserted) return;
+        static_cast<void>(feature::detail::rollback_new_clock_bindings(feature_registry_,
+            std::span<const feature::detail::ClockBindingKey>(&approval.key, 1)));
+        new_clock_bindings_.pop_back();
+    };
     try {
-        preview = factory();
-    } catch (const std::exception& exception) {
-        return foundation::Result::failure(foundation::ResultCode::kUnknown,
-                                           std::string("module feature factory threw: ") + exception.what());
-    } catch (...) {
-        return foundation::Result::failure(foundation::ResultCode::kUnknown,
-                                           "module feature factory threw an unknown exception");
+        const auto approved = feature::detail::admit_clock_request(feature_registry_, definition.contract);
+        if (!approved) return approved.result;
+        approval = approved.value;
+        if (approval.inserted) new_clock_bindings_.emplace_back(approval.key.id, approval.key.version);
+        const auto registered = feature_registry_.register_definition(std::move(definition));
+        if (!registered) {
+            undo_approval();
+            return registered;
+        }
+        feature_definitions_.push_back(id); // Reserved above; StableId copy cannot allocate.
+        return foundation::Result::success();
+    } catch (const std::bad_alloc&) {
+        undo_approval();
+        return out_of_memory("module Feature registration allocation failed");
     }
-    if (!preview) {
-        return invalid_argument("module feature factory returned null");
-    }
-    const pipeline::FeatureDescriptor descriptor = preview->descriptor();
-    if (descriptor.owner_module != module_id_) {
-        return invalid_argument("feature owner module does not match registration context");
-    }
-
-    const auto preview_holder = std::make_shared<std::unique_ptr<pipeline::PipelineFeature>>(std::move(preview));
-    const auto factory_holder = std::make_shared<pipeline::FeatureFactory>(std::move(factory));
-    const foundation::Result result = pipeline_registry_.register_feature(
-        [preview_holder, factory_holder]() mutable -> std::unique_ptr<pipeline::PipelineFeature> {
-            if (*preview_holder != nullptr) {
-                return std::move(*preview_holder);
-            }
-            return (*factory_holder)();
-        });
-    if (!result) {
-        return result;
-    }
-    if (const foundation::Result record_result =
-            push_id(features_, descriptor.id, "module feature ownership allocation failed");
-        !record_result) {
-        static_cast<void>(pipeline_registry_.unregister_feature(descriptor.id));
-        return record_result;
-    }
-    return foundation::Result::success();
-}
-
-foundation::Result ModuleRegistrationContext::register_render_pass(pipeline::RenderPassFactory factory) {
-    if (render_pass_registry_ == nullptr) {
-        return unsupported("module registry has no render pass registry");
-    }
-    if (!factory) {
-        return invalid_argument("module render pass factory is empty");
-    }
-    std::unique_ptr<pipeline::RenderPass> preview;
-    try {
-        preview = factory();
-    } catch (const std::exception& exception) {
-        return foundation::Result::failure(foundation::ResultCode::kUnknown,
-                                           std::string("module render pass factory threw: ") + exception.what());
-    } catch (...) {
-        return foundation::Result::failure(foundation::ResultCode::kUnknown,
-                                           "module render pass factory threw an unknown exception");
-    }
-    if (!preview) {
-        return invalid_argument("module render pass factory returned null");
-    }
-    const auto descriptor = preview->descriptor();
-    if (descriptor.owner_module != module_id_) {
-        return invalid_argument("render pass owner module does not match registration context");
-    }
-    const auto preview_holder = std::make_shared<std::unique_ptr<pipeline::RenderPass>>(std::move(preview));
-    const auto factory_holder = std::make_shared<pipeline::RenderPassFactory>(std::move(factory));
-    const foundation::Result result = render_pass_registry_->register_pass(
-        [preview_holder, factory_holder]() mutable -> std::unique_ptr<pipeline::RenderPass> {
-            if (*preview_holder != nullptr) {
-                return std::move(*preview_holder);
-            }
-            return (*factory_holder)();
-        });
-    if (!result) {
-        return result;
-    }
-    if (const foundation::Result record_result =
-            push_id(render_passes_, descriptor.type, "module render pass ownership allocation failed");
-        !record_result) {
-        static_cast<void>(render_pass_registry_->unregister_pass(descriptor.type));
-        return record_result;
-    }
-    return foundation::Result::success();
-}
-
-foundation::Result ModuleRegistrationContext::bind_feature(const pipeline::FeatureBindingDescriptor& binding) {
-    pipeline::FeatureBindingDescriptor normalized = binding;
-    if (!normalized.instance.is_valid()) {
-        normalized.instance = pipeline::make_feature_instance_id(normalized.feature, normalized.pipeline,
-                                                                 normalized.scope, normalized.point);
-    }
-    const foundation::Result result = pipeline_registry_.bind_feature(normalized);
-    if (!result) {
-        return result;
-    }
-    if (const foundation::Result record_result =
-            push_id(feature_bindings_, normalized.instance, "module feature binding allocation failed");
-        !record_result) {
-        static_cast<void>(pipeline_registry_.unbind_feature(normalized.instance));
-        return record_result;
-    }
-    return foundation::Result::success();
 }
 
 foundation::Result ModuleRegistrationContext::register_type(reflection::TypeDescriptor descriptor) {
@@ -221,48 +130,13 @@ foundation::Result ModuleRegistrationContext::register_type(reflection::TypeDesc
 }
 
 foundation::Result ModuleRegistrationContext::rollback() noexcept {
-    foundation::Result first_error = foundation::Result::success();
-    for (auto iterator = feature_bindings_.rbegin(); iterator != feature_bindings_.rend(); ++iterator) {
-        const foundation::Result result = pipeline_registry_.unbind_feature(*iterator);
-        if (!result && first_error) {
-            first_error = result;
-        }
+    auto result = unregister_definitions(feature_registry_, reflection_registry_, feature_definitions_, types_);
+    for (auto iterator = new_clock_bindings_.rbegin(); iterator != new_clock_bindings_.rend(); ++iterator) {
+        const feature::detail::ClockBindingKey key{iterator->first, iterator->second};
+        const auto removed = feature::detail::rollback_new_clock_bindings(feature_registry_, {&key, 1});
+        if (!removed && result) result = removed;
     }
-    for (auto iterator = pipelines_.rbegin(); iterator != pipelines_.rend(); ++iterator) {
-        const foundation::Result result = pipeline_registry_.unregister_pipeline(*iterator);
-        if (!result && first_error) {
-            first_error = result;
-        }
-    }
-    for (auto iterator = features_.rbegin(); iterator != features_.rend(); ++iterator) {
-        const foundation::Result result = pipeline_registry_.unregister_feature(*iterator);
-        if (!result && first_error) {
-            first_error = result;
-        }
-    }
-    if (render_pass_registry_ != nullptr) {
-        for (auto iterator = render_passes_.rbegin(); iterator != render_passes_.rend(); ++iterator) {
-            const foundation::Result result = render_pass_registry_->unregister_pass(*iterator);
-            if (!result && first_error) {
-                first_error = result;
-            }
-        }
-    }
-    for (auto iterator = phases_.rbegin(); iterator != phases_.rend(); ++iterator) {
-        const foundation::Result result = pipeline_registry_.phase_registry().unregister_phase(*iterator);
-        if (!result && first_error) {
-            first_error = result;
-        }
-    }
-    if (reflection_registry_ != nullptr) {
-        for (auto iterator = types_.rbegin(); iterator != types_.rend(); ++iterator) {
-            const foundation::Result result = reflection_registry_->unregister_type(*iterator);
-            if (!result && first_error) {
-                first_error = result;
-            }
-        }
-    }
-    return first_error;
+    return result;
 }
 
 foundation::Result ModuleRegistry::validate_descriptor(const ModuleDescriptor& descriptor) const {
@@ -313,7 +187,7 @@ foundation::Result ModuleRegistry::register_module(ModuleFactory factory) {
         }
     }
 
-    ModuleRegistrationContext context(pipeline_registry_, reflection_registry_, render_pass_registry_, descriptor.id);
+    ModuleRegistrationContext context(feature_registry_, reflection_registry_, descriptor.id);
     foundation::Result registration_result;
     try {
         registration_result = module->register_module(context);
@@ -337,11 +211,7 @@ foundation::Result ModuleRegistry::register_module(ModuleFactory factory) {
     try {
         registration.implementation = std::shared_ptr<Module>(std::move(module));
         registration.descriptor = descriptor;
-        registration.phases = context.phases_;
-        registration.pipelines = context.pipelines_;
-        registration.features = context.features_;
-        registration.render_passes = context.render_passes_;
-        registration.feature_bindings = context.feature_bindings_;
+        registration.feature_definitions = context.feature_definitions_;
         registration.types = context.types_;
         std::unique_lock lock(mutex_);
         if (registrations_.find(descriptor.id) != registrations_.end()) {
@@ -357,53 +227,11 @@ foundation::Result ModuleRegistry::register_module(ModuleFactory factory) {
 }
 
 foundation::Result ModuleRegistry::unregister_owned(const Registration& registration) noexcept {
-    foundation::Result first_error = foundation::Result::success();
-    for (auto iterator = registration.feature_bindings.rbegin(); iterator != registration.feature_bindings.rend();
-         ++iterator) {
-        const foundation::Result result = pipeline_registry_.unbind_feature(*iterator);
-        if (!result && first_error) {
-            first_error = result;
-        }
-    }
-    for (auto iterator = registration.pipelines.rbegin(); iterator != registration.pipelines.rend(); ++iterator) {
-        const foundation::Result result = pipeline_registry_.unregister_pipeline(*iterator);
-        if (!result && first_error) {
-            first_error = result;
-        }
-    }
-    for (auto iterator = registration.features.rbegin(); iterator != registration.features.rend(); ++iterator) {
-        const foundation::Result result = pipeline_registry_.unregister_feature(*iterator);
-        if (!result && first_error) {
-            first_error = result;
-        }
-    }
-    if (render_pass_registry_ != nullptr) {
-        for (auto iterator = registration.render_passes.rbegin(); iterator != registration.render_passes.rend();
-             ++iterator) {
-            const foundation::Result result = render_pass_registry_->unregister_pass(*iterator);
-            if (!result && first_error) {
-                first_error = result;
-            }
-        }
-    }
-    for (auto iterator = registration.phases.rbegin(); iterator != registration.phases.rend(); ++iterator) {
-        const foundation::Result result = pipeline_registry_.phase_registry().unregister_phase(*iterator);
-        if (!result && first_error) {
-            first_error = result;
-        }
-    }
-    if (reflection_registry_ != nullptr) {
-        for (auto iterator = registration.types.rbegin(); iterator != registration.types.rend(); ++iterator) {
-            const foundation::Result result = reflection_registry_->unregister_type(*iterator);
-            if (!result && first_error) {
-                first_error = result;
-            }
-        }
-    }
-    return first_error;
+    return unregister_definitions(feature_registry_, reflection_registry_,
+                                  registration.feature_definitions, registration.types);
 }
 
-foundation::Result ModuleRegistry::unregister_module(pipeline::ModuleId id) {
+foundation::Result ModuleRegistry::unregister_module(ModuleId id) {
     if (!id.is_valid()) {
         return invalid_argument("module id is invalid");
     }
@@ -449,7 +277,7 @@ foundation::Result ModuleRegistry::unregister_module(pipeline::ModuleId id) {
     return foundation::Result::success();
 }
 
-bool ModuleRegistry::contains(pipeline::ModuleId id) const noexcept {
+bool ModuleRegistry::contains(ModuleId id) const noexcept {
     if (!id.is_valid()) {
         return false;
     }
@@ -457,7 +285,7 @@ bool ModuleRegistry::contains(pipeline::ModuleId id) const noexcept {
     return registrations_.find(id) != registrations_.end();
 }
 
-foundation::ResultValue<ModuleDescriptor> ModuleRegistry::find_module(pipeline::ModuleId id) const {
+foundation::ResultValue<ModuleDescriptor> ModuleRegistry::find_module(ModuleId id) const {
     if (!id.is_valid()) {
         return {invalid_argument("module id is invalid"), {}};
     }

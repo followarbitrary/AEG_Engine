@@ -25,7 +25,6 @@
 #include <span>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -37,32 +36,39 @@
 
 #include "Components/component_ids.hpp"
 #include "application_platform.hpp"
+#include "concurrency.hpp"
 #include "editor_error.hpp"
 #include "editor_imgui.hpp"
-#include "composition/editor_composition_storage.hpp"
-#include "composition/editor_flowgraph_panel.hpp"
+#include "composition/editor_feature_graph_panel.hpp"
+#include "composition/editor_render_graph_inspection.hpp"
 #include "editor_preferences.hpp"
 #include "editor_scene_runtime.hpp"
+#include "editor_project_operations.hpp"
+#if defined(AEG_EDITOR_WORKFLOW_TESTS)
+#include "editor_main_feature_workflow_probe.hpp"
+#endif
 #include "editor_toolbar.hpp"
 #include "editor_ui_interaction.hpp"
 #include "editor_workspace.hpp"
 #include "engine_frame_orchestrator.hpp"
+#include "engine_frame_pipeline_host.hpp"
+#include "engine_frame_pipeline_registration.hpp"
 #include "font/editor_system_font_catalog.hpp"
 #include "frame_context.hpp"
+#include "feature_graph_io.hpp"
 #include "hierarchy_ui_layout.hpp"
 #include "imgui_internal.h"
 #include "imgui_renderer.hpp"
+#include "imgui_render_execution.hpp"
 #include "imgui_texture_registry.hpp"
 #include "input_system.hpp"
 #include "logging.hpp"
 #include "pipeline.hpp"
-#include "pipeline_overview_layout.hpp"
 #include "preferences/editor_preference_controller.hpp"
 #include "project_context.hpp"
 #include "render_graph.hpp"
-#include "render_state_flow.hpp"
 #include "renderer.hpp"
-#include "renderer_variants.hpp"
+#include "renderer_variants_internal.hpp"
 #include "resource_uploader.hpp"
 #include "rhi.hpp"
 #include "texture_uploader.hpp"
@@ -70,6 +76,9 @@
 struct ImGuiWindow;
 
 namespace {
+#if defined(AEG_EDITOR_WORKFLOW_TESTS)
+std::unique_ptr<aeg::editor_test::MainFeatureWorkflowProbe> feature_workflow_probe;
+#endif
 using aeg::application::ComponentUpdateView;
 using aeg::application::EditorAssetStatus;
 using aeg::application::EditorAssetImportRequest;
@@ -299,6 +308,11 @@ struct ResourceDragPayload final {
 
 inline constexpr const char* kResourcePayload = "AEG.EditorResource";
 
+std::string path_text(const std::filesystem::path& path) {
+    const auto text = path.generic_u8string();
+    return {text.begin(), text.end()};
+}
+
 template <std::size_t Size>
 void set_text_buffer(std::array<char, Size>& buffer, std::string_view value) {
     std::fill(buffer.begin(), buffer.end(), '\0');
@@ -480,12 +494,6 @@ public:
             gizmo_mode_ = ViewportGizmoMode::kScale;
         }
         const float toolbar_bottom = ImGui::GetItemRectMax().y + 10.0f;
-        if (!runtime_.renderer_pipeline_diagnostic().empty()) {
-            place_toolbar_item(ImGui::CalcTextSize("Default preview").x + 12.0f);
-            ImGui::TextColored(ImVec4{1.0f, 0.75f, 0.25f, 1.0f}, "Default preview");
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("%s", std::string(runtime_.renderer_pipeline_diagnostic()).c_str());
-        }
         viewport_draw->ChannelsSetCurrent(0);
         ImGui::SetCursorScreenPos(viewport_origin);
         const ImVec2 extent = ImGui::GetContentRegionAvail();
@@ -493,7 +501,6 @@ public:
         const uint32_t height = static_cast<uint32_t>(std::max(extent.y, 1.0f));
         static_cast<void>(runtime_.request_viewport_extent(width, height));
         const ImVec2 image_min = ImGui::GetCursorScreenPos();
-        const bool present_connected = runtime_.viewport_present_connected();
         if (texture_handle_.is_valid() && runtime_.viewport_ready()) {
             ImGui::Image(static_cast<ImTextureID>(aeg::editor::make_imgui_texture_id(texture_handle_)), extent);
             if (ImGui::BeginDragDropTarget()) {
@@ -507,13 +514,8 @@ public:
             }
             const bool hovered = ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem) &&
                                  ImGui::GetMousePos().y > toolbar_bottom;
-            if (present_connected) {
-                draw_gizmo(image_min, extent, width, height);
-                handle_input(image_min, extent, width, height, hovered);
-            } else {
-                viewport_draw->AddText({image_min.x + 18.0f, image_min.y + 18.0f}, IM_COL32(130, 160, 174, 255),
-                                       "No render state reaches Present.");
-            }
+            draw_gizmo(image_min, extent, width, height);
+            handle_input(image_min, extent, width, height, hovered);
         } else {
             ImGui::TextUnformatted("Scene target is preparing...");
         }
@@ -1556,7 +1558,7 @@ public:
         }
 
         const std::filesystem::path root = runtime_.project_root();
-        const std::string root_name = root.filename().empty() ? root.string() : root.filename().string();
+        const std::string root_name = path_text(root.filename().empty() ? root : root.filename());
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4{0.040f, 0.102f, 0.134f, 1.0f});
         ImGui::BeginChild("ProjectHeader", ImVec2{0.0f, 42.0f}, true, ImGuiWindowFlags_NoScrollbar);
         ImGui::AlignTextToFramePadding();
@@ -1583,8 +1585,14 @@ public:
         ImGui::InputTextWithHint("##project-tree-filter", "Search project...", filter_.data(), filter_.size());
         ImGui::Separator();
 
+        std::string selected_extension = selected_path_.extension().string();
+        std::transform(selected_extension.begin(), selected_extension.end(), selected_extension.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        const bool retired_asset = selected_extension == ".aegpipe" || selected_extension == ".aegframe" ||
+                                   selected_extension == ".aegpipeline" ||
+                                   selected_extension == ".pipeline";
         const std::vector<EditorResourceDescriptor> descriptors = runtime_.resource_descriptors();
-        const float details_height = selected_path_.empty() ? 0.0f : 74.0f;
+        const float details_height = selected_path_.empty() ? 0.0f : (retired_asset ? 112.0f : 74.0f);
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4{0.028f, 0.078f, 0.102f, 1.0f});
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2{5.0f, 6.0f});
         ImGui::PushStyleVar(ImGuiStyleVar_IndentSpacing, 15.0f);
@@ -1621,6 +1629,10 @@ public:
                 descriptor != nullptr) {
                 ImGui::SameLine();
                 ImGui::TextColored(ImVec4{0.40f, 0.74f, 0.94f, 1.0f}, "%s", resource_kind_name(descriptor->kind));
+            }
+            if (retired_asset) {
+                ImGui::Separator();
+                ImGui::TextWrapped("Unsupported retired author asset. Use a project FeatureGraph (.aegfeature).");
             }
             ImGui::EndChild();
             ImGui::PopStyleColor();
@@ -1696,7 +1708,7 @@ private:
             draw->AddCircleFilled(ImVec2{x + 3.5f, y + 5.0f}, 1.4f, IM_COL32(5, 27, 37, 230));
             draw->AddLine(ImVec2{x + 2.0f, y + 9.5f}, ImVec2{x + 7.4f, y + 9.5f}, IM_COL32(5, 27, 37, 230), 1.1f);
             draw->AddLine(ImVec2{x + 5.5f, y + 6.5f}, ImVec2{x + 7.4f, y + 9.5f}, IM_COL32(5, 27, 37, 230), 1.1f);
-        } else if (extension == ".aegpipeline" || extension == ".pipeline") {
+        } else if (extension == ".aegfeature") {
             draw->AddCircleFilled(ImVec2{x + 2.5f, y + 5.5f}, 1.2f, IM_COL32(18, 28, 42, 235));
             draw->AddCircleFilled(ImVec2{x + 7.0f, y + 8.5f}, 1.2f, IM_COL32(18, 28, 42, 235));
             draw->AddLine(ImVec2{x + 3.5f, y + 6.2f}, ImVec2{x + 6.0f, y + 7.8f}, IM_COL32(18, 28, 42, 235), 1.1f);
@@ -1732,7 +1744,7 @@ private:
         const std::string extension = path.extension().string();
         if (extension == ".aegscene")
             return {0.45f, 0.74f, 0.96f, 1.0f};
-        if (extension == ".aegpipeline" || extension == ".pipeline")
+        if (extension == ".aegfeature")
             return {0.90f, 0.64f, 0.96f, 1.0f};
         if (extension == ".aegproj" || extension == ".aegproject")
             return {0.47f, 0.88f, 0.73f, 1.0f};
@@ -1925,28 +1937,98 @@ private:
 
 class FlowGraphWorkspacePanel final : public aeg::editor::EditorPanel {
 public:
-    using DocumentProvider = std::function<aeg::application::EditorCompositionDocument*()>;
+    using FeatureDocumentProvider = std::function<aeg::application::EditorFeatureGraphDocument*()>;
+    using FeaturePathProvider = std::function<std::filesystem::path()>;
+    using FeatureAuthoringProvider =
+        std::function<std::span<const aeg::application::EditorProjectFeatureGraphDocument>()>;
+    using FeatureCatalogProvider = std::function<const aeg::feature::FeatureCatalog*()>;
+    using FeatureAuthorityProvider = std::function<std::span<const aeg::feature::FeatureDefinitionId>()>;
+    using FeatureFocusReporter = std::function<void(bool)>;
+    using FeatureActionsProvider = std::function<aeg::application::EditorFeatureGraphPanel::Actions()>;
+    using FeatureSelectionAction = std::function<Result(const std::filesystem::path&)>;
+    using FeatureRecoveryAction = std::function<Result(const std::filesystem::path&,
+        const aeg::application::authoring::FeatureGraphFileRevision&,
+        const aeg::application::authoring::FeatureGraphFileRevision&)>;
     using ProjectRootProvider = std::function<std::filesystem::path()>;
-    using Action = std::function<Result()>;
-    using StatusProvider = std::function<std::string()>;
-    using RuntimeInspectProvider =
-        std::function<std::vector<aeg::application::EditorRuntimePlanView>()>;
-
-    FlowGraphWorkspacePanel(DocumentProvider provider, ProjectRootProvider project_root_provider, Action save_draft,
-                            Action apply_to_viewport, Action restore_default_viewport, StatusProvider runtime_status,
-                            RuntimeInspectProvider runtime_inspect)
-        : provider_(std::move(provider)), project_root_provider_(std::move(project_root_provider)),
-          save_draft_(std::move(save_draft)), apply_to_viewport_(std::move(apply_to_viewport)),
-          restore_default_viewport_(std::move(restore_default_viewport)), runtime_status_(std::move(runtime_status)),
-          runtime_inspect_(std::move(runtime_inspect)) {}
+    using PreviewExecutionProvider = std::function<aeg::foundation::ResultValue<
+        aeg::application::runtime::FeatureRuntimeExecutionSnapshot>()>;
+    using RenderGraphResult = aeg::foundation::ResultValue<
+        std::shared_ptr<const aeg::application::EditorRenderGraphSnapshot>>;
+    using RenderGraphProvider = std::function<RenderGraphResult()>;
+    FlowGraphWorkspacePanel(FeatureDocumentProvider feature_provider,
+                            FeaturePathProvider feature_path_provider, FeatureAuthoringProvider feature_authoring_provider,
+                            FeatureCatalogProvider feature_catalog_provider,
+                            FeatureAuthorityProvider feature_authority_provider,
+                            FeatureFocusReporter feature_focus_reporter,
+                            ProjectRootProvider project_root_provider,
+                            std::function<Result()> save_draft, FeatureActionsProvider feature_actions,
+                            FeatureSelectionAction select_feature_graph,
+                            FeatureRecoveryAction recover_feature_graph,
+                            PreviewExecutionProvider preview_execution, RenderGraphProvider render_graph)
+        : feature_provider_(std::move(feature_provider)),
+          feature_document_path_provider_(std::move(feature_path_provider)),
+          feature_authoring_provider_(std::move(feature_authoring_provider)),
+          feature_catalog_provider_(std::move(feature_catalog_provider)),
+          feature_authority_provider_(std::move(feature_authority_provider)),
+          feature_focus_reporter_(std::move(feature_focus_reporter)),
+          project_root_provider_(std::move(project_root_provider)),
+          save_draft_(std::move(save_draft)), feature_actions_provider_(std::move(feature_actions)),
+          select_feature_graph_(std::move(select_feature_graph)),
+          recover_feature_graph_(std::move(recover_feature_graph)),
+          preview_execution_(std::move(preview_execution)), render_graph_(std::move(render_graph)) {}
 
     void build_ui() override { build_ui(aeg::editor::EditorPanelBuildContext{}); }
 
     void build_ui(const aeg::editor::EditorPanelBuildContext& context) override {
-        if (auto* document = provider_(); document != nullptr) {
-            panel_.draw(*document, {}, project_root_provider_ ? project_root_provider_() : std::filesystem::path{},
-                        {save_draft_, apply_to_viewport_, restore_default_viewport_, runtime_status_, runtime_inspect_,
-                         context.native_window, context.window_actions});
+        if (auto* feature_document = feature_provider_(); feature_document != nullptr) {
+            const auto authored = feature_authoring_provider_ ? feature_authoring_provider_()
+                                                              : std::span<const aeg::application::EditorProjectFeatureGraphDocument>{};
+            auto actions = feature_actions_provider_ ? feature_actions_provider_()
+                                                      : aeg::application::EditorFeatureGraphPanel::Actions{};
+            std::filesystem::path requested_graph;
+            actions.draw_graph_selector = [&] {
+                draw_frame_render_inspection();
+                draw_source_diagnostics(authored);
+                if (authored.empty()) return;
+                const auto current_path = feature_document_path_provider_ ? feature_document_path_provider_()
+                                                                          : std::filesystem::path{};
+                const std::string current_label = current_path.empty() ? "Select FeatureGraph"
+                                                                       : current_path.filename().string();
+                ImGui::BeginDisabled(!select_feature_graph_);
+                if (ImGui::BeginCombo("Select FeatureGraph", current_label.c_str())) {
+                    for (const auto& document : authored) {
+                        if (!document.load_result)
+                            continue;
+                        const bool selected = document.path == current_path;
+                        const std::string label = document.path.generic_string();
+                        if (ImGui::Selectable(label.c_str(), selected) && select_feature_graph_)
+                            requested_graph = document.path;
+                        if (selected)
+                            ImGui::SetItemDefaultFocus();
+                    }
+                    ImGui::EndCombo();
+                }
+                ImGui::EndDisabled();
+                if (!selection_operation_)
+                    ImGui::TextWrapped("%s", selection_operation_.message.c_str());
+            };
+            actions.authored_feature_documents =
+                authored;
+            actions.save_draft = save_draft_;
+            actions.report_focus = feature_focus_reporter_;
+            actions.feature_catalog = feature_catalog_provider_ ? feature_catalog_provider_() : nullptr;
+            actions.native_window = context.native_window;
+            actions.window_actions = context.window_actions;
+            actions.project_root = project_root_provider_ ? project_root_provider_() : std::filesystem::path{};
+            actions.compiled_features = feature_authority_provider_ ? feature_authority_provider_()
+                                                                   : std::span<const aeg::feature::FeatureDefinitionId>{};
+            feature_panel_.draw(*feature_document, feature_document_path_provider_ ? feature_document_path_provider_()
+                                                                                 : std::filesystem::path{}, actions);
+            // The panel still borrows feature_document during draw. Replacing the
+            // selected root here keeps that document alive until its last use.
+            if (!requested_graph.empty() && select_feature_graph_)
+                selection_operation_ = select_feature_graph_(requested_graph);
+            restore_requested_source();
             return;
         }
         const ImGuiWindowFlags window_flags = context.native_window
@@ -1961,19 +2043,216 @@ public:
             ImGui::PopStyleVar();
         if (context.native_window)
             aeg::editor::draw_editor_window_chrome("Flow Graph", "No authored graph", context.window_actions);
-        ImGui::TextDisabled("Open a project with an authored .aegpipe document to edit its FlowGraph.");
+        if (feature_focus_reporter_)
+            feature_focus_reporter_(false);
+        const auto authored = feature_authoring_provider_ ? feature_authoring_provider_()
+                                                          : std::span<const aeg::application::EditorProjectFeatureGraphDocument>{};
+        const bool reported_diagnostic = draw_source_diagnostics(authored);
+        if (!reported_diagnostic)
+            ImGui::TextDisabled("Open a project with an authored .aegfeature document to edit its FlowGraph.");
+        draw_frame_render_inspection();
         ImGui::End();
+        restore_requested_source();
     }
 
 private:
-    DocumentProvider provider_{};
+    struct RecoveryRequest final {
+        std::filesystem::path path{};
+        aeg::application::authoring::FeatureGraphFileRevision source{}, backup{};
+    };
+    bool draw_source_diagnostics(std::span<const aeg::application::EditorProjectFeatureGraphDocument> documents) {
+        bool reported = false;
+        for (const auto& document : documents) {
+            if (document.load_result) continue;
+            if (!reported) ImGui::TextUnformatted("FeatureGraph diagnostics");
+            reported = true;
+            const auto utf8 = document.path.generic_u8string();
+            const std::string label(utf8.begin(), utf8.end());
+            ImGui::PushID(label.c_str());
+            ImGui::TextColored(ImVec4{1.0f, 0.45f, 0.30f, 1.0f}, "%s", label.c_str());
+            ImGui::TextWrapped("%s", document.load_result.message.c_str());
+            ImGui::BeginDisabled(!recover_feature_graph_);
+            if (ImGui::Button("Inspect recoverable backup")) {
+                inspected_recovery_.reset();
+                auto source = aeg::application::authoring::inspect_feature_graph_file_revision(document.path);
+                auto backup_path = document.path; backup_path += ".bak";
+                auto backup = aeg::application::authoring::load_feature_graph_source(backup_path);
+                recovery_operation_ = !source ? source.result : backup.result;
+                if (source && backup) {
+                    recovery_version_ = backup.value.document.graph_version;
+                    inspected_recovery_ = RecoveryRequest{document.path, std::move(source.value),
+                                                         std::move(backup.value.revision)};
+                }
+            }
+            ImGui::EndDisabled();
+            if (inspected_recovery_ && inspected_recovery_->path == document.path) {
+                ImGui::TextWrapped("Restore graph version %llu. The displaced source will be retained for recovery.",
+                    static_cast<unsigned long long>(recovery_version_));
+                ImGui::BeginDisabled(!recover_feature_graph_);
+                if (ImGui::Button("Restore inspected backup")) requested_recovery_ = inspected_recovery_;
+                ImGui::EndDisabled();
+            }
+            ImGui::PopID();
+        }
+        if (!recovery_operation_) ImGui::TextWrapped("%s", recovery_operation_.message.c_str());
+        return reported;
+    }
+    void restore_requested_source() {
+        if (!requested_recovery_) return;
+        auto request = std::move(*requested_recovery_);
+        requested_recovery_.reset();
+        recovery_operation_ = recover_feature_graph_ ? recover_feature_graph_(request.path, request.source, request.backup)
+            : aeg::foundation::invalid_state("FeatureGraph recovery is unavailable");
+        if (recovery_operation_) inspected_recovery_.reset();
+    }
+    static void draw_execution_source(const aeg::application::runtime::FeatureRuntimeExecutionSnapshot& source) {
+        ImGui::Text("Asset %s  generation %llu", source.asset_uuid.c_str(),
+                    static_cast<unsigned long long>(source.generation.value()));
+        ImGui::Text("Graph %llu  draft %llu  contract %llu", static_cast<unsigned long long>(source.graph_version),
+                    static_cast<unsigned long long>(source.draft_revision),
+                    static_cast<unsigned long long>(source.contract_digest));
+        if (!source.source_path.empty())
+            ImGui::TextWrapped("Source %s", source.source_path.generic_string().c_str());
+        if (!ImGui::BeginTable("PublishedFeatureInstances", 7,
+                               ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp))
+            return;
+        for (const auto* label : {"Clock", "Order", "Definition", "Source node", "Instance", "Invocation", "Module"})
+            ImGui::TableSetupColumn(label);
+        ImGui::TableHeadersRow();
+        for (const auto& plan : source.plans) {
+            for (std::size_t index = 0; index < plan.instances.size(); ++index) {
+                const auto row = std::find_if(source.provenance.begin(), source.provenance.end(),
+                    [&](const auto& item) { return item.runtime.instance_id == plan.instances[index]; });
+                ImGui::TableNextRow(); ImGui::TableSetColumnIndex(0);
+                ImGui::Text("%llu", static_cast<unsigned long long>(plan.clock.value()));
+                ImGui::TableSetColumnIndex(1); ImGui::Text("%zu", index + 1);
+                ImGui::TableSetColumnIndex(4);
+                ImGui::Text("%llu", static_cast<unsigned long long>(plan.instances[index].value()));
+                if (row == source.provenance.end()) {
+                    ImGui::TableSetColumnIndex(2); ImGui::TextDisabled("No captured provenance");
+                    continue;
+                }
+                const auto& origin = row->runtime;
+                ImGui::TableSetColumnIndex(2);
+                ImGui::Text("%llu", static_cast<unsigned long long>(origin.definition_id.value()));
+                ImGui::TableSetColumnIndex(3);
+                ImGui::Text("%llu", static_cast<unsigned long long>(row->authored_node_id.value()));
+                ImGui::TableSetColumnIndex(5);
+                ImGui::Text("%llu", static_cast<unsigned long long>(origin.invocation_id.value()));
+                ImGui::TableSetColumnIndex(6);
+                ImGui::Text("%llu", static_cast<unsigned long long>(origin.owner_module.value()));
+            }
+        }
+        ImGui::EndTable();
+    }
+
+    void draw_frame_render_inspection() {
+        ImGui::Separator();
+        if (!ImGui::CollapsingHeader("Frame / Render (read-only)"))
+            return;
+        // Native author canvases fill the remaining window with their own
+        // scrolling child. Keep this actual-source view above that canvas and
+        // give it an independent scroll region in both presentations.
+        const float height = std::clamp(ImGui::GetContentRegionAvail().y * 0.40f, 160.0f, 320.0f);
+        ImGui::BeginChild("FrameRenderSources", ImVec2{0.0f, height}, true);
+        draw_frame_render_sources();
+        ImGui::EndChild();
+    }
+
+    void draw_frame_render_sources() {
+        if (ImGui::TreeNodeEx("Published Preview ExecutionPlan", ImGuiTreeNodeFlags_DefaultOpen)) {
+            const auto observed = preview_execution_();
+            if (observed) draw_execution_source(observed.value);
+            else ImGui::TextWrapped("%s", observed.result.message.c_str());
+            ImGui::TreePop();
+        }
+        if (!ImGui::TreeNodeEx("Last successful RenderGraph", ImGuiTreeNodeFlags_DefaultOpen))
+            return;
+        const auto observed = render_graph_();
+        if (!observed || !observed.value) {
+            ImGui::TextWrapped("%s", observed.result.message.c_str());
+            ImGui::TreePop();
+            return;
+        }
+        const auto& graph = *observed.value;
+        ImGui::Text("Frame %llu  revision %llu", static_cast<unsigned long long>(graph.frame_index),
+                    static_cast<unsigned long long>(graph.plan.revision));
+        ImGui::Text("Resources %u  passes %u  culled %u  batches %u", graph.compilation.resource_count,
+                    graph.compilation.pass_count, graph.compilation.culled_pass_count, graph.compilation.batch_count);
+        if (ImGui::BeginTable("CapturedFeatureWork", 6,
+                              ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+            for (const auto* label : {"Order / pass", "Batch", "Live", "Source / definition", "Instance / invocation", "Operation"})
+                ImGui::TableSetupColumn(label);
+            ImGui::TableHeadersRow();
+            for (const auto& pass : graph.plan.pass_plans) {
+                ImGui::TableNextRow(); ImGui::TableSetColumnIndex(0);
+                ImGui::Text("%u / %u", pass.topological_index, pass.pass.index);
+                ImGui::TableSetColumnIndex(1); ImGui::Text("%u", pass.batch_index);
+                ImGui::TableSetColumnIndex(2); ImGui::TextUnformatted(pass.live ? "yes" : "no");
+                ImGui::TableSetColumnIndex(3);
+                if (!pass.feature_work) { ImGui::TextDisabled("Frame infrastructure"); continue; }
+                const auto& work = *pass.feature_work;
+                const auto source = std::find_if(graph.sources.begin(), graph.sources.end(), [&](const auto& item) {
+                    return item.generation == work.invocation.generation &&
+                        std::any_of(item.provenance.begin(), item.provenance.end(), [&](const auto& row) {
+                            return row.runtime.instance_id == work.instance_id && row.runtime.node_id == work.node_id &&
+                                   row.runtime.definition_id == work.feature_definition_id &&
+                                   row.runtime.owner_module == work.owner_module;
+                        });
+                });
+                if (source != graph.sources.end()) ImGui::TextWrapped("%s", source->asset_uuid.c_str());
+                else ImGui::TextDisabled("Unattributed Feature");
+                ImGui::Text("Definition %llu", static_cast<unsigned long long>(work.feature_definition_id.value()));
+                ImGui::TableSetColumnIndex(4);
+                ImGui::Text("%llu / %llu", static_cast<unsigned long long>(work.instance_id.value()),
+                            static_cast<unsigned long long>(work.invocation.invocation_id.value()));
+                ImGui::TableSetColumnIndex(5);
+                ImGui::Text("%u / %s", work.operation_index,
+                            work.kind == aeg::render_graph::RenderWorkItemKind::kExecute ? "execute" : "prepare");
+            }
+            ImGui::EndTable();
+        }
+        if (ImGui::TreeNode("Captured source owners")) {
+            for (std::size_t index = 0; index < graph.sources.size(); ++index) {
+                ImGui::PushID(static_cast<int>(index));
+                if (ImGui::TreeNode(graph.sources[index].asset_uuid.c_str())) {
+                    draw_execution_source(graph.sources[index]);
+                    ImGui::TreePop();
+                }
+                ImGui::PopID();
+            }
+            ImGui::TreePop();
+        }
+        if (ImGui::TreeNode("Queue batches and dependencies")) {
+            for (const auto& batch : graph.plan.batches)
+                ImGui::BulletText("Batch %u  queue %u  passes %zu", batch.index,
+                                  static_cast<unsigned>(batch.queue), batch.pass_indices.size());
+            for (const auto& edge : graph.plan.queue_dependencies)
+                ImGui::BulletText("Batch %u -> %u  hazards %u", edge.source_batch, edge.destination_batch,
+                                  edge.resource_hazard_count);
+            ImGui::TreePop();
+        }
+        ImGui::TreePop();
+    }
+
+    FeatureDocumentProvider feature_provider_{};
+    std::function<std::filesystem::path()> feature_document_path_provider_{};
+    FeatureAuthoringProvider feature_authoring_provider_{};
+    FeatureCatalogProvider feature_catalog_provider_{};
+    FeatureAuthorityProvider feature_authority_provider_{};
+    FeatureFocusReporter feature_focus_reporter_{};
     ProjectRootProvider project_root_provider_{};
-    Action save_draft_{};
-    Action apply_to_viewport_{};
-    Action restore_default_viewport_{};
-    StatusProvider runtime_status_{};
-    RuntimeInspectProvider runtime_inspect_{};
-    aeg::application::EditorFlowGraphPanel panel_{};
+    std::function<Result()> save_draft_{};
+    FeatureActionsProvider feature_actions_provider_{};
+    FeatureSelectionAction select_feature_graph_{};
+    FeatureRecoveryAction recover_feature_graph_{};
+    std::optional<RecoveryRequest> inspected_recovery_{}, requested_recovery_{};
+    uint64_t recovery_version_{0};
+    Result recovery_operation_{};
+    PreviewExecutionProvider preview_execution_{};
+    RenderGraphProvider render_graph_{};
+    Result selection_operation_{Result::success()};
+    aeg::application::EditorFeatureGraphPanel feature_panel_{};
 };
 
 class EditorApplication final {
@@ -1987,7 +2266,8 @@ class EditorApplication final {
         std::unique_ptr<RenderGraph> render_graph{};
         std::unique_ptr<ImGuiRenderer> imgui_renderer{};
         PipelineRegistry registry{};
-        PipelineScheduler scheduler{{1, 1, 1, 1}};
+        PipelineScheduler scheduler;
+        aeg::engine::EngineFramePipelineHost pipeline_host{registry, scheduler};
         PipelineScopeHost frame_host{PipelineScope::kFrame,
                                      aeg::pipeline::PipelineInstanceId("Editor.NativeViewport.Frame")};
         std::unique_ptr<aeg::engine::EngineFrameOrchestrator> orchestrator{};
@@ -2000,6 +2280,22 @@ public:
 
     EditorApplication(const EditorApplication&) = delete;
     EditorApplication& operator=(const EditorApplication&) = delete;
+
+    [[nodiscard]] Result launch_project_operation(aeg::tooling::ProjectOperationRequest request) {
+        if (const auto synced = sync_project_operations(); !synced) return synced;
+        if (scene_runtime_ == nullptr || !scene_runtime_->project_loaded() ||
+            std::filesystem::weakly_canonical(request.project_file) != scene_runtime_->project_file())
+            return aeg::foundation::invalid_state("Project operation requires the explicitly opened project");
+        request.project_file = scene_runtime_->project_file();
+        if (request.engine_directory.empty()) request.engine_directory = AEG_ENGINE_SOURCE_DIR;
+        if (request.cmake_executable.empty()) request.cmake_executable = AEG_CMAKE_EXECUTABLE;
+        if (request.target.empty()) request.target = project_operations_.request().target;
+        if (const auto configured = project_operations_.set_request(request); !configured) return configured;
+        if (const auto started = project_operations_.start(request.operation); !started) return started;
+        project_operation_cli_ = true;
+        project_operations_open_ = true;
+        return Result::success();
+    }
 
     [[nodiscard]] bool initialize(const std::filesystem::path& resource_root = {},
                                   const std::filesystem::path& startup_project = {}) {
@@ -2067,7 +2363,7 @@ public:
             return false;
         }
         if (startup_project_.empty()) {
-            const std::filesystem::path bundled_demo = resource_root_ / "DemoProject" / "project.aegproject";
+            const std::filesystem::path bundled_demo = resource_root_ / "DemoProject" / "Project.aegproj";
             if (std::filesystem::exists(bundled_demo)) {
                 startup_project_ = bundled_demo;
             }
@@ -2076,21 +2372,31 @@ public:
             const auto project_result =
                 aeg::editor::guard_editor_operation([&] { return scene_runtime_->import_project(startup_project_); });
             if (!project_result) {
-                notify_runtime_result(project_result, "open_startup_project");
+                const std::string_view diagnostic{project_result.message};
+                const bool retired_startup_input = project_result.code == ResultCode::kUnsupported &&
+                    (diagnostic.starts_with("Retired Scene author sidecar is unsupported: ") ||
+                     diagnostic.starts_with("Retired Frame/Pipeline author documents cannot be opened as a Scene") ||
+                     diagnostic.starts_with("Removed project startup field: ") ||
+                     diagnostic.starts_with("Removed startup asset extension in build.startup_feature_graphs: ") ||
+                     diagnostic.starts_with("Unsupported project format_version") ||
+                     diagnostic.starts_with("Unsupported retired project extension: ") ||
+                     diagnostic.starts_with("Unsupported retired project header: "));
+                // These inputs are rejected before replacing the initialized
+                // Preview. Report that usable startup state without changing
+                // device, backend, or Runtime failure classification.
+                if (retired_startup_input && !scene_runtime_->project_loaded()) {
+                    static_cast<void>(aeg::editor::guard_editor_operation([&] {
+                        AEG_LOG_WARNING(aeg::logging::Category::kApplication,
+                            "Editor operation open_startup_project rejected [{}]: {}",
+                            aeg::foundation::result_code_name(project_result.code), project_result.message);
+                        return Result::success();
+                    }));
+                } else {
+                    notify_runtime_result(project_result, "open_startup_project");
+                }
                 if (fatal_runtime_error_)
                     return false;
             } else {
-                if (!scene_runtime_->renderer_pipeline_diagnostic().empty()) {
-                    AEG_LOG_WARNING(aeg::logging::Category::kApplication, "{}",
-                                    scene_runtime_->renderer_pipeline_diagnostic());
-                }
-                const auto pipeline_result =
-                    aeg::editor::guard_editor_operation([&] { return restore_pipeline_document(); });
-                if (!pipeline_result) {
-                    notify_runtime_result(pipeline_result, "restore_startup_pipeline_document");
-                    if (fatal_runtime_error_)
-                        return false;
-                }
                 sync_flowgraph_document();
             }
         }
@@ -2175,18 +2481,15 @@ public:
         if (!report_result(aeg::renderer::register_render_pipeline(registry_), "register_render_pipeline")) {
             return false;
         }
-        if (!report_result(aeg::editor::register_imgui_render_feature(registry_, *imgui_renderer_),
-                           "register_imgui_render_feature")) {
-            return false;
-        }
-
         if (!report_result(frame_host_.bind_pipeline(aeg::pipeline::PipelineId("RenderPipeline")),
                            "bind_editor_render_pipeline")) {
             return false;
         }
-        orchestrator_ = std::make_unique<aeg::engine::EngineFrameOrchestrator>(registry_, scheduler_, *frame_context_,
-                                                                               *render_graph_);
-        if (!report_result(orchestrator_->register_pipeline(frame_host_), "register_editor_frame_pipeline")) {
+        orchestrator_ = std::make_unique<aeg::engine::EngineFrameOrchestrator>(
+            pipeline_host_, *frame_context_, *render_graph_);
+        if (!report_result(orchestrator_->register_pipeline(
+                               aeg::engine::EngineFramePipelineRegistration{frame_host_}),
+                           "register_editor_frame_pipeline")) {
             return false;
         }
         if (!report_result(orchestrator_->initialize(), "initialize_engine_frame_orchestrator")) {
@@ -2194,52 +2497,118 @@ public:
         }
 
         auto flowgraph_panel = std::make_unique<FlowGraphWorkspacePanel>(
-            [this] { return flowgraph_document_.get(); },
+            [this] { return feature_graph_document_.get(); },
+            [this] { return feature_graph_document_path_; },
+            [this] {
+                return scene_runtime_ == nullptr
+                           ? std::span<const aeg::application::EditorProjectFeatureGraphDocument>{}
+                           : scene_runtime_->authored_feature_graphs();
+            },
+            [this] {
+                return scene_runtime_ == nullptr ? nullptr : &scene_runtime_->authored_feature_catalog();
+            },
+            [this] { return scene_runtime_ == nullptr ? std::span<const aeg::feature::FeatureDefinitionId>{} : scene_runtime_->authored_compiled_features(); },
+            [this](bool focused) { feature_graph_focused_ = focused; },
             [this] { return scene_runtime_ == nullptr ? std::filesystem::path{} : scene_runtime_->project_root(); },
-            [this] { return save_flowgraph_document(); },
+            [this] { return save_feature_graph_document(); },
             [this] {
-                if (scene_runtime_ == nullptr || flowgraph_document_ == nullptr || flowgraph_document_path_.empty())
-                    return aeg::foundation::invalid_state("Open an authored Pipeline document before applying it");
-                if (const Result result = save_flowgraph_document(); !result)
-                    return result;
-                return scene_runtime_->activate_renderer_pipeline_document(flowgraph_document_path_);
-            },
-            [this] {
-                if (scene_runtime_ == nullptr)
-                    return aeg::foundation::invalid_state("Scene runtime is unavailable");
-                return scene_runtime_->restore_default_renderer_pipeline();
-            },
-            [this] {
-                if (scene_runtime_ == nullptr)
-                    return std::string{};
-                const auto diagnostic = scene_runtime_->renderer_pipeline_diagnostic();
-                if (!diagnostic.empty())
-                    return std::string{"Viewport fallback: "} + std::string{diagnostic};
-                const auto& active = scene_runtime_->active_renderer_pipeline_document();
-                return active.empty() ? std::string{"Viewport: default"}
-                                      : std::string{"Viewport: "} + active.filename().string();
-            },
-            [this] {
-                std::vector<aeg::application::EditorRuntimePlanView> result;
-                if (scene_runtime_ == nullptr)
-                    return result;
-                const aeg::pipeline::PipelineDocument* applied = nullptr;
-                for (const auto& document : scene_runtime_->authored_pipeline_documents()) {
-                    if (document.path == scene_runtime_->active_renderer_pipeline_document()) {
-                        applied = &document.document;
-                        break;
-                    }
+                aeg::application::EditorFeatureGraphPanel::Actions actions;
+                if (scene_runtime_ == nullptr) return actions;
+                actions.project_file = scene_runtime_->project_file();
+                actions.asset_kind_resolver = aeg::application::make_editor_asset_kind_resolver(actions.project_file);
+                actions.active_module_catalog = scene_runtime_->active_feature_module_catalog();
+                actions.inspect_module_catalog = [this](const std::filesystem::path& manifest) {
+                    return scene_runtime_->inspect_feature_module_catalog(manifest);
+                };
+                actions.select_module = [this](const std::filesystem::path& manifest, std::string_view configuration) {
+                    return scene_runtime_->select_feature_module(manifest, configuration);
+                };
+                actions.select_saved_module = [this](const std::filesystem::path& manifest, std::string_view configuration) {
+                    return scene_runtime_->select_feature_module(
+                        manifest, configuration, EditorSceneRuntime::FeatureGraphLoadPolicy::kSavedStartup);
+                };
+                if (actions.active_module_catalog != nullptr) {
+                    actions.apply_graph = [this](const aeg::feature::FeatureGraphDocument& graph) {
+                        return scene_runtime_->queue_feature_graph(graph);
+                    };
                 }
-                for (const auto& [source, plan] : scene_runtime_->pipeline_snapshots()) {
-                    if (plan == nullptr)
-                        continue;
-                    auto snapshot = aeg::application::project_runtime_plan(
-                        *plan, source, source == "Game / Renderer" ? applied : nullptr);
-                    if (snapshot)
-                        result.push_back(std::move(snapshot.value));
-                }
-                return result;
-            });
+                actions.feature_presentations = scene_runtime_->authored_feature_presentations();
+                actions.inspect_node = [this](std::string_view asset, aeg::feature::FeatureNodeId node) {
+                    auto result = scene_runtime_->inspect_feature_node(asset, node);
+#if defined(AEG_EDITOR_WORKFLOW_TESTS)
+                    if (feature_workflow_probe) feature_workflow_probe->record_inspection(result);
+#endif
+                    return result;
+                };
+                actions.inspect_execution = [this](std::string_view asset) {
+                    return scene_runtime_->inspect_feature_execution(asset);
+                };
+                actions.inspect_render_graph = [this] { return scene_runtime_->inspect_render_graph(); };
+                actions.control_process = [this](const aeg::application::runtime::RuntimeProcessCommand& command) {
+                    return scene_runtime_->control_feature_process(command);
+                };
+                actions.world_binding_editable =
+                    scene_runtime_->mode() == EditorSceneRuntime::Mode::kEdit;
+                actions.selected_world_target_label = [this] {
+                    if (scene_runtime_ == nullptr) return std::string{};
+                    const auto selected = scene_runtime_->selected_entity();
+                    const auto entities = scene_runtime_->entities();
+                    const auto found = std::find_if(entities.begin(), entities.end(), [&](const auto& entity) {
+                        return entity.id == selected;
+                    });
+                    if (found == entities.end()) return std::string{};
+                    return found->name + " (Scene entity " + std::to_string(selected.high()) + ":" +
+                           std::to_string(selected.low()) + ")";
+                };
+                actions.world_binding_status = [this](std::string_view asset_uuid,
+                                                       aeg::feature::FeatureNodeId node) {
+                    if (scene_runtime_ == nullptr) return std::string{};
+                    const auto& bindings = scene_runtime_->feature_world_bindings();
+                    const auto found = std::find_if(bindings.begin(), bindings.end(), [&](const auto& binding) {
+                        return binding.graph_asset_uuid == asset_uuid && binding.node_id == node;
+                    });
+                    if (found == bindings.end()) return std::string{};
+                    const auto entities = scene_runtime_->entities();
+                    const auto target = std::find_if(entities.begin(), entities.end(), [&](const auto& entity) {
+                        return entity.id == found->scene_entity;
+                    });
+                    const std::string label = target == entities.end() ? "missing Scene entity" : target->name;
+                    return "Currently routed to " + label + " (" + std::to_string(found->scene_entity.high()) +
+                           ":" + std::to_string(found->scene_entity.low()) + ").";
+                };
+                actions.bind_world_command = [this](std::string_view asset_uuid,
+                                                    aeg::feature::FeatureNodeId node) {
+                    if (scene_runtime_ == nullptr)
+                        return aeg::foundation::invalid_state("Editor Scene runtime is unavailable");
+                    return scene_runtime_->bind_feature_world_node(asset_uuid, node,
+                                                                   scene_runtime_->selected_entity());
+                };
+                actions.clear_world_command = [this](std::string_view asset_uuid,
+                                                     aeg::feature::FeatureNodeId node) {
+                    if (scene_runtime_ == nullptr)
+                        return aeg::foundation::invalid_state("Editor Scene runtime is unavailable");
+                    return scene_runtime_->clear_feature_world_node_binding(asset_uuid, node);
+                };
+                actions.publication_pending = scene_runtime_->feature_publication_pending();
+                return actions;
+            },
+            [this](const std::filesystem::path& path) { return select_feature_graph(path); },
+            [this](const std::filesystem::path& path,
+                   const aeg::application::authoring::FeatureGraphFileRevision& source,
+                   const aeg::application::authoring::FeatureGraphFileRevision& backup) {
+                if (scene_runtime_ == nullptr || scene_runtime_->mode() != EditorSceneRuntime::Mode::kEdit)
+                    return aeg::foundation::invalid_state("Stop preview before restoring a FeatureGraph source");
+                if (feature_graph_document_ && feature_graph_document_->dirty())
+                    return aeg::foundation::invalid_state("Save the current draft before restoring a source");
+                const auto restored = aeg::application::authoring::recover_feature_graph_document(path, source, &backup);
+                if (!restored) return restored;
+                if (const auto refreshed = scene_runtime_->refresh_assets(); !refreshed) return refreshed;
+                feature_graph_document_.reset();
+                feature_graph_document_path_.clear();
+                return select_feature_graph(path);
+            },
+            [this] { return scene_runtime_->inspect_renderer_feature_execution(); },
+            [this] { return scene_runtime_->inspect_render_graph(); });
         if (!report_result(workspace_.register_panel(
                                EditorPanelDescriptor{"scene_viewport", "Scene Viewport", EditorDockRegion::kCenter,
                                                      true, false, true},
@@ -2260,10 +2629,12 @@ public:
                            "register_hierarchy_panel") ||
             !report_result(workspace_.register_panel(
                                EditorPanelDescriptor{"project", "Project", EditorDockRegion::kLeft, true, true, true},
-                               std::make_unique<ProjectPanel>(*scene_runtime_, [this] {
-                                   request_confirmed_document_action(
-                                       EditorDocumentAction{EditorDocumentActionType::kCloseProject});
-                               })),
+                               std::make_unique<ProjectPanel>(
+                                   *scene_runtime_,
+                                   [this] {
+                                       request_confirmed_document_action(
+                                           EditorDocumentAction{EditorDocumentActionType::kCloseProject});
+                                   })),
                            "register_project_panel") ||
             !report_result(workspace_.register_panel(EditorPanelDescriptor{"inspector", "Inspector",
                                                                            EditorDockRegion::kRight, true, true, true},
@@ -2291,10 +2662,26 @@ public:
         for (auto action : std::vector<aeg::editor::EditorWorkspaceActionDescriptor>{
                  {"save_scene", "Save", [this] { return scene_runtime_->save_scene(); }, false,
                   [this] { return scene_runtime_->mode() == EditorSceneRuntime::Mode::kEdit; }},
-                 {"undo", "Undo", [this] { return scene_runtime_->undo(); }, false,
-                  [this] { return scene_runtime_->can_undo(); }},
-                 {"redo", "Redo", [this] { return scene_runtime_->redo(); }, false,
-                  [this] { return scene_runtime_->can_redo(); }},
+                 {"undo", "Undo", [this] {
+                      return feature_graph_history_active()
+                                 ? feature_graph_document_->undo()
+                                 : scene_runtime_->undo();
+                  }, false,
+                  [this] {
+                      return feature_graph_history_active()
+                                 ? feature_graph_document_->can_undo()
+                                 : scene_runtime_->can_undo();
+                  }},
+                 {"redo", "Redo", [this] {
+                      return feature_graph_history_active()
+                                 ? feature_graph_document_->redo()
+                                 : scene_runtime_->redo();
+                  }, false,
+                  [this] {
+                      return feature_graph_history_active()
+                                 ? feature_graph_document_->can_redo()
+                                 : scene_runtime_->can_redo();
+                  }},
                  {"play", "Play", [this] { return scene_runtime_->play(); }, false,
                   [this] { return scene_runtime_->mode() != EditorSceneRuntime::Mode::kPlay; }},
                  {"pause", "Pause", [this] { return scene_runtime_->pause(); }, false,
@@ -2338,7 +2725,9 @@ public:
 
     [[nodiscard]] int run(uint32_t frame_limit, bool resize_regression, bool open_preferences_regression,
                           bool native_viewport_regression,
-                          const aeg::application::IConsoleInterruptController& console_interrupt) {
+                          const aeg::application::IConsoleInterruptController& console_interrupt,
+                          bool verify_feature_preview, bool expect_project_rejected,
+                          const std::filesystem::path& expected_scene) {
         regression_mode_ = resize_regression || open_preferences_regression || native_viewport_regression;
         resize_regression_ = resize_regression;
         preferences_regression_mode_ = open_preferences_regression;
@@ -2349,8 +2738,19 @@ public:
         preferences_regression_preview_completed_ = false;
         preferences_open_requested_ = open_preferences_regression;
         uint32_t attempted_frames = 0;
+        uint32_t successful_scene_frames = 0;
         while (!close_requested() && !console_interrupt.interrupted()) {
             try {
+                if (const auto polled = project_operations_.poll(); !polled) {
+                    notify_runtime_result(polled, "poll_project_operation");
+                    if (project_operation_cli_) return 1;
+                }
+                if (project_operation_cli_ && project_operations_.status().execution_complete
+#if defined(AEG_EDITOR_WORKFLOW_TESTS)
+                    && (!feature_workflow_probe || feature_workflow_probe->complete())
+#endif
+                    )
+                    break;
                 // A bounded automated run must finish even when every attempted
                 // frame reports a recoverable error before it can be presented.
                 if (frame_limit != 0 && attempted_frames >= frame_limit) {
@@ -2498,7 +2898,7 @@ public:
                         if (fatal_runtime_error_) {
                             return 1;
                         }
-                        std::this_thread::sleep_for(std::chrono::milliseconds(16));
+                        static_cast<void>(aeg::concurrency::sleep_for(16'000'000ull));
                         continue;
                     }
                 }
@@ -2509,19 +2909,20 @@ public:
                     if (fatal_runtime_error_) {
                         return 1;
                     }
-                    std::this_thread::sleep_for(std::chrono::milliseconds(16));
+                    static_cast<void>(aeg::concurrency::sleep_for(16'000'000ull));
                     continue;
                 }
                 const auto finish_input_frame = [this]() noexcept { input_system_.end_frame(); };
 
                 if (window_->state().minimized) {
                     finish_input_frame();
-                    std::this_thread::sleep_for(std::chrono::milliseconds(16));
+                    static_cast<void>(aeg::concurrency::sleep_for(16'000'000ull));
                     continue;
                 }
 
                 const auto now = std::chrono::steady_clock::now();
-                float delta_seconds = std::chrono::duration<float>(now - last_frame_time_).count();
+                const double feature_delta_seconds = std::chrono::duration<double>(now - last_frame_time_).count();
+                float delta_seconds = static_cast<float>(feature_delta_seconds);
                 last_frame_time_ = now;
                 if (!(delta_seconds > 0.0f) || delta_seconds > 0.25f) {
                     delta_seconds = 1.0f / 60.0f;
@@ -2530,13 +2931,10 @@ public:
                 if (scene_runtime_ != nullptr) {
                     Result scene_frame_result = Result::success();
                     if (scene_runtime_->viewport_resize_pending()) {
-                        // The previous viewport image is referenced by the editor UI draw packet.
-                        // Release its frame-local descriptors before SceneRuntime replaces it.
-                        if (imgui_renderer_ != nullptr) {
-                            scene_frame_result = imgui_renderer_->release_prepared_frame();
-                            if (!scene_frame_result) {
-                                notify_runtime_result(scene_frame_result, "release_scene_viewport_frame");
-                            }
+                        // Detached UI packets may also sample the old SceneColor image.
+                        scene_frame_result = release_shared_ui_texture_frames();
+                        if (!scene_frame_result) {
+                            notify_runtime_result(scene_frame_result, "release_scene_viewport_frame");
                         }
                         if (scene_frame_result && render_graph_ != nullptr) {
                             // The editor graph also caches logical imports of SceneColor. Rebuild
@@ -2546,13 +2944,14 @@ public:
                             render_graph_->reset();
                             try {
                                 orchestrator_ = std::make_unique<aeg::engine::EngineFrameOrchestrator>(
-                                    registry_, scheduler_, *frame_context_, *render_graph_);
+                                    pipeline_host_, *frame_context_, *render_graph_);
                             } catch (const std::bad_alloc&) {
                                 scene_frame_result = aeg::foundation::out_of_memory(
                                     "Editor frame orchestrator recreation allocation failed");
                             }
                             if (scene_frame_result) {
-                                scene_frame_result = orchestrator_->register_pipeline(frame_host_);
+                                scene_frame_result = orchestrator_->register_pipeline(
+                                    aeg::engine::EngineFramePipelineRegistration{frame_host_});
                             }
                             if (scene_frame_result) {
                                 scene_frame_result = orchestrator_->initialize();
@@ -2563,7 +2962,9 @@ public:
                         }
                     }
                     if (scene_frame_result) {
-                        scene_frame_result = scene_runtime_->render_frame(frame_count_);
+                        scene_frame_result = scene_runtime_->render_frame(frame_count_, feature_delta_seconds);
+                        if (verify_feature_preview && scene_frame_result)
+                            ++successful_scene_frames;
                     }
                     if (!scene_frame_result) {
                         notify_runtime_result(scene_frame_result, "render_editor_scene");
@@ -2612,11 +3013,26 @@ public:
                 }
                 imgui_frame_active = true;
                 build_editor_menu();
+                if (project_operations_open_) {
+                    if (const auto synced = sync_project_operations(); !synced)
+                        notify_runtime_result(synced, "select_project_operation_project");
+                    if (ImGui::Begin("Project Operations", &project_operations_open_))
+                        project_operations_.draw();
+                    ImGui::End();
+                }
                 sync_flowgraph_document();
                 workspace_.set_preferences_open(preferences_window_ != nullptr || preferences_open_requested_);
                 workspace_.set_playing(scene_runtime_->mode() != EditorSceneRuntime::Mode::kEdit);
                 workspace_.set_paused(scene_runtime_->mode() == EditorSceneRuntime::Mode::kPause);
                 workspace_.set_game_draw_calls(scene_runtime_ != nullptr ? scene_runtime_->draw_call_count() : 0);
+#if defined(AEG_EDITOR_WORKFLOW_TESTS)
+                if (feature_workflow_probe) {
+                    if (const auto result = feature_workflow_probe->before_ui(feature_workflow_context()); !result) {
+                        std::fprintf(stderr, "Main Feature workflow: %s\n", result.message.c_str());
+                        return 73;
+                    }
+                }
+#endif
                 const Result build_workspace_result = workspace_.build_ui();
                 if (!build_workspace_result) {
                     notify_runtime_result(build_workspace_result, "build_editor_workspace");
@@ -2627,6 +3043,14 @@ public:
                     }
                     continue;
                 }
+#if defined(AEG_EDITOR_WORKFLOW_TESTS)
+                if (feature_workflow_probe) {
+                    if (const auto result = feature_workflow_probe->after_ui(feature_workflow_context()); !result) {
+                        std::fprintf(stderr, "Main Feature workflow: %s\n", result.message.c_str());
+                        return 73;
+                    }
+                }
+#endif
                 if (scene_runtime_ != nullptr && scene_runtime_->mode() != last_scene_mode_) {
                     input_system_.reset();
                     last_scene_mode_ = scene_runtime_->mode();
@@ -2790,7 +3214,7 @@ public:
                 notify_runtime_result(failure, "editor_operation_exception");
                 if (fatal_runtime_error_ || regression_mode_)
                     return 1;
-                std::this_thread::sleep_for(std::chrono::milliseconds(16));
+                static_cast<void>(aeg::concurrency::sleep_for(16'000'000ull));
             }
         }
         if (preferences_regression_mode_ &&
@@ -2802,340 +3226,222 @@ public:
              imgui_host_.active_font_size_pixels() != preference_model_->applied_state().font_size_pixels)) {
             return 1;
         }
+        if (verify_feature_preview) {
+            const auto verified = verify_preview_source(expect_project_rejected, expected_scene, successful_scene_frames);
+            if (!verified) {
+                std::fprintf(stderr, "Feature Preview verification failed: %s\n", verified.message.c_str());
+                return 1;
+            }
+            std::printf("FEATURE_PREVIEW_VERIFIED %s\n", expect_project_rejected ? "rejected" : "recovered");
+        }
+        if (project_operation_cli_) {
+            const auto& operation = project_operations_.status();
+            if (!operation.execution_complete || operation.state != aeg::tooling::ProjectOperationState::kSucceeded) {
+                std::fprintf(stderr, "Project operation failed or did not finish: %s\n", operation.result.message.c_str());
+                return 1;
+            }
+            std::printf("PROJECT_OPERATION_COMPLETE commits=%zu manifest=%s\n",
+                        operation.feature_stages.size(), operation.game_manifest.string().c_str());
+        }
+#if defined(AEG_EDITOR_WORKFLOW_TESTS)
+        if (feature_workflow_probe) {
+            if (const auto result = feature_workflow_probe->finish(); !result) {
+                std::fprintf(stderr, "Main Feature workflow: %s\n", result.message.c_str());
+                return 73;
+            }
+        }
+#endif
         return 0;
     }
 
 private:
+#if defined(AEG_EDITOR_WORKFLOW_TESTS)
+    [[nodiscard]] aeg::editor_test::FeatureWorkflowContext feature_workflow_context() {
+        return {*scene_runtime_, feature_graph_document_.get(), feature_graph_document_path_,
+                project_operations_.request(), project_operations_.status(),
+                [this](std::string_view action) { return workspace_.invoke_view_action(action); }};
+    }
+#endif
+    [[nodiscard]] Result sync_project_operations() {
+        const auto file = scene_runtime_ == nullptr ? std::filesystem::path{} : scene_runtime_->project_file();
+        if (file == project_operations_.request().project_file) return Result::success();
+        if (const auto selected = project_operations_.set_project(file); !selected) return selected;
+        if (file.empty()) return Result::success();
+        auto request = project_operations_.request();
+        request.engine_directory = AEG_ENGINE_SOURCE_DIR;
+        request.cmake_executable = AEG_CMAKE_EXECUTABLE;
+        return project_operations_.set_request(request);
+    }
+    [[nodiscard]] Result verify_preview_source(bool expect_rejected, const std::filesystem::path& expected_scene,
+                                               uint32_t successful_scene_frames) const {
+        if (scene_runtime_ == nullptr || frame_count_ == 0 || successful_scene_frames != frame_count_ ||
+            !scene_runtime_->viewport_ready() || scene_runtime_->draw_call_count() == 0)
+            return aeg::foundation::invalid_state("Scene Preview did not complete every presented test frame");
+        if (expect_rejected) {
+            if (scene_runtime_->project_loaded())
+                return aeg::foundation::invalid_state("Rejected project became active");
+        } else {
+            if (!scene_runtime_->project_loaded())
+                return aeg::foundation::invalid_state("Supported recovery project was not loaded");
+            std::error_code error;
+            const auto root = startup_project_.has_extension() ? startup_project_.parent_path() : startup_project_;
+            if (!std::filesystem::equivalent(root, scene_runtime_->project_root(), error) || error)
+                return aeg::foundation::invalid_state("Recovered Preview belongs to another project");
+            if (!std::filesystem::equivalent(expected_scene, scene_runtime_->scene_path(), error) || error)
+                return aeg::foundation::invalid_state("Recovered Preview did not open the real expected Scene");
+        }
+        const auto execution = scene_runtime_->inspect_renderer_feature_execution();
+        const auto captured = scene_runtime_->inspect_render_graph();
+        if (!execution || !captured || !captured.value || execution.value.asset_uuid != "renderer-scene-opaque" ||
+            !execution.value.generation.is_valid() || execution.value.contract_digest == 0)
+            return aeg::foundation::invalid_state("Actual Opaque Preview publication or successful RenderGraph is absent");
+        const auto& published = execution.value;
+        const auto& graph = *captured.value;
+        const auto source = std::find_if(graph.sources.begin(), graph.sources.end(), [&](const auto& candidate) {
+            return candidate.asset_uuid == published.asset_uuid && candidate.generation == published.generation &&
+                   candidate.contract_digest == published.contract_digest && candidate.graph_version == published.graph_version;
+        });
+        if (source == graph.sources.end())
+            return aeg::foundation::invalid_state("Successful RenderGraph does not retain the actual Preview source owner");
+        const auto definition = aeg::feature::FeatureDefinitionId{"Renderer.Scene.Opaque"};
+        const auto node = aeg::feature::FeatureNodeId{"Renderer.Scene.Root"};
+        const auto module = aeg::feature::ModuleIdentity{"com.aeg.renderer"};
+        const auto clock = aeg::feature::ClockId{"Frame"};
+        const auto origin = std::find_if(source->provenance.begin(), source->provenance.end(), [&](const auto& row) {
+            return row.authored_node_id == node && row.runtime.definition_id == definition &&
+                   row.runtime.owner_module == module && row.runtime.clock == clock &&
+                   row.runtime.instance_id.is_valid() && row.runtime.invocation_id.is_valid();
+        });
+        if (origin == source->provenance.end())
+            return aeg::foundation::invalid_state("Captured Preview has no actual Opaque Frame owner provenance");
+        const auto contains_owner = [&](const auto& snapshot) {
+            return std::any_of(snapshot.plans.begin(), snapshot.plans.end(), [&](const auto& plan) {
+                return plan.clock == clock && std::find(plan.instances.begin(), plan.instances.end(),
+                    origin->runtime.instance_id) != plan.instances.end();
+            });
+        };
+        if (!contains_owner(published) || !contains_owner(*source))
+            return aeg::foundation::invalid_state("Opaque owner is absent from the actual published Frame plan");
+        const auto live_origin = std::find_if(published.provenance.begin(), published.provenance.end(), [&](const auto& row) {
+            return row.runtime.instance_id == origin->runtime.instance_id && row.runtime.node_id == origin->runtime.node_id &&
+                   row.runtime.definition_id == definition && row.runtime.owner_module == module && row.runtime.clock == clock &&
+                   row.runtime.invocation_id == origin->runtime.invocation_id;
+        });
+        if (live_origin == published.provenance.end())
+            return aeg::foundation::invalid_state("Captured Preview owner differs from the live publication");
+        const bool live_work = std::any_of(graph.plan.pass_plans.begin(), graph.plan.pass_plans.end(), [&](const auto& pass) {
+            if (!pass.live || !pass.feature_work) return false;
+            const auto& work = *pass.feature_work;
+            return work.kind == aeg::render_graph::RenderWorkItemKind::kExecute && work.id.is_valid() &&
+                   work.domain == aeg::feature::FeatureDomain::kRender && work.feature_definition_id == definition &&
+                   work.node_id == origin->runtime.node_id && work.instance_id == origin->runtime.instance_id &&
+                   work.owner_module == module && work.invocation.generation == source->generation &&
+                   work.invocation.invocation_id == origin->runtime.invocation_id && work.invocation.attempt_id.is_valid();
+        });
+        return live_work ? Result::success() :
+            aeg::foundation::invalid_state("Successful RenderGraph has no live work from the actual Opaque invocation token");
+    }
+
     enum class SceneDialogMode : uint8_t {
         kOpen,
         kSaveAs,
     };
 
-    [[nodiscard]] Result apply_pipeline_drafts() {
-        std::vector<aeg::application::PipelineSavedOrdering> persisted_changes;
-        persisted_changes.reserve(pipeline_drafts_.changes().size());
-        for (const auto& change : pipeline_drafts_.changes()) {
-            const auto source = pipeline_node_identity(change.source, change.source_node);
-            const auto destination = pipeline_node_identity(change.source, change.destination_node);
-            if (!source || !destination) {
-                return aeg::foundation::invalid_state("Pipeline graph changed before its edits could be saved");
-            }
-            persisted_changes.push_back({change.source, *source, *destination, change.add});
-        }
-        for (const auto& change : pipeline_drafts_.changes()) {
-            Result result =
-                aeg::foundation::invalid_argument("The selected pipeline does not support saved ordering changes");
-            if (change.source == "Built-in / Editor UI") {
-                if (!aeg::application::builtin_pipeline_debug_enabled()) {
-                    return aeg::foundation::invalid_state(
-                        "Built-in / Editor UI Pipeline editing is disabled outside an explicit Debug build");
-                }
-                result = change.add ? frame_host_.add_runtime_ordering(change.source_node, change.destination_node)
-                                    : frame_host_.remove_runtime_ordering(change.source_node, change.destination_node);
-            } else if (change.source == "Game / Renderer") {
-                result = change.add
-                             ? scene_runtime_->add_render_state_link(change.source_node, change.destination_node)
-                             : scene_runtime_->remove_render_state_link(change.source_node, change.destination_node);
-            } else if (change.source == "Game / World") {
-                result =
-                    change.add
-                        ? scene_runtime_->add_pipeline_runtime_ordering(EditorSceneRuntime::PipelineTarget::kWorld,
-                                                                        change.source_node, change.destination_node)
-                        : scene_runtime_->remove_pipeline_runtime_ordering(EditorSceneRuntime::PipelineTarget::kWorld,
-                                                                           change.source_node, change.destination_node);
-            }
-            // A graph refresh can make an already-removed edge stale. Treat that
-            // delete as complete so it cannot prevent later rewiring from saving.
-            if (!result && !(!change.add && result.code == ResultCode::kNotFound))
-                return result;
-        }
-        for (const auto& change : persisted_changes)
-            pipeline_saved_orderings_.stage(change);
-        pipeline_drafts_.clear();
-        return Result::success();
+    [[nodiscard]] bool feature_graph_history_active() const noexcept {
+        if (feature_graph_document_ == nullptr || !feature_graph_focused_)
+            return false;
+        const auto* layout = workspace_.layout();
+        const auto* panel = layout == nullptr ? nullptr : layout->find_panel("flowgraph");
+        return panel != nullptr && panel->visible;
     }
 
-    [[nodiscard]] Result save_scene_and_apply_pipeline_drafts() {
+    [[nodiscard]] Result save_scene_and_feature_graph() {
         if (const Result result = scene_runtime_->save_scene(); !result)
             return result;
-        if (const Result result = apply_pipeline_drafts(); !result)
-            return result;
-        if (const Result result = save_pipeline_document(); !result)
-            return result;
-        return save_flowgraph_document();
+        return save_feature_graph_document();
     }
 
-    [[nodiscard]] Result save_scene_as_and_apply_pipeline_drafts(const std::filesystem::path& path) {
+    [[nodiscard]] Result save_scene_as_and_feature_graph(const std::filesystem::path& path) {
         if (const Result result = scene_runtime_->save_scene_as(path); !result)
             return result;
-        if (const Result result = apply_pipeline_drafts(); !result)
-            return result;
-        if (const Result result = save_pipeline_document(); !result)
-            return result;
-        return save_flowgraph_document();
+        return save_feature_graph_document();
     }
 
-    [[nodiscard]] Result save_flowgraph_document() {
-        if (flowgraph_document_ == nullptr || flowgraph_document_path_.empty())
+    [[nodiscard]] Result save_feature_graph_document() {
+        if (feature_graph_document_ == nullptr || feature_graph_document_path_.empty())
             return Result::success();
-        return aeg::application::save_editor_composition(flowgraph_document_path_, *flowgraph_document_);
+        const auto resolver = aeg::application::make_editor_asset_kind_resolver(
+            scene_runtime_ != nullptr ? scene_runtime_->project_file() : std::filesystem::path{});
+        return feature_graph_document_->save(feature_graph_document_path_, resolver);
+    }
+
+    [[nodiscard]] Result select_feature_graph(const std::filesystem::path& path) {
+        if (scene_runtime_ == nullptr)
+            return aeg::foundation::invalid_state("No project is open");
+        const auto normalize = [this](std::filesystem::path candidate) {
+            if (candidate.is_relative())
+                candidate = scene_runtime_->project_root() / candidate;
+            return candidate.lexically_normal();
+        };
+        const auto requested = normalize(path);
+        const auto authored = scene_runtime_->authored_feature_graphs();
+        const auto target = std::find_if(authored.begin(), authored.end(), [&](const auto& document) {
+            return document.load_result && normalize(document.path) == requested;
+        });
+        if (target == authored.end())
+            return aeg::foundation::not_found("FeatureGraph document is not available for editing");
+        if (feature_graph_document_ != nullptr && feature_graph_document_->dirty() &&
+            normalize(feature_graph_document_path_) != requested)
+            return aeg::foundation::invalid_state("Save the current FeatureGraph before switching documents");
+        if (feature_graph_document_ != nullptr && normalize(feature_graph_document_path_) == requested)
+            return Result::success();
+        auto source = aeg::application::authoring::load_feature_graph_source(target->path);
+        if (!source) return source.result;
+        feature_graph_document_ = std::make_unique<aeg::application::EditorFeatureGraphDocument>(
+            std::move(source.value.document), scene_runtime_->authored_feature_catalog());
+        feature_graph_document_->bind_source_file(target->path, std::move(source.value.revision));
+        feature_graph_document_path_ = target->path;
+        return Result::success();
     }
 
     void sync_flowgraph_document() {
         if (scene_runtime_ == nullptr) {
-            flowgraph_document_.reset();
-            flowgraph_document_path_.clear();
+            feature_graph_document_.reset();
+            feature_graph_document_path_.clear();
             return;
         }
-        const auto documents = scene_runtime_->authored_pipeline_documents();
-        const auto active_renderer = scene_runtime_->active_renderer_pipeline_document();
-        auto selected = std::find_if(documents.begin(), documents.end(), [&](const auto& document) {
-            return static_cast<bool>(document.load_result) && !active_renderer.empty() &&
-                   document.path.lexically_normal() == active_renderer.lexically_normal();
+        const auto feature_graphs = scene_runtime_->authored_feature_graphs();
+        const auto normalize = [this](std::filesystem::path candidate) {
+            if (candidate.is_relative())
+                candidate = scene_runtime_->project_root() / candidate;
+            return candidate.lexically_normal();
+        };
+        auto selected_document = std::find_if(feature_graphs.begin(), feature_graphs.end(), [&](const auto& document) {
+            return document.load_result && !feature_graph_document_path_.empty() &&
+                   normalize(document.path) == normalize(feature_graph_document_path_);
         });
-        if (selected == documents.end())
-            selected = std::find_if(documents.begin(), documents.end(), [](const auto& document) {
-                return static_cast<bool>(document.load_result);
-            });
-        if (selected == documents.end()) {
-            flowgraph_document_.reset();
-            flowgraph_document_path_.clear();
+        if (selected_document == feature_graphs.end()) {
+            selected_document = std::find_if(feature_graphs.begin(), feature_graphs.end(),
+                                             [](const auto& document) { return static_cast<bool>(document.load_result); });
+        }
+        if (selected_document != feature_graphs.end()) {
+            if (feature_graph_document_ != nullptr &&
+                normalize(feature_graph_document_path_) == normalize(selected_document->path))
+                return;
+            auto source = aeg::application::authoring::load_feature_graph_source(selected_document->path);
+            if (!source) {
+                feature_graph_source_operation_ = source.result;
+                return;
+            }
+            feature_graph_document_ = std::make_unique<aeg::application::EditorFeatureGraphDocument>(
+                std::move(source.value.document), scene_runtime_->authored_feature_catalog());
+            feature_graph_document_->bind_source_file(selected_document->path, std::move(source.value.revision));
+            feature_graph_source_operation_ = Result::success();
+            feature_graph_document_path_ = selected_document->path;
             return;
         }
-        if (flowgraph_document_ != nullptr && flowgraph_document_path_ == selected->path)
-            return;
-        // Runtime preparation uses the compiled catalog only. The editor view
-        // additionally sees non-generated drafts so they can be reopened and
-        // completed without making draft-only types executable.
-        aeg::pipeline::TypeCatalog editor_catalog;
-        for (const auto& entry : scene_runtime_->authored_pipeline_catalog().entries())
-            static_cast<void>(editor_catalog.add(entry));
-        for (const auto& draft : scene_runtime_->authored_pipeline_drafts())
-            if (editor_catalog.find(draft.draft.entry.key) == nullptr)
-                static_cast<void>(editor_catalog.add(draft.draft.entry));
-        flowgraph_document_ = std::make_unique<aeg::application::EditorCompositionDocument>(
-            selected->document, std::move(editor_catalog));
-        flowgraph_document_path_ = selected->path;
-    }
-
-    [[nodiscard]] std::optional<aeg::pipeline::PipelinePlanHandle> pipeline_snapshot_for_source(
-        std::string_view source) const {
-        if (source == "Built-in / Editor UI") {
-            if (!aeg::application::builtin_pipeline_debug_enabled())
-                return std::nullopt;
-            return frame_host_.active_plan_snapshot();
-        }
-        if (scene_runtime_ == nullptr)
-            return std::nullopt;
-        for (const auto& [name, plan] : scene_runtime_->pipeline_snapshots()) {
-            if (name == source)
-                return plan;
-        }
-        return std::nullopt;
-    }
-
-    [[nodiscard]] std::optional<aeg::application::PipelineNodeIdentity> pipeline_node_identity(
-        std::string_view source, uint32_t node_index) const {
-        const auto plan = pipeline_snapshot_for_source(source);
-        if (!plan || *plan == nullptr || node_index >= (*plan)->nodes.size())
-            return std::nullopt;
-        const auto& node = (*plan)->nodes[node_index];
-        return aeg::application::PipelineNodeIdentity{node.stage.value(), node.task.value()};
-    }
-
-    [[nodiscard]] std::optional<uint32_t> pipeline_node_index(std::string_view source,
-                                                              aeg::application::PipelineNodeIdentity identity) const {
-        const auto plan = pipeline_snapshot_for_source(source);
-        if (!plan || *plan == nullptr)
-            return std::nullopt;
-        for (uint32_t index = 0; index < (*plan)->nodes.size(); ++index) {
-            const auto& node = (*plan)->nodes[index];
-            if (node.stage.value() == identity.stage && node.task.value() == identity.task)
-                return index;
-        }
-        return std::nullopt;
-    }
-
-    [[nodiscard]] std::filesystem::path pipeline_document_path() const {
-        if (scene_runtime_ == nullptr)
-            return {};
-        std::filesystem::path path = scene_runtime_->scene_path();
-        path += ".pipeline";
-        return path;
-    }
-
-    [[nodiscard]] Result save_pipeline_document() {
-        const std::filesystem::path path = pipeline_document_path();
-        if (path.empty())
-            return aeg::foundation::invalid_state("Pipeline document has no scene path");
-        // Blend choices change the state compositor immediately, but they are not
-        // durable until this sidecar document is written with the scene.
-        pipeline_saved_blends_.clear();
-        if (scene_runtime_ != nullptr) {
-            for (const auto& blend : scene_runtime_->render_state_blend_overrides()) {
-                const auto node = pipeline_node_identity("Game / Renderer", blend.node);
-                if (!node)
-                    continue;
-                pipeline_saved_blends_.stage({"Game / Renderer", *node, static_cast<uint8_t>(blend.blend_mode)});
-            }
-        }
-        const std::filesystem::path temporary = path.string() + ".tmp";
-        {
-            std::ofstream stream(temporary, std::ios::binary | std::ios::trunc);
-            if (!stream)
-                return Result::failure(ResultCode::kBackendError, "Unable to create Pipeline document");
-            stream << "AEG_PIPELINE_EDITS 3\n";
-            for (const auto& change : pipeline_saved_orderings_.changes()) {
-                if (change.source == "Built-in / Editor UI" && !aeg::application::builtin_pipeline_debug_enabled()) {
-                    continue;
-                }
-                stream << "EDGE " << std::quoted(change.source) << ' ' << change.source_node.stage << ' '
-                       << change.source_node.task << ' ' << change.destination_node.stage << ' '
-                       << change.destination_node.task << ' ' << (change.add ? 1 : 0) << '\n';
-            }
-            for (const auto& layout : pipeline_layouts_.layouts()) {
-                if (layout.source == "Built-in / Editor UI" && !aeg::application::builtin_pipeline_debug_enabled()) {
-                    continue;
-                }
-                stream << "LAYOUT " << std::quoted(layout.source) << ' ' << layout.node.stage << ' ' << layout.node.task
-                       << ' ' << layout.x << ' ' << layout.y << '\n';
-            }
-            for (const auto& blend : pipeline_saved_blends_.blends()) {
-                stream << "BLEND " << std::quoted(blend.source) << ' ' << blend.node.stage << ' ' << blend.node.task
-                       << ' ' << static_cast<uint32_t>(blend.blend_mode) << '\n';
-            }
-            stream.flush();
-            if (!stream)
-                return Result::failure(ResultCode::kBackendError, "Unable to write Pipeline document");
-        }
-        std::error_code error;
-        std::filesystem::rename(temporary, path, error);
-        if (error) {
-            std::filesystem::remove(path, error);
-            error.clear();
-            std::filesystem::rename(temporary, path, error);
-        }
-        if (error)
-            return Result::failure(ResultCode::kBackendError, "Unable to replace Pipeline document");
-        return Result::success();
-    }
-
-    [[nodiscard]] Result restore_pipeline_document() {
-        pipeline_saved_orderings_.clear();
-        pipeline_layouts_.clear();
-        pipeline_saved_blends_.clear();
-        // Saved project graph overrides must not modify the Editor fallback preview.
-        if (scene_runtime_ != nullptr && !scene_runtime_->renderer_pipeline_diagnostic().empty())
-            return Result::success();
-        const std::filesystem::path path = pipeline_document_path();
-        if (path.empty() || !std::filesystem::exists(path))
-            return Result::success();
-        if (scene_runtime_ != nullptr && scene_runtime_->project_loaded()) {
-            if (const Result result = scene_runtime_->create_project_renderer_pipeline(); !result)
-                return result;
-        }
-        std::ifstream stream(path, std::ios::binary);
-        std::string signature;
-        uint32_t version = 0;
-        if (!(stream >> signature >> version) || signature != "AEG_PIPELINE_EDITS" ||
-            (version != 1 && version != 2 && version != 3)) {
-            return aeg::foundation::invalid_state("Pipeline document format is invalid");
-        }
-        const auto restore_edge = [this](aeg::application::PipelineSavedOrdering saved) -> Result {
-            if (saved.source == "Built-in / Editor UI" && !aeg::application::builtin_pipeline_debug_enabled()) {
-                return Result::success();
-            }
-            const auto source = pipeline_node_index(saved.source, saved.source_node);
-            const auto destination = pipeline_node_index(saved.source, saved.destination_node);
-            if (!source || !destination)
-                return Result::success();
-            aeg::application::PipelineOrderingDraft draft{saved.source, *source, *destination, saved.add};
-            Result result = aeg::foundation::invalid_argument("The saved Pipeline source is unavailable");
-            if (draft.source == "Built-in / Editor UI") {
-                result = draft.add ? frame_host_.add_runtime_ordering(draft.source_node, draft.destination_node)
-                                   : frame_host_.remove_runtime_ordering(draft.source_node, draft.destination_node);
-            } else if (draft.source == "Game / Renderer") {
-                result = draft.add
-                             ? scene_runtime_->add_render_state_link(draft.source_node, draft.destination_node)
-                             : scene_runtime_->remove_render_state_link(draft.source_node, draft.destination_node);
-            } else if (draft.source == "Game / World") {
-                result =
-                    draft.add
-                        ? scene_runtime_->add_pipeline_runtime_ordering(EditorSceneRuntime::PipelineTarget::kWorld,
-                                                                        draft.source_node, draft.destination_node)
-                        : scene_runtime_->remove_pipeline_runtime_ordering(EditorSceneRuntime::PipelineTarget::kWorld,
-                                                                           draft.source_node, draft.destination_node);
-            }
-            if (result || (!draft.add && result.code == ResultCode::kNotFound))
-                pipeline_saved_orderings_.stage(saved);
-            return result || (!draft.add && result.code == ResultCode::kNotFound) ? Result::success() : result;
-        };
-        const auto restore_blend = [this](aeg::application::PipelineSavedBlend saved) -> Result {
-            if (saved.source != "Game / Renderer" ||
-                saved.blend_mode > static_cast<uint8_t>(aeg::pipeline::RenderStateBlendMode::kAdd)) {
-                return Result::success();
-            }
-            const auto node = pipeline_node_index(saved.source, saved.node);
-            if (!node)
-                return Result::success();
-            const Result result = scene_runtime_->set_render_state_blend(
-                *node, static_cast<aeg::pipeline::RenderStateBlendMode>(saved.blend_mode));
-            if (!result)
-                return result;
-            pipeline_saved_blends_.stage(std::move(saved));
-            return Result::success();
-        };
-        if (version == 1) {
-            aeg::application::PipelineSavedOrdering saved{};
-            int add = 0;
-            while (stream >> std::quoted(saved.source) >> saved.source_node.stage >> saved.source_node.task >>
-                   saved.destination_node.stage >> saved.destination_node.task >> add) {
-                saved.add = add != 0;
-                if (const Result result = restore_edge(saved); !result)
-                    return result;
-            }
-        } else {
-            std::string record;
-            while (stream >> record) {
-                if (record == "EDGE") {
-                    aeg::application::PipelineSavedOrdering saved{};
-                    int add = 0;
-                    if (!(stream >> std::quoted(saved.source) >> saved.source_node.stage >> saved.source_node.task >>
-                          saved.destination_node.stage >> saved.destination_node.task >> add))
-                        break;
-                    saved.add = add != 0;
-                    if (const Result result = restore_edge(saved); !result)
-                        return result;
-                } else if (record == "LAYOUT") {
-                    aeg::application::PipelineNodeLayout layout{};
-                    if (!(stream >> std::quoted(layout.source) >> layout.node.stage >> layout.node.task >> layout.x >>
-                          layout.y))
-                        break;
-                    if (!std::isfinite(layout.x) || !std::isfinite(layout.y)) {
-                        return aeg::foundation::invalid_state("Pipeline document contains a non-finite node position");
-                    }
-                    if (layout.source != "Built-in / Editor UI" || aeg::application::builtin_pipeline_debug_enabled()) {
-                        pipeline_layouts_.stage(std::move(layout));
-                    }
-                } else if (record == "BLEND" && version >= 3) {
-                    aeg::application::PipelineSavedBlend blend{};
-                    uint32_t blend_mode = 0;
-                    if (!(stream >> std::quoted(blend.source) >> blend.node.stage >> blend.node.task >> blend_mode))
-                        break;
-                    if (blend_mode > static_cast<uint32_t>(aeg::pipeline::RenderStateBlendMode::kAdd)) {
-                        return aeg::foundation::invalid_state("Pipeline document contains an invalid blend mode");
-                    }
-                    blend.blend_mode = static_cast<uint8_t>(blend_mode);
-                    if (const Result result = restore_blend(std::move(blend)); !result)
-                        return result;
-                } else {
-                    return aeg::foundation::invalid_state("Pipeline document contains an unknown record");
-                }
-            }
-        }
-        if (!stream.eof())
-            return aeg::foundation::invalid_state("Pipeline document contains an invalid record");
-        return Result::success();
+        feature_graph_document_.reset();
+        feature_graph_document_path_.clear();
     }
 
     void request_document_action(EditorDocumentAction action) {
@@ -3166,8 +3472,8 @@ private:
                                  action.type == EditorDocumentActionType::kImportProject ||
                                  action.type == EditorDocumentActionType::kCloseProject ||
                                  action.type == EditorDocumentActionType::kCloseEditor;
-        if (destructive && (scene_runtime_->dirty() || pipeline_drafts_.dirty() ||
-                            (flowgraph_document_ != nullptr && flowgraph_document_->dirty()))) {
+        if (destructive && (scene_runtime_->dirty() ||
+                            (feature_graph_document_ != nullptr && feature_graph_document_->dirty()))) {
             pending_document_action_ = std::move(action);
             unsaved_changes_pending_ = true;
             return;
@@ -3188,54 +3494,39 @@ private:
         switch (action.type) {
             case EditorDocumentActionType::kNewScene:
                 result = scene_runtime_->new_scene();
-                if (result) {
-                    pipeline_saved_orderings_.clear();
-                    pipeline_layouts_.clear();
-                    pipeline_saved_blends_.clear();
-                }
                 break;
             case EditorDocumentActionType::kOpenScene:
                 result = scene_runtime_->open_scene(action.path);
-                if (result)
-                    result = restore_pipeline_document();
                 break;
             case EditorDocumentActionType::kSaveScene:
-                result = save_scene_and_apply_pipeline_drafts();
+                result = save_scene_and_feature_graph();
                 break;
             case EditorDocumentActionType::kSaveAsScene:
-                result = save_scene_as_and_apply_pipeline_drafts(action.path);
+                result = save_scene_as_and_feature_graph(action.path);
                 break;
             case EditorDocumentActionType::kNewProject:
                 result = action.project_options.has_value()
                              ? scene_runtime_->new_project(*action.project_options)
                              : scene_runtime_->new_project(action.path, action.name);
                 if (result) {
-                    pipeline_saved_orderings_.clear();
-                    pipeline_layouts_.clear();
-                    pipeline_saved_blends_.clear();
-                    flowgraph_document_.reset();
-                    flowgraph_document_path_.clear();
+                    feature_graph_document_.reset();
+                    feature_graph_document_path_.clear();
                     project_hub_operation_ = Result::success();
                 }
                 break;
             case EditorDocumentActionType::kImportProject:
                 result = scene_runtime_->import_project(action.path);
-                if (result)
-                    result = restore_pipeline_document();
                 if (result) {
-                    flowgraph_document_.reset();
-                    flowgraph_document_path_.clear();
+                    feature_graph_document_.reset();
+                    feature_graph_document_path_.clear();
                     project_hub_operation_ = Result::success();
                 }
                 break;
             case EditorDocumentActionType::kCloseProject:
                 result = scene_runtime_->close_project();
                 if (result) {
-                    pipeline_saved_orderings_.clear();
-                    pipeline_layouts_.clear();
-                    pipeline_saved_blends_.clear();
-                    flowgraph_document_.reset();
-                    flowgraph_document_path_.clear();
+                    feature_graph_document_.reset();
+                    feature_graph_document_path_.clear();
                     project_hub_pending_ = false;
                 }
                 break;
@@ -3244,6 +3535,10 @@ private:
                 force_shutdown_ = true;
                 return;
         }
+        if (result && (action.type == EditorDocumentActionType::kNewProject ||
+                       action.type == EditorDocumentActionType::kImportProject ||
+                       action.type == EditorDocumentActionType::kCloseProject))
+            result = sync_project_operations();
         if (!result) {
             if (action.type == EditorDocumentActionType::kNewProject ||
                 action.type == EditorDocumentActionType::kImportProject) {
@@ -3296,7 +3591,7 @@ private:
                 ImGui::TextColored(ImVec4{1.0f, 0.35f, 0.25f, 1.0f}, "%s", unsaved_operation_.message.c_str());
             }
             if (ImGui::Button("Save", ImVec2{90.0f, 0.0f})) {
-                unsaved_operation_ = save_scene_and_apply_pipeline_drafts();
+                unsaved_operation_ = save_scene_and_feature_graph();
                 if (unsaved_operation_) {
                     EditorDocumentAction next = std::move(pending_document_action_);
                     ImGui::CloseCurrentPopup();
@@ -3374,11 +3669,31 @@ private:
             }
             ImGui::EndMenu();
         }
+        if (ImGui::BeginMenu("Build")) {
+            if (ImGui::MenuItem("Build / Cook...", nullptr, false, has_project)) {
+                const auto selected = sync_project_operations();
+                if (selected) project_operations_open_ = true;
+                else notify_runtime_result(selected, "select_project_operation_project");
+            }
+            ImGui::EndMenu();
+        }
         if (ImGui::BeginMenu("Edit")) {
-            if (ImGui::MenuItem("Undo", "Ctrl+Z", false, scene_runtime_->can_undo()))
-                report_history_result(scene_runtime_->undo(), "undo_editor_menu");
-            if (ImGui::MenuItem("Redo", "Ctrl+Y / Ctrl+Shift+Z", false, scene_runtime_->can_redo()))
-                report_history_result(scene_runtime_->redo(), "redo_editor_menu");
+            if (ImGui::MenuItem("Undo", "Ctrl+Z", false,
+                                feature_graph_history_active()
+                                    ? feature_graph_document_->can_undo()
+                                    : scene_runtime_->can_undo()))
+                report_history_result(feature_graph_history_active()
+                                          ? feature_graph_document_->undo()
+                                          : scene_runtime_->undo(),
+                                      "undo_editor_menu");
+            if (ImGui::MenuItem("Redo", "Ctrl+Y / Ctrl+Shift+Z", false,
+                                feature_graph_history_active()
+                                    ? feature_graph_document_->can_redo()
+                                    : scene_runtime_->can_redo()))
+                report_history_result(feature_graph_history_active()
+                                          ? feature_graph_document_->redo()
+                                          : scene_runtime_->redo(),
+                                      "redo_editor_menu");
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Assets")) {
@@ -3551,7 +3866,7 @@ private:
                 ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * 1.32f);
                 ImGui::TextUnformatted("Create New Project");
                 ImGui::PopFont();
-                ImGui::TextDisabled("Name your project and choose a starting setup.");
+                ImGui::TextDisabled("Name your project.");
                 ImGui::EndGroup();
             }
             ImGui::Separator();
@@ -3586,77 +3901,17 @@ private:
             }
             ImGui::PopStyleVar();
             ImGui::Dummy(ImVec2{0.0f, 10.0f});
-            ImGui::TextUnformatted("Template");
-            if (ImGui::BeginTable("ProjectHubTemplates", 3, ImGuiTableFlags_SizingStretchSame)) {
-                const char* titles[] = {"Empty", "Forward", "Deferred"};
-                const char* descriptions[] = {"No preset", "Forward profile", "Deferred profile"};
-                for (int index = 0; index < 3; ++index) {
-                    ImGui::TableNextColumn();
-                    ImGui::PushID(index);
-                    const ImVec2 card_size{ImGui::GetContentRegionAvail().x, 76.0f};
-                    ImGui::InvisibleButton("TemplateCard", card_size);
-                    const bool clicked = ImGui::IsItemClicked();
-                    const bool hovered = ImGui::IsItemHovered();
-                    if (clicked) {
-                        project_hub_template_index_ = index;
-                    }
-                    if (hovered) {
-                        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-                    }
-                    const ImVec2 card_min = ImGui::GetItemRectMin();
-                    const ImVec2 card_max = ImGui::GetItemRectMax();
-                    ImDrawList* draw = ImGui::GetWindowDrawList();
-                    const bool selected = project_hub_template_index_ == index;
-                    draw->AddRectFilled(card_min, card_max,
-                                        selected  ? IM_COL32(29, 68, 68, 255)
-                                        : hovered ? IM_COL32(34, 56, 67, 255)
-                                                  : card_fill,
-                                        7.0f);
-                    draw->AddRect(card_min, card_max, selected ? accent : card_border, 7.0f, 0, selected ? 2.0f : 1.0f);
-                    if (index == 0) {
-                        draw_project_cube_icon(draw, ImVec2{card_min.x + 30.0f, card_min.y + 38.0f}, 16.0f, accent);
-                    } else if (index == 1) {
-                        draw->AddTriangle(ImVec2{card_min.x + 20.0f, card_min.y + 22.0f},
-                                          ImVec2{card_min.x + 20.0f, card_min.y + 54.0f},
-                                          ImVec2{card_min.x + 46.0f, card_min.y + 38.0f}, icon_blue, 2.2f);
-                    } else {
-                        for (int layer = 0; layer < 3; ++layer) {
-                            const float y = card_min.y + 25.0f + layer * 10.0f;
-                            draw->AddPolyline(std::array<ImVec2, 4>{ImVec2{card_min.x + 18.0f, y},
-                                                                    ImVec2{card_min.x + 32.0f, y - 8.0f},
-                                                                    ImVec2{card_min.x + 46.0f, y},
-                                                                    ImVec2{card_min.x + 32.0f, y + 8.0f}}
-                                                  .data(),
-                                              4, icon_blue, ImDrawFlags_Closed, 2.2f);
-                        }
-                    }
-                    const float card_text_width = std::max(0.0f, card_max.x - (card_min.x + 62.0f) - 10.0f);
-                    const std::string title = fit_project_hub_text(titles[index], card_text_width);
-                    const std::string description = fit_project_hub_text(descriptions[index], card_text_width);
-                    draw->PushClipRect(card_min, card_max, true);
-                    draw->AddText(ImVec2{card_min.x + 62.0f, card_min.y + 18.0f}, IM_COL32(233, 242, 246, 255),
-                                  title.c_str());
-                    draw->AddText(ImVec2{card_min.x + 62.0f, card_min.y + 43.0f}, muted, description.c_str());
-                    draw->PopClipRect();
-                    ImGui::PopID();
-                }
-                ImGui::EndTable();
-            }
+            ImGui::TextUnformatted("Template: FeatureGraph starter");
+            ImGui::TextDisabled("Includes a Logic / Process example. Open Flow Graph to validate, compile and edit it.");
             ImGui::Dummy(ImVec2{0.0f, 14.0f});
             const char* engine_sdks[] = {"1.0", "2.0"};
-            const char* pipelines[] = {"Forward", "Deferred"};
             ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2{10.0f, 8.0f});
-            if (ImGui::BeginTable("ProjectHubEngineRenderer", 2, ImGuiTableFlags_SizingStretchSame)) {
+            if (ImGui::BeginTable("ProjectHubEngine", 1, ImGuiTableFlags_SizingStretchSame)) {
                 ImGui::TableNextColumn();
                 ImGui::TextUnformatted("Engine Version");
                 ImGui::SetNextItemWidth(-1.0f);
                 ImGui::Combo("##ProjectHubSdk", &project_hub_sdk_index_, engine_sdks, IM_ARRAYSIZE(engine_sdks));
                 ImGui::TextDisabled("Saved as this project's version.");
-                ImGui::TableNextColumn();
-                ImGui::TextUnformatted("Startup Renderer");
-                ImGui::SetNextItemWidth(-1.0f);
-                ImGui::Combo("##ProjectHubPipeline", &project_hub_pipeline_index_, pipelines, IM_ARRAYSIZE(pipelines));
-                ImGui::TextDisabled("The renderer used when the project opens.");
                 ImGui::EndTable();
             }
             ImGui::PopStyleVar();
@@ -3670,12 +3925,9 @@ private:
                 ProjectCreateOptions options{};
                 options.root = std::filesystem::path(project_hub_path_buffer_.data()) / project_hub_name_buffer_.data();
                 options.name = project_hub_name_buffer_.data();
-                options.template_id = project_hub_template_index_ == 2
-                                          ? "deferred"
-                                          : (project_hub_template_index_ == 1 ? "forward" : "empty");
+                options.template_id = "empty";
                 options.engine_sdk = project_hub_sdk_index_ == 1 ? "2.0" : "1.0";
-                options.render_pipeline = project_hub_pipeline_index_ == 1 ? "Assets/Pipelines/Deferred.aegpipe"
-                                                                           : "Assets/Pipelines/Forward.aegpipe";
+                options.startup_feature_graph = "Assets/Features/Default.aegfeature";
                 EditorDocumentAction action{};
                 action.type = EditorDocumentActionType::kNewProject;
                 action.project_options = std::move(options);
@@ -3684,7 +3936,6 @@ private:
             }
             ImGui::PopStyleColor(3);
             ImGui::EndDisabled();
-            ImGui::TextDisabled("Both renderers are included. You can change the startup choice later.");
 
             ImGui::TableNextColumn();
             {
@@ -3712,16 +3963,16 @@ private:
                 ImGui::TextDisabled("No recent projects yet.");
             }
             for (const auto& recent : recent_projects) {
-                ImGui::PushID(recent.root.string().c_str());
+                const auto project_source = path_text(recent.project_file);
+                ImGui::PushID(project_source.c_str());
                 ImGui::InvisibleButton("RecentProjectCard", ImVec2{-1.0f, 60.0f});
                 const bool hovered = ImGui::IsItemHovered();
                 if (hovered) {
                     ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-                    ImGui::SetTooltip("%s", recent.root.string().c_str());
+                    ImGui::SetTooltip("%s", project_source.c_str());
                 }
                 if (ImGui::IsItemClicked()) {
-                    project_hub_selected_root_ = recent.root;
-                    open_project_from_path(recent.root);
+                    open_project_from_path(recent.project_file);
                 }
                 const ImVec2 card_min = ImGui::GetItemRectMin();
                 const ImVec2 card_max = ImGui::GetItemRectMax();
@@ -3732,7 +3983,7 @@ private:
                 const float text_x = card_min.x + 66.0f;
                 const float available_text_width = card_max.x - text_x - 15.0f;
                 const std::string display_name = fit_project_hub_text(recent.name, available_text_width);
-                const std::string display_path = fit_project_hub_text(recent.root.string(), available_text_width, true);
+                const std::string display_path = fit_project_hub_text(project_source, available_text_width, true);
                 draw->PushClipRect(card_min, card_max, true);
                 draw->AddText(ImVec2{text_x, card_min.y + 11.0f}, IM_COL32(233, 242, 246, 255), display_name.c_str());
                 draw->AddText(ImVec2{text_x, card_min.y + 33.0f}, muted, display_path.c_str());
@@ -3803,9 +4054,13 @@ private:
         set_text_buffer(project_settings_assets_, project_settings_draft_.paths.assets.generic_string());
         set_text_buffer(project_settings_source_, project_settings_draft_.paths.source.generic_string());
         set_text_buffer(project_settings_cache_, project_settings_draft_.paths.cache.generic_string());
-        set_text_buffer(project_settings_pipeline_, project_settings_draft_.startup_pipelines.empty()
-                                                       ? std::string_view{}
-                                                       : project_settings_draft_.startup_pipelines.front().generic_string());
+        project_settings_feature_graphs_.clear();
+        project_settings_feature_graphs_.reserve(project_settings_draft_.startup_feature_graphs.size());
+        for (const auto& path : project_settings_draft_.startup_feature_graphs) {
+            std::array<char, 256> buffer{};
+            set_text_buffer(buffer, path.generic_string());
+            project_settings_feature_graphs_.push_back(std::move(buffer));
+        }
         project_settings_operation_ = Result::success();
         project_settings_loaded_ = true;
     }
@@ -3833,8 +4088,25 @@ private:
                     ImGui::InputText("Engine SDK", project_settings_sdk_.data(), project_settings_sdk_.size());
                     ImGui::InputText("Target", project_settings_target_.data(), project_settings_target_.size());
                     ImGui::InputText("Startup Scene", project_settings_scene_.data(), project_settings_scene_.size());
-                    ImGui::InputText("Startup Pipeline", project_settings_pipeline_.data(),
-                                     project_settings_pipeline_.size());
+                    ImGui::TextUnformatted("Startup FeatureGraphs");
+                    std::optional<std::size_t> remove_feature_graph;
+                    for (std::size_t index = 0; index < project_settings_feature_graphs_.size(); ++index) {
+                        auto& buffer = project_settings_feature_graphs_[index];
+                        ImGui::PushID(static_cast<int>(index));
+                        const std::string label = "Startup FeatureGraph " + std::to_string(index + 1);
+                        ImGui::InputText(label.c_str(), buffer.data(), buffer.size());
+                        ImGui::SameLine();
+                        if (ImGui::SmallButton("Remove"))
+                            remove_feature_graph = index;
+                        ImGui::PopID();
+                    }
+                    if (remove_feature_graph)
+                        project_settings_feature_graphs_.erase(project_settings_feature_graphs_.begin() +
+                                                              static_cast<std::ptrdiff_t>(*remove_feature_graph));
+                    if (ImGui::Button("Add Startup FeatureGraph"))
+                        project_settings_feature_graphs_.emplace_back();
+                    if (project_settings_feature_graphs_.empty())
+                        ImGui::TextDisabled("No startup FeatureGraphs configured.");
                     ImGui::EndTabItem();
                 }
                 if (ImGui::BeginTabItem("Directories")) {
@@ -3857,9 +4129,10 @@ private:
             project_settings_draft_.paths.assets = project_settings_assets_.data();
             project_settings_draft_.paths.source = project_settings_source_.data();
             project_settings_draft_.paths.cache = project_settings_cache_.data();
-            project_settings_draft_.startup_pipelines.clear();
-            if (project_settings_pipeline_[0] != '\0') {
-                project_settings_draft_.startup_pipelines.emplace_back(project_settings_pipeline_.data());
+            project_settings_draft_.startup_feature_graphs.clear();
+            for (const auto& buffer : project_settings_feature_graphs_) {
+                if (buffer[0] != '\0')
+                    project_settings_draft_.startup_feature_graphs.emplace_back(buffer.data());
             }
             if (project_settings_draft_.name.empty() || project_settings_draft_.paths.assets.empty()) {
                 project_settings_operation_ = aeg::foundation::invalid_argument(
@@ -4050,14 +4323,20 @@ private:
         };
         if (!io.WantTextInput && io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z, false)) {
             if (io.KeyShift) {
-                const Result result = scene_runtime_->redo();
+                const Result result = feature_graph_history_active()
+                                          ? feature_graph_document_->redo()
+                                          : scene_runtime_->redo();
                 report_history_result(result, "redo_editor_shortcut");
             } else {
-                const Result result = scene_runtime_->undo();
+                const Result result = feature_graph_history_active()
+                                          ? feature_graph_document_->undo()
+                                          : scene_runtime_->undo();
                 report_history_result(result, "undo_editor_shortcut");
             }
         } else if (!io.WantTextInput && io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Y, false)) {
-            const Result result = scene_runtime_->redo();
+            const Result result = feature_graph_history_active()
+                                      ? feature_graph_document_->redo()
+                                      : scene_runtime_->redo();
             report_history_result(result, "redo_editor_shortcut");
         }
 
@@ -4285,18 +4564,14 @@ private:
             static_cast<void>(close_preferences());
             return result;
         }
-        if (!(result =
-                  aeg::editor::register_imgui_render_feature(preferences_registry_, *preferences_imgui_renderer_))) {
-            static_cast<void>(close_preferences());
-            return result;
-        }
         if (!(result = preferences_frame_host_.bind_pipeline(aeg::pipeline::PipelineId("RenderPipeline")))) {
             static_cast<void>(close_preferences());
             return result;
         }
         preferences_orchestrator_ = std::make_unique<aeg::engine::EngineFrameOrchestrator>(
-            preferences_registry_, preferences_scheduler_, *preferences_frame_context_, *preferences_render_graph_);
-        if (!(result = preferences_orchestrator_->register_pipeline(preferences_frame_host_))) {
+            preferences_pipeline_host_, *preferences_frame_context_, *preferences_render_graph_);
+        if (!(result = preferences_orchestrator_->register_pipeline(
+                  aeg::engine::EngineFramePipelineRegistration{preferences_frame_host_}))) {
             static_cast<void>(close_preferences());
             return result;
         }
@@ -4331,11 +4606,18 @@ private:
             keep_first_error(preference_controller_->cancel(preference_model_->state()));
         if (preference_model_ != nullptr)
             preference_model_->discard();
+        if (const Result result = release_shared_ui_texture_frames(); !result) {
+            keep_first_error(result);
+            return first_result;
+        }
         if (preferences_orchestrator_ != nullptr) {
             keep_first_error(preferences_orchestrator_->shutdown());
             preferences_orchestrator_.reset();
         }
-        keep_first_error(aeg::editor::unregister_imgui_render_feature(preferences_registry_));
+        const Result unregister_pipeline_result =
+            preferences_registry_.unregister_pipeline(aeg::pipeline::PipelineId("RenderPipeline"));
+        if (unregister_pipeline_result.code != ResultCode::kNotFound)
+            keep_first_error(unregister_pipeline_result);
         if (preferences_imgui_host_.is_initialized()) {
             keep_first_error(preferences_imgui_host_.shutdown());
         }
@@ -4496,6 +4778,11 @@ private:
                 !result) {
                 return result;
             }
+            if (const Result result = aeg::editor::detail::ImGuiRenderExecution::build_render_graph(
+                    *preferences_imgui_renderer_, context.render_graph, context.swapchain_resource);
+                !result) {
+                return result;
+            }
             if (!regression_mode_) {
                 return Result::success();
             }
@@ -4586,28 +4873,9 @@ private:
             !read_result) {
             return read_result;
         }
-        constexpr uint32_t kClearProbeExtent = 8;
-        const auto pixel_is_clear = [&pixels, width = target.extent.width](uint32_t x, uint32_t y) {
-            const size_t offset = (static_cast<size_t>(y) * width + x) * 4u;
-            // The full-bleed Settings surface now covers the formerly black
-            // padding. Corners must contain an opaque, dark themed background,
-            // not uninitialized swapchain pixels left over after resize.
-            return std::to_integer<unsigned>(pixels[offset]) <= 32 &&
-                   std::to_integer<unsigned>(pixels[offset + 1]) <= 32 &&
-                   std::to_integer<unsigned>(pixels[offset + 2]) <= 32 && pixels[offset + 3] == std::byte{255};
-        };
-        bool clear_probes_are_clean = true;
-        for (uint32_t y = 0; y < kClearProbeExtent; ++y) {
-            for (uint32_t x = 0; x < kClearProbeExtent; ++x) {
-                clear_probes_are_clean = clear_probes_are_clean && pixel_is_clear(x, y) &&
-                                         pixel_is_clear(target.extent.width - 1u - x, y) &&
-                                         pixel_is_clear(x, target.extent.height - 1u - y) &&
-                                         pixel_is_clear(target.extent.width - 1u - x, target.extent.height - 1u - y);
-            }
-        }
-        if (!clear_probes_are_clean) {
-            return aeg::foundation::invalid_state("preferences framebuffer regression check failed");
-        }
+        if (const Result verified = validate_ui_framebuffer(preferences_imgui_host_, preferences_font_texture_handle_,
+                draw_packet, target, pixels, preferences_orchestrator_->draw_call_count()); !verified)
+            return verified;
         return result;
     }
 
@@ -4835,6 +5103,53 @@ private:
         return refresh_preferences_font_texture();
     }
 
+    /** @brief Retires every UI consumer before changing a borrowed shared texture binding. */
+    [[nodiscard]] Result release_shared_ui_texture_frames() noexcept {
+        struct Host final {
+            FrameContext* frame{nullptr};
+            RenderGraph* graph{nullptr};
+            ImGuiRenderer* renderer{nullptr};
+        };
+        try {
+            std::vector<Host> hosts;
+            hosts.reserve(native_viewports_.size() + 2);
+            hosts.push_back({frame_context_.get(), render_graph_.get(), imgui_renderer_.get()});
+            hosts.push_back({preferences_frame_context_.get(), preferences_render_graph_.get(),
+                             preferences_imgui_renderer_.get()});
+            for (const auto& [window, state] : native_viewports_) {
+                if (state != nullptr)
+                    hosts.push_back({state->frame_context.get(), state->render_graph.get(), state->imgui_renderer.get()});
+            }
+            std::vector<ImGuiRenderer*> renderers;
+            renderers.reserve(hosts.size());
+            for (const Host& host : hosts) {
+                if (host.frame != nullptr && host.frame->is_frame_active())
+                    return aeg::foundation::invalid_state("Cannot replace a shared UI texture during an active frame");
+                if (host.renderer != nullptr)
+                    renderers.push_back(host.renderer);
+            }
+            // Drop submitted command references across all hosts before freeing any descriptors.
+            for (const Host& host : hosts) {
+                if (host.frame != nullptr) {
+                    if (const Result result = host.frame->drain(); !result)
+                        return result;
+                }
+            }
+            for (const Host& host : hosts) {
+                if (host.graph != nullptr)
+                    host.graph->reset();
+            }
+            return aeg::editor::detail::ImGuiRenderExecution::release_prepared_frames(
+                std::span<ImGuiRenderer* const>{renderers.data(), renderers.size()});
+        } catch (const std::bad_alloc&) {
+            return aeg::foundation::out_of_memory("Editor UI texture consumer collection allocation failed");
+        } catch (const std::exception& exception) {
+            return aeg::foundation::unknown_exception(exception);
+        } catch (...) {
+            return Result::failure(ResultCode::kUnknown, "Editor UI texture consumer release failed");
+        }
+    }
+
     /** @brief Rebuilds and replaces the engine-owned GPU font texture for the current CPU atlas. */
     [[nodiscard]] Result refresh_font_texture() {
         const GpuTexture previous_texture = font_texture_;
@@ -4842,7 +5157,7 @@ private:
         const ImGuiTextureHandle previous_handle = font_texture_handle_;
 
         if (previous_handle.is_valid()) {
-            if (const Result result = imgui_renderer_->release_prepared_frame(); !result) {
+            if (const Result result = release_shared_ui_texture_frames(); !result) {
                 return result;
             }
         }
@@ -5109,7 +5424,7 @@ private:
             preferences_imgui_renderer_ == nullptr) {
             return aeg::foundation::invalid_state("Preferences font preview resources are not initialized");
         }
-        if (const Result result = preferences_imgui_renderer_->release_prepared_frame(); !result) {
+        if (const Result result = release_shared_ui_texture_frames(); !result) {
             return result;
         }
 
@@ -5261,20 +5576,19 @@ private:
         if (result)
             result = aeg::renderer::register_render_pipeline(state->registry);
         if (result)
-            result = aeg::editor::register_imgui_render_feature(state->registry, *state->imgui_renderer);
-        if (result)
             result = state->frame_host.bind_pipeline(aeg::pipeline::PipelineId("RenderPipeline"));
         if (result) {
             state->orchestrator = std::make_unique<aeg::engine::EngineFrameOrchestrator>(
-                state->registry, state->scheduler, *state->frame_context, *state->render_graph);
-            result = state->orchestrator->register_pipeline(state->frame_host);
+                state->pipeline_host, *state->frame_context, *state->render_graph);
+            result = state->orchestrator->register_pipeline(
+                aeg::engine::EngineFramePipelineRegistration{state->frame_host});
         }
         if (result)
             result = state->orchestrator->initialize();
         if (!result) {
             if (state->orchestrator != nullptr)
                 static_cast<void>(state->orchestrator->shutdown());
-            static_cast<void>(aeg::editor::unregister_imgui_render_feature(state->registry));
+            static_cast<void>(state->registry.unregister_pipeline(aeg::pipeline::PipelineId("RenderPipeline")));
             static_cast<void>(state->imgui_renderer->shutdown());
             static_cast<void>(device_->destroy_swapchain(state->swapchain));
             static_cast<void>(device_->destroy_surface(state->surface));
@@ -5352,8 +5666,11 @@ private:
                 });
             if (!clear_result)
                 return clear_result.result;
-            return state.imgui_renderer->prepare_frame(context.frame_context, context.render_graph, draw_packet,
-                                                       target);
+            if (const Result result = state.imgui_renderer->prepare_frame(
+                    context.frame_context, context.render_graph, draw_packet, target); !result)
+                return result;
+            return aeg::editor::detail::ImGuiRenderExecution::build_render_graph(
+                *state.imgui_renderer, context.render_graph, context.swapchain_resource);
         };
         return state.orchestrator->run_frame(frame_desc);
     }
@@ -5369,7 +5686,7 @@ private:
             // Release it before those services, just as for the main viewport.
             state.orchestrator.reset();
         }
-        static_cast<void>(aeg::editor::unregister_imgui_render_feature(state.registry));
+        static_cast<void>(state.registry.unregister_pipeline(aeg::pipeline::PipelineId("RenderPipeline")));
         if (state.imgui_renderer != nullptr) {
             static_cast<void>(state.imgui_renderer->release_prepared_frame());
             static_cast<void>(state.imgui_renderer->shutdown());
@@ -5406,6 +5723,169 @@ private:
             windows.push_back(window);
         for (WindowId window : windows)
             destroy_native_viewport(window);
+    }
+
+    /** @brief Checks current UI pixels against the captured packet, including genuinely uncovered clear pixels. */
+    [[nodiscard]] Result validate_ui_framebuffer(const EditorImGuiHost& host, ImGuiTextureHandle font,
+        const ImGuiDrawPacket& packet, const ImGuiRenderTargetDesc& target, std::span<const std::byte> pixels,
+        uint64_t gpu_draws) const {
+        constexpr uint32_t kProbeExtent = 8;
+        if (target.extent.width < kProbeExtent * 2 || target.extent.height < kProbeExtent * 2 ||
+            pixels.size() != uint64_t(target.extent.width) * target.extent.height * 4 ||
+            packet.display_width <= 0 || packet.display_height <= 0 || packet.empty() ||
+            packet.vertices.empty() || packet.indices.empty() || gpu_draws == 0)
+            return aeg::foundation::invalid_state("UI framebuffer regression requires actual draw geometry and pixels");
+        if (target.format != Format::kBgra8Unorm && target.format != Format::kRgba8Unorm)
+            return aeg::foundation::unsupported("UI framebuffer regression requires an RGBA8/BGRA8 Unorm target");
+        ImGuiFontAtlasData atlas;
+        if (const Result result = host.capture_font_atlas(atlas); !result)
+            return result;
+        if (!atlas.is_valid())
+            return aeg::foundation::invalid_state("UI framebuffer regression has no actual font atlas");
+        struct Probe final {
+            uint32_t x{0}, y{0}, corner{0};
+            std::array<unsigned, 4> rgba{0u, 0u, 0u, 255u};
+            size_t command{SIZE_MAX};
+            double u{0}, v{0}, source_alpha{0};
+            bool painted{false};
+        };
+        std::array<Probe, 4 * kProbeExtent * kProbeExtent> probes{};
+        size_t next = 0;
+        for (uint32_t corner = 0; corner < 4; ++corner)
+            for (uint32_t y = 0; y < kProbeExtent; ++y)
+                for (uint32_t x = 0; x < kProbeExtent; ++x)
+                    probes[next++] = {(corner & 1u) ? target.extent.width - 1u - x : x,
+                        (corner & 2u) ? target.extent.height - 1u - y : y, corner};
+        const auto sample_font = [&atlas](double u, double v) {
+            // Match the actual RGBA8 Unorm font texture and its linear, clamp-to-edge sampler.
+            const double x = u * atlas.width - .5, y = v * atlas.height - .5;
+            const int64_t ix = static_cast<int64_t>(std::floor(x));
+            const int64_t iy = static_cast<int64_t>(std::floor(y));
+            const double fx = x - std::floor(x), fy = y - std::floor(y);
+            std::array<double, 4> sampled{};
+            for (int64_t dy = 0; dy < 2; ++dy)
+                for (int64_t dx = 0; dx < 2; ++dx) {
+                    const auto sx = static_cast<uint32_t>(std::clamp<int64_t>(ix + dx, 0, atlas.width - 1));
+                    const auto sy = static_cast<uint32_t>(std::clamp<int64_t>(iy + dy, 0, atlas.height - 1));
+                    const size_t offset = size_t(sy) * atlas.row_pitch + size_t(sx) * 4;
+                    const double weight = (dx == 0 ? 1.0 - fx : fx) * (dy == 0 ? 1.0 - fy : fy);
+                    for (size_t channel = 0; channel < 4; ++channel)
+                        sampled[channel] += std::to_integer<unsigned>(atlas.rgba8_pixels[offset + channel]) * weight / 255.0;
+                }
+            return sampled;
+        };
+        struct Point final { double x, y; };
+        const auto screen = [&](const auto& vertex) {
+            return Point{(double(vertex.position_x) - packet.display_pos_x) * target.extent.width / packet.display_width,
+                (double(vertex.position_y) - packet.display_pos_y) * target.extent.height / packet.display_height};
+        };
+        const auto edge = [](Point a, Point b, Point p) {
+            return (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
+        };
+        const auto top_left = [](Point a, Point b) {
+            return b.y < a.y || (b.y == a.y && b.x > a.x);
+        };
+        uint64_t visible_commands = 0;
+        for (size_t command_index = 0; command_index < packet.commands.size(); ++command_index) {
+            const auto& command = packet.commands[command_index];
+            if (command.elem_count == 0) continue;
+            const auto clip = [&](float coordinate, float origin, float scale, uint32_t limit, bool maximum) {
+                const float value = (coordinate - origin) * scale;
+                return std::clamp(maximum ? std::ceil(value) : std::floor(value), 0.f, static_cast<float>(limit));
+            };
+            const double left = clip(command.clip_min_x, packet.display_pos_x, packet.framebuffer_scale_x, target.extent.width, false);
+            const double right = clip(command.clip_max_x, packet.display_pos_x, packet.framebuffer_scale_x, target.extent.width, true);
+            const double top = clip(command.clip_min_y, packet.display_pos_y, packet.framebuffer_scale_y, target.extent.height, false);
+            const double bottom = clip(command.clip_max_y, packet.display_pos_y, packet.framebuffer_scale_y, target.extent.height, true);
+            if (left >= right || top >= bottom) continue;
+            ++visible_commands;
+            const uint64_t end = uint64_t(command.index_offset) + command.elem_count;
+            if (end > packet.indices.size() || command.elem_count % 3 != 0)
+                return aeg::foundation::invalid_state("UI framebuffer regression has an invalid actual triangle range");
+            for (uint64_t index = command.index_offset; index < end; index += 3) {
+                std::array<const aeg::editor::ImGuiDrawVertex*, 3> vertices{};
+                for (size_t vertex = 0; vertex < 3; ++vertex) {
+                    const int64_t selected = int64_t(packet.indices[size_t(index) + vertex]) + command.vertex_offset;
+                    if (selected < 0 || uint64_t(selected) >= packet.vertices.size())
+                        return aeg::foundation::invalid_state("UI framebuffer regression has an invalid actual vertex range");
+                    vertices[vertex] = &packet.vertices[size_t(selected)];
+                }
+                Point a = screen(*vertices[0]), b = screen(*vertices[1]), c = screen(*vertices[2]);
+                double area = edge(a, b, c);
+                if (area == 0) continue;
+                if (area < 0) {
+                    std::swap(b, c);
+                    std::swap(vertices[1], vertices[2]);
+                    area = -area;
+                }
+                for (Probe& probe : probes) {
+                    const Point point{probe.x + .5, probe.y + .5};
+                    if (point.x < left || point.x >= right || point.y < top || point.y >= bottom) continue;
+                    const auto inside = [&](Point p, Point q) {
+                        const double value = edge(p, q, point);
+                        return value > 0 || (value == 0 && top_left(p, q));
+                    };
+                    if (!inside(a, b) || !inside(b, c) || !inside(c, a)) continue;
+                    if (command.texture != font) {
+                        AEG_LOG_ERROR(aeg::logging::Category::kApplication,
+                            "UI framebuffer probe ({},{}) covered by a non-font texture at command={} triangle={} commands={} GPUdraws={}",
+                            probe.x, probe.y, command_index, index, packet.commands.size(), gpu_draws);
+                        return aeg::foundation::invalid_state("UI framebuffer regression cannot predict a non-font texture at a probe");
+                    }
+                    const std::array<double, 3> weights{edge(b, c, point) / area,
+                        edge(c, a, point) / area, edge(a, b, point) / area};
+                    std::array<double, 4> source{};
+                    double u = 0, v = 0;
+                    for (size_t vertex = 0; vertex < 3; ++vertex) {
+                        u += vertices[vertex]->uv_x * weights[vertex];
+                        v += vertices[vertex]->uv_y * weights[vertex];
+                        for (size_t channel = 0; channel < 4; ++channel)
+                            source[channel] += ((vertices[vertex]->color >> (channel * 8u)) & 255u) * weights[vertex] / 255.0;
+                    }
+                    const auto sampled = sample_font(u, v);
+                    for (size_t channel = 0; channel < 4; ++channel)
+                        source[channel] = std::clamp(source[channel] * sampled[channel], 0.0, 1.0);
+                    // Match DrawMesh: SrcAlpha/OneMinusSrcAlpha RGB, One/OneMinusSrcAlpha alpha, quantized per fragment.
+                    for (size_t channel = 0; channel < 4; ++channel) {
+                        const double value = source[channel] * (channel == 3 ? 1.0 : source[3]) +
+                            probe.rgba[channel] / 255.0 * (1.0 - source[3]);
+                        probe.rgba[channel] = static_cast<unsigned>(std::lround(std::clamp(value, 0.0, 1.0) * 255.0));
+                    }
+                    probe.command = command_index;
+                    probe.u = u;
+                    probe.v = v;
+                    probe.source_alpha = source[3];
+                    probe.painted = probe.painted || source[3] > 0.0;
+                }
+            }
+        }
+        if (visible_commands != gpu_draws)
+            return aeg::foundation::invalid_state("UI framebuffer regression GPU draw count differs from its actual visible commands");
+        std::array<uint32_t, 4> painted_counts{};
+        for (const Probe& probe : probes) {
+            auto expected = probe.rgba;
+            if (target.format == Format::kBgra8Unorm) std::swap(expected[0], expected[2]);
+            const size_t offset = (size_t(probe.y) * target.extent.width + probe.x) * 4;
+            bool matches = true;
+            for (size_t channel = 0; channel < 4; ++channel) {
+                const int actual = std::to_integer<unsigned>(pixels[offset + channel]);
+                const int tolerance = probe.painted && channel < 3 ? 1 : 0;
+                matches = matches && std::abs(actual - int(expected[channel])) <= tolerance;
+            }
+            if (!matches) {
+                AEG_LOG_ERROR(aeg::logging::Category::kApplication,
+                    "UI framebuffer probe ({},{}) command={} expected={}/{}/{}/{} actual={}/{}/{}/{} uv={}/{} sourceAlpha={} commands={} GPUdraws={} format={}",
+                    probe.x, probe.y, probe.command, expected[0], expected[1], expected[2], expected[3],
+                    std::to_integer<unsigned>(pixels[offset]), std::to_integer<unsigned>(pixels[offset + 1]),
+                    std::to_integer<unsigned>(pixels[offset + 2]), std::to_integer<unsigned>(pixels[offset + 3]),
+                    probe.u, probe.v, probe.source_alpha, visible_commands, gpu_draws, static_cast<unsigned>(target.format));
+                return aeg::foundation::invalid_state("UI framebuffer regression pixel differs from its actual font draw or uncovered clear");
+            }
+            if (probe.painted) ++painted_counts[probe.corner];
+        }
+        if (std::any_of(painted_counts.begin(), painted_counts.end(), [](auto count) { return count == 0; }))
+            return aeg::foundation::invalid_state("UI framebuffer regression has no actual font UI proof at a viewport corner");
+        return Result::success();
     }
 
     [[nodiscard]] Result run_engine_frame(const ImGuiDrawPacket& draw_packet) {
@@ -5450,6 +5930,11 @@ private:
             }
             if (const Result result =
                     imgui_renderer_->prepare_frame(context.frame_context, context.render_graph, draw_packet, target);
+                !result) {
+                return result;
+            }
+            if (const Result result = aeg::editor::detail::ImGuiRenderExecution::build_render_graph(
+                    *imgui_renderer_, context.render_graph, context.swapchain_resource);
                 !result) {
                 return result;
             }
@@ -5539,24 +6024,9 @@ private:
         if (const Result read_result = frame_context_->read_readback(readback_allocation, pixels); !read_result) {
             return read_result;
         }
-        constexpr uint32_t kClearProbeExtent = 8;
-        const auto pixel_is_clear = [&pixels, width = target.extent.width](uint32_t x, uint32_t y) {
-            const size_t offset = (static_cast<size_t>(y) * width + x) * 4u;
-            return pixels[offset] == std::byte{0} && pixels[offset + 1] == std::byte{0} &&
-                   pixels[offset + 2] == std::byte{0};
-        };
-        bool clear_probes_are_clean = true;
-        for (uint32_t y = 0; y < kClearProbeExtent; ++y) {
-            for (uint32_t x = 0; x < kClearProbeExtent; ++x) {
-                clear_probes_are_clean = clear_probes_are_clean && pixel_is_clear(x, y) &&
-                                         pixel_is_clear(target.extent.width - 1u - x, y) &&
-                                         pixel_is_clear(x, target.extent.height - 1u - y) &&
-                                         pixel_is_clear(target.extent.width - 1u - x, target.extent.height - 1u - y);
-            }
-        }
-        if (!clear_probes_are_clean) {
-            return aeg::foundation::invalid_state("editor framebuffer regression check failed");
-        }
+        if (const Result verified = validate_ui_framebuffer(imgui_host_, font_texture_handle_, draw_packet, target,
+                pixels, orchestrator_->draw_call_count()); !verified)
+            return verified;
         return frame_result;
     }
 
@@ -5581,18 +6051,20 @@ private:
     }
 
     void cleanup() noexcept {
+        project_operations_.shutdown();
         if (startup_splash_ != nullptr) {
             startup_splash_->close();
             startup_splash_.reset();
+        }
+        if (const Result result = release_shared_ui_texture_frames(); !result) {
+            static_cast<void>(report_result(result, "release_editor_ui_texture_frames"));
+            return;
         }
         static_cast<void>(close_preferences());
         release_all_native_viewports();
         if (viewport_texture_handle_.is_valid()) {
             static_cast<void>(texture_registry_.unregister_texture(viewport_texture_handle_));
             viewport_texture_handle_ = {};
-        }
-        if (imgui_renderer_ != nullptr) {
-            static_cast<void>(imgui_renderer_->release_prepared_frame());
         }
         if (scene_runtime_ != nullptr) {
             static_cast<void>(scene_runtime_->shutdown());
@@ -5602,6 +6074,7 @@ private:
             static_cast<void>(orchestrator_->shutdown());
             orchestrator_.reset();
         }
+        static_cast<void>(registry_.unregister_pipeline(aeg::pipeline::PipelineId("RenderPipeline")));
         if (imgui_renderer_ != nullptr) {
             static_cast<void>(imgui_renderer_->shutdown());
             imgui_renderer_.reset();
@@ -5667,7 +6140,8 @@ private:
     EditorImGuiHost preferences_imgui_host_{};
     std::unique_ptr<ImGuiRenderer> preferences_imgui_renderer_{};
     PipelineRegistry preferences_registry_{};
-    PipelineScheduler preferences_scheduler_{{1, 1, 1, 1}};
+    PipelineScheduler preferences_scheduler_;
+    aeg::engine::EngineFramePipelineHost preferences_pipeline_host_{preferences_registry_, preferences_scheduler_};
     PipelineScopeHost preferences_frame_host_{PipelineScope::kFrame,
                                               aeg::pipeline::PipelineInstanceId("Editor.Preferences.Frame")};
     std::unique_ptr<aeg::engine::EngineFrameOrchestrator> preferences_orchestrator_{};
@@ -5699,21 +6173,18 @@ private:
     EditorImGuiHost imgui_host_{};
     /** @brief Application-owned five-panel editor workspace. */
     EditorWorkspace workspace_;
-    /** @brief Pipeline edits remain local until the next successful scene save. */
-    aeg::application::PipelineOrderingDraftQueue pipeline_drafts_{};
-    /** @brief Stable graph edits restored from and persisted beside the active scene document. */
-    aeg::application::PipelineOrderingSaveState pipeline_saved_orderings_{};
-    /** Free-form Pipeline node placement saved beside the scene document. */
-    aeg::application::PipelineLayoutSaveState pipeline_layouts_{};
-    aeg::application::PipelineBlendSaveState pipeline_saved_blends_{};
-    /** Active project-authored FlowGraph document edited by the dedicated canvas. */
-    std::unique_ptr<aeg::application::EditorCompositionDocument> flowgraph_document_{};
-    std::filesystem::path flowgraph_document_path_{};
+    /** Canonical project FeatureGraph document edited by the main FlowGraph panel. */
+    std::unique_ptr<aeg::application::EditorFeatureGraphDocument> feature_graph_document_{};
+    std::filesystem::path feature_graph_document_path_{};
+    Result feature_graph_source_operation_{};
+    /** @brief Focus state sampled by the FeatureGraph panel for shared history commands. */
+    bool feature_graph_focused_{false};
     std::unique_ptr<ImGuiRenderer> imgui_renderer_{};
     /** Engine render targets for ImGui-created native panel viewports. */
     std::unordered_map<WindowId, std::unique_ptr<NativeViewportRenderState>, WindowIdHash> native_viewports_{};
     PipelineRegistry registry_{};
-    PipelineScheduler scheduler_{{1, 1, 1, 1}};
+    PipelineScheduler scheduler_;
+    aeg::engine::EngineFramePipelineHost pipeline_host_{registry_, scheduler_};
     PipelineScopeHost frame_host_{PipelineScope::kFrame, aeg::pipeline::PipelineInstanceId("Editor.Frame")};
     std::unique_ptr<aeg::engine::EngineFrameOrchestrator> orchestrator_{};
     InputSystem input_system_{};
@@ -5746,6 +6217,9 @@ private:
     bool initialized_{false};
     std::filesystem::path resource_root_{};
     std::filesystem::path startup_project_{};
+    aeg::application::EditorProjectOperations project_operations_{};
+    bool project_operations_open_{false};
+    bool project_operation_cli_{false};
     bool close_confirmation_requested_{false};
     bool force_shutdown_{false};
     bool scene_dialog_pending_{false};
@@ -5758,13 +6232,10 @@ private:
     bool project_hub_pending_{false};
     bool project_hub_close_requested_{false};
     bool project_hub_initialized_{false};
-    std::filesystem::path project_hub_selected_root_{};
     std::array<char, 512> project_hub_open_path_buffer_{};
     std::array<char, 512> project_hub_path_buffer_{};
     std::array<char, 128> project_hub_name_buffer_{};
-    int project_hub_template_index_{0};
     int project_hub_sdk_index_{0};
-    int project_hub_pipeline_index_{0};
     Result project_hub_operation_{Result::success()};
     bool project_settings_pending_{false};
     bool project_settings_loaded_{false};
@@ -5773,7 +6244,7 @@ private:
     std::array<char, 64> project_settings_sdk_{};
     std::array<char, 128> project_settings_target_{};
     std::array<char, 256> project_settings_scene_{};
-    std::array<char, 128> project_settings_pipeline_{};
+    std::vector<std::array<char, 256>> project_settings_feature_graphs_{};
     std::array<char, 128> project_settings_assets_{};
     std::array<char, 128> project_settings_source_{};
     std::array<char, 128> project_settings_cache_{};
@@ -5836,14 +6307,58 @@ int main(int argc, char** argv) {
             return 1;
         }
         EditorApplication application;
+        const bool verify_feature_preview = has_argument(argc, argv, "--verify-feature-preview");
+        const bool expect_project_rejected = has_argument(argc, argv, "--expect-project-rejected");
+        const auto expected_scene = parse_path_argument(argc, argv, "--expected-scene");
+        const auto startup_project = parse_path_argument(argc, argv, "--project");
+        const bool run_project_operation = has_argument(argc, argv, "--project-operation");
+#if defined(AEG_EDITOR_WORKFLOW_TESTS)
+        if (has_argument(argc, argv, "--verify-feature-workflow")) {
+            if (!run_project_operation || startup_project.empty() || parse_frame_limit(argc, argv) == 0) {
+                std::fprintf(stderr, "Main Feature workflow verification requires an operation, project and bounded frames\n");
+                return 1;
+            }
+            feature_workflow_probe = std::make_unique<aeg::editor_test::MainFeatureWorkflowProbe>();
+        }
+#endif
+        aeg::tooling::ProjectOperationRequest project_operation{};
+        if (run_project_operation) {
+            const auto kind = parse_path_argument(argc, argv, "--project-operation").string();
+            if (startup_project.empty() || (kind != "build" && kind != "cook" && kind != "build-and-cook")) {
+                std::fprintf(stderr, "--project-operation requires --project and build, cook or build-and-cook\n");
+                return 1;
+            }
+            project_operation.project_file = startup_project;
+            project_operation.operation = kind == "build" ? aeg::tooling::ProjectOperation::kBuild
+                : kind == "cook" ? aeg::tooling::ProjectOperation::kCook : aeg::tooling::ProjectOperation::kBuildAndCook;
+            project_operation.engine_directory = parse_path_argument(argc, argv, "--engine-dir");
+            project_operation.cmake_executable = parse_path_argument(argc, argv, "--cmake");
+            project_operation.module_manifest = parse_path_argument(argc, argv, "--module-manifest");
+            project_operation.output_directory = parse_path_argument(argc, argv, "--output-directory");
+            project_operation.target = parse_path_argument(argc, argv, "--target").string();
+            const auto configuration = parse_path_argument(argc, argv, "--configuration").string();
+            if (!configuration.empty()) project_operation.configuration = configuration;
+        }
+        if (verify_feature_preview && (parse_frame_limit(argc, argv) == 0 || startup_project.empty() ||
+            expect_project_rejected == !expected_scene.empty())) {
+            std::fprintf(stderr, "Feature Preview verification requires bounded frames, a project, and one expected outcome\n");
+            return 1;
+        }
         const std::filesystem::path resource_root =
             std::filesystem::absolute(std::filesystem::path{argv[0]}).parent_path();
-        if (!application.initialize(resource_root, parse_path_argument(argc, argv, "--project"))) {
+        if (!application.initialize(resource_root, startup_project)) {
             return 1;
+        }
+        if (run_project_operation) {
+            if (const auto launched = application.launch_project_operation(std::move(project_operation)); !launched) {
+                std::fprintf(stderr, "Cannot start project operation: %s\n", launched.message.c_str());
+                return 1;
+            }
         }
         return application.run(parse_frame_limit(argc, argv), has_argument(argc, argv, "--stress-resize"),
                                has_argument(argc, argv, "--open-preferences"),
-                               has_argument(argc, argv, "--stress-native-viewports"), *console_interrupt_result.value);
+                               has_argument(argc, argv, "--stress-native-viewports"), *console_interrupt_result.value,
+                               verify_feature_preview, expect_project_rejected, expected_scene);
     } catch (...) {
         // Startup is also an application boundary: a malformed argument,
         // filesystem failure, or backend exception must have a controlled exit.

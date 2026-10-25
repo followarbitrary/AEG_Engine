@@ -13,10 +13,8 @@
 #include "Components/component_bundle.hpp"
 #include "Components/component_ids.hpp"
 #include "Components/component_render_extraction.hpp"
-#include "post_process.hpp"
 
 namespace aeg::engine::components {
-const std::string_view kTransformName{"Game.Transform"};
 const std::string_view kCameraName{"Game.Camera"};
 const std::string_view kMeshRendererName{"Game.MeshRenderer"};
 const std::string_view kTextRendererName{"Game.TextRenderer"};
@@ -24,9 +22,6 @@ const std::string_view kDirectionalLightName{"Game.DirectionalLight"};
 const std::string_view kPointLightName{"Game.PointLight"};
 const std::string_view kSpotLightName{"Game.SpotLight"};
 const std::string_view kSceneEnvironmentName{"Game.SceneEnvironment"};
-const std::string_view kVec3TypeName{"Math.Vec3"};
-const std::string_view kQuatTypeName{"Math.Quat"};
-const uint32_t kRenderComponentSchemaVersion = 1;
 
 namespace {
 /** @brief Builds the ECS identity from one Runtime component's stable logical name. */
@@ -39,14 +34,6 @@ template <typename Owner>
 [[nodiscard]] reflection::FieldAccessor make_vec3_accessor(math::Vec3 Owner::* member) {
     reflection::FieldAccessor accessor = reflection::make_member_accessor(member);
     accessor.value_kind = reflection::FieldValueKind::kVec3;
-    return accessor;
-}
-
-/** @brief Adapts a quaternion member to the contract-specific XYZW wire encoding. */
-template <typename Owner>
-[[nodiscard]] reflection::FieldAccessor make_quat_accessor(math::Quat Owner::* member) {
-    reflection::FieldAccessor accessor = reflection::make_member_accessor(member);
-    accessor.value_kind = reflection::FieldValueKind::kQuat;
     return accessor;
 }
 
@@ -182,28 +169,6 @@ template <typename Component>
     return ensure_reflected_component_storage<Component>(world, *registered_schema.value, component_id, name);
 }
 }  // namespace
-
-foundation::ResultValue<reflection::TypeDescriptor> transform_reflection_descriptor() {
-    reflection::TypeBuilder builder(reflection::TypeDescriptor{
-        reflection::TypeId(kTransformName), std::string(kTransformName), kRenderComponentSchemaVersion,
-        reflection::TypeKind::kComponent, sizeof(Transform), alignof(Transform)});
-    if (const foundation::Result result = builder.add_field("translation", reflection::TypeId(kVec3TypeName),
-                                                            make_vec3_accessor(&Transform::translation));
-        !result) {
-        return {result, {}};
-    }
-    if (const foundation::Result result =
-            builder.add_field("rotation", reflection::TypeId(kQuatTypeName), make_quat_accessor(&Transform::rotation));
-        !result) {
-        return {result, {}};
-    }
-    if (const foundation::Result result =
-            builder.add_field("scale", reflection::TypeId(kVec3TypeName), make_vec3_accessor(&Transform::scale));
-        !result) {
-        return {result, {}};
-    }
-    return std::move(builder).finish();
-}
 
 foundation::ResultValue<reflection::TypeDescriptor> camera_reflection_descriptor() {
     reflection::TypeBuilder builder(reflection::TypeDescriptor{
@@ -623,6 +588,7 @@ foundation::ResultValue<renderer::RenderView> make_render_view(const ecs::WorldS
     view.world = world_snapshot.world();
     view.view_id = desc.view_id;
     view.output_extent = desc.output_extent;
+    view.shadow_extent = desc.shadow_extent;
     view.camera = render_camera.value;
     view.visibility_mask = desc.visibility_mask;
     view.color_target = desc.color_target;
@@ -761,12 +727,14 @@ foundation::ResultValue<renderer::RenderExtractorId> register_directional_light_
     return renderer.register_extractor(&extract_directional_lights);
 }
 
-foundation::ResultValue<renderer::RenderPostProcessSettings> make_post_process_settings(
+foundation::ResultValue<feature::RenderPostProcessSettings> make_post_process_settings(
     const SceneEnvironment& environment) {
-    renderer::RenderPostProcessSettings settings{
-        environment.sky_zenith, environment.sky_horizon, environment.sky_ground,  environment.exposure,
+    feature::RenderPostProcessSettings settings{
+        {environment.sky_zenith.x, environment.sky_zenith.y, environment.sky_zenith.z},
+        {environment.sky_horizon.x, environment.sky_horizon.y, environment.sky_horizon.z},
+        {environment.sky_ground.x, environment.sky_ground.y, environment.sky_ground.z}, environment.exposure,
         environment.gamma,      environment.sky_enabled, environment.tone_mapping};
-    const auto result = renderer::validate_post_process_settings(settings);
+    const auto result = feature::validate_post_process_settings(settings);
     return {result, settings};
 }
 

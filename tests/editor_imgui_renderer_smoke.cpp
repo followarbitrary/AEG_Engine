@@ -1,21 +1,27 @@
 /**
  * @file editor_imgui_renderer_smoke.cpp
- * @brief Executes the backend-neutral ImGui RenderFeature and verifies pixels.
+ * @brief Executes the fixed backend-neutral ImGui overlay and verifies pixels.
  */
+#include "feature_clock_test_fixture.hpp"
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <iostream>
 #include <limits>
 #include <memory>
 #include <span>
 
 #include "frame_context.hpp"
 #include "imgui_renderer.hpp"
+#include "../Application/EditorFramework/public/imgui_render_execution.hpp"
 #include "imgui_texture_registry.hpp"
 #include "pipeline.hpp"
-#include "render_feature_runtime.hpp"
 #include "render_graph.hpp"
+
+#include "../Engine/RenderGraph/private/render_graph_execution.hpp"
 #include "renderer.hpp"
+#include "renderer_variants_internal.hpp"
+#include "renderer_feature_profiles.hpp"
 #include "rhi.hpp"
 #include "texture_uploader.hpp"
 
@@ -29,19 +35,12 @@ using aeg::editor::ImGuiTextureBinding;
 using aeg::editor::ImGuiTextureRegistry;
 using aeg::foundation::Result;
 using aeg::foundation::ResultCode;
-using aeg::pipeline::PipelineCompileInput;
-using aeg::pipeline::PipelineCompiler;
-using aeg::pipeline::PipelineId;
-using aeg::pipeline::PipelineInstanceId;
 using aeg::pipeline::PipelineRegistry;
-using aeg::pipeline::PipelineScope;
 using aeg::pipeline::RenderResourceId;
 using aeg::render_graph::FrameAllocation;
 using aeg::render_graph::FrameContext;
 using aeg::render_graph::RenderGraph;
 using aeg::render_graph::RenderGraphBuffer;
-using aeg::render_graph::RenderGraphFeatureRuntime;
-using aeg::render_graph::RenderGraphFeatureRuntimeDesc;
 using aeg::render_graph::RenderGraphTexture;
 using aeg::resource::GpuTexture;
 using aeg::resource::TextureData;
@@ -286,23 +285,9 @@ int main() {
         return 11;
     }
     ImGuiRenderer imgui_renderer(*device, texture_registry);
-    if (!check(imgui_renderer.initialize(), "initialize_imgui_renderer") ||
-        !check(aeg::editor::register_imgui_render_feature(registry, imgui_renderer), "register_imgui_render_feature")) {
+    if (!check(imgui_renderer.initialize(), "initialize_imgui_renderer")) {
         return 12;
     }
-
-    const auto compiled_plan = PipelineCompiler{}.compile(PipelineCompileInput{
-        PipelineId("RenderPipeline"),
-        PipelineScope::kFrame,
-        0,
-        &registry,
-        PipelineInstanceId("Editor.ImGuiRendererSmoke"),
-        nullptr,
-    });
-    if (!check(compiled_plan, "compile_render_pipeline")) {
-        return 13;
-    }
-    aeg::pipeline::PipelinePlan plan = std::move(compiled_plan.value);
 
     RenderGraph graph(*device);
     const auto target_resource_result = graph.import_texture(target_texture, target_view, target_desc,
@@ -391,22 +376,27 @@ int main() {
         (void)frame_context.abort_frame();
         return 19;
     }
+    ImGuiDrawPacket missing_texture_packet = packet;
+    ++missing_texture_packet.commands[0].texture.generation;
+    const auto missing_texture = imgui_renderer.prepare_frame(frame_context, graph, missing_texture_packet, imgui_target);
+    if (missing_texture || missing_texture.code != ResultCode::kNotFound || imgui_renderer.has_prepared_frame()) return 74;
+    auto invalid_texture_binding = texture_binding;
+    invalid_texture_binding.texture_desc.extent.width = 0;
+    const auto invalid_texture = texture_registry.register_texture(invalid_texture_binding);
+    if (!check(invalid_texture, "register_invalid_texture_description")) return 74;
+    auto invalid_texture_packet = packet;
+    invalid_texture_packet.commands[0].texture = invalid_texture.value;
+    const auto invalid_texture_preparation = imgui_renderer.prepare_frame(frame_context, graph, invalid_texture_packet, imgui_target);
+    if (invalid_texture_preparation || invalid_texture_preparation.code != ResultCode::kInvalidArgument ||
+        imgui_renderer.has_prepared_frame() || !check(texture_registry.unregister_texture(invalid_texture.value),
+            "unregister_invalid_texture_description")) return 74;
     if (!check(imgui_renderer.prepare_frame(frame_context, graph, packet, imgui_target), "prepare_imgui_frame")) {
         (void)frame_context.abort_frame();
         return 19;
     }
 
-    const std::array<aeg::render_graph::RenderGraphFeatureTextureBinding, 1> feature_textures{{
-        {RenderResourceId("SceneColor"), target_resource},
-    }};
-    const RenderGraphFeatureRuntimeDesc runtime_desc{
-        {},
-        feature_textures,
-        nullptr,
-        nullptr,
-    };
-    RenderGraphFeatureRuntime runtime(graph, plan, registry, runtime_desc);
-    if (!check(runtime.build(), "build_imgui_feature")) {
+    if (!check(aeg::editor::detail::ImGuiRenderExecution::build_render_graph(imgui_renderer, graph, target_resource),
+               "build_imgui_overlay")) {
         (void)frame_context.abort_frame();
         return 20;
     }
@@ -442,13 +432,13 @@ int main() {
         return 21;
     }
 
-    if (!check(graph.compile(), "compile_imgui_graph") || graph.compile_info().pass_count < 3 ||
-        graph.compile_info().culled_pass_count != 0 || graph.compile_info().barrier_count == 0 ||
-        graph.compile_info().queue_dependency_count == 0) {
+    if (!check(graph.compile(), "compile_imgui_graph") || aeg::render_graph::detail::RenderGraphExecution::compile_info(graph).pass_count < 3 ||
+        aeg::render_graph::detail::RenderGraphExecution::compile_info(graph).culled_pass_count != 0 || aeg::render_graph::detail::RenderGraphExecution::compile_info(graph).barrier_count == 0 ||
+        aeg::render_graph::detail::RenderGraphExecution::compile_info(graph).queue_dependency_count == 0) {
         (void)frame_context.abort_frame();
         return 22;
     }
-    const auto& batches = graph.plan().batches;
+    const auto& batches = aeg::render_graph::detail::RenderGraphExecution::plan(graph).batches;
     const bool has_clear_upload_imgui_batches =
             batches.size() >= 3 && batches[0].queue == QueueClass::kGraphics && batches[0].pass_indices.size() == 1 &&
             batches[1].queue == QueueClass::kCopy && batches[1].pass_indices.size() >= 3 &&
@@ -458,11 +448,21 @@ int main() {
         (void)frame_context.abort_frame();
         return 22;
     }
+    unsigned actual_overlays = 0;
+    for (const auto& pass : aeg::render_graph::detail::RenderGraphExecution::plan(graph).pass_plans) {
+        const auto actual = aeg::render_graph::detail::RenderGraphExecution::inspect_pass(graph, pass.pass);
+        if (!check(actual, "inspect_overlay_pass")) return 75;
+        if (actual.value.name != "Editor.ImGui.Draw") continue;
+        if (!pass.live || pass.feature_work || actual.value.queue != QueueClass::kGraphics) return 75;
+        ++actual_overlays;
+    }
+    if (actual_overlays != 1) return 75;
 
     const auto execution_result = graph.execute(frame_context);
     if (!check(execution_result, "execute_imgui_graph")) {
         return 23;
     }
+    if (execution_result.value.draw_call_count == 0) return 75;
     if (execution_result.value.completion.is_valid() &&
         !check(device->wait(execution_result.value.completion, std::numeric_limits<uint64_t>::max()),
                "wait_imgui_graph")) {
@@ -487,6 +487,18 @@ int main() {
         pixels[center_pixel + 2] == std::byte{0}) {
         return 26;
     }
+    for (const auto offset : {std::size_t{0}, std::size_t{(kTargetWidth - 1) * 4},
+        std::size_t{(kTargetHeight - 1) * kTargetWidth * 4}, std::size_t{kReadbackSize - 4}})
+        if (pixels[offset] != std::byte{0} || pixels[offset + 1] != std::byte{0} ||
+            pixels[offset + 2] != std::byte{0} || pixels[offset + 3] != std::byte{255}) return 75;
+    aeg::feature::FeatureRegistry scene_features{aeg::feature::test::clock_test_host()};
+    if (!check(aeg::renderer::register_scene_render_profiles(scene_features), "register_scene_profiles")) return 73;
+    for (const auto id : {"Renderer.Scene.Opaque", "Renderer.Scene.Forward", "Renderer.Scene.Deferred"})
+        if (!scene_features.find_definition(aeg::feature::FeatureDefinitionId(id))) return 73;
+    const bool retired_imgui_absent = !scene_features.find_definition(
+        aeg::feature::FeatureDefinitionId("Editor.ImGuiRenderFeature"));
+    std::cout << "ImGui GPU pixels verified; three real Scene definitions present, retired ImGui identity absent="
+              << retired_imgui_absent << '\n';
 
     if (!check(frame_context.end_frame(), "end_imgui_frame")) {
         return 27;
@@ -500,15 +512,93 @@ int main() {
         return 32;
     }
     if (!check(frame_context.abort_frame(), "abort_rejected_imgui_frame")) return 33;
+    {
+        RenderGraph empty_graph(*device);
+        const auto stale_target = empty_graph.create_texture(target_desc);
+        if (!check(stale_target, "create_stale_overlay_target")) return 76;
+        empty_graph.reset();
+        const auto current_target = empty_graph.import_texture(target_texture, target_view, target_desc,
+            {ResourceUsage::kCopySource, aeg::rhi::ShaderStage::kAll, QueueClass::kCopy, false, PipelineStage::kCopy});
+        if (!check(current_target, "import_empty_overlay_target") ||
+            !check(frame_context.begin_frame(), "begin_empty_overlay_frame")) return 76;
+        auto empty_packet = packet;
+        empty_packet.clear();
+        if (!check(imgui_renderer.prepare_frame(frame_context, empty_graph, empty_packet, imgui_target),
+                "prepare_empty_overlay") || !imgui_renderer.has_prepared_frame() ||
+            !check(empty_graph.compile(), "compile_empty_overlay_baseline")) return 76;
+        const auto baseline = aeg::render_graph::detail::RenderGraphExecution::compile_info(empty_graph);
+        for (const auto rejected_target : {RenderGraphTexture{}, target_resource, stale_target.value}) {
+            const auto rejected = aeg::editor::detail::ImGuiRenderExecution::build_render_graph(
+                imgui_renderer, empty_graph, rejected_target);
+            if (rejected || !check(empty_graph.compile(), "compile_rejected_overlay_target")) return 76;
+            const auto restored = aeg::render_graph::detail::RenderGraphExecution::compile_info(empty_graph);
+            if (restored.pass_count != baseline.pass_count || restored.resource_count != baseline.resource_count ||
+                !imgui_renderer.has_prepared_frame()) return 76;
+        }
+        const auto empty_clear = empty_graph.add_pass("Editor.ImGui.EmptyClear", QueueClass::kGraphics,
+            [target = current_target.value](aeg::render_graph::PassBuilder& pass) {
+                return pass.use_color_attachment(target, LoadOp::kClear, StoreOp::kStore, {.2f, .4f, .6f, 1.f});
+            }, [](aeg::render_graph::PassExecutionContext& command) {
+                if (const auto result = command.begin_rendering(); !result) return result;
+                return command.end_rendering();
+            });
+        if (!check(empty_clear, "add_empty_overlay_clear") ||
+            !check(aeg::editor::detail::ImGuiRenderExecution::build_render_graph(imgui_renderer, empty_graph, current_target.value),
+                "build_empty_overlay") || !check(empty_graph.compile(), "compile_empty_overlay_without_readback")) return 77;
+        const auto empty_info = aeg::render_graph::detail::RenderGraphExecution::compile_info(empty_graph);
+        if (empty_info.pass_count != 2 || empty_info.culled_pass_count != 0) return 77;
+        unsigned empty_overlays = 0;
+        uint32_t clear_order = std::numeric_limits<uint32_t>::max(), overlay_order = clear_order;
+        bool loads_target = false;
+        for (const auto& pass : aeg::render_graph::detail::RenderGraphExecution::plan(empty_graph).pass_plans) {
+            const auto actual = aeg::render_graph::detail::RenderGraphExecution::inspect_pass(empty_graph, pass.pass);
+            if (!check(actual, "inspect_empty_overlay") || !pass.live || pass.feature_work) return 77;
+            if (pass.pass == empty_clear.value) clear_order = pass.topological_index;
+            if (actual.value.name != "Editor.ImGui.Draw") continue;
+            ++empty_overlays;
+            overlay_order = pass.topological_index;
+            for (const auto& barrier : pass.barriers)
+                if (barrier.resource_kind == aeg::render_graph::RenderGraphResourceKind::kTexture &&
+                    barrier.resource_index == current_target.value.index &&
+                    barrier.resource_generation == current_target.value.generation &&
+                    barrier.phase == aeg::render_graph::RenderGraphBarrierPhase::kBeforePass &&
+                    barrier.access == aeg::render_graph::ResourceAccess::kReadWrite && !barrier.discard_contents)
+                    loads_target = true;
+        }
+        if (empty_overlays != 1 || !loads_target || clear_order >= overlay_order) return 77;
+        const auto allocation = frame_context.allocate_readback(kReadbackSize, 256);
+        if (!check(allocation, "allocate_empty_overlay_readback")) return 78;
+        const auto destination = empty_graph.import_buffer(allocation.value.buffer,
+            make_readback_desc(allocation.value.buffer_size), make_host_read_state());
+        if (!check(destination, "import_empty_overlay_readback")) return 78;
+        const auto copied = empty_graph.add_pass("Editor.ImGui.EmptyReadback", QueueClass::kCopy,
+            [target = current_target.value, buffer = destination.value, offset = allocation.value.offset](aeg::render_graph::PassBuilder& pass) {
+                if (const auto result = pass.read(target, ResourceUsage::kCopySource, PipelineStage::kCopy); !result) return result;
+                pass.set_side_effects();
+                return pass.write(buffer, ResourceUsage::kCopyDestination, PipelineStage::kCopy,
+                    aeg::rhi::ShaderStage::kAll, {offset, kReadbackSize});
+            }, [target = current_target.value, buffer = destination.value, offset = allocation.value.offset](aeg::render_graph::PassExecutionContext& command) {
+                return command.copy_texture_to_buffer(target, {aeg::rhi::Aspect::kColor, 0, 0, 1}, {},
+                    {kTargetWidth, kTargetHeight, 1}, buffer, offset, 0, 0);
+            });
+        if (!check(copied, "add_empty_overlay_readback")) return 78;
+        const auto empty_execution = empty_graph.execute(frame_context);
+        if (!check(empty_execution, "execute_empty_overlay") || empty_execution.value.draw_call_count != 0 ||
+            !check(device->wait_idle(), "wait_empty_overlay")) return 78;
+        std::array<std::byte, kReadbackSize> empty_pixels{};
+        if (!check(frame_context.read_readback(allocation.value, empty_pixels), "read_empty_overlay_pixels")) return 78;
+        for (std::size_t offset = 0; offset < empty_pixels.size(); offset += 4)
+            if (empty_pixels[offset] != std::byte{51} || empty_pixels[offset + 1] != std::byte{102} ||
+                empty_pixels[offset + 2] != std::byte{153} || empty_pixels[offset + 3] != std::byte{255}) return 78;
+        if (!check(frame_context.end_frame(), "end_empty_overlay_frame")) return 78;
+        empty_graph.reset();
+    }
     if (!check(imgui_renderer.release_prepared_frame(), "release_prepared_imgui_frame") ||
         !check(device->wait_idle(), "wait_before_imgui_resource_replacement") ||
         !check(texture_uploader.destroy_texture(ui_texture), "destroy_ui_texture_before_renderer_shutdown")) {
         return 28;
     }
     if (!check(imgui_renderer.shutdown(), "shutdown_imgui_renderer")) {
-        return 29;
-    }
-    if (!check(aeg::editor::unregister_imgui_render_feature(registry), "unregister_imgui_render_feature")) {
         return 29;
     }
     graph.reset();
@@ -520,5 +610,5 @@ int main() {
         !check(device->destroy_sampler(sampler), "destroy_sampler")) {
         return 30;
     }
-    return 0;
+    return retired_imgui_absent ? 0 : 73;
 }

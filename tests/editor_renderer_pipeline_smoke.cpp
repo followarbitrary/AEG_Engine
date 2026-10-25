@@ -1,11 +1,13 @@
-/** @brief Verifies project-authored renderer selection changes the live viewport. */
+/** @brief Verifies real Renderer Feature publication, recovery and viewport pixels. */
+#include <algorithm>
+#include <array>
 #include <chrono>
+#include <concurrency.hpp>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <ranges>
-#include <thread>
 #if defined(_MSC_VER) && defined(_DEBUG)
 #include <crtdbg.h>
 #endif
@@ -13,9 +15,9 @@
 #include "Components/component_ids.hpp"
 #include "Components/render_components.hpp"
 #include "editor_scene_runtime.hpp"
-#include "pipeline_document_io.hpp"
+#include "composition/editor_render_graph_inspection.hpp"
 #include "project_context.hpp"
-#include "renderer_variant_document_fixture.hpp"
+#include "renderer_feature_profiles.hpp"
 
 namespace {
 using namespace aeg;
@@ -26,8 +28,8 @@ bool check(const foundation::Result& result) {
 }
 bool draw(application::EditorSceneRuntime& runtime, uint64_t frame) {
     std::cerr << "Rendering frame " << frame << '\n';
-    if (!runtime.viewport_present_connected() || !check(runtime.request_viewport_readback()) ||
-        !check(runtime.render_frame(frame)))
+    if (!check(runtime.request_viewport_readback()) ||
+        !check(runtime.render_frame(frame, 1.0 / 60.0)))
         return false;
     const auto pixels = runtime.read_viewport_pixels();
     if (!pixels || pixels.value.empty())
@@ -41,77 +43,101 @@ bool draw(application::EditorSceneRuntime& runtime, uint64_t frame) {
         std::cerr << "Selected renderer did not draw scene pixels\n";
     return colored >= 10;
 }
-bool active(application::EditorSceneRuntime& runtime, pipeline::PipelineId pipeline) {
-    return std::ranges::any_of(runtime.pipeline_snapshots(), [&](const auto& item) {
-        return item.first == "Game / Renderer" && item.second && item.second->pipeline == pipeline;
-    });
+std::string read_file(const std::filesystem::path& path) {
+    std::ifstream file(path, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>{file}, std::istreambuf_iterator<char>{});
 }
-bool invalid_startup_renderer_is_recoverable(application::EditorSceneRuntime& runtime, rhi::Device& device,
-                                             const std::filesystem::path& fixture, const pipeline::TypeCatalog& catalog,
-                                             uint64_t& frame) {
-    const auto root = fixture / "RecoveryProject";
-    if (!check(runtime.new_project(root, "Pipeline recovery")))
-        return false;
-    const auto scene_path = runtime.scene_path();
-    std::filesystem::copy_file(fixture / "source.aegscene", scene_path,
-                               std::filesystem::copy_options::overwrite_existing);
-    if (!check(runtime.open_scene(scene_path)))
-        return false;
-    const auto forward = root / "Assets" / "Forward.aegpipe";
-    const auto deferred = root / "Assets" / "Deferred.aegpipe";
-    const auto read_file = [](const std::filesystem::path& path) {
-        std::ifstream file(path, std::ios::binary);
-        return std::string(std::istreambuf_iterator<char>{file}, std::istreambuf_iterator<char>{});
-    };
-    if (!check(application::project::save_pipeline_document(forward, test::renderer_document(catalog, true))) ||
-        !check(application::project::save_pipeline_document(deferred, test::renderer_document(catalog, false))) ||
-        !check(runtime.refresh_assets()) || !check(runtime.activate_renderer_pipeline_document(forward)))
-        return false;
-    for (int failure = 0; failure < 4; ++failure) {
-        std::cerr << "Recovering startup renderer failure " << failure << '\n';
-        if (failure == 0) {
-            if (!check(runtime.set_authored_present_connection(forward, "SkyboxPostProcess", false)))
-                return false;
-        } else if (failure == 1) {
-            auto invalid = test::renderer_document(catalog, true);
-            invalid.pass_nodes.front().enabled = false;
-            if (!check(application::project::save_pipeline_document(forward, invalid)))
-                return false;
-        } else if (failure == 2) {
-            std::ofstream(forward, std::ios::trunc) << "pipeline_nodes = [invalid TOML";
-        } else {
-            std::filesystem::remove(forward);
-        }
-        const auto project_bytes = read_file(root / "Project.aegproj");
-        const auto pipeline_bytes = read_file(forward);
-        if (failure == 0 && (!check(runtime.shutdown()) || !check(runtime.initialize(device))))
+bool active(application::EditorSceneRuntime& runtime, renderer::SceneRenderProfile profile) {
+    const auto definition = renderer::scene_render_profile_definition(profile);
+    const auto source = runtime.inspect_renderer_feature_execution();
+    return definition && source && source.value.generation.is_valid() && source.value.plans.size() == 1 &&
+        source.value.provenance.size() == 1 &&
+        source.value.provenance.front().runtime.definition_id == definition.value.id;
+}
+bool actual_feature_work(application::EditorSceneRuntime& runtime, renderer::SceneRenderProfile profile) {
+    const auto source = runtime.inspect_renderer_feature_execution();
+    const auto captured = runtime.inspect_render_graph();
+    const auto definition = renderer::scene_render_profile_definition(profile);
+    if (!source || !captured || !definition || !active(runtime, profile)) return false;
+    const size_t count = profile == renderer::SceneRenderProfile::kOpaque ? 1 :
+                         profile == renderer::SceneRenderProfile::kForward ? 5 : 4;
+    std::vector<bool> operations(count, false);
+    const auto& origin = source.value.provenance.front().runtime;
+    for (const auto& pass : captured.value->plan.pass_plans) {
+        if (!pass.live || !pass.feature_work) continue;
+        const auto& work = *pass.feature_work;
+        if (work.feature_definition_id != definition.value.id || work.node_id != origin.node_id ||
+            work.instance_id != origin.instance_id || !work.id.is_valid() ||
+            work.owner_module != feature::ModuleIdentity("com.aeg.renderer") ||
+            work.invocation.generation != source.value.generation || !work.invocation.invocation_id.is_valid() ||
+            work.frame_index != captured.value->frame_index || work.operation_index >= count)
             return false;
-        // A bad project graph must not fail project opening or take down the editor viewport.
-        if (!check(runtime.import_project(root)) || !runtime.project_loaded() ||
-            !runtime.active_renderer_pipeline_document().empty() ||
-            runtime.diagnostic().find("Forward.aegpipe") == std::string_view::npos || !draw(runtime, frame++)) {
-            std::cerr << "Invalid startup pipeline blocked the editor or lacked a diagnostic\n";
-            return false;
-        }
-        if (failure != 3 && !std::ranges::any_of(runtime.authored_pipeline_documents(),
-                                                 [&](const auto& item) { return item.path == forward; }))
-            return false;
-        if (read_file(root / "Project.aegproj") != project_bytes || read_file(forward) != pipeline_bytes ||
-            runtime.diagnostic().find("Forward.aegpipe") == std::string_view::npos)
-            return false;
-        const auto entity_count = runtime.entities().size();
-        if (!check(runtime.create_scene_entity({}, "Still editable")) ||
-            runtime.entities().size() != entity_count + 1 || !check(runtime.undo()) ||
-            runtime.entities().size() != entity_count)
-            return false;
-        // Repair and explicitly apply the same document without restarting the editor.
-        if (!check(application::project::save_pipeline_document(forward, test::renderer_document(catalog, true))) ||
-            !check(runtime.refresh_assets()) || !check(runtime.activate_renderer_pipeline_document(forward)) ||
-            runtime.diagnostic().find("Forward.aegpipe") != std::string_view::npos ||
-            !active(runtime, renderer::kForwardRenderPipelineId) || !draw(runtime, frame++))
-            return false;
+        operations[work.operation_index] = true;
     }
-    return true;
+    return std::ranges::all_of(operations, [](bool value) { return value; }) &&
+        std::ranges::any_of(captured.value->sources, [&](const auto& value) {
+            return value.asset_uuid == source.value.asset_uuid && value.generation == source.value.generation &&
+                value.contract_digest == source.value.contract_digest && !value.plans.empty();
+        });
+}
+bool default_feature_preview(application::EditorSceneRuntime& runtime, uint64_t frame) {
+    return active(runtime, renderer::SceneRenderProfile::kOpaque) && draw(runtime, frame) &&
+        actual_feature_work(runtime, renderer::SceneRenderProfile::kOpaque);
+}
+bool retired_authoring_is_rejected(application::EditorSceneRuntime& runtime,
+                                   const std::filesystem::path& fixture, uint64_t& frame) {
+    const auto source = runtime.inspect_renderer_feature_execution();
+    const auto scene_path = runtime.scene_path();
+    const auto entity_count = runtime.entities().size();
+    const auto project_file = runtime.project_root() / "Project.aegproj";
+    const auto project_bytes = read_file(project_file);
+    const auto scene_bytes = read_file(scene_path);
+    const auto unchanged = [&] {
+        const auto after = runtime.inspect_renderer_feature_execution();
+        return source && after && after.value.generation == source.value.generation &&
+            after.value.contract_digest == source.value.contract_digest && runtime.scene_path() == scene_path &&
+            runtime.entities().size() == entity_count && read_file(project_file) == project_bytes &&
+            read_file(scene_path) == scene_bytes;
+    };
+    for (const auto& extension : {".aegframe", ".aegpipe", ".aegpipeline", ".pipeline", ".AEGFRAME", ".AEGPIPE"}) {
+        const auto path = runtime.project_root() / "Assets" / (std::string("Retired") + extension);
+        std::ofstream(path) << "retired author schema must never be decoded";
+        const auto bytes = read_file(path);
+        const auto result = runtime.open_scene(path);
+        if (result || result.code != foundation::ResultCode::kUnsupported || !unchanged() || read_file(path) != bytes) {
+            std::cerr << "Retired author document changed the active Feature source or was not explicitly rejected\n";
+            return false;
+        }
+        const bool dirty_before = runtime.dirty();
+        const auto saved = runtime.save_scene_as(path);
+        if (saved || saved.code != foundation::ResultCode::kUnsupported || !unchanged() ||
+            runtime.dirty() != dirty_before || read_file(path) != bytes) {
+            std::cerr << "Save As overwrote retired author bytes or changed the active Scene/Feature source\n";
+            return false;
+        }
+    }
+    const auto sidecar = std::filesystem::path(scene_path.string() + ".pipeline");
+    for (const auto& bytes : {std::string("AEG_PIPELINE_EDITS 3\n"), std::string("malformed bytes\n")}) {
+        std::ofstream(sidecar, std::ios::binary | std::ios::trunc) << bytes;
+        for (bool import : {false, true}) {
+            const auto result = import ? runtime.import_project(runtime.project_root()) : runtime.open_scene(scene_path);
+            if (result || result.code != foundation::ResultCode::kUnsupported || !unchanged() || read_file(sidecar) != bytes)
+                return false;
+        }
+        if (!draw(runtime, frame++) || !unchanged()) return false;
+    }
+    std::filesystem::remove(sidecar);
+    const auto blocked_root = fixture / "BlockedProject";
+    const auto blocked_scene = blocked_root / application::project::ProjectConfig{}.startup_scene;
+    std::filesystem::create_directories(blocked_scene.parent_path());
+    const auto blocked_sidecar = std::filesystem::path(blocked_scene.string() + ".pipeline");
+    std::ofstream(blocked_sidecar) << "do not import or mutate";
+    const auto blocked = runtime.new_project(blocked_root, "Blocked author project");
+    if (blocked || blocked.code != foundation::ResultCode::kUnsupported || !unchanged() ||
+        std::filesystem::exists(blocked_root / "Project.aegproj")) return false;
+    const auto count = runtime.entities().size();
+    return check(runtime.create_scene_entity({}, "Still editable")) && runtime.entities().size() == count + 1 &&
+        check(runtime.undo()) && runtime.entities().size() == count && draw(runtime, frame++);
 }
 bool vertical_orientation_pixels(application::EditorSceneRuntime& runtime, uint64_t& frame) {
     using namespace engine::components;
@@ -167,9 +193,9 @@ bool previously_uploaded_mesh_pixels(application::EditorSceneRuntime& runtime, u
     // Upload while no entity references this mesh. Its first draw is in a
     // later frame, so the resident GPU buffers still belong to the copy queue.
     for (int i = 0; i < 10; ++i) {
-        if (!check(runtime.render_frame(frame++)))
+        if (!check(runtime.render_frame(frame++, 1.0 / 60.0)))
             return false;
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        static_cast<void>(aeg::concurrency::sleep_for(50'000'000ull));
     }
     uint64_t mesh_id = 0;
     const auto relative = path.lexically_relative(runtime.project_root()).generic_string();
@@ -307,7 +333,7 @@ bool environment_pixels(application::EditorSceneRuntime& runtime, uint64_t& fram
     environment.gamma = 1;
     const auto render = [&]() {
         return check(runtime.queue_component_update(entity, type, std::as_bytes(std::span{&environment, 1}))) &&
-               check(runtime.request_viewport_readback()) && check(runtime.render_frame(frame++));
+               check(runtime.request_viewport_readback()) && check(runtime.render_frame(frame++, 1.0 / 60.0));
     };
     std::array<unsigned, 3> values{};
     for (size_t step = 0; step < values.size(); ++step) {
@@ -330,7 +356,7 @@ bool environment_pixels(application::EditorSceneRuntime& runtime, uint64_t& fram
     if (!check(runtime.save_scene()) || !check(runtime.open_scene(path)))
         return false;
     const auto* restored = static_cast<const SceneEnvironment*>(runtime.component_value(entity, type));
-    if (!restored || restored->gamma != 2 || restored->sky_horizon.y != 0.5f)
+    if (!restored || restored->gamma != 2 || restored->sky_horizon[1] != 0.5f)
         return false;
     environment.gamma = 0;
     if (runtime.queue_component_update(entity, type, std::as_bytes(std::span{&environment, 1})))
@@ -418,7 +444,7 @@ bool local_light_pixels(application::EditorSceneRuntime& runtime, uint64_t& fram
              {point_entity, point_type, std::as_bytes(std::span{&point, 1})},
              {spot_entity, spot_type, std::as_bytes(std::span{&spot, 1})}}};
         if (!check(runtime.queue_component_updates(updates)) || !check(runtime.request_viewport_readback()) ||
-            !check(runtime.render_frame(frame++)))
+            !check(runtime.render_frame(frame++, 1.0 / 60.0)))
             return false;
         const auto pixels = runtime.read_viewport_pixels();
         if (!pixels || pixels.value.size() != 64 * 64 * 4)
@@ -460,151 +486,124 @@ int main(int argc, char** argv) try {
     _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
 #endif
     const bool recovery_fixture = argc == 3 && std::string_view(argv[1]) == "--startup-recovery-fixture";
-    if (argc != 1 && !recovery_fixture)
-        return 25;
-    const auto fixture = recovery_fixture
-                             ? std::filesystem::absolute(argv[2])
-                             : std::filesystem::temp_directory_path() /
-                                   ("aeg_renderer_selection_" +
-                                    std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    if (argc != 1 && !recovery_fixture) return 25;
+    const auto fixture = recovery_fixture ? std::filesystem::absolute(argv[2]) :
+        std::filesystem::temp_directory_path() / ("aeg_renderer_feature_" +
+            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     std::filesystem::create_directories(fixture);
+    // Closing a project saves the detached editor_scene.aegscene relative to
+    // the process working directory. Keep that source and its atomic-save
+    // files inside this invocation's fixture too.
+    const auto previous_working_directory = std::filesystem::current_path();
+    std::filesystem::current_path(fixture);
 #if defined(_WIN32)
-    // Keep the editor's recent-project list inside this test's temporary fixture.
     _putenv_s("APPDATA", fixture.string().c_str());
 #endif
     const auto root = fixture / "Project";
-    auto device = rhi::create_device({rhi::BackendType::kVulkan, "Editor renderer pipeline smoke"});
-    if (!device)
-        return 1;
+    auto device = rhi::create_device({rhi::BackendType::kVulkan, "Editor Renderer Feature smoke"});
+    if (!device) return 1;
     application::EditorSceneRuntime runtime;
-    std::cerr << "Initializing scene and project\n";
-    if (!check(runtime.initialize(*device.value)))
-        return 2;
-    std::cerr << "Saving source scene\n";
-    if (!check(runtime.save_scene_as(fixture / "source.aegscene")))
-        return 2;
-    std::cerr << "Creating project\n";
-    if (!check(runtime.new_project(root, "Renderer selection")))
-        return 2;
-    std::cerr << "Opening mesh scene\n";
+    if (!check(runtime.initialize(*device.value)) || !check(runtime.save_scene_as(fixture / "source.aegscene")) ||
+        !check(runtime.new_project(root, "Renderer Feature publication"))) return 2;
     const auto project_settings = application::project::ProjectFileCodec{}.load(root / "Project.aegproj");
-    if (!project_settings)
-        return 2;
+    if (!project_settings) return 2;
     const auto mesh_scene = root / project_settings.value.config.startup_scene.parent_path() / "Mesh.aegscene";
     std::filesystem::copy_file(fixture / "source.aegscene", mesh_scene);
-    if (!check(runtime.open_scene(mesh_scene)) || !check(runtime.request_viewport_extent(64, 64)))
-        return 3;
-    pipeline::TypeCatalog catalog;
-    if (!check(renderer::register_renderer_authoring_types(catalog)))
-        return 4;
-    const auto forward = root / "Assets" / "Forward.aegpipe";
-    const auto deferred = root / "Assets" / "Deferred.aegpipe";
-    std::cerr << "Importing renderer documents\n";
-    if (!check(application::project::save_pipeline_document(forward, test::renderer_document(catalog, true))) ||
-        !check(application::project::save_pipeline_document(deferred, test::renderer_document(catalog, false))) ||
-        !check(runtime.import_project(root)))
-        return 5;
-    uint64_t frame = 1;
+    if (!check(runtime.open_scene(mesh_scene)) || !check(runtime.request_viewport_extent(64, 64))) return 3;
     if (recovery_fixture) {
-        if (!check(runtime.activate_renderer_pipeline_document(forward)) ||
-            !check(runtime.set_authored_present_connection(forward, "SkyboxPostProcess", false)))
-            return 25;
-        // Keep the broken document selected so the application test also draws its load-error UI.
-        std::filesystem::remove(deferred);
+        // Main must explicitly reject this retired sidecar before mutating a Scene, while its default Preview remains usable.
         std::ofstream(runtime.scene_path().string() + ".pipeline") << "AEG_PIPELINE_EDITS 3\n";
         return check(runtime.shutdown()) ? 0 : 25;
     }
-    for (const auto& path : {forward, deferred, forward}) {
-        std::cerr << "Activating " << path.filename() << '\n';
-        if (!check(runtime.activate_renderer_pipeline_document(path)) ||
-            !active(runtime,
-                    path == deferred ? renderer::kDeferredRenderPipelineId : renderer::kForwardRenderPipelineId) ||
-            runtime.active_renderer_pipeline_document() != path || !draw(runtime, frame++))
-            return 6;
+    const auto settings_bytes = read_file(root / "Project.aegproj");
+    auto forward = renderer::scene_render_profile_graph(renderer::SceneRenderProfile::kForward);
+    auto deferred = renderer::scene_render_profile_graph(renderer::SceneRenderProfile::kDeferred);
+    if (!forward || !deferred) return 4;
+    uint64_t frame = 1;
+    for (const auto profile : {renderer::SceneRenderProfile::kForward, renderer::SceneRenderProfile::kDeferred,
+                               renderer::SceneRenderProfile::kForward}) {
+        const auto graph = renderer::scene_render_profile_graph(profile);
+        const auto before = runtime.inspect_renderer_feature_execution();
+        if (!graph || !before || !check(runtime.publish_renderer_feature_graph(graph.value))) return 5;
+        const auto after = runtime.inspect_renderer_feature_execution();
+        if (!after || after.value.generation == before.value.generation || !draw(runtime, frame++) ||
+            !actual_feature_work(runtime, profile)) return 6;
         if (!check(runtime.request_viewport_extent(96, 48)) || !draw(runtime, frame++) ||
-            !check(runtime.request_viewport_extent(64, 64)) || !draw(runtime, frame++))
-            return 6;
-        if (!vertical_orientation_pixels(runtime, frame))
-            return 23;
-        if (!shadow_pixels(runtime, frame))
-            return 18;
-        if (!transformed_lighting_pixels(runtime, frame))
-            return 19;
-        if (!environment_pixels(runtime, frame))
-            return 21;
+            !check(runtime.request_viewport_extent(64, 64)) || !draw(runtime, frame++)) return 6;
+        if (!vertical_orientation_pixels(runtime, frame)) return 23;
+        if (!shadow_pixels(runtime, frame)) return 18;
+        if (!transformed_lighting_pixels(runtime, frame)) return 19;
+        if (!environment_pixels(runtime, frame)) return 21;
     }
-    if (!local_light_pixels(runtime, frame))
-        return 20;
-    auto invalid = test::renderer_document(catalog, false);
-    invalid.pass_nodes.front().enabled = false;
-    const auto invalid_path = root / "Assets" / "Invalid.aegpipe";
-    if (!check(application::project::save_pipeline_document(invalid_path, invalid)))
-        return 7;
-    const auto rejected = runtime.activate_renderer_pipeline_document(invalid_path);
-    if (rejected || !active(runtime, renderer::kForwardRenderPipelineId) ||
-        runtime.active_renderer_pipeline_document() != forward || !draw(runtime, frame++))
-        return 8;
-    const auto settings = application::project::ProjectFileCodec{}.load(root / "Project.aegproj");
-    auto expected_startup = project_settings.value.config.startup_pipelines;
-    expected_startup.emplace_back("Assets/Forward.aegpipe");
-    if (!settings || settings.value.config.startup_pipelines != expected_startup)
-        return 9;
-    const auto outside = fixture / "Outside.aegpipe";
-    if (!check(application::project::save_pipeline_document(outside, test::renderer_document(catalog, false))))
-        return 13;
-    if (runtime.activate_renderer_pipeline_document(outside) || runtime.active_renderer_pipeline_document() != forward)
-        return 13;
-    // Force the project's atomic save to fail after the candidate host has initialized.
-    const auto blocked_save = root / "Project.aegproj.tmp";
-    std::filesystem::create_directory(blocked_save);
-    const auto save_failed = runtime.activate_renderer_pipeline_document(deferred);
-    std::filesystem::remove(blocked_save);
-    if (save_failed || runtime.active_renderer_pipeline_document() != forward ||
-        !active(runtime, renderer::kForwardRenderPipelineId) || !draw(runtime, frame++))
-        return 14;
-    const auto after_failure = application::project::ProjectFileCodec{}.load(root / "Project.aegproj");
-    if (!after_failure || after_failure.value.config.startup_pipelines != expected_startup)
-        return 14;
-    if (!check(runtime.play()) || runtime.activate_renderer_pipeline_document(deferred) || !draw(runtime, frame++) ||
-        !check(runtime.pause()) || runtime.restore_default_renderer_pipeline() || !check(runtime.stop()) ||
-        !draw(runtime, frame++))
-        return 15;
-    std::cerr << "Restoring project selection\n";
-    if (!check(runtime.import_project(root)) || !active(runtime, renderer::kForwardRenderPipelineId) ||
-        !draw(runtime, frame++))
-        return 10;
-    std::cerr << "Restoring default renderer\n";
-    const auto missing_active = root / "Assets" / "Forward.aegpipe.missing";
-    std::filesystem::rename(forward, missing_active);
-    const auto default_result = runtime.restore_default_renderer_pipeline();
-    std::filesystem::rename(missing_active, forward);
-    if (!check(default_result) || !active(runtime, pipeline::PipelineId("RenderPipeline")) || !draw(runtime, frame++))
-        return 11;
-    const auto restored = application::project::ProjectFileCodec{}.load(root / "Project.aegproj");
-    if (!restored || restored.value.config.startup_pipelines != project_settings.value.config.startup_pipelines ||
-        !runtime.active_renderer_pipeline_document().empty())
-        return 16;
-    if (!check(runtime.activate_renderer_pipeline_document(deferred)) || !draw(runtime, frame++) ||
+    if (!local_light_pixels(runtime, frame)) return 20;
+    const auto valid_source = runtime.inspect_renderer_feature_execution();
+    const auto valid_pixels = runtime.read_viewport_pixels();
+    if (!valid_source || !valid_pixels) return 7;
+    for (int failure = 0; failure < 6; ++failure) {
+        auto invalid = deferred.value;
+        if (failure == 0) invalid.nodes.front().definition_id = feature::FeatureDefinitionId("Unknown.Scene");
+        if (failure == 1) ++invalid.nodes.front().definition_version.major;
+        if (failure == 2) ++invalid.contract_digest;
+        if (failure == 3) invalid.edges.push_back({invalid.nodes.front().node_id, feature::PortId("Missing"),
+            invalid.nodes.front().node_id, feature::PortId("Missing"), feature::EdgeKind::kData});
+        if (failure == 4) { auto duplicate = invalid.nodes.front(); duplicate.node_id = feature::FeatureNodeId("Second.Root"); invalid.nodes.push_back(duplicate); }
+        if (failure == 5) invalid.process_subgraphs.push_back({invalid.nodes.front().node_id});
+        const auto rejected = runtime.publish_renderer_feature_graph(invalid);
+        const auto after = runtime.inspect_renderer_feature_execution();
+        if (rejected || !after || after.value.generation != valid_source.value.generation ||
+            !draw(runtime, frame++) || !actual_feature_work(runtime, renderer::SceneRenderProfile::kForward) ||
+            runtime.read_viewport_pixels().value != valid_pixels.value) return 8;
+    }
+    if (!retired_authoring_is_rejected(runtime, fixture, frame)) return 24;
+    const auto before_boundary = runtime.inspect_renderer_feature_execution();
+    if (!check(runtime.play()) || runtime.publish_renderer_feature_graph(deferred.value) ||
+        runtime.restore_default_renderer_feature() || !draw(runtime, frame++) || !check(runtime.pause()) ||
+        runtime.publish_renderer_feature_graph(deferred.value) || runtime.restore_default_renderer_feature() ||
+        !check(runtime.stop()) || !draw(runtime, frame++)) return 15;
+    const auto after_boundary = runtime.inspect_renderer_feature_execution();
+    if (!before_boundary || !after_boundary || after_boundary.value.generation != before_boundary.value.generation ||
+        !actual_feature_work(runtime, renderer::SceneRenderProfile::kForward)) return 15;
+    if (!check(runtime.restore_default_renderer_feature()) || !default_feature_preview(runtime, frame++) ||
+        read_file(root / "Project.aegproj") != settings_bytes) return 11;
+    if (!check(runtime.publish_renderer_feature_graph(deferred.value)) || !draw(runtime, frame++) ||
         !check(runtime.new_project(fixture / "OtherProject", "Other renderer project")) ||
-        !runtime.active_renderer_pipeline_document().empty() || active(runtime, renderer::kDeferredRenderPipelineId))
-        return 17;
-    if (!check(runtime.import_project(root)) || !check(runtime.activate_renderer_pipeline_document(deferred)) ||
-        !draw(runtime, frame++))
-        return 18;
-    for (const auto& path : {forward, deferred}) {
-        if (!check(runtime.activate_renderer_pipeline_document(path)) ||
-            !previously_uploaded_mesh_pixels(runtime, frame, root / "Assets" / (path.stem().string() + ".obj")))
-            return 22;
+        !active(runtime, renderer::SceneRenderProfile::kOpaque)) return 17;
+    if (!check(runtime.import_project(root)) || !default_feature_preview(runtime, frame++)) return 10;
+    for (const auto profile : {renderer::SceneRenderProfile::kForward, renderer::SceneRenderProfile::kDeferred}) {
+        const auto graph = renderer::scene_render_profile_graph(profile);
+        if (!graph || !check(runtime.publish_renderer_feature_graph(graph.value)) ||
+            !previously_uploaded_mesh_pixels(runtime, frame, root / "Assets" /
+                (profile == renderer::SceneRenderProfile::kForward ? "Forward.obj" : "Deferred.obj")) ||
+            !actual_feature_work(runtime, profile)) return 22;
     }
-    if (!invalid_startup_renderer_is_recoverable(runtime, *device.value, fixture, catalog, frame))
-        return 24;
-    std::cerr << "Shutting down renderer\n";
-    if (!check(runtime.shutdown()))
-        return 12;
+    const auto last_pixels = runtime.read_viewport_pixels();
+    auto empty = deferred.value; ++empty.graph_version; empty.nodes.clear();
+    const auto last_source = runtime.inspect_renderer_feature_execution();
+    if (!last_pixels || !last_source || !check(runtime.publish_renderer_feature_graph(empty))) return 26;
+    for (unsigned rotation = 0; rotation < 4; ++rotation) {
+        if (!check(runtime.request_viewport_readback()) || !check(runtime.render_frame(frame++, 0))) return 26;
+        const auto pixels = runtime.read_viewport_pixels();
+        const auto captured = runtime.inspect_render_graph();
+        const auto source = runtime.inspect_renderer_feature_execution();
+        if (!pixels || pixels.value != last_pixels.value || runtime.draw_call_count() != 0 || !source ||
+            source.value.generation == last_source.value.generation || !source.value.plans.empty() || !captured ||
+            std::ranges::any_of(captured.value->plan.pass_plans, [](const auto& pass) { return pass.feature_work.has_value(); })) return 26;
+    }
+    if (!check(runtime.restore_default_renderer_feature()) || !default_feature_preview(runtime, frame++) ||
+        !check(runtime.close_project()) || !active(runtime, renderer::SceneRenderProfile::kOpaque) ||
+        !runtime.entities().empty() || !check(runtime.request_viewport_readback()) ||
+        !check(runtime.render_frame(frame++, 0)) || !actual_feature_work(runtime, renderer::SceneRenderProfile::kOpaque)) return 16;
+    const auto closed_pixels = runtime.read_viewport_pixels();
+    if (!closed_pixels || closed_pixels.value.empty() || runtime.draw_call_count() != 0) return 16;
+    for (size_t offset = 0; offset < closed_pixels.value.size(); offset += 4)
+        for (size_t channel = 0; channel < 3; ++channel)
+            if (std::to_integer<unsigned>(closed_pixels.value[offset + channel]) > 9) return 16;
+    if (read_file(root / "Project.aegproj") != settings_bytes || !check(runtime.shutdown())) return 12;
+    std::filesystem::current_path(previous_working_directory);
     std::error_code error;
     std::filesystem::remove_all(fixture, error);
-    std::cout << "Editor renderer selection and pixels passed\n";
+    std::cout << "Editor Renderer Feature publication and pixels passed\n";
 } catch (const std::exception& error) {
-    std::cerr << "Renderer selection test failed: " << error.what() << '\n';
+    std::cerr << "Renderer Feature test failed: " << error.what() << '\n';
     return 20;
 }

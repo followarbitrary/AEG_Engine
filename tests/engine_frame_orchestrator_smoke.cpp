@@ -3,10 +3,17 @@
  * @brief Exercises custom Phase intervals and automatic RenderGraph orchestration.
  */
 #include <engine_frame_orchestrator.hpp>
+#include "engine_frame_pipeline_host.hpp"
+#include "engine_frame_pipeline_registration.hpp"
+#include "engine_frame_inspection.hpp"
+#include <algorithm>
+#include <array>
+#include <cstdio>
 #include <memory>
 #include <pipeline.hpp>
 #include <rhi.hpp>
 #include <runtime_session.hpp>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -14,8 +21,6 @@ using aeg::foundation::Result;
 using aeg::foundation::ResultCode;
 using aeg::pipeline::EnginePhase;
 using aeg::pipeline::ExecutionDomain;
-using aeg::pipeline::FeatureDomain;
-using aeg::pipeline::FeaturePointFlags;
 using aeg::pipeline::PhaseId;
 using aeg::pipeline::PipelineScope;
 using aeg::pipeline::TimePolicy;
@@ -26,175 +31,116 @@ inline constexpr PhaseId kFramePhase{"FrameSmoke"};
 inline constexpr PhaseId kPostFramePhase{"PostFrameSmoke"};
 inline constexpr PhaseId kAfterShutdownPhase{"AfterShutdownSmoke"};
 
+template <typename T>
+concept HasLegacyRenderBuffers = requires(T value) { value.render_feature_buffers; };
+template <typename T>
+concept HasLegacyRenderState = requires(T value) { value.render_feature_state; };
+static_assert(!HasLegacyRenderBuffers<aeg::engine::EngineFrameDesc>);
+static_assert(!HasLegacyRenderState<aeg::engine::EngineFrameDesc>);
+
 struct OrchestratorState final {
     std::vector<PhaseId> executed_phases{};
     void* expected_frame_user_data{nullptr};
     uint32_t render_pass_execution_count{0};
     uint32_t post_build_pass_execution_count{0};
+    uint32_t legacy_callback_count{0};
     bool post_build_hook_invoked{false};
-    bool render_feature_received_user_data{false};
+    bool marker_received_user_data{false};
 };
 
-[[nodiscard]] Result record_phase(aeg::pipeline::PipelineTaskContext& context) {
-    auto* state = static_cast<OrchestratorState*>(context.user_data());
-    if (state == nullptr) {
-        return Result::failure(ResultCode::kInvalidArgument, "orchestrator smoke state is null");
+[[nodiscard]] Result read_phase_trace(const aeg::engine::EngineFrameOrchestrator& owner, OrchestratorState& state) {
+    const auto trace = aeg::engine::detail::EngineFrameInspection::capture(owner);
+    if (!trace) return trace.result;
+    state.executed_phases.clear();
+    for (const auto& observation : trace.value.stages) {
+        const std::array stages{aeg::pipeline::StageId{"BeforeStartupStage"}, aeg::pipeline::StageId{"PreFrameStage"},
+            aeg::pipeline::StageId{"FrameStage"}, aeg::pipeline::StageId{"PostFrameStage"},
+            aeg::pipeline::StageId{"PresentStage"}, aeg::pipeline::StageId{"AfterShutdownStage"}};
+        if (std::find(stages.begin(), stages.end(), observation.stage) == stages.end()) continue;
+        if (observation.phase == kPostFramePhase && observation.user_data_identity !=
+            reinterpret_cast<uintptr_t>(state.expected_frame_user_data))
+            return aeg::foundation::invalid_state("post-frame inspection lost actual frame user data");
+        state.executed_phases.push_back(observation.phase);
     }
-    if (context.node().phase_id == kPostFramePhase &&
-        context.execution_context().user_data() != state->expected_frame_user_data) {
-        return Result::failure(ResultCode::kInvalidState, "post-frame phase lost frame user data");
-    }
-    state->executed_phases.push_back(context.node().phase_id);
     return Result::success();
 }
-
-class OrchestratorPipeline final : public aeg::pipeline::Pipeline {
-public:
-    explicit OrchestratorPipeline(OrchestratorState& state) : state_(state) {
-        descriptor_.id = aeg::pipeline::PipelineId("EngineFrameOrchestratorSmoke");
-        descriptor_.name = "EngineFrameOrchestratorSmoke";
-        descriptor_.category = aeg::pipeline::PipelineCategory::kRendering;
-        descriptor_.domains = aeg::pipeline::to_mask(FeatureDomain::kRender);
-        descriptor_.supported_scopes = aeg::pipeline::to_mask(PipelineScope::kFrame);
-    }
-
-    [[nodiscard]] const aeg::pipeline::PipelineDescriptor& descriptor() const noexcept override { return descriptor_; }
-
-    [[nodiscard]] Result build(aeg::pipeline::PipelineBuilder& builder) const override {
-        const auto add_phase_task = [&](aeg::pipeline::StageId stage_id, aeg::pipeline::TaskId task_id,
-                                        EnginePhase compatibility_phase, PhaseId phase,
-                                        TimePolicy time_policy) -> Result {
-            const auto stage = builder.add_stage({
-                stage_id,
-                compatibility_phase,
-                ExecutionDomain::kMainThread,
-                time_policy,
-                false,
-                phase,
-            });
-            const auto task = builder.add_task({
-                task_id,
-                aeg::pipeline::TaskFlags::kSideEffect,
-                &record_phase,
-                &state_,
-            });
-            if (!stage || !task) {
-                return builder.status();
-            }
-            return builder.bind_task(task, stage);
-        };
-
-        if (const Result result =
-                add_phase_task(aeg::pipeline::StageId("BeforeStartupStage"), aeg::pipeline::TaskId("BeforeStartupTask"),
-                               EnginePhase::kStartup, kBeforeStartupPhase, TimePolicy::kStartup);
-            !result) {
-            return result;
-        }
-        if (const Result result =
-                add_phase_task(aeg::pipeline::StageId("PreFrameStage"), aeg::pipeline::TaskId("PreFrameTask"),
-                               EnginePhase::kFrameBegin, kPreFramePhase, TimePolicy::kFrame);
-            !result) {
-            return result;
-        }
-        if (const Result result =
-                add_phase_task(aeg::pipeline::StageId("FrameStage"), aeg::pipeline::TaskId("FrameTask"),
-                               EnginePhase::kVariableUpdate, kFramePhase, TimePolicy::kFrame);
-            !result) {
-            return result;
-        }
-        if (const Result result =
-                add_phase_task(aeg::pipeline::StageId("PostFrameStage"), aeg::pipeline::TaskId("PostFrameTask"),
-                               EnginePhase::kFrameEnd, kPostFramePhase, TimePolicy::kFrame);
-            !result) {
-            return result;
-        }
-        if (const Result result = add_phase_task(aeg::pipeline::StageId("PresentStage"),
-                                                 aeg::pipeline::TaskId("PresentTask"), EnginePhase::kPresent,
-                                                 aeg::pipeline::to_phase_id(EnginePhase::kPresent), TimePolicy::kFrame);
-            !result) {
-            return result;
-        }
-        if (const Result result =
-                add_phase_task(aeg::pipeline::StageId("AfterShutdownStage"), aeg::pipeline::TaskId("AfterShutdownTask"),
-                               EnginePhase::kShutdown, kAfterShutdownPhase, TimePolicy::kShutdown);
-            !result) {
-            return result;
-        }
-
-        const auto render_anchor = builder.add_stage({
-            aeg::pipeline::StageId("OrchestratorRenderAnchor"),
-            EnginePhase::kRenderBuild,
-            ExecutionDomain::kMainThread,
-            TimePolicy::kFrame,
-            false,
-        });
-        if (!render_anchor) {
-            return builder.status();
-        }
-        const auto point = builder.add_feature_point({
-            aeg::pipeline::FeaturePointId("OrchestratorRenderPoint"),
-            "OrchestratorRenderPoint",
-            {},
-            aeg::pipeline::StageId("OrchestratorRenderAnchor"),
-            aeg::pipeline::FeaturePointPosition::kBefore,
-            aeg::pipeline::to_mask(FeatureDomain::kRender),
-            aeg::pipeline::to_mask(PipelineScope::kFrame),
-            FeaturePointFlags::kMayCreateComputePass,
-        });
-        return point ? Result::success() : builder.status();
-    }
-
-private:
-    aeg::pipeline::PipelineDescriptor descriptor_{};
-    OrchestratorState& state_;
-};
-
-class OrchestratorRenderFeature final : public aeg::pipeline::RenderFeature {
-public:
-    explicit OrchestratorRenderFeature(OrchestratorState& state) : state_(state) {
-        descriptor_.id = aeg::pipeline::FeatureId("OrchestratorRenderFeature");
-        descriptor_.name = "OrchestratorRenderFeature";
-        descriptor_.domain = FeatureDomain::kRender;
-        descriptor_.domain_mask = aeg::pipeline::to_mask(FeatureDomain::kRender);
-        descriptor_.supported_scopes = aeg::pipeline::to_mask(PipelineScope::kFrame);
-    }
-
-    [[nodiscard]] const aeg::pipeline::FeatureDescriptor& descriptor() const noexcept override { return descriptor_; }
-
-    [[nodiscard]] Result build_render_graph(aeg::pipeline::RenderGraphBuilder& builder) const override {
-        state_.render_feature_received_user_data = builder.user_data() == state_.expected_frame_user_data;
-        const auto pass = builder.add_compute_pass(
-            "OrchestratorRuntimePass",
-            [](aeg::pipeline::RenderPassBuilder& pass_builder) {
-                pass_builder.set_side_effects();
-                return Result::success();
-            },
-            [this](aeg::pipeline::RenderPassExecutionContext&) {
-                ++state_.render_pass_execution_count;
-                return Result::success();
-            },
-            aeg::rhi::QueueClass::kGraphics);
-        return pass ? Result::success() : pass.result;
-    }
-
-protected:
-    [[nodiscard]] Result setup(aeg::pipeline::RenderGraphBuilder& builder) const override {
+[[nodiscard]] aeg::foundation::ResultValue<aeg::pipeline::PipelineDefinition> orchestrator_pipeline_definition() {
+    aeg::pipeline::PipelineDescriptor descriptor{};
+    descriptor.id = aeg::pipeline::PipelineId("EngineFrameOrchestratorSmoke");
+    descriptor.name = "EngineFrameOrchestratorSmoke";
+    descriptor.category = aeg::pipeline::PipelineCategory::kRendering;
+    descriptor.supported_scopes = aeg::pipeline::to_mask(PipelineScope::kFrame);
+    aeg::pipeline::PipelineBuilder builder(descriptor);
+    const auto add_phase_stage = [&](aeg::pipeline::StageId stage_id,
+                                    EnginePhase compatibility_phase, PhaseId phase,
+                                    TimePolicy time_policy) -> Result {
         const auto stage = builder.add_stage({
-            aeg::pipeline::StageId("OrchestratorRenderFeatureStage"),
-            EnginePhase::kRenderBuild,
+            stage_id,
+            compatibility_phase,
             ExecutionDomain::kMainThread,
-            TimePolicy::kFrame,
+            time_policy,
             false,
+            phase,
         });
-        return stage
-                   ? Result::success()
-                   : Result::failure(ResultCode::kInvalidState, "orchestrator render feature stage declaration failed");
+        return stage ? Result::success() : builder.status();
+    };
+
+    if (const Result result =
+            add_phase_stage(aeg::pipeline::StageId("BeforeStartupStage"),
+                           EnginePhase::kStartup, kBeforeStartupPhase, TimePolicy::kStartup);
+        !result) {
+        return {result, {}};
+    }
+    if (const Result result =
+            add_phase_stage(aeg::pipeline::StageId("PreFrameStage"),
+                           EnginePhase::kFrameBegin, kPreFramePhase, TimePolicy::kFrame);
+        !result) {
+        return {result, {}};
+    }
+    if (const Result result =
+            add_phase_stage(aeg::pipeline::StageId("FrameStage"),
+                           EnginePhase::kVariableUpdate, kFramePhase, TimePolicy::kFrame);
+        !result) {
+        return {result, {}};
+    }
+    if (const Result result =
+            add_phase_stage(aeg::pipeline::StageId("PostFrameStage"),
+                           EnginePhase::kFrameEnd, kPostFramePhase, TimePolicy::kFrame);
+        !result) {
+        return {result, {}};
+    }
+    if (const Result result = add_phase_stage(aeg::pipeline::StageId("PresentStage"), EnginePhase::kPresent,
+                                             aeg::pipeline::to_phase_id(EnginePhase::kPresent), TimePolicy::kFrame);
+        !result) {
+        return {result, {}};
+    }
+    if (const Result result =
+            add_phase_stage(aeg::pipeline::StageId("AfterShutdownStage"),
+                           EnginePhase::kShutdown, kAfterShutdownPhase, TimePolicy::kShutdown);
+        !result) {
+        return {result, {}};
     }
 
-private:
-    aeg::pipeline::FeatureDescriptor descriptor_{};
-    OrchestratorState& state_;
-};
+    const auto render_anchor = builder.add_stage({
+        aeg::pipeline::StageId("OrchestratorRenderAnchor"),
+        EnginePhase::kRenderBuild,
+        ExecutionDomain::kMainThread,
+        TimePolicy::kFrame,
+        false,
+    });
+    if (!render_anchor) {
+        return {builder.status(), {}};
+    }
+    const auto marker_stage = builder.add_stage({
+        aeg::pipeline::StageId("OrchestratorMarkerStage"),
+        EnginePhase::kRenderBuild,
+        ExecutionDomain::kMainThread,
+        TimePolicy::kFrame,
+        false,
+    });
+    if (!marker_stage) return {builder.status(), {}};
+    return builder.finish();
+}
 }  // namespace
 
 int main() {
@@ -224,46 +170,31 @@ int main() {
                         aeg::pipeline::PhaseOrderRelation::kAfter)) {
         return 2;
     }
-    if (const Result result =
-            registry.register_pipeline([&state] { return std::make_unique<OrchestratorPipeline>(state); });
-        !result) {
+    auto definition = orchestrator_pipeline_definition();
+    if (!definition || !registry.register_pipeline(std::move(definition.value))) {
         return 3;
     }
-    if (const Result result =
-            registry.register_feature([&state] { return std::make_unique<OrchestratorRenderFeature>(state); });
-        !result) {
-        return 4;
-    }
-    if (const Result result = registry.bind_feature({
-            aeg::pipeline::FeatureId("OrchestratorRenderFeature"),
-            aeg::pipeline::PipelineId("EngineFrameOrchestratorSmoke"),
-            PipelineScope::kFrame,
-            aeg::pipeline::FeaturePointId("OrchestratorRenderPoint"),
-            0,
-            true,
-            {},
-        });
-        !result) {
-        return 5;
-    }
-
     aeg::pipeline::PipelineScopeHost host(PipelineScope::kFrame,
                                           aeg::pipeline::PipelineInstanceId("EngineFrameOrchestratorSmokeInstance"));
     if (const Result result = host.bind_pipeline(aeg::pipeline::PipelineId("EngineFrameOrchestratorSmoke")); !result) {
         return 6;
     }
 
-    aeg::pipeline::PipelineScheduler scheduler({1, 1, 1, 1});
+    aeg::pipeline::PipelineScheduler scheduler;
     aeg::render_graph::FrameContext frame_context(*device);
     aeg::render_graph::RenderGraph render_graph(*device);
-    aeg::engine::EngineFrameOrchestrator orchestrator(registry, scheduler, frame_context, render_graph);
-    if (const Result result = orchestrator.register_pipeline(host); !result) {
+    aeg::engine::EngineFramePipelineHost pipeline_host(registry, scheduler);
+    aeg::engine::EngineFrameOrchestrator orchestrator(pipeline_host, frame_context, render_graph);
+    if (const Result result = orchestrator.register_pipeline(
+            aeg::engine::EngineFramePipelineRegistration{host}); !result) {
         return 7;
     }
+    if (!aeg::engine::detail::EngineFrameInspection::enable(orchestrator)) return 8;
     aeg::engine::RuntimeSession runtime(orchestrator);
     if (const Result result = runtime.initialize(); !result) {
         return 8;
     }
+    if (!read_phase_trace(orchestrator, state)) return 9;
     if (runtime.mode() != aeg::engine::RuntimeMode::kStopped ||
         state.executed_phases != std::vector<PhaseId>{kBeforeStartupPhase}) {
         return 9;
@@ -274,7 +205,39 @@ int main() {
     }
     aeg::engine::EngineFrameDesc frame_desc{};
     frame_desc.user_data = &frame_user_data;
-    frame_desc.render_feature_post_build = [&state](const aeg::engine::EngineFramePostBuildContext& context) {
+    frame_desc.render_feature_preparation = [&state, &orchestrator, carrier = frame_desc.user_data](
+        const aeg::engine::EngineFramePreparationContext& context) {
+        const auto trace = aeg::engine::detail::EngineFrameInspection::capture(orchestrator);
+        if (!trace) return trace.result;
+        const auto marker = std::find_if(trace.value.stages.begin(), trace.value.stages.end(),
+            [](const auto& observation) { return observation.stage == aeg::pipeline::StageId("OrchestratorMarkerStage"); });
+        if (marker == trace.value.stages.end() || !context.frame_context.is_frame_active() ||
+            marker->frame_number != context.frame_context.frame_number() || carrier != state.expected_frame_user_data ||
+            marker->user_data_identity != reinterpret_cast<uintptr_t>(carrier))
+            return aeg::foundation::invalid_state("preparation marker lost the actual frame user data carrier");
+        state.marker_received_user_data = true;
+        const auto pass = context.render_graph.add_pass(
+            "OrchestratorRuntimePass", aeg::rhi::QueueClass::kGraphics,
+            [](aeg::render_graph::PassBuilder& builder) {
+                builder.set_side_effects();
+                return Result::success();
+            },
+            [&state, carrier](aeg::render_graph::RenderPassCommandContext&) {
+                if (carrier != state.expected_frame_user_data)
+                    return aeg::foundation::invalid_state("fixed marker execution lost frame user data");
+                ++state.render_pass_execution_count;
+                return Result::success();
+            });
+        return pass ? Result::success() : pass.result;
+    };
+    frame_desc.render_feature_post_build = [&state, &orchestrator](const aeg::engine::EngineFramePostBuildContext& context) {
+        const auto before = aeg::engine::detail::EngineFrameInspection::capture(orchestrator);
+        const auto change = aeg::engine::detail::EngineFrameInspection::enable(orchestrator, false);
+        const auto after = aeg::engine::detail::EngineFrameInspection::capture(orchestrator);
+        if (!before || !after || before.value.stages.empty() ||
+            change.code != ResultCode::kInvalidState || before.value.stages.size() != after.value.stages.size() ||
+            before.value.stages.front().stage != after.value.stages.front().stage)
+            return aeg::foundation::invalid_state("active-frame inspection change lost committed visits");
         state.post_build_hook_invoked = true;
         const auto pass = context.render_graph.add_pass(
             "OrchestratorPostBuildPass", aeg::rhi::QueueClass::kGraphics,
@@ -291,13 +254,14 @@ int main() {
     if (const Result result = runtime.tick(frame_desc); !result || runtime.frame_number() != 1) {
         return 10;
     }
+    if (!read_phase_trace(orchestrator, state)) return 11;
     const std::vector<PhaseId> expected_frame_phases{
         kBeforeStartupPhase, kPreFramePhase, kFramePhase, aeg::pipeline::to_phase_id(EnginePhase::kPresent),
         kPostFramePhase,
     };
     if (state.executed_phases != expected_frame_phases || state.render_pass_execution_count != 1 ||
         state.post_build_pass_execution_count != 1 || !state.post_build_hook_invoked ||
-        !state.render_feature_received_user_data) {
+        !state.marker_received_user_data) {
         return 11;
     }
 
@@ -310,9 +274,12 @@ int main() {
     if (const Result result = runtime.shutdown(); !result) {
         return 12;
     }
+    if (!read_phase_trace(orchestrator, state)) return 13;
     const std::vector<PhaseId> expected_lifecycle_phases{
         kBeforeStartupPhase, kPreFramePhase,      kFramePhase, aeg::pipeline::to_phase_id(EnginePhase::kPresent),
         kPostFramePhase,     kAfterShutdownPhase,
     };
-    return state.executed_phases == expected_lifecycle_phases ? 0 : 13;
+    if (state.executed_phases != expected_lifecycle_phases) return 13;
+    std::printf("legacy_callback_count=%u\n", state.legacy_callback_count);
+    return state.legacy_callback_count == 0 ? 0 : 73;
 }

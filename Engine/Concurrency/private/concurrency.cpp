@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <exception>
@@ -65,6 +66,45 @@ using foundation::out_of_memory;
     }
 }
 }  // namespace
+
+uint64_t allocate_unique_identity() noexcept {
+    static std::atomic<uint64_t> next_id{1};
+    auto candidate = next_id.load(std::memory_order_relaxed);
+    for (;;) {
+        // Reserve the maximum as the exhausted sentinel; never wrap to zero.
+        if (candidate == (std::numeric_limits<uint64_t>::max)()) std::terminate();
+        if (next_id.compare_exchange_weak(candidate, candidate + 1, std::memory_order_relaxed))
+            return candidate;
+    }
+}
+
+ThreadId current_thread_id() noexcept {
+    thread_local const ThreadId id{allocate_unique_identity()};
+    return id;
+}
+
+void yield_current_thread() noexcept {
+    std::this_thread::yield();
+}
+
+foundation::Result sleep_for(uint64_t duration_nanoseconds, CancellationToken cancellation) {
+    if (cancellation.is_cancellation_requested()) {
+        return cancelled();
+    }
+    if (duration_nanoseconds == kWaitIndefinitely) {
+        return invalid_argument("sleep_for requires a finite duration");
+    }
+    if (cancellation.is_valid()) {
+        std::mutex mutex;
+        std::condition_variable_any condition;
+        std::unique_lock lock(mutex);
+        static_cast<void>(condition.wait_for(lock, cancellation.native_stop_token(),
+                                             to_duration(duration_nanoseconds), [] { return false; }));
+    } else {
+        std::this_thread::sleep_for(to_duration(duration_nanoseconds));
+    }
+    return cancellation.is_cancellation_requested() ? cancelled() : foundation::Result::success();
+}
 
 struct CancellationToken::State final {
     struct PropagateStop final {
@@ -744,14 +784,19 @@ foundation::ResultValue<Completion> WorkerExecutor::submit(TaskDesc task) {
         auto queued_task = std::make_shared<Impl::QueuedTask>();
         queued_task->task = std::move(task);
         queued_task->source = std::move(source);
+        bool executor_is_stopping = false;
         {
             std::lock_guard lock(impl_->mutex);
             if (impl_->stopping) {
-                static_cast<void>(queued_task->source.complete(invalid_state("worker executor is stopping")));
-                return {invalid_state("worker executor is stopping"), {}};
+                executor_is_stopping = true;
+            } else {
+                queued_task->sequence = impl_->next_sequence++;
+                impl_->queue.push(std::move(queued_task));
             }
-            queued_task->sequence = impl_->next_sequence++;
-            impl_->queue.push(std::move(queued_task));
+        }
+        if (executor_is_stopping) {
+            static_cast<void>(queued_task->source.complete(invalid_state("worker executor is stopping")));
+            return {invalid_state("worker executor is stopping"), {}};
         }
     } catch (const std::bad_alloc&) {
         return {out_of_memory("executor task submission allocation failed"), {}};

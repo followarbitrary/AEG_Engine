@@ -12,8 +12,8 @@
 namespace {
 using namespace aeg;
 
-asset::AssetId id(const char* text) {
-    const auto parsed = asset::AssetId::parse(text);
+foundation::AssetId id(const char* text) {
+    const auto parsed = foundation::AssetId::parse(text);
     assert(parsed);
     return parsed.value;
 }
@@ -26,10 +26,10 @@ int main() {
                                               std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}};
     const auto payload = asset::encode_font_payload({0, source_bytes});
     assert(payload);
-    const auto cooked = asset::encode_cooked_asset({font_id, asset::AssetKind::kFont, 1, {}, payload.value});
+    const auto cooked = asset::encode_cooked_asset({font_id, foundation::AssetKind::kFont, 1, {}, payload.value});
     assert(cooked);
     const auto package_path = std::filesystem::temp_directory_path() / "aeg_runtime_font_cache_smoke.aegbin";
-    assert(tooling::AssetPackageWriter{}.write(package_path, {{font_id, asset::AssetKind::kFont, 1, cooked.value}}));
+    assert(tooling::AssetPackageWriter{}.write(package_path, {{font_id, foundation::AssetKind::kFont, 1, cooked.value}}));
     const auto package = asset::AssetPackageReader::open(package_path);
     assert(package);
     application::runtime::RuntimeAssetCache cache{std::make_shared<asset::AssetPackageReader>(package.value)};

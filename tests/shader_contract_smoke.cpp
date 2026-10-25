@@ -21,11 +21,12 @@ int main() {
     program.name = "parameter-pack";
     program.stages.push_back({aeg::rhi::ShaderStage::kVertex, "main", std::vector<std::byte>(4)});
     program.contract.reflection = reflection;
-    const auto packed = aeg::shader::pack_parameter_block(program, aeg::pipeline::ParameterBlock{{1, 2.5}});
+    const auto packed = aeg::shader::pack_parameter_block(program, aeg::foundation::ParameterBlock{{1, 2.5}});
     assert(packed && packed.value.size() == 4);
     float value = 0.0f;
     std::memcpy(&value, packed.value.data(), sizeof(value));
     assert(value == 2.5f);
-    assert(!aeg::shader::pack_parameter_block(program, aeg::pipeline::ParameterBlock{{1, std::string{"bad"}}}));
+    assert(!aeg::shader::pack_parameter_block(program,
+                                              aeg::foundation::ParameterBlock{{1, std::string{"bad"}}}));
     return 0;
 }

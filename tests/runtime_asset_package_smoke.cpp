@@ -15,8 +15,8 @@
 #include "cooked_asset_generated.h"
 
 namespace {
-using aeg::asset::AssetId;
-using aeg::asset::AssetKind;
+using aeg::foundation::AssetId;
+using aeg::foundation::AssetKind;
 
 AssetId id(std::string_view text) {
     const auto parsed = AssetId::parse(text);
@@ -84,8 +84,8 @@ int main() {
         return 1;
     }
 
-    const auto cooked_bytes = cooked(mesh, AssetKind::kPipeline, {std::byte{0xA1}, std::byte{0xB2}});
-    const auto package_bytes = package(mesh, AssetKind::kPipeline, cooked_bytes);
+    const auto cooked_bytes = cooked(mesh, AssetKind::kFeatureGraph, {std::byte{0xA1}, std::byte{0xB2}});
+    const auto package_bytes = package(mesh, AssetKind::kFeatureGraph, cooked_bytes);
     const auto root = std::filesystem::temp_directory_path() / "aeg_runtime_asset_package_smoke.aegbin";
     {
         std::ofstream stream(root, std::ios::binary | std::ios::trunc);
@@ -97,7 +97,7 @@ int main() {
     if (!reader || reader.value.entry_count() != 1)
         return 2;
     const auto decoded = reader.value.read_cooked(mesh);
-    if (!decoded || decoded.value.id != mesh || decoded.value.kind != AssetKind::kPipeline ||
+    if (!decoded || decoded.value.id != mesh || decoded.value.kind != AssetKind::kFeatureGraph ||
         decoded.value.payload.size() != 2 || decoded.value.payload[0] != std::byte{0xA1}) {
         return 3;
     }

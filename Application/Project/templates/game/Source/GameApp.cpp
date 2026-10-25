@@ -1,4 +1,4 @@
-#include "runtime_bootstrap.hpp"
+#include "game_runtime_bootstrap.hpp"
 
 aeg::foundation::Result aeg_configure_game_application(aeg::application::runtime::RuntimeBootRequest& request) {
     request.window_title = "MyGameProject";

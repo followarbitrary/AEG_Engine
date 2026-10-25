@@ -1,11 +1,13 @@
 #include "editor_node_contract_storage.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <fstream>
 #include <nlohmann/json.hpp>
 #include <system_error>
 
 #include "module_bundle.hpp"
+#include "feature_contract_json.hpp"
 
 namespace aeg::application {
 namespace {
@@ -71,40 +73,23 @@ foundation::ResultValue<std::string> canonical_without_digest(Json root) {
     return module::module_content_sha256(root.dump());
 }
 
-foundation::ResultValue<std::string> encode_metadata(const pipeline::TypeCatalogEntry& entry) {
-    module::ModuleMetadata metadata{};
-    metadata.module = {entry.owner_module, "Editor Node Contract", {1, 0, 0}, {}};
-    metadata.descriptor = metadata.module;
-    metadata.build_id = "editor-draft";
-    metadata.target = "editor";
-    metadata.configuration = "Editor";
-    metadata.contract_digest = "editor-draft";
-    if (const auto result = metadata.catalog.add(entry); !result)
-        return {result, {}};
-    const auto digest = module::module_contract_sha256(metadata);
-    if (!digest)
-        return {digest.result, {}};
-    metadata.contract_digest = digest.value;
-    return module::encode_module_metadata(metadata);
-}
-
 Json envelope(const NodeContractFile& file, bool include_digest) {
-    Json root;
-    const auto metadata = encode_metadata(file.draft.entry);
-    root = metadata ? Json::parse(metadata.value) : Json::object();
-    root["editor_contract"] = Json{{"schema_version", 1},
-                                    {"source", source_name(file.draft.source)},
-                                    {"generated", file.draft.generated},
-                                    {"draft_revision_hash", file.draft.draft_revision_hash},
-                                    {"retired_port_ids", file.draft.retired_port_ids},
-                                    {"retired_parameter_ids", file.draft.retired_parameter_ids}};
-    if (include_digest)
-        root["digest"] = file.digest;
+    const auto contract = feature::encode_feature_contract_json(file.draft.entry.contract);
+    if (!contract) throw std::invalid_argument(contract.result.message);
+    Json labels = Json::array();
+    for (const auto& label : file.draft.port_labels) labels.push_back({{"id", std::to_string(label.id.value())}, {"name", label.name}});
+    Json root{{"schema_version", 3}, {"owner_module", std::to_string(file.draft.entry.owner_module.value())},
+        {"feature_contract", Json::parse(contract.value)},
+        {"editor_contract", {{"schema_version", 2}, {"source", source_name(file.draft.source)},
+            {"generated", file.draft.generated}, {"name", file.draft.name}, {"display_name", file.draft.display_name},
+            {"port_labels", std::move(labels)}, {"draft_revision_hash", file.draft.draft_revision_hash},
+            {"retired_port_ids", file.draft.retired_port_ids}, {"retired_parameter_ids", file.draft.retired_parameter_ids}}}};
+    if (include_digest) root["digest"] = file.digest;
     return root;
 }
 
-foundation::ResultValue<std::vector<std::filesystem::path>> contract_paths(const std::filesystem::path& project_root) {
-    const auto directory = project_root / "Source" / "FlowGraph";
+foundation::ResultValue<std::vector<std::filesystem::path>> contract_paths(const std::filesystem::path& source_directory) {
+    const auto directory = source_directory / "FlowGraph";
     std::vector<std::filesystem::path> paths;
     std::error_code error;
     if (!std::filesystem::exists(directory, error)) {
@@ -139,24 +124,34 @@ foundation::ResultValue<NodeContractFile> read_editor_node_contract(const std::f
         return {bytes.result, {}};
     try {
         const Json root = Json::parse(bytes.value);
-        if (!root.is_object() || root.value("schema_version", 0u) != 1u ||
-            (!root.contains("editor_contract") && !root.contains("metadata")))
-            return {foundation::invalid_argument("editor contract envelope is invalid"), {}};
-        const Json& envelope_root = root.contains("editor_contract") ? root.at("editor_contract") : root;
+        if (!root.is_object() || root.value("schema_version", 0u) != 3u ||
+            !root.contains("editor_contract") || !root.contains("feature_contract"))
+            return {foundation::invalid_argument("editor Feature contract envelope is invalid"), {}};
+        const auto& envelope_root = root.at("editor_contract");
+        if (envelope_root.value("schema_version", 0u) != 2u)
+            return {foundation::invalid_argument("editor Feature contract schema is unsupported"), {}};
         const auto source = parse_source(envelope_root);
-        if (!source)
-            return {source.result, {}};
-        const auto metadata = root.contains("metadata") ? module::decode_module_metadata(root.at("metadata").dump())
-                                                          : module::decode_module_metadata(root.dump());
-        if (!metadata || metadata.value.catalog.entries().size() != 1)
-            return {metadata ? foundation::invalid_argument("editor contract metadata catalog is invalid")
-                             : metadata.result,
-                    {}};
+        if (!source) return {source.result, {}};
+        const auto contract = feature::decode_feature_contract_json(root.at("feature_contract").dump());
+        if (!contract) return {contract.result, {}};
+        const auto owner_text = root.at("owner_module").get<std::string>();
+        uint64_t owner{}; const auto parsed = std::from_chars(owner_text.data(), owner_text.data() + owner_text.size(), owner);
+        if (!owner || parsed.ec != std::errc{} || parsed.ptr != owner_text.data() + owner_text.size())
+            return {foundation::invalid_argument("editor Feature owner module is invalid"), {}};
         NodeContractFile result{};
-        result.path = path;
-        result.source = source.value;
-        result.draft.source = source.value;
-        result.draft.entry = metadata.value.catalog.entries().front();
+        result.path = path; result.source = source.value; result.draft.source = source.value;
+        result.draft.entry.contract = contract.value;
+        result.draft.entry.id = contract.value.definition_id; result.draft.entry.version = contract.value.version;
+        result.draft.entry.owner_module = feature::ModuleIdentity{owner};
+        result.draft.name = envelope_root.at("name").get<std::string>();
+        result.draft.display_name = envelope_root.at("display_name").get<std::string>();
+        for (const auto& label : envelope_root.at("port_labels")) {
+            const auto text = label.at("id").get<std::string>(); uint64_t id{};
+            const auto number = std::from_chars(text.data(), text.data() + text.size(), id);
+            if (!id || number.ec != std::errc{} || number.ptr != text.data() + text.size())
+                return {foundation::invalid_argument("editor Feature port label identity is invalid"), {}};
+            result.draft.port_labels.push_back({feature::PortId{id}, label.at("name").get<std::string>()});
+        }
         result.draft.generated = envelope_root.value("generated", false);
         result.draft.draft_revision_hash = envelope_root.value("draft_revision_hash", std::string{});
         if (envelope_root.contains("retired_port_ids"))
@@ -194,10 +189,18 @@ foundation::ResultValue<std::string> encode_editor_node_contract(const NodeContr
 }
 
 foundation::ResultValue<std::vector<NodeContractFile>> scan_editor_node_contracts(
-    const std::filesystem::path& project_root) {
+    const std::filesystem::path& project_root, std::vector<std::string>* diagnostics) {
+    return scan_editor_node_contracts(project_root, project_root / "Source", diagnostics);
+}
+
+foundation::ResultValue<std::vector<NodeContractFile>> scan_editor_node_contracts(
+    const std::filesystem::path& project_root, const std::filesystem::path& source_directory,
+    std::vector<std::string>* diagnostics) {
     if (project_root.empty())
         return {foundation::invalid_argument("project root is empty"), {}};
-    const auto paths = contract_paths(project_root);
+    if (source_directory.empty() || !path_inside(project_root, source_directory))
+        return {foundation::invalid_argument("editor contract source directory is outside the project"), {}};
+    const auto paths = contract_paths(source_directory);
     if (!paths)
         return {paths.result, {}};
     std::vector<NodeContractFile> result;
@@ -206,8 +209,11 @@ foundation::ResultValue<std::vector<NodeContractFile>> scan_editor_node_contract
         if (!path_inside(project_root, path))
             return {foundation::invalid_argument("editor contract is outside the project: " + path.string()), {}};
         const auto file = read_editor_node_contract(path);
-        if (!file)
-            return {file.result, {}};
+        if (!file) {
+            if (!diagnostics) return {file.result, {}};
+            diagnostics->push_back(path.string() + ": " + file.result.message);
+            continue;
+        }
         result.push_back(file.value);
     }
     return {foundation::Result::success(), std::move(result)};
@@ -273,5 +279,3 @@ foundation::Result write_editor_node_contract_atomic(const NodeContractFile& fil
 }
 
 }  // namespace aeg::application
-
-\n

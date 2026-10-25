@@ -17,7 +17,7 @@ struct ProjectScaffoldRequest final {
     std::string module_target{"GameModule"};
     std::string template_id{"empty"};
     std::string engine_sdk{"1.0"};
-    std::string render_pipeline{"Assets/Pipelines/Default.aegpipe"};
+    std::string startup_feature_graph{"Assets/Features/Default.aegfeature"};
 };
 
 /** @brief Copies the tracked game template and publishes Project.aegproj last. */

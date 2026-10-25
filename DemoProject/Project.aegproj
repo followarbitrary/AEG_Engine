@@ -1,0 +1,25 @@
+format_version = 2
+
+[project]
+name = "AEG Demonstration Project"
+
+[paths]
+binaries = "Binaries"
+assets = "Assets"
+source = "Source"
+cache = "Cache"
+build = "Build"
+saved = "Saved"
+
+[build]
+target = "windows-x64-vulkan"
+startup_scene = "Scenes/RenderingShowcase.aegscene"
+startup_feature_graphs = ["Assets/Features/Motion.aegfeature"]
+
+[module]
+target = "GameModule"
+id = "com.aeg.demo"
+
+[engine]
+association = "AEG"
+sdk_requirement = "1.0"

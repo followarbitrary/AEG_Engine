@@ -33,8 +33,8 @@ std::atomic_uint64_t publication_sequence{0};
             return ".aegscene";
         case AssetKind::kFont:
             return ".aegfont";
-        case AssetKind::kPipeline:
-            return ".aegpipebin";
+        case AssetKind::kFeatureGraph:
+            return ".aegfeaturebin";
         case AssetKind::kShader:
             return ".aegshaderbin";
     }
@@ -53,8 +53,8 @@ std::atomic_uint64_t publication_sequence{0};
             return "scene";
         case AssetKind::kFont:
             return "font";
-        case AssetKind::kPipeline:
-            return "pipeline";
+        case AssetKind::kFeatureGraph:
+            return "feature_graph";
         case AssetKind::kShader:
             return "shader";
     }
@@ -68,7 +68,7 @@ std::atomic_uint64_t publication_sequence{0};
         {"material", AssetKind::kMaterial},
         {"scene", AssetKind::kScene},
         {"font", AssetKind::kFont},
-        {"pipeline", AssetKind::kPipeline},
+        {"feature_graph", AssetKind::kFeatureGraph},
         {"shader", AssetKind::kShader},
     }};
     for (const auto& [name, kind] : kKinds) {
@@ -94,8 +94,8 @@ std::atomic_uint64_t publication_sequence{0};
     return foundation::Result::success();
 }
 
-[[nodiscard]] foundation::Result replace_file(const std::filesystem::path& source,
-                                              const std::filesystem::path& destination) {
+[[nodiscard]] foundation::Result replace_file_impl(const std::filesystem::path& source,
+                                                   const std::filesystem::path& destination) {
 #if defined(_WIN32)
     if (::MoveFileExW(source.c_str(), destination.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) == 0) {
         return foundation::Result::failure(foundation::ResultCode::kBackendError,
@@ -127,6 +127,11 @@ std::atomic_uint64_t publication_sequence{0};
     return std::to_string(timestamp) + "_" + std::to_string(publication_sequence.fetch_add(1));
 }
 }  // namespace
+
+foundation::Result replace_file_atomically(const std::filesystem::path& source,
+                                           const std::filesystem::path& destination) {
+    return replace_file_impl(source, destination);
+}
 
 CookedArtifactStore::CookedArtifactStore(std::filesystem::path cache_root) : cache_root_(std::move(cache_root)) {}
 
@@ -192,7 +197,7 @@ foundation::ResultValue<CookedArtifactBundle> CookedArtifactStore::publish(
                     {}};
         }
     }
-    const auto replace_result = replace_file(pointer_temporary, source_directory / "current.toml");
+    const auto replace_result = replace_file_atomically(pointer_temporary, source_directory / "current.toml");
     if (!replace_result) {
         std::filesystem::remove(pointer_temporary, error);
         return {replace_result, {}};

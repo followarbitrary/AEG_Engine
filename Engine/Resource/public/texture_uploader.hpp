@@ -5,6 +5,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string_view>
 
 #include "frame_context.hpp"
@@ -25,6 +26,7 @@ namespace aeg::resource {
         render_graph::RenderGraphTexture target{};
         uint64_t transfer_size{0};
         uint32_t subresource_count{0};
+        std::shared_ptr<const void> submission{};
 
         [[nodiscard]] bool is_valid() const noexcept {
             return texture.is_valid() && staging.is_valid() && source.is_valid() && target.is_valid() &&
@@ -44,10 +46,10 @@ namespace aeg::resource {
         explicit TextureUploader(rhi::Device& device) noexcept : device_(device) {
         }
 
-        /** @brief Creates a texture and records copies for all supplied subresources. */
+        /** @brief Records all subresources into a new or matching caller-owned replay destination. */
         [[nodiscard]] foundation::ResultValue<TextureUpload> upload_texture(
                 render_graph::FrameContext& frame_context, render_graph::RenderGraph& graph,
-                const TextureData& texture, std::string_view name = {});
+                const TextureData& texture, std::string_view name = {}, const GpuTexture* reuse_destination = nullptr);
 
         /** @brief Defers destruction of a GPU texture until the frame is reusable. */
         [[nodiscard]] foundation::Result defer_destroy_texture(

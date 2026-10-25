@@ -12,8 +12,8 @@
 #include "scene_payload.hpp"
 
 using namespace aeg;
-using aeg::asset::AssetId;
-using aeg::asset::AssetKind;
+using aeg::foundation::AssetId;
+using aeg::foundation::AssetKind;
 using aeg::tooling::CookedAsset;
 
 static AssetId id(std::string_view s) {

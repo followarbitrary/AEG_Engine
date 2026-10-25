@@ -45,7 +45,7 @@ foundation::ResultValue<std::filesystem::path> bundle_path(const std::filesystem
     const auto value = required_string(manifest, field);
     if (!value)
         return {value.result, {}};
-    const std::filesystem::path relative(value.value);
+    const std::filesystem::path relative = std::filesystem::u8path(value.value);
     if (relative.empty() || relative.is_absolute() || relative.has_root_name() || relative.has_root_directory())
         return {invalid(field), {}};
     const auto normalized = relative.lexically_normal();
@@ -65,7 +65,11 @@ foundation::ResultValue<std::filesystem::path> bundle_path(const std::filesystem
     if (error)
         return {foundation::invalid_argument("module bundle path could not be canonicalized"), {}};
     const auto relative_to_root = candidate_absolute.lexically_relative(root);
-    if (relative_to_root.empty() || relative_to_root == ".." || relative_to_root.begin()->string() == "..")
+    // Never use path::string() for validation on Windows: it converts through
+    // the active ANSI code page and throws for perfectly valid UTF-8 paths.
+    // Compare the path component itself so the check remains lossless.
+    if (relative_to_root.empty() || relative_to_root == ".." ||
+        *relative_to_root.begin() == std::filesystem::path{".."})
         return {invalid(field), {}};
     return {foundation::Result::success(), candidate};
 }
@@ -158,16 +162,7 @@ foundation::ResultValue<ModuleBundle> validate_module_bundle(const std::filesyst
         if (root.contains("metadata_path") || root.contains("binary_path") || root.contains("manifest_schema_version"))
             return validate_manifest(manifest_path, root);
 
-        // Legacy metadata-only manifests remain readable for static and development fixtures.
-        const auto metadata = detail::decode_metadata_json(contents.value);
-        if (!metadata)
-            return {metadata.result, {}};
-        ModuleBundle bundle;
-        bundle.directory = manifest_path.parent_path();
-        bundle.manifest_path = manifest_path;
-        bundle.metadata_path = manifest_path;
-        bundle.metadata = std::move(metadata.value);
-        return {foundation::Result::success(), std::move(bundle)};
+        return {invalid("module bundle requires a manifest with metadata and binary paths"), {}};
     } catch (const std::exception& exception) {
         return {foundation::invalid_argument(std::string("module manifest JSON is invalid: ") + exception.what()), {}};
     }

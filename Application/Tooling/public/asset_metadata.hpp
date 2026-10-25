@@ -22,9 +22,9 @@ namespace aeg::tooling {
  * UUID or AssetKind ABI. Keeping one identity type prevents metadata, cooked
  * packages and runtime lookups from drifting apart.
  */
-using Uuid = asset::Uuid;
-using AssetId = asset::AssetId;
-using AssetKind = asset::AssetKind;
+using Uuid = foundation::Uuid;
+using AssetId = foundation::AssetId;
+using AssetKind = foundation::AssetKind;
 
 /** @brief Identity of one source file and its import settings. */
 struct SourceId final {

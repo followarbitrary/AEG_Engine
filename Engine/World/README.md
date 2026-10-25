@@ -2,14 +2,14 @@
 
 ## 目录职责
 
-`World` 是 ECS 可变状态与 Domain-Oriented Pipeline `kWorld` Scope 之间的适配层。
-它负责把一个具体 `ecs::World` 绑定到 World Pipeline Host，维护标准
-`WorldSnapshot` Artifact，并为每个 Frame/View 建立只读的 World-to-Frame Bridge。
+`World` 持有 ECS 领域聚合状态、宿主命令和不可变快照。WorldScope 只接受已有的
+`ecs::World` 所有权，不接受业务 Pipeline、Registry 或执行计划注入。每个 Frame/View
+读取强类型 WorldSnapshot；底层 Artifact 存储与桥接属于 Engine 私有技术实现。
 
 ## 公共入口
 
-- `public/world_scope.hpp`：`WorldScope`、`WorldFrameScope`、`WorldFrameKey` 和标准
-  World Snapshot Artifact 身份。
+- `public/world_scope.hpp`：`WorldScope`、`WorldFrameScope` 和 `WorldFrameKey`，不传播
+  Pipeline/Artifact 头或类型；Frame 读取拥有共享不可变数据的 WorldSnapshot 值。
 - `public/world_serializer.hpp`：`WorldSerializer` 与 `WorldSerializationOptions`，用于
   对已提交的 `ecs::WorldSnapshot` 执行运行时 World Archive 编解码。
 - `WorldScope::command_buffer()`：外部输入、网络和 Editor 命令的线程安全入口。
@@ -40,24 +40,22 @@ Version。当前版本允许读取不高于目标版本的旧数据，但尚未�
 推荐使用 `WorldManager::find()` 返回的 `std::shared_ptr<ecs::World>` 构造
 `WorldScope`，确保 Scope 与 Manager 查询到的是同一份可变状态。当前公共构造函数只接受
 `std::shared_ptr<ecs::World>`；不得仅凭 `WorldHandle` 重新构造 World，因为句柄本身不携带
-可变状态所有权。`WorldScope` 不拥有 Pipeline Registry，但拥有自己的 Pipeline Host、命令
-缓冲和快照引用。
+可变状态所有权。`WorldScope` 持有命令缓冲和快照引用，没有 Pipeline Host。
 
-World Pipeline Host 的 Scope 固定为 `PipelineScope::kWorld`；Frame 只能通过
-`ArtifactScopeBridge` 读取已提交快照，不得取得 `ecs::World&`。World 销毁、Frame
-退休和 Pipeline Plan 切换必须在对应的生命周期边界完成。每次
+Frame 只读取已提交的不可变快照，不取得 `ecs::World&`。World 销毁和 Frame
+退休必须在对应的生命周期边界完成。每次
 `WorldScope::initialize()` 都会建立新的 Scope 活跃代际；`shutdown()` 会使该代际失效
 并清空尚未消费的命令。已经完成 `capture()` 的 `WorldFrameScope` 仍可读取其持有的
 不可变 Snapshot，但在关闭后不得再次 `capture()`；重新初始化也不会复活旧的 Frame Scope。
 
-`PipelineExecutionContext::user_data()` 保留为编排调用方提供的宿主上下文；
-World Pipeline 通过 `PipelineExecutionContext::scope_data()` 获取 `WorldScope*`，
-Frame Pipeline 通过同一接口获取当前 View 的 `WorldFrameScope*`。这些指针均为非拥有
-借用，不得跨越 Scope 或 Frame 生命周期保存。
+Engine 私有的 Frame 观察器仍可使用当前 View 的技术 Artifact 桥；私有
+`WorldSnapshotExecution` 提供 canonical 身份和受控桥访问。Orchestrator 明确拒绝
+原始 World Pipeline 注册，不再向任务提供可变 WorldScope 指针。
 
 ## 依赖边界
 
-该模块可以依赖 ECS、Pipeline、Serialization、Reflection 和 Foundation，不依赖 RenderGraph、
+公共模块依赖 ECS、Serialization、Reflection 和 Foundation；Pipeline 仅为私有链接依赖。
+World 不依赖 RenderGraph、
 RHI 后端或窗口系统。World Archive 仅复用通用 Reflection Serialization 的对象编码，
 不改变 World Scope 的跨作用域数据流规则。
 统一帧编排由 `EngineFrameOrchestrator` 完成：`PreUpdate` 应用命令，`WorldCommit`
@@ -65,3 +63,19 @@ RHI 后端或窗口系统。World Archive 仅复用通用 Reflection Serializati
 `PipelineExecutionContext::scope_data()` 指向当前 `WorldFrameScope`，其 `key()` 提供
 `frame_number`、`WorldHandle` 和 `view_id`；Frame 仍只能通过该 Scope 的桥接快照读取
 World 数据。
+
+World-frame 回归使用真实 FeatureGraph、Logic Call invocation 和已提交 outbox，经 Engine
+Runtime 的生产 typed consumer 应用真实 Game.Transform。外部 command→5、两个已接受
+pending→6→7、WorldCommit→Frame snapshot 保持顺序，失败预检不改 World 或确认交付。
+真实 copy-throw snapshot 失败后，Applied receipt 保持，移除失败组件后可重试发布而不重放。
+
+多 View 的帧观察使用 Runtime 私有 owning Stage trace，直接保留当前 WorldFrameScope
+的 immutable snapshot 和 host 实际 bridge read，验证 Scope 地址、帧号、revision、View、
+userdata 及 sentinel bridge 恢复。Frame Pipeline 的 raw CPU callback 已删除；业务夹具
+使用真正 Feature StateDelta/outbox，由固定生产 consumer 应用；诊断 trace 只保留观察值。
+
+`private/world_generation_access.hpp` 仅为 Engine 内部适配器捕获/验证原 active_token_ 和
+实际 ECS owner 的 weak lease。shutdown/reinitialize 后旧 route 失效，即使 WorldHandle
+数值相同也不能复活。这里不添加代次 counter，也不引入 Runtime、Feature 或组件协议
+依赖；固定 Game.Transform 解码和授权消费属于 Engine Runtime。其余 World 业务仍继续
+按五域主线迁移，不能据此宣称全部组件已有通用应用事务。

@@ -15,7 +15,7 @@ target = "GameModule"
 [build]
 target = "windows-x64-vulkan"
 startup_scene = "Assets/Scenes/Main.aegscene"
-startup_pipelines = ["Assets/Pipelines/Default.aegpipe"]
+startup_feature_graphs = ["Assets/Features/Default.aegfeature"]
 
 [paths]
 assets = "Assets"

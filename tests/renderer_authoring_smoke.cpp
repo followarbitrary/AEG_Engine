@@ -1,135 +1,101 @@
-/** @file renderer_authoring_smoke.cpp */
+/** @brief Renderer FeatureGraph persistence and actual compiled Render provenance. */
+#include "feature_clock_test_fixture.hpp"
 #include <algorithm>
+#include <fstream>
 #include <iostream>
-#include <renderer_variants.hpp>
-#include <variant>
+#include <stdexcept>
 
-#include "renderer_variant_document_fixture.hpp"
+#include "feature_graph_io.hpp"
+#include "../Engine/RenderGraph/private/render_feature_projector.hpp"
+#include "renderer_feature_profiles.hpp"
+
+namespace {
+using namespace aeg;
+void require(bool value, const char* message) { if (!value) throw std::runtime_error(message); }
+}
 
 int main() {
-    aeg::pipeline::TypeCatalog catalog;
-    if (!aeg::renderer::register_renderer_authoring_types(catalog)) {
-        return 1;
-    }
-    if (catalog.entries().size() != 11u) {
-        return 2;
-    }
-    const auto* deferred =
-        catalog.find({aeg::pipeline::AuthoringTypeKind::kPipeline, aeg::renderer::kDeferredRenderPipelineId.value()});
-    const auto* forward_feature =
-        catalog.find({aeg::pipeline::AuthoringTypeKind::kFeature, aeg::renderer::kForwardRenderFeatureId.value()});
-    if (deferred == nullptr || forward_feature == nullptr) {
-        return 3;
-    }
-    const auto* declaration = std::get_if<aeg::pipeline::FeatureAuthoringDeclaration>(&forward_feature->declaration);
-    if (declaration == nullptr || declaration->allowed_pass_types.size() != 5u ||
-        declaration->default_resources.size() != 5u || !declaration->allow_add_passes) {
-        return 4;
-    }
-    aeg::pipeline::TypeCatalogEntry collision = *deferred;
-    collision.name = "Renderer.ConflictingPipeline";
-    if (catalog.add(collision)) {
-        return 5;
-    }
-    aeg::pipeline::PipelineRegistry pipelines;
-    aeg::pipeline::RenderPassRegistry passes;
-    if (!aeg::renderer::register_builtin_rendering(pipelines, passes))
-        return 6;
-    for (bool forward : {false, true}) {
-        auto document = aeg::test::renderer_document(catalog, forward);
-        if (document.feature_nodes.size() != 1 || document.pass_nodes.size() != (forward ? 5u : 4u) ||
-            document.edges.empty())
-            return 7;
-        const auto diagnostics = aeg::pipeline::validate_pipeline_document(document, catalog);
-        for (const auto& diagnostic : diagnostics)
-            std::cerr << diagnostic.code << ": " << diagnostic.message << '\n';
-        if (!diagnostics.empty())
-            return 8;
-        auto prepared = aeg::pipeline::prepare_pipeline_document(document, catalog, pipelines, passes);
-        if (!prepared || prepared.value.data_dependencies.empty())
-            return 9;
-        auto reversed = document;
-        std::reverse(reversed.pass_nodes.begin(), reversed.pass_nodes.end());
-        if (aeg::pipeline::document_semantic_digest(reversed) ==
-            aeg::pipeline::document_semantic_digest(document))
-            return 23;
-        auto ordered = aeg::pipeline::prepare_pipeline_document(reversed, catalog, pipelines, passes);
-        if (!ordered ||
-            ordered.value.configurations.front()->features.front().passes.front().source !=
-                document.pass_nodes[1].node_id ||
-            !std::any_of(ordered.value.configurations.front()->features.front().passes.begin() + 1,
-                         ordered.value.configurations.front()->features.front().passes.end(),
-                         [](const auto& pass) { return !pass.ordered_after.empty(); })) {
-            return 20;
+    try {
+        feature::FeatureRegistry registry{aeg::feature::test::clock_test_host()};
+        require(bool(renderer::register_scene_render_profiles(registry)), "real Renderer registration failed");
+        const auto catalog = renderer::scene_render_profile_catalog();
+        require(catalog && catalog.value.entries().size() == 3, "catalog contains technical Pipeline/Pass author entries");
+        auto collision = catalog.value;
+        require(!collision.add_entry(catalog.value.entries().front()) && collision.entries().size() == 3,
+                "catalog accepted a duplicate Scene Feature definition");
+        const auto root = std::filesystem::temp_directory_path() / "aeg_renderer_feature_authoring";
+        std::filesystem::create_directories(root);
+        const auto path = root / "Scene.aegfeature";
+        for (auto profile : {renderer::SceneRenderProfile::kOpaque, renderer::SceneRenderProfile::kForward,
+                             renderer::SceneRenderProfile::kDeferred}) {
+            auto preset = renderer::scene_render_profile_graph(profile);
+            require(bool(preset), "profile FeatureGraph factory failed");
+            preset.value.graph_version = 17; preset.value.draft_revision = 9;
+            require(bool(application::authoring::save_feature_graph_document(path, preset.value)), "FeatureGraph save failed");
+            const auto loaded = application::authoring::load_feature_graph_document(path);
+            require(loaded && loaded.value.asset_uuid == preset.value.asset_uuid && loaded.value.graph_version == 17 &&
+                        loaded.value.draft_revision == 9 && loaded.value.contract_digest == catalog.value.contract_digest(),
+                    "serialized graph lost author identity/version/digest");
+            auto compiled = feature::FeatureGraphCompiler{}.compile(loaded.value, registry);
+            feature::FeatureRuntime runtime(registry);
+            require(compiled && compiled.value.plans.size() == 1 && compiled.value.provenance.size() == 1 &&
+                        runtime.publish_graph(loaded.value, compiled.value) && runtime.tick(renderer::kSceneRenderProfileClock),
+                    "persisted graph did not publish and execute its real Frame plan");
+            const auto outputs = runtime.capture_render_outputs(compiled.value);
+            require(outputs && outputs.value.size() == 1, "persisted graph has no actual captured Render output");
+            const auto work = render_graph::RenderFeatureProjector{}.project(outputs.value, 73);
+            require(work && work.value.size() == (profile == renderer::SceneRenderProfile::kOpaque ? 1u :
+                                                 profile == renderer::SceneRenderProfile::kForward ? 5u : 4u),
+                    "persisted profile lost its actual operation sequence");
+            const auto& owner = compiled.value.provenance.front();
+            for (size_t operation = 0; operation != work.value.size(); ++operation) {
+                const auto& item = work.value[operation];
+                require(item.node_id == owner.node_id && item.instance_id == owner.instance_id &&
+                            item.feature_definition_id == owner.definition_id && item.owner_module == owner.owner_module &&
+                            item.invocation == outputs.value.front().invocation && item.operation_index == operation &&
+                            item.frame_index == 73, "projected work fabricated or dropped its Runtime source");
+            }
+            if (profile == renderer::SceneRenderProfile::kForward) {
+                auto broken = outputs.value;
+                std::swap(broken[0].intent.operations[2], broken[0].intent.operations[3]);
+                require(!render_graph::RenderFeatureProjector{}.plan(broken), "private LightList consumer ran before its producer");
+                auto foreign = outputs.value;
+                std::get<feature::RenderDrawClusteredScene>(foreign[0].intent.operations[3]).light_list.id =
+                    feature::RenderResourceId{"Unbound.LightList"};
+                require(!render_graph::RenderFeatureProjector{}.plan(foreign), "unbound resource became executable");
+            }
+            auto empty = loaded.value;
+            empty.nodes.clear(); empty.edges.clear(); empty.process_subgraphs.clear(); ++empty.graph_version;
+            auto empty_plan = feature::FeatureGraphCompiler{}.compile(empty, registry);
+            require(empty_plan && empty_plan.value.plans.empty() && runtime.publish_graph(empty, empty_plan.value),
+                    "empty author graph revived hidden native profile work");
+            const auto empty_outputs = runtime.capture_render_outputs(empty_plan.value);
+            require(empty_outputs && empty_outputs.value.empty(), "empty author graph retained retired output");
+            auto old_order = loaded.value;
+            old_order.edges.push_back({old_order.nodes.front().node_id, feature::PortId{"BeforePass"},
+                                       old_order.nodes.front().node_id, feature::PortId{"AfterPass"},
+                                       feature::EdgeKind::kData, renderer::kSceneRenderProfileClock,
+                                       renderer::kSceneRenderProfileClock, 1, 1});
+            require(!feature::FeatureGraphCompiler{}.compile(old_order, registry), "technical Pass ordering became a valid Feature DataEdge");
         }
-        auto legacy_ordered = reversed;
-        legacy_ordered.edges.push_back({"legacy-pass-order", aeg::pipeline::DocumentEdgeKind::kOrdering,
-                                        {document.pass_nodes[0].node_id, 0, 0},
-                                        {document.pass_nodes[1].node_id, 0, 0}, 0});
-        auto migrated_order = aeg::pipeline::prepare_pipeline_document(legacy_ordered, catalog, pipelines, passes);
-        if (!migrated_order ||
-            migrated_order.value.configurations.front()->features.front().passes.front().source !=
-                document.pass_nodes[1].node_id)
-            return 22;
-        auto explicitly_empty = document;
-        explicitly_empty.pass_nodes.clear();
-        explicitly_empty.edges.clear();
-        explicitly_empty.input_bindings.clear();
-        explicitly_empty.present_connections = {document.feature_nodes.front().node_id};
-        auto empty_materialized =
-            aeg::pipeline::prepare_pipeline_document(explicitly_empty, catalog, pipelines, passes);
-        if (!empty_materialized ||
-            !empty_materialized.value.configurations.front()->features.front().passes.empty())
-            return 21;
-        auto configuration = prepared.value.configurations.front();
-        aeg::pipeline::PipelineScopeHost host(aeg::pipeline::PipelineScope::kFrame, configuration->instance);
-        if (!host.bind_pipeline(configuration->pipeline) || !host.set_configuration(configuration) ||
-            !host.rebuild(pipelines) || host.active_plan()->feature_contributions.size() != 1)
-            return 10;
-        auto rebound = std::make_shared<aeg::pipeline::PipelineInstanceConfiguration>(*configuration);
-        rebound->features.front().passes.front().resource_bindings.emplace(1, 2);
-        if (!host.set_configuration(rebound) ||
-            host.rebuild(pipelines).code != aeg::foundation::ResultCode::kUnsupported)
-            return 16;
-        const auto definition = pipelines.find_definition(configuration->pipeline);
-        const auto* pipeline_entry =
-            catalog.find({aeg::pipeline::AuthoringTypeKind::kPipeline, configuration->pipeline.value()});
-        if (!definition || pipeline_entry == nullptr)
-            return 17;
-        const auto* pipeline_declaration =
-            std::get_if<aeg::pipeline::PipelineAuthoringDeclaration>(&pipeline_entry->declaration);
-        if (pipeline_declaration == nullptr ||
-            pipeline_declaration->feature_points.size() != definition.value->feature_points.size())
-            return 18;
-        for (const auto& runtime_point : definition.value->feature_points) {
-            const auto authored =
-                std::find_if(pipeline_declaration->feature_points.begin(), pipeline_declaration->feature_points.end(),
-                             [&](const auto& point) { return point.id == runtime_point.descriptor.id; });
-            if (authored == pipeline_declaration->feature_points.end() ||
-                authored->anchor_stage != runtime_point.descriptor.anchor_stage ||
-                authored->domains != runtime_point.descriptor.allowed_domains ||
-                authored->scopes != runtime_point.descriptor.allowed_scopes ||
-                authored->flags != runtime_point.descriptor.flags)
-                return 19;
+        for (auto old_payload : {"pipeline_nodes = []", "pass_nodes = []", "present_connections = []"}) {
+            std::ofstream output(path);
+            output << "schema_version = 1\ngraph_version = 1\nasset_uuid = \"renamed-retired\"\n" << old_payload << '\n';
+            output.close();
+            require(!application::authoring::load_feature_graph_document(path), "renamed retired payload passed the FeatureGraph reader");
         }
-        auto invalid = document;
-        invalid.present_connections.clear();
-        if (aeg::pipeline::validate_pipeline_document(invalid, catalog).empty())
-            return 11;
-        invalid = document;
-        invalid.pass_nodes.front().enabled = false;
-        if (aeg::pipeline::validate_pipeline_document(invalid, catalog).empty())
-            return 15;
-        invalid = document;
-        invalid.pass_nodes.front().type = aeg::pipeline::RenderPassTypeId("Renderer.MissingPass");
-        if (aeg::pipeline::validate_pipeline_document(invalid, catalog).empty())
-            return 12;
-        invalid = document;
-        invalid.resources.front().type = {};
-        if (aeg::pipeline::validate_pipeline_document(invalid, catalog).empty())
-            return 13;
-    }
-    if (aeg::renderer::register_renderer_authoring_types(catalog))
-        return 14;
-    return 0;
+        auto backup = path;
+        backup += ".bak";
+        const auto previous = application::authoring::load_feature_graph_document(backup);
+        const auto forward = renderer::scene_render_profile_graph(renderer::SceneRenderProfile::kForward);
+        require(previous && forward && previous.value.asset_uuid == forward.value.asset_uuid &&
+                    previous.value.graph_version == 17 && previous.value.draft_revision == 9 &&
+                    previous.value.contract_digest == catalog.value.contract_digest(),
+                "FeatureGraph replacement lost the complete previous Render profile backup");
+        require(std::filesystem::remove(path), "FeatureGraph fixture source cleanup failed");
+        require(std::filesystem::remove(backup), "FeatureGraph fixture backup cleanup failed");
+        require(std::filesystem::remove(root), "FeatureGraph fixture directory cleanup failed");
+        std::cout << "Renderer FeatureGraph authoring/persistence and actual Render provenance passed\n";
+        return 0;
+    } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

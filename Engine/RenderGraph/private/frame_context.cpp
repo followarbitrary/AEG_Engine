@@ -78,7 +78,9 @@ FrameContext::~FrameContext() {
             }
         }
 
-        (void)release_deferred(slot.deferred);
+    }
+    (void)release_deferred(slots_);
+    for (FrameSlot& slot : slots_) {
         for (const UploadChunk& chunk : slot.upload_chunks) {
             if (chunk.buffer.is_valid()) {
                 (void)device_.destroy_buffer(chunk.buffer);
@@ -265,7 +267,7 @@ foundation::Result FrameContext::abort_frame() {
     if (const foundation::Result result = reset_command_lists(slot); !result) {
         return result;
     }
-    if (const foundation::Result result = release_deferred(slot.deferred); !result) {
+    if (const foundation::Result result = release_deferred({&slot, 1}); !result) {
         return result;
     }
     slot.retained_owners.clear();
@@ -297,10 +299,8 @@ foundation::Result FrameContext::drain() {
         if (const auto result = reset_command_lists(slot); !result)
             return result;
     }
-    for (FrameSlot& slot : slots_) {
-        if (const auto result = release_deferred(slot.deferred); !result)
-            return result;
-    }
+    if (const auto result = release_deferred(slots_); !result)
+        return result;
     for (FrameSlot& slot : slots_) {
         slot.retained_owners.clear();
         slot.completions.clear();
@@ -323,7 +323,7 @@ foundation::Result FrameContext::prepare_slot(FrameSlot& slot) {
     if (!reset_result) {
         return reset_result;
     }
-    const foundation::Result release_result = release_deferred(slot.deferred);
+    const foundation::Result release_result = release_deferred({&slot, 1});
     if (!release_result) {
         return release_result;
     }
@@ -894,30 +894,39 @@ foundation::Result FrameContext::defer_destroy_pipeline(rhi::PipelineHandle pipe
     return add_deferred_handle(slots_[current_slot_].deferred.pipelines, pipeline);
 }
 
-foundation::Result FrameContext::release_deferred(DeferredResources& resources) {
+foundation::Result FrameContext::release_deferred(std::span<FrameSlot> slots) {
     foundation::Result first_error = foundation::Result::success();
-    const auto destroy_all = [&first_error](auto& handles, auto&& destroy_fn) {
-        for (const auto handle : handles) {
-            const foundation::Result result = destroy_fn(handle);
-            if (!result && result.code != foundation::ResultCode::kNotFound && first_error) {
-                first_error = result;
+    const auto destroy_all = [&first_error, slots](auto member, auto&& destroy_fn) {
+        for (auto& slot : slots) {
+            auto& handles = slot.deferred.*member;
+            auto pending = handles.begin();
+            for (const auto handle : handles) {
+                const foundation::Result result = destroy_fn(handle);
+                if (!result && result.code != foundation::ResultCode::kNotFound) {
+                    if (first_error) first_error = result;
+                    *pending++ = handle;
+                }
             }
+            // Failed retirement remains owned so a later drain can retry it.
+            handles.erase(pending, handles.end());
         }
-        handles.clear();
     };
 
-    destroy_all(resources.binding_sets,
+    // A descriptor in a later completed slot may still reference a view
+    // retired by an earlier slot. Retire each dependency kind across all
+    // selected slots before deleting the resources it references.
+    destroy_all(&DeferredResources::binding_sets,
                 [this](rhi::BindingSetHandle handle) { return device_.destroy_binding_set(handle); });
-    destroy_all(resources.buffer_views,
-                [this](rhi::BufferViewHandle handle) { return device_.destroy_buffer_view(handle); });
-    destroy_all(resources.texture_views,
-                [this](rhi::TextureViewHandle handle) { return device_.destroy_texture_view(handle); });
-    destroy_all(resources.samplers, [this](rhi::SamplerHandle handle) { return device_.destroy_sampler(handle); });
-    destroy_all(resources.pipelines, [this](rhi::PipelineHandle handle) { return device_.destroy_pipeline(handle); });
-    destroy_all(resources.binding_layouts,
+    destroy_all(&DeferredResources::pipelines, [this](rhi::PipelineHandle handle) { return device_.destroy_pipeline(handle); });
+    destroy_all(&DeferredResources::binding_layouts,
                 [this](rhi::BindingLayoutHandle handle) { return device_.destroy_binding_layout(handle); });
-    destroy_all(resources.buffers, [this](rhi::BufferHandle handle) { return device_.destroy_buffer(handle); });
-    destroy_all(resources.textures, [this](rhi::TextureHandle handle) { return device_.destroy_texture(handle); });
+    destroy_all(&DeferredResources::buffer_views,
+                [this](rhi::BufferViewHandle handle) { return device_.destroy_buffer_view(handle); });
+    destroy_all(&DeferredResources::texture_views,
+                [this](rhi::TextureViewHandle handle) { return device_.destroy_texture_view(handle); });
+    destroy_all(&DeferredResources::samplers, [this](rhi::SamplerHandle handle) { return device_.destroy_sampler(handle); });
+    destroy_all(&DeferredResources::buffers, [this](rhi::BufferHandle handle) { return device_.destroy_buffer(handle); });
+    destroy_all(&DeferredResources::textures, [this](rhi::TextureHandle handle) { return device_.destroy_texture(handle); });
     return first_error;
 }
 }  // namespace aeg::render_graph

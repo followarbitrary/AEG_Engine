@@ -11,10 +11,13 @@
 
 #include "frame_context.hpp"
 #include "render_graph.hpp"
+
+#include "../Engine/RenderGraph/private/render_graph_execution.hpp"
 #include "renderer.hpp"
 #include "resource_uploader.hpp"
 #include "rhi.hpp"
 #include "runtime_asset_resolver.hpp"
+#include "runtime_asset_upload_host.hpp"
 
 namespace {
 using namespace aeg;
@@ -26,11 +29,52 @@ bool check(const foundation::Result& result, const char* label) {
 }
 
 bool near(float actual, float expected) {
-    return std::abs(actual - expected) < 1.0e-4f;
+    return std::isfinite(actual) && std::abs(actual - expected) < 1.0e-4f;
 }
 
-render_graph::RenderGraphBuffer as_graph(pipeline::RenderGraphBuffer value) {
-    return {value.index, value.generation, value.graph_id};
+foundation::ResultValue<render_graph::FrameAllocation> add_readback(
+    render_graph::FrameContext& frame, render_graph::RenderGraph& graph,
+    const renderer::RenderLightingResource& lighting, const char* label) {
+    const auto allocation = frame.allocate_readback(sizeof(renderer::RenderLightingConstants), 256);
+    if (!allocation) return allocation;
+    rhi::BufferDesc desc{};
+    desc.size = allocation.value.buffer_size;
+    desc.capabilities = rhi::BufferCapability::kTransferDestination;
+    desc.memory = rhi::MemoryClass::kReadback;
+    desc.initial_usage = rhi::ResourceUsage::kHostRead;
+    desc.initial_stages = rhi::PipelineStage::kHost;
+    desc.initial_queue = rhi::QueueClass::kCopy;
+    const auto imported = graph.import_buffer(allocation.value.buffer, desc);
+    if (!imported) return {imported.result, {}};
+    const auto pass = graph.add_pass(
+        label, rhi::QueueClass::kCopy,
+        [lighting, resource = imported.value, range = allocation.value](render_graph::PassBuilder& pass) {
+            if (const auto result = pass.read(lighting.lighting_resource, rhi::ResourceUsage::kCopySource,
+                                              rhi::PipelineStage::kCopy, rhi::ShaderStage::kNone,
+                                              {lighting.lighting_offset, lighting.lighting_size}); !result)
+                return result;
+            pass.set_side_effects();
+            return pass.write(resource, rhi::ResourceUsage::kCopyDestination, rhi::PipelineStage::kCopy, rhi::ShaderStage::kNone,
+                              {range.offset, range.size});
+        },
+        [lighting, resource = imported.value, range = allocation.value](render_graph::RenderPassCommandContext& command) {
+            return command.copy_buffer(lighting.lighting_resource, resource, lighting.lighting_offset,
+                                       range.offset, sizeof(renderer::RenderLightingConstants));
+        });
+    return {pass.result, allocation.value};
+}
+
+bool matches(const renderer::RenderLightingConstants& actual, const renderer::RenderLightingConstants& expected) {
+    const auto components = [](const renderer::RenderLightingConstants& value) {
+        const auto& d = value.directional_direction_intensity;
+        const auto& c = value.directional_color;
+        const auto& a = value.ambient_color;
+        return std::array{d.x, d.y, d.z, d.w, c.x, c.y, c.z, c.w, a.x, a.y, a.z, a.w};
+    };
+    const auto values = components(actual), reference = components(expected);
+    for (size_t i = 0; i < values.size(); ++i)
+        if (!near(values[i], reference[i])) return false;
+    return true;
 }
 
 }  // namespace
@@ -58,11 +102,13 @@ int main() {
     render_graph::RenderGraph graph(*device);
     resource::ResourceUploader uploader(*device);
     application::runtime::RuntimeAssetResolver resolver;
-    resolver.set_upload_context({.device = device.get(),
-                                 .frame_context = &frame,
-                                 .graph = &graph,
-                                 .uploader = &uploader,
-                                 .lighting_binding_layout = layout.value});
+    application::runtime::RuntimeAssetResolver::UploadContext upload_context{
+        .device = device.get(),
+        .frame_context = &frame,
+        .graph = &graph,
+        .uploader = &uploader,
+        .lighting_binding_layout = layout.value};
+    resolver.set_upload_context(upload_context);
 
     renderer::RenderSceneSnapshot directional_snapshot{};
     directional_snapshot.lights.push_back(renderer::RenderLight{
@@ -72,7 +118,8 @@ int main() {
         .color = math::Vec3{0.8f, 0.6f, 0.4f},
         .intensity = 3.0f,
     });
-    const renderer::RenderView view{};
+    renderer::RenderView view{};
+    view.id = renderer::make_render_view_id(0);
 
     const auto inactive = resolver.resolve_lighting(directional_snapshot, view);
     if (inactive || inactive.result.code != foundation::ResultCode::kNotReady) {
@@ -81,7 +128,7 @@ int main() {
     }
     if (!check(frame.begin_frame(), "begin directional frame"))
         return 3;
-    const auto first = resolver.resolve_lighting(directional_snapshot, view);
+    auto first = resolver.resolve_lighting(directional_snapshot, view);
     if (!first || !first.value.is_valid() || first.value.binding_group != 2 ||
         first.value.lighting_size != sizeof(renderer::RenderLightingConstants))
         return 4;
@@ -92,35 +139,63 @@ int main() {
     if (!again || again.value.binding_set != first.value.binding_set ||
         again.value.lighting_buffer != first.value.lighting_buffer)
         return 6;
-    const auto expected = renderer::make_render_lighting_constants(directional_snapshot.lights);
-    if (!expected)
-        return 7;
-    const auto directional_readback = frame.allocate_readback(sizeof(renderer::RenderLightingConstants), 256);
-    rhi::BufferDesc readback_desc{};
-    readback_desc.size = directional_readback ? directional_readback.value.buffer_size : 0;
-    readback_desc.capabilities = rhi::BufferCapability::kTransferDestination;
-    readback_desc.memory = rhi::MemoryClass::kReadback;
-    const auto readback_resource = directional_readback
-                                       ? graph.import_buffer(directional_readback.value.buffer, readback_desc)
-                                       : foundation::ResultValue<render_graph::RenderGraphBuffer>{};
-    if (!directional_readback || !readback_resource)
-        return 8;
-    const auto copy_directional = graph.add_pass(
-        "Read directional lighting", rhi::QueueClass::kGraphics,
-        [&](render_graph::PassBuilder& pass) {
-            if (const auto result = pass.read(as_graph(first.value.lighting_resource), rhi::ResourceUsage::kCopySource,
-                                              rhi::PipelineStage::kCopy);
-                !result)
-                return result;
-            pass.set_side_effects();
-            return pass.write(readback_resource.value, rhi::ResourceUsage::kCopyDestination, rhi::PipelineStage::kCopy);
-        },
-        [&](render_graph::RenderPassCommandContext& command) {
-            return command.copy_buffer(as_graph(first.value.lighting_resource), readback_resource.value, 0,
-                                       directional_readback.value.offset, sizeof(renderer::RenderLightingConstants));
-        });
-    if (!copy_directional)
-        return 9;
+    // Resolve every consumer before recording any readback. Same-view changed
+    // lights and equal constants in another view must not rewrite A's buffer.
+    auto other_view = view;
+    other_view.id = renderer::make_render_view_id(1);
+    auto changed_snapshot = directional_snapshot;
+    changed_snapshot.lights.front().intensity = 2.0f;
+    auto other_snapshot = directional_snapshot;
+    other_snapshot.lights.front().direction = {0.0f, 0.0f, -1.0f};
+    other_snapshot.lights.front().color = {1.0f, 0.25f, 0.5f};
+    other_snapshot.lights.front().intensity = 4.0f;
+    const std::array snapshots{directional_snapshot, other_snapshot, changed_snapshot, directional_snapshot};
+    const std::array views{view, other_view, view, other_view};
+    std::array<renderer::RenderLightingResource, 4> resources{};
+    for (size_t i = 0; i < resources.size(); ++i) {
+        const auto resolved = resolver.resolve_lighting(snapshots[i], views[i]);
+        if (!resolved) return 6;
+        resources[i] = resolved.value;
+        for (size_t j = 0; j < i; ++j) {
+            if (resources[i].lighting_buffer == resources[j].lighting_buffer ||
+                resources[i].binding_set == resources[j].binding_set) {
+                std::cerr << "same-frame scene/view lighting constants alias\n";
+                (void)frame.abort_frame();
+                (void)resolver.retire_gpu_resources();
+                (void)device->destroy_binding_layout(layout.value);
+                return 6;
+            }
+        }
+    }
+    const auto unchanged = resolver.resolve_lighting(directional_snapshot, view);
+    if (!unchanged || unchanged.value.lighting_buffer != resources[0].lighting_buffer ||
+        unchanged.value.binding_set != resources[0].binding_set) return 6;
+    auto equivalent_snapshot = directional_snapshot;
+    equivalent_snapshot.lights.front().direction.x = -0.f;
+    const auto equivalent = resolver.resolve_lighting(equivalent_snapshot, view);
+    if (!equivalent || equivalent.value.lighting_buffer != resources[0].lighting_buffer ||
+        equivalent.value.binding_set != resources[0].binding_set) return 6;
+    // An unsubmitted upload lost by clear_passes must be recorded again even
+    // though its imported resource handle still belongs to this graph.
+    graph.clear_passes();
+    for (size_t i = 0; i < resources.size(); ++i) {
+        const auto replay = resolver.resolve_lighting(snapshots[i], views[i]);
+        if (!replay || replay.value.lighting_buffer != resources[i].lighting_buffer ||
+            replay.value.binding_set != resources[i].binding_set) {
+            std::cerr << "lost lighting upload was not replayed into its existing allocation\n";
+            return 6;
+        }
+        resources[i] = replay.value;
+    }
+    if (!check(graph.compile(), "compile lighting retry") || aeg::render_graph::detail::RenderGraphExecution::compile_info(graph).pass_count != resources.size())
+        return 6;
+    first.value = resources[0];
+    std::array<render_graph::FrameAllocation, 4> readbacks{};
+    for (size_t i = 0; i < resources.size(); ++i) {
+        const auto readback = add_readback(frame, graph, resources[i], "Read isolated lighting");
+        if (!readback) return 8;
+        readbacks[i] = readback.value;
+    }
     if (!check(graph.compile(), "compile directional graph"))
         return 10;
     const auto execution = graph.execute(frame);
@@ -138,18 +213,19 @@ int main() {
         return 12;
     if (!check(frame.end_frame(), "end directional frame") || !check(device->wait_idle(), "wait directional frame"))
         return 13;
-    renderer::RenderLightingConstants directional_values{};
-    if (!check(
-            frame.read_readback(directional_readback.value, std::as_writable_bytes(std::span{&directional_values, 1})),
-            "read directional constants"))
-        return 14;
-    if (!near(directional_values.directional_direction_intensity.x, 0.0f) ||
-        !near(directional_values.directional_direction_intensity.y, -0.7071067f) ||
-        !near(directional_values.directional_direction_intensity.z, -0.7071067f) ||
-        !near(directional_values.directional_direction_intensity.w, 3.0f) ||
-        !near(directional_values.directional_color.x, 0.8f) || !near(directional_values.directional_color.y, 0.6f) ||
-        !near(directional_values.directional_color.z, 0.4f))
-        return 15;
+    // Independent literal oracle, including reserved alpha and ambient values.
+    const renderer::RenderLightingConstants expected_a{{0.0f, -0.7071067f, -0.7071067f, 3.0f},
+                                                       {0.8f, 0.6f, 0.4f, 1.0f}, {0.05f, 0.05f, 0.05f, 1.0f}};
+    auto expected_c = expected_a;
+    expected_c.directional_direction_intensity.w = 2.0f;
+    const std::array expected{expected_a,
+        renderer::RenderLightingConstants{{0.0f, 0.0f, -1.0f, 4.0f}, {1.0f, 0.25f, 0.5f, 1.0f},
+                                          {0.05f, 0.05f, 0.05f, 1.0f}}, expected_c, expected_a};
+    for (size_t i = 0; i < readbacks.size(); ++i) {
+        renderer::RenderLightingConstants values{};
+        if (!check(frame.read_readback(readbacks[i], std::as_writable_bytes(std::span{&values, 1})),
+                   "read isolated constants") || !matches(values, expected[i])) return 15;
+    }
 
     graph.reset();
     if (!check(frame.begin_frame(), "begin ambient frame"))
@@ -172,35 +248,8 @@ int main() {
                   << first.value.lighting_resource.generation << '\n';
         return 17;
     }
-    const auto ambient_readback_allocation = frame.allocate_readback(sizeof(renderer::RenderLightingConstants), 256);
-    rhi::BufferDesc ambient_readback_desc{};
-    ambient_readback_desc.size = ambient_readback_allocation ? ambient_readback_allocation.value.buffer_size : 0;
-    ambient_readback_desc.capabilities = rhi::BufferCapability::kTransferDestination;
-    ambient_readback_desc.memory = rhi::MemoryClass::kReadback;
-    const auto ambient_readback_resource =
-        ambient_readback_allocation
-            ? graph.import_buffer(ambient_readback_allocation.value.buffer, ambient_readback_desc)
-            : foundation::ResultValue<render_graph::RenderGraphBuffer>{};
-    if (!ambient_readback_allocation || !ambient_readback_resource)
-        return 18;
-    const auto copy_ambient = graph.add_pass(
-        "Read ambient lighting", rhi::QueueClass::kGraphics,
-        [&](render_graph::PassBuilder& pass) {
-            if (const auto result = pass.read(as_graph(ambient.value.lighting_resource),
-                                              rhi::ResourceUsage::kCopySource, rhi::PipelineStage::kCopy);
-                !result)
-                return result;
-            pass.set_side_effects();
-            return pass.write(ambient_readback_resource.value, rhi::ResourceUsage::kCopyDestination,
-                              rhi::PipelineStage::kCopy);
-        },
-        [&](render_graph::RenderPassCommandContext& command) {
-            return command.copy_buffer(as_graph(ambient.value.lighting_resource), ambient_readback_resource.value, 0,
-                                       ambient_readback_allocation.value.offset,
-                                       sizeof(renderer::RenderLightingConstants));
-        });
-    if (!copy_ambient)
-        return 19;
+    const auto ambient_readback_allocation = add_readback(frame, graph, ambient.value, "Read ambient lighting");
+    if (!ambient_readback_allocation) return 18;
     if (!check(graph.compile(), "compile ambient graph"))
         return 20;
     const auto ambient_execution = graph.execute(frame);

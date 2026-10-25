@@ -3,6 +3,8 @@
  * @brief Implements frame-local buffer and indexed-mesh uploads.
  */
 #include "../public/resource_uploader.hpp"
+#include "../../RenderGraph/private/render_graph_execution.hpp"
+#include "render_graph_upload_access.hpp"
 
 #include <array>
 #include <cstddef>
@@ -155,8 +157,9 @@ namespace aeg::resource {
 
         [[nodiscard]] foundation::ResultValue<PreparedUpload> prepare_upload(
                 rhi::Device& device, render_graph::FrameContext& frame_context, render_graph::RenderGraph& graph,
-                const BufferUploadDesc& input) {
-            if (&frame_context.device() != &device || &graph.device() != &device) {
+                const BufferUploadDesc& input, rhi::BufferHandle reuse_destination = {}) {
+            if (&frame_context.device() != &device ||
+                &render_graph::detail::RenderGraphExecution::device(graph) != &device) {
                 return {foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                                      "Resource upload objects must use the same RHI device"), {}};
             }
@@ -187,7 +190,9 @@ namespace aeg::resource {
                 return {write_result, {}};
             }
 
-            auto destination_result = device.create_buffer(destination_desc);
+            auto destination_result = reuse_destination.is_valid()
+                ? foundation::ResultValue<rhi::BufferHandle>{foundation::Result::success(), reuse_destination}
+                : device.create_buffer(destination_desc);
             if (!destination_result) {
                 return {destination_result.result, {}};
             }
@@ -195,7 +200,7 @@ namespace aeg::resource {
             auto target_resource_result = graph.import_buffer(destination_result.value, destination_desc,
                                                                make_initial_state(destination_desc));
             if (!target_resource_result) {
-                (void) device.destroy_buffer(destination_result.value);
+                if (!reuse_destination.is_valid()) (void) device.destroy_buffer(destination_result.value);
                 return {target_resource_result.result, {}};
             }
 
@@ -214,9 +219,10 @@ namespace aeg::resource {
         }
 
         template<size_t Count>
-        [[nodiscard]] foundation::Result add_copy_pass(render_graph::RenderGraph& graph, std::string_view name,
-                                                        const std::array<CopyOperation, Count>& operations) {
-            return graph.add_pass(
+        [[nodiscard]] foundation::ResultValue<std::shared_ptr<const void>> add_copy_pass(
+                render_graph::RenderGraph& graph, uint64_t frame_index, std::string_view name,
+                const std::array<CopyOperation, Count>& operations) {
+            const auto pass = graph.add_pass(
                            name, rhi::QueueClass::kCopy,
                            [operations](render_graph::PassBuilder& builder) {
                                for (const CopyOperation& operation: operations) {
@@ -251,8 +257,10 @@ namespace aeg::resource {
                                    }
                                }
                                return foundation::Result::success();
-                           })
-                    .result;
+                           });
+            if (!pass) return {pass.result, {}};
+            return render_graph::detail::RenderGraphUploadAccess::track_pass_submission(
+                graph, pass.value, frame_index);
         }
 
         [[nodiscard]] foundation::Result first_failure(const foundation::Result& first,
@@ -266,15 +274,15 @@ namespace aeg::resource {
 
     foundation::ResultValue<BufferUpload> ResourceUploader::upload_buffer(
             render_graph::FrameContext& frame_context, render_graph::RenderGraph& graph,
-            const BufferUploadDesc& desc) {
-        auto prepared_result = prepare_upload(device_, frame_context, graph, desc);
+            const BufferUploadDesc& desc, rhi::BufferHandle reuse_destination) {
+        auto prepared_result = prepare_upload(device_, frame_context, graph, desc, reuse_destination);
         if (!prepared_result) {
             return {prepared_result.result, {}};
         }
         PreparedUpload prepared = prepared_result.value;
         auto source_resource_result = import_staging_buffer(graph, prepared.staging);
         if (!source_resource_result) {
-            (void) device_.destroy_buffer(prepared.destination);
+            if (!reuse_destination.is_valid()) (void) device_.destroy_buffer(prepared.destination);
             return {source_resource_result.result, {}};
         }
         prepared.source = source_resource_result.value;
@@ -285,28 +293,36 @@ namespace aeg::resource {
         const std::string_view pass_name = desc.destination.name.value.empty()
                                                     ? std::string_view{"ResourceUploader.BufferUpload"}
                                                     : desc.destination.name.value;
-        const foundation::Result pass_result = add_copy_pass(graph, pass_name, operations);
+        const auto pass_result = add_copy_pass(graph, frame_context.frame_number(), pass_name, operations);
         if (!pass_result) {
-            (void) device_.destroy_buffer(prepared.destination);
-            return {pass_result, {}};
+            if (!reuse_destination.is_valid()) (void) device_.destroy_buffer(prepared.destination);
+            return {pass_result.result, {}};
         }
 
         return {foundation::Result::success(),
                 BufferUpload{prepared.staging, prepared.destination, prepared.source, prepared.target,
-                             prepared.destination_offset, prepared.size, prepared.transfer_size}};
+                             prepared.destination_offset, prepared.size, prepared.transfer_size, pass_result.value}};
     }
 
     foundation::ResultValue<MeshUpload> ResourceUploader::upload_mesh(
             render_graph::FrameContext& frame_context, render_graph::RenderGraph& graph, const MeshData& mesh,
-            std::string_view name) {
+            std::string_view name, const GpuMesh* reuse_destination) {
         const foundation::Result mesh_result = validate_mesh_data(mesh);
         if (!mesh_result) {
             return {mesh_result, {}};
         }
-        if (&frame_context.device() != &device_ || &graph.device() != &device_) {
+        if (&frame_context.device() != &device_ ||
+            &render_graph::detail::RenderGraphExecution::device(graph) != &device_) {
             return {foundation::Result::failure(foundation::ResultCode::kInvalidArgument,
                                                  "Resource upload objects must use the same RHI device"), {}};
         }
+
+        if (reuse_destination && (!reuse_destination->is_valid() ||
+            reuse_destination->vertex_stride != mesh.vertex_stride ||
+            reuse_destination->vertex_count != mesh.vertex_count ||
+            reuse_destination->index_count != mesh.index_count ||
+            reuse_destination->index_format != mesh.index_format))
+            return {foundation::invalid_argument("Mesh replay destination metadata does not match its payload"), {}};
 
         const std::string_view resource_name = name.empty() ? std::string_view{"Resource.Mesh"} : name;
         rhi::BufferDesc vertex_destination{};
@@ -320,27 +336,38 @@ namespace aeg::resource {
                                           rhi::BufferCapability::kIndex;
         index_destination.memory = rhi::MemoryClass::kDeviceLocal;
         index_destination.name = rhi::DebugName{resource_name};
+        if (reuse_destination) {
+            vertex_destination.size = reuse_destination->vertex_buffer_size;
+            index_destination.size = reuse_destination->index_buffer_size;
+        }
 
         const BufferUploadDesc vertex_upload_desc{mesh.vertex_data, vertex_destination, 0, 4};
         const BufferUploadDesc index_upload_desc{mesh.index_data, index_destination, 0,
                                                  4};
 
-        auto vertex_result = prepare_upload(device_, frame_context, graph, vertex_upload_desc);
+        auto vertex_result = prepare_upload(device_, frame_context, graph, vertex_upload_desc,
+            reuse_destination ? reuse_destination->vertex_buffer : rhi::BufferHandle{});
         if (!vertex_result) {
             return {vertex_result.result, {}};
         }
-        auto index_result = prepare_upload(device_, frame_context, graph, index_upload_desc);
+        auto index_result = prepare_upload(device_, frame_context, graph, index_upload_desc,
+            reuse_destination ? reuse_destination->index_buffer : rhi::BufferHandle{});
         if (!index_result) {
-            (void) device_.destroy_buffer(vertex_result.value.destination);
+            if (!reuse_destination) (void) device_.destroy_buffer(vertex_result.value.destination);
             return {index_result.result, {}};
         }
 
         PreparedUpload vertex = vertex_result.value;
         PreparedUpload index = index_result.value;
+        const auto cleanup = [&] {
+            if (!reuse_destination) {
+                (void) device_.destroy_buffer(vertex.destination);
+                (void) device_.destroy_buffer(index.destination);
+            }
+        };
         auto vertex_source_result = import_staging_buffer(graph, vertex.staging);
         if (!vertex_source_result) {
-            (void) device_.destroy_buffer(vertex.destination);
-            (void) device_.destroy_buffer(index.destination);
+            cleanup();
             return {vertex_source_result.result, {}};
         }
         vertex.source = vertex_source_result.value;
@@ -350,8 +377,7 @@ namespace aeg::resource {
         } else {
             auto index_source_result = import_staging_buffer(graph, index.staging);
             if (!index_source_result) {
-                (void) device_.destroy_buffer(vertex.destination);
-                (void) device_.destroy_buffer(index.destination);
+                cleanup();
                 return {index_source_result.result, {}};
             }
             index.source = index_source_result.value;
@@ -362,23 +388,22 @@ namespace aeg::resource {
                 CopyOperation{index.source, index.target, index.staging.offset, index.destination_offset,
                               index.transfer_size}
         };
-        const foundation::Result pass_result = add_copy_pass(graph, resource_name, operations);
+        const auto pass_result = add_copy_pass(graph, frame_context.frame_number(), resource_name, operations);
         if (!pass_result) {
-            (void) device_.destroy_buffer(vertex.destination);
-            (void) device_.destroy_buffer(index.destination);
-            return {pass_result, {}};
+            cleanup();
+            return {pass_result.result, {}};
         }
 
         GpuMesh gpu_mesh{};
         gpu_mesh.vertex_buffer = vertex.destination;
         gpu_mesh.index_buffer = index.destination;
-        gpu_mesh.vertex_buffer_size = vertex.transfer_size;
-        gpu_mesh.index_buffer_size = index.transfer_size;
+        gpu_mesh.vertex_buffer_size = reuse_destination ? reuse_destination->vertex_buffer_size : vertex.transfer_size;
+        gpu_mesh.index_buffer_size = reuse_destination ? reuse_destination->index_buffer_size : index.transfer_size;
         gpu_mesh.vertex_stride = mesh.vertex_stride;
         gpu_mesh.vertex_count = mesh.vertex_count;
         gpu_mesh.index_count = mesh.index_count;
         gpu_mesh.index_format = mesh.index_format;
-        return {foundation::Result::success(), MeshUpload{gpu_mesh, vertex.target, index.target}};
+        return {foundation::Result::success(), MeshUpload{gpu_mesh, vertex.target, index.target, pass_result.value}};
     }
 
     foundation::Result ResourceUploader::defer_destroy_mesh(render_graph::FrameContext& frame_context,

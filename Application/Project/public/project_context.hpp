@@ -45,7 +45,7 @@ struct ProjectEngineConfig final {
     std::string template_id{"empty"};
 };
 
-/** @brief Stable settings loaded from one .aegproject TOML file. */
+/** @brief Stable settings loaded from one modern Project.aegproj TOML file. */
 struct ProjectConfig final {
     uint32_t format_version{2};
     std::string name{};
@@ -54,7 +54,7 @@ struct ProjectConfig final {
     ProjectEngineConfig engine{};
     ProjectModuleConfig module{};
     std::filesystem::path startup_scene{"Assets/Scenes/Main.aegscene"};
-    std::vector<std::filesystem::path> startup_pipelines{};
+    std::vector<std::filesystem::path> startup_feature_graphs{};
     ProjectPathConfig paths{};
 };
 
@@ -62,7 +62,6 @@ struct ProjectConfig final {
 struct ProjectFile final {
     ProjectConfig config{};
     std::shared_ptr<const void> retained_source{};
-    bool legacy{false};
 };
 
 /** @brief Resolves and validates the directories of one project session. */
@@ -100,7 +99,7 @@ public:
     [[nodiscard]] foundation::Result save(const std::filesystem::path& file, const ProjectFile& project) const;
 };
 
-/** @brief Finds the canonical Project.aegproj or legacy project.aegproject under a root. */
+/** @brief Finds Project.aegproj under a root, or validates an explicitly selected modern file. */
 [[nodiscard]] foundation::ResultValue<std::filesystem::path> discover_project_file(
     const std::filesystem::path& root_or_file);
 

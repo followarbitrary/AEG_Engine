@@ -79,12 +79,12 @@ foundation::ResultValue<AssetPackageReader> AssetPackageReader::open(const std::
         uint32_t kind = 0, alignment = 0;
         if (!read_le(input, offset + 16, kind) || !read_le(input, offset + 20, entry.schema_version) ||
             !read_le(input, offset + 24, entry.offset) || !read_le(input, offset + 32, entry.byte_count) ||
-            !read_le(input, offset + 40, alignment) || kind > static_cast<uint32_t>(AssetKind::kShader) ||
+            !read_le(input, offset + 40, alignment) || kind > static_cast<uint32_t>(foundation::AssetKind::kShader) ||
             alignment != kAlignment || entry.offset % kAlignment != 0 ||
             !valid_range(entry.offset, entry.byte_count, index_offset)) {
             return {foundation::invalid_argument("Asset package entry is invalid"), {}};
         }
-        entry.kind = static_cast<AssetKind>(kind);
+        entry.kind = static_cast<foundation::AssetKind>(kind);
         reader.index_.push_back(entry);
     }
     if (!std::is_sorted(reader.index_.begin(), reader.index_.end(),
@@ -101,9 +101,9 @@ std::size_t AssetPackageReader::entry_count() const noexcept {
     return index_.size();
 }
 
-foundation::ResultValue<PackagedAsset> AssetPackageReader::read(AssetId id) const {
+foundation::ResultValue<PackagedAsset> AssetPackageReader::read(foundation::AssetId id) const {
     const auto found = std::lower_bound(index_.begin(), index_.end(), id,
-                                        [](const IndexEntry& entry, AssetId needle) { return entry.id < needle; });
+                                        [](const IndexEntry& entry, foundation::AssetId needle) { return entry.id < needle; });
     if (found == index_.end() || found->id != id) {
         return {foundation::not_found("Asset UUID is not present in package"), {}};
     }
@@ -113,7 +113,7 @@ foundation::ResultValue<PackagedAsset> AssetPackageReader::read(AssetId id) cons
             {found->id, found->kind, found->schema_version, {bytes_.begin() + offset, bytes_.begin() + offset + size}}};
 }
 
-foundation::ResultValue<CookedAsset> AssetPackageReader::read_cooked(AssetId id) const {
+foundation::ResultValue<CookedAsset> AssetPackageReader::read_cooked(foundation::AssetId id) const {
     const auto packaged = read(id);
     if (!packaged)
         return {packaged.result, {}};

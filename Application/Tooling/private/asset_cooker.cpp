@@ -10,6 +10,7 @@
 
 #include "cgltf_mesh_importer.hpp"
 #include "font_importer.hpp"
+#include "feature_graph_asset_importer.hpp"
 #include "material_asset_importer.hpp"
 #include "stb_texture_importer.hpp"
 
@@ -26,7 +27,10 @@ foundation::Result AssetCooker::register_default_importers() {
     if (const foundation::Result result = register_importer(std::make_unique<MaterialAssetImporter>()); !result) {
         return result;
     }
-    return register_importer(std::make_unique<FontImporter>());
+    if (const foundation::Result result = register_importer(std::make_unique<FontImporter>()); !result) {
+        return result;
+    }
+    return register_importer(std::make_unique<FeatureGraphAssetImporter>());
 }
 
 foundation::Result AssetCooker::register_importer(std::unique_ptr<AssetImporter> importer) {

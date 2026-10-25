@@ -3,6 +3,16 @@
  * @brief Implements the unified engine frame lifecycle.
  */
 #include "../public/engine_frame_orchestrator.hpp"
+#include "../../RenderGraph/private/render_graph_resource_access.hpp"
+#include "../../Pipeline/private/phase_registry_execution.hpp"
+#include "../../Pipeline/private/pipeline_scope_host_execution.hpp"
+#include "world_snapshot_execution.hpp"
+#include "engine_frame_pipeline_host.hpp"
+#include "engine_frame_pipeline_registration.hpp"
+#include "engine_frame_inspection.hpp"
+#include "engine_frame_world_commands.hpp"
+#include "feature_world_commands.hpp"
+#include "renderer_frame_contract.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -13,6 +23,137 @@
 #include <utility>
 
 namespace aeg::engine {
+struct EngineFrameOrchestrator::Impl final {
+    Impl(EngineFrameOrchestrator& owner, const EngineFramePipelineHost& pipeline_host,
+         render_graph::FrameContext& frame_context, render_graph::RenderGraph& render_graph,
+         uint64_t available_capabilities);
+    ~Impl();
+    /** @brief Registers a non-owning pipeline scope host. */
+    [[nodiscard]] foundation::Result register_pipeline(const EngineFramePipelineRegistration& registration);
+    /** @brief Registers a World aggregate for command application and snapshot publication. */
+    [[nodiscard]] foundation::Result register_world(world::WorldScope& world_scope);
+    /** Registers snapshot extraction for a FeatureGraph view without a Pipeline host. */
+    [[nodiscard]] foundation::Result register_world_frame(world::WorldScope& world_scope, uint32_t view_id = 0);
+    /** @brief Registers a World view and connects it to a Frame pipeline host. */
+    [[nodiscard]] foundation::Result register_world_frame(world::WorldScope& world_scope,
+                                                          const EngineFramePipelineRegistration& registration,
+                                                          uint32_t view_id = 0);
+    /** @brief Unregisters a World view registration. */
+    [[nodiscard]] foundation::Result unregister_world_frame(ecs::WorldHandle world, uint32_t view_id);
+    /** @brief Unregisters a World aggregate after its views have been removed. */
+    [[nodiscard]] foundation::Result unregister_world(ecs::WorldHandle world);
+
+    /** @brief Builds and activates all registered pipeline instances. */
+    [[nodiscard]] foundation::Result initialize();
+    /** @brief Begins a frame and pins all active pipeline plans. */
+    [[nodiscard]] foundation::Result begin_frame(const EngineFrameDesc& desc = {});
+    /** @brief Executes all ordinary frame phases in the registered global order. */
+    [[nodiscard]] foundation::Result run_frame(const EngineFrameDesc& desc = {});
+    /** @brief Executes shutdown work and deactivates registered pipelines. */
+    [[nodiscard]] foundation::Result shutdown();
+
+
+
+    EngineFrameOrchestrator& owner_;
+    detail::FeatureWorldCommandConsumer* world_commands_{nullptr};
+
+    enum class PhaseExecutionMode : uint8_t {
+        kStartup,
+        kPreFrame,
+        kFrame,
+        kPostFrame,
+        kShutdown,
+    };
+
+    struct PinnedPipeline final {
+        pipeline::PipelineScopeHost* host{nullptr};
+        pipeline::PipelinePlanHandle plan{};
+    };
+
+    struct WorldRegistration final {
+        world::WorldScope* world{nullptr};
+    };
+
+    /** @brief Internal rollback record for one registered World view. */
+    struct WorldFrameBinding final {
+        world::WorldScope* world{nullptr};
+        pipeline::PipelineScopeHost* frame_host{nullptr};
+        uint32_t view_id{0};
+        bool frame_host_registered_by_orchestrator{false};
+    };
+
+    [[nodiscard]] foundation::Result validate_frame_desc(const EngineFrameDesc& desc) const;
+    [[nodiscard]] foundation::Result register_pipeline_typed(pipeline::PipelineScopeHost& host);
+    [[nodiscard]] foundation::Result unregister_pipeline(pipeline::PipelineInstanceId instance);
+    [[nodiscard]] foundation::Result register_world_frame_impl(world::WorldScope& world_scope,
+        pipeline::PipelineScopeHost* frame_host, uint32_t view_id);
+    [[nodiscard]] foundation::Result synchronize_phase_registry();
+    [[nodiscard]] foundation::Result activate_all();
+    [[nodiscard]] foundation::Result deactivate_all();
+    [[nodiscard]] foundation::Result execute_registered_phase(pipeline::PhaseId phase, PhaseExecutionMode mode,
+                                                              bool finalize_frame);
+    [[nodiscard]] foundation::Result execute_pipeline_phase(const PinnedPipeline& pinned_pipeline,
+                                                            pipeline::PhaseId phase);
+    [[nodiscard]] foundation::Result prepare_world_frames();
+    [[nodiscard]] foundation::Result apply_world_commands();
+    [[nodiscard]] foundation::Result commit_worlds();
+    [[nodiscard]] foundation::Result extract_render_scenes();
+    [[nodiscard]] foundation::Result bind_feature_texture(feature::RenderResourceId id,
+                                                          render_graph::RenderGraphTexture texture);
+    [[nodiscard]] foundation::Result post_build_render_features();
+    [[nodiscard]] foundation::Result execute_render_graph();
+    [[nodiscard]] foundation::Result release_frame_artifacts();
+    [[nodiscard]] foundation::Result finish_frame(bool clear_state);
+    [[nodiscard]] foundation::Result fail_frame(foundation::Result result);
+    [[nodiscard]] foundation::Result clear_frame_state() noexcept;
+    [[nodiscard]] std::vector<pipeline::PipelineScopeHost*> ordered_pipelines() const;
+    [[nodiscard]] bool contains_pipeline(const pipeline::PipelineScopeHost& host) const noexcept;
+    [[nodiscard]] world::WorldFrameScope* find_frame_scope_for_host(
+        const pipeline::PipelineScopeHost& host) const noexcept;
+    [[nodiscard]] pipeline::PipelineScopeHost* find_pipeline_registration(
+        pipeline::PipelineInstanceId instance) const noexcept;
+    void remove_pipeline_registration(pipeline::PipelineScopeHost& host) noexcept;
+    void clear_world_frames() noexcept;
+    [[nodiscard]] std::size_t phase_rank(const pipeline::PhaseRegistrySnapshot& snapshot,
+                                         pipeline::PhaseId phase) const noexcept;
+
+    const EngineFramePipelineHost* pipeline_host_{nullptr};
+    render_graph::FrameContext& frame_context_;
+    render_graph::RenderGraph& render_graph_;
+    pipeline::CapabilityMask available_capabilities_{0};
+    std::vector<pipeline::PipelineScopeHost*> pipelines_{};
+    std::vector<WorldRegistration> worlds_{};
+    std::vector<WorldFrameBinding> world_frames_{};
+    std::vector<pipeline::PipelineScopeHost*> activated_pipelines_{};
+    std::vector<PinnedPipeline> pinned_pipelines_{};
+    struct ActiveWorldFrame final {
+        WorldFrameBinding binding{};
+        std::unique_ptr<world::WorldFrameScope> scope{};
+        const pipeline::ArtifactScopeBridge* previous_bridge{nullptr};
+    };
+    std::vector<ActiveWorldFrame> active_world_frames_{};
+    std::vector<render_graph::RenderGraphFeatureTextureBinding> feature_textures_{};
+    std::vector<render_graph::RenderGraphExecutionLease> execution_leases_{};
+    std::vector<renderer::RenderView> render_views_{};
+    std::vector<std::shared_ptr<const renderer::RenderSceneSnapshot>> render_scene_snapshots_{};
+    render_graph::RenderGraphTexture swapchain_resource_{};
+    EngineFrameDesc frame_desc_{};
+    uint64_t phase_revision_{0};
+    std::size_t last_phase_rank_{0};
+    bool has_last_phase_{false};
+    bool initialized_{false};
+    bool frame_active_{false};
+    bool render_feature_prepared_{false};
+    bool render_feature_post_built_{false};
+    bool render_graph_executed_{false};
+    bool frame_presented_{false};
+    bool worlds_committed_{false};
+    uint32_t draw_call_count_{0};
+    bool inspection_enabled_{false};
+    detail::EngineFrameInspectionTrace inspection_trace_{};
+
+};
+
 namespace {
 using foundation::invalid_argument;
 using foundation::invalid_state;
@@ -49,14 +190,16 @@ EngineFramePreparationContext::EngineFramePreparationContext(render_graph::Frame
                                                              render_graph::RenderGraph& render_graph,
                                                              const rhi::FrameAcquireResult* acquired_frame,
                                                              render_graph::RenderGraphTexture swapchain_resource,
+                                                             std::span<const std::shared_ptr<const renderer::RenderSceneSnapshot>> scenes,
                                                              EngineFrameOrchestrator& owner) noexcept
     : frame_context(frame_context),
       render_graph(render_graph),
       acquired_frame(acquired_frame),
       swapchain_resource(swapchain_resource),
+      render_scenes(scenes),
       owner_(&owner) {}
 
-foundation::Result EngineFramePreparationContext::bind_feature_texture(pipeline::RenderResourceId id,
+foundation::Result EngineFramePreparationContext::bind_feature_texture(feature::RenderResourceId id,
                                                                        render_graph::RenderGraphTexture texture) const {
     if (owner_ == nullptr) {
         return invalid_state("render feature preparation context is no longer active");
@@ -64,18 +207,16 @@ foundation::Result EngineFramePreparationContext::bind_feature_texture(pipeline:
     return owner_->bind_feature_texture(id, texture);
 }
 
-EngineFrameOrchestrator::EngineFrameOrchestrator(pipeline::PipelineRegistry& registry,
-                                                 pipeline::PipelineScheduler& scheduler,
+EngineFrameOrchestrator::Impl::Impl(EngineFrameOrchestrator& owner, const EngineFramePipelineHost& pipeline_host,
                                                  render_graph::FrameContext& frame_context,
                                                  render_graph::RenderGraph& render_graph,
                                                  pipeline::CapabilityMask available_capabilities)
-    : registry_(registry),
-      scheduler_(scheduler),
+    : owner_(owner), pipeline_host_(&pipeline_host),
       frame_context_(frame_context),
       render_graph_(render_graph),
       available_capabilities_(available_capabilities) {}
 
-EngineFrameOrchestrator::~EngineFrameOrchestrator() {
+EngineFrameOrchestrator::Impl::~Impl() {
     if (frame_active_ || frame_context_.is_frame_active()) {
         (void)frame_context_.abort_frame();
     }
@@ -88,9 +229,17 @@ EngineFrameOrchestrator::~EngineFrameOrchestrator() {
     }
 }
 
-foundation::Result EngineFrameOrchestrator::register_pipeline(pipeline::PipelineScopeHost& host) {
+foundation::Result EngineFrameOrchestrator::Impl::register_pipeline(
+    const EngineFramePipelineRegistration& registration) {
+    return register_pipeline_typed(registration.host());
+}
+
+foundation::Result EngineFrameOrchestrator::Impl::register_pipeline_typed(pipeline::PipelineScopeHost& host) {
     if (initialized_ || frame_active_) {
         return invalid_state("cannot register a pipeline while the orchestrator is running");
+    }
+    if (host.scope() == pipeline::PipelineScope::kWorld) {
+        return unsupported("Raw World Pipeline execution is retired; register the World aggregate");
     }
     if (!host.instance_id().is_valid()) {
         return invalid_argument("pipeline host instance id is invalid");
@@ -108,11 +257,11 @@ foundation::Result EngineFrameOrchestrator::register_pipeline(pipeline::Pipeline
     return foundation::Result::success();
 }
 
-bool EngineFrameOrchestrator::contains_pipeline(const pipeline::PipelineScopeHost& host) const noexcept {
+bool EngineFrameOrchestrator::Impl::contains_pipeline(const pipeline::PipelineScopeHost& host) const noexcept {
     return std::find(pipelines_.begin(), pipelines_.end(), &host) != pipelines_.end();
 }
 
-pipeline::PipelineScopeHost* EngineFrameOrchestrator::find_pipeline_registration(
+pipeline::PipelineScopeHost* EngineFrameOrchestrator::Impl::find_pipeline_registration(
     pipeline::PipelineInstanceId instance) const noexcept {
     const auto iterator =
         std::find_if(pipelines_.begin(), pipelines_.end(), [instance](const pipeline::PipelineScopeHost* host) {
@@ -121,18 +270,18 @@ pipeline::PipelineScopeHost* EngineFrameOrchestrator::find_pipeline_registration
     return iterator == pipelines_.end() ? nullptr : *iterator;
 }
 
-void EngineFrameOrchestrator::remove_pipeline_registration(pipeline::PipelineScopeHost& host) noexcept {
+void EngineFrameOrchestrator::Impl::remove_pipeline_registration(pipeline::PipelineScopeHost& host) noexcept {
     const auto iterator = std::find(pipelines_.begin(), pipelines_.end(), &host);
     if (iterator != pipelines_.end()) {
         pipelines_.erase(iterator);
     }
 }
 
-foundation::Result EngineFrameOrchestrator::register_world(world::WorldScope& world_scope) {
+foundation::Result EngineFrameOrchestrator::Impl::register_world(world::WorldScope& world_scope) {
     if (initialized_ || frame_active_) {
         return invalid_state("cannot register a World while the orchestrator is running");
     }
-    if (!world_scope.handle().is_valid() || world_scope.pipeline_host().scope() != pipeline::PipelineScope::kWorld) {
+    if (!world_scope.handle().is_valid()) {
         return invalid_argument("World Scope registration is invalid");
     }
     if (!world_scope.is_initialized()) {
@@ -145,38 +294,37 @@ foundation::Result EngineFrameOrchestrator::register_world(world::WorldScope& wo
         }
     }
 
-    const bool should_register_pipeline = world_scope.has_pipeline();
-    const bool pipeline_registered = contains_pipeline(world_scope.pipeline_host());
-    if (should_register_pipeline && !pipeline_registered) {
-        if (const foundation::Result result = register_pipeline(world_scope.pipeline_host()); !result) {
-            return result;
-        }
-    }
     try {
-        worlds_.push_back(WorldRegistration{&world_scope, should_register_pipeline && !pipeline_registered});
+        worlds_.push_back(WorldRegistration{&world_scope});
     } catch (const std::bad_alloc&) {
-        if (should_register_pipeline && !pipeline_registered) {
-            static_cast<void>(unregister_pipeline(world_scope.pipeline_host().instance_id()));
-        }
         return out_of_memory("World Scope registration allocation failed");
     }
     return foundation::Result::success();
 }
 
-foundation::Result EngineFrameOrchestrator::register_world_frame(world::WorldScope& world_scope,
-                                                                 pipeline::PipelineScopeHost& frame_host,
+foundation::Result EngineFrameOrchestrator::Impl::register_world_frame(world::WorldScope& world_scope,
+                                                                 const EngineFramePipelineRegistration& registration,
                                                                  uint32_t view_id) {
+    return register_world_frame_impl(world_scope, &registration.host(), view_id);
+}
+
+foundation::Result EngineFrameOrchestrator::Impl::register_world_frame(world::WorldScope& world_scope, uint32_t view_id) {
+    return register_world_frame_impl(world_scope, nullptr, view_id);
+}
+
+foundation::Result EngineFrameOrchestrator::Impl::register_world_frame_impl(world::WorldScope& world_scope,
+    pipeline::PipelineScopeHost* frame_host, uint32_t view_id) {
     if (initialized_ || frame_active_) {
         return invalid_state("cannot register a World view while the orchestrator is running");
     }
-    if (frame_host.scope() != pipeline::PipelineScope::kFrame) {
+    if (frame_host && frame_host->scope() != pipeline::PipelineScope::kFrame) {
         return invalid_argument("World view requires a Frame pipeline host");
     }
     for (const WorldFrameBinding& binding : world_frames_) {
         if (binding.world == &world_scope && binding.view_id == view_id) {
             return invalid_state("World view is already registered");
         }
-        if (binding.frame_host == &frame_host) {
+        if (frame_host && binding.frame_host == frame_host) {
             return invalid_state("Frame pipeline host is already bound to a World view");
         }
     }
@@ -196,9 +344,9 @@ foundation::Result EngineFrameOrchestrator::register_world_frame(world::WorldSco
         world_registered_here = true;
     }
 
-    const bool pipeline_registered = contains_pipeline(frame_host);
+    const bool pipeline_registered = !frame_host || contains_pipeline(*frame_host);
     if (!pipeline_registered) {
-        if (const foundation::Result result = register_pipeline(frame_host); !result) {
+        if (const foundation::Result result = register_pipeline_typed(*frame_host); !result) {
             if (world_registered_here) {
                 static_cast<void>(unregister_world(world_scope.handle()));
             }
@@ -206,10 +354,10 @@ foundation::Result EngineFrameOrchestrator::register_world_frame(world::WorldSco
         }
     }
     try {
-        world_frames_.push_back(WorldFrameBinding{&world_scope, &frame_host, view_id, !pipeline_registered});
+        world_frames_.push_back(WorldFrameBinding{&world_scope, frame_host, view_id, !pipeline_registered});
     } catch (const std::bad_alloc&) {
         if (!pipeline_registered) {
-            static_cast<void>(unregister_pipeline(frame_host.instance_id()));
+            static_cast<void>(unregister_pipeline(frame_host->instance_id()));
         }
         if (world_registered_here) {
             static_cast<void>(unregister_world(world_scope.handle()));
@@ -219,7 +367,7 @@ foundation::Result EngineFrameOrchestrator::register_world_frame(world::WorldSco
     return foundation::Result::success();
 }
 
-foundation::Result EngineFrameOrchestrator::unregister_pipeline(pipeline::PipelineInstanceId instance) {
+foundation::Result EngineFrameOrchestrator::Impl::unregister_pipeline(pipeline::PipelineInstanceId instance) {
     if (initialized_ || frame_active_) {
         return invalid_state("cannot unregister a pipeline while the orchestrator is running");
     }
@@ -230,11 +378,6 @@ foundation::Result EngineFrameOrchestrator::unregister_pipeline(pipeline::Pipeli
     if (host == nullptr) {
         return not_found("pipeline host instance is not registered");
     }
-    for (const WorldRegistration& registration : worlds_) {
-        if (registration.world != nullptr && &registration.world->pipeline_host() == host) {
-            return invalid_state("World pipeline host must be unregistered through unregister_world");
-        }
-    }
     for (const WorldFrameBinding& binding : world_frames_) {
         if (binding.frame_host == host) {
             return invalid_state("Frame pipeline host is still bound to a World view");
@@ -244,7 +387,7 @@ foundation::Result EngineFrameOrchestrator::unregister_pipeline(pipeline::Pipeli
     return foundation::Result::success();
 }
 
-foundation::Result EngineFrameOrchestrator::unregister_world_frame(ecs::WorldHandle world_handle, uint32_t view_id) {
+foundation::Result EngineFrameOrchestrator::Impl::unregister_world_frame(ecs::WorldHandle world_handle, uint32_t view_id) {
     if (initialized_ || frame_active_) {
         return invalid_state("cannot unregister a World view while the orchestrator is running");
     }
@@ -276,7 +419,7 @@ foundation::Result EngineFrameOrchestrator::unregister_world_frame(ecs::WorldHan
     return foundation::Result::success();
 }
 
-foundation::Result EngineFrameOrchestrator::unregister_world(ecs::WorldHandle world_handle) {
+foundation::Result EngineFrameOrchestrator::Impl::unregister_world(ecs::WorldHandle world_handle) {
     if (initialized_ || frame_active_) {
         return invalid_state("cannot unregister a World while the orchestrator is running");
     }
@@ -295,20 +438,11 @@ foundation::Result EngineFrameOrchestrator::unregister_world(ecs::WorldHandle wo
     if (frame_iterator != world_frames_.end()) {
         return invalid_state("World still has registered Frame views");
     }
-    const pipeline::PipelineInstanceId instance = world_scope->pipeline_host().instance_id();
-    if (registration.pipeline_registered_by_orchestrator) {
-        if (find_pipeline_registration(instance) != &world_scope->pipeline_host()) {
-            return invalid_state("World registration references an inconsistent pipeline host");
-        }
-    }
     worlds_.erase(world_iterator);
-    if (registration.pipeline_registered_by_orchestrator) {
-        remove_pipeline_registration(world_scope->pipeline_host());
-    }
     return foundation::Result::success();
 }
 
-foundation::Result EngineFrameOrchestrator::validate_frame_desc(const EngineFrameDesc& desc) const {
+foundation::Result EngineFrameOrchestrator::Impl::validate_frame_desc(const EngineFrameDesc& desc) const {
     if (!desc.render_output_extent.is_valid()) {
         return invalid_argument("render output extent is invalid");
     }
@@ -333,7 +467,7 @@ foundation::Result EngineFrameOrchestrator::validate_frame_desc(const EngineFram
     return foundation::Result::success();
 }
 
-std::vector<pipeline::PipelineScopeHost*> EngineFrameOrchestrator::ordered_pipelines() const {
+std::vector<pipeline::PipelineScopeHost*> EngineFrameOrchestrator::Impl::ordered_pipelines() const {
     std::vector<pipeline::PipelineScopeHost*> ordered = pipelines_;
     std::stable_sort(ordered.begin(), ordered.end(),
                      [](const pipeline::PipelineScopeHost* left, const pipeline::PipelineScopeHost* right) {
@@ -351,7 +485,7 @@ std::vector<pipeline::PipelineScopeHost*> EngineFrameOrchestrator::ordered_pipel
     return ordered;
 }
 
-std::size_t EngineFrameOrchestrator::phase_rank(const pipeline::PhaseRegistrySnapshot& snapshot,
+std::size_t EngineFrameOrchestrator::Impl::phase_rank(const pipeline::PhaseRegistrySnapshot& snapshot,
                                                 pipeline::PhaseId phase) const noexcept {
     const auto iterator = std::find(snapshot.ordered_phases.begin(), snapshot.ordered_phases.end(), phase);
     if (iterator == snapshot.ordered_phases.end()) {
@@ -360,9 +494,9 @@ std::size_t EngineFrameOrchestrator::phase_rank(const pipeline::PhaseRegistrySna
     return static_cast<std::size_t>(std::distance(snapshot.ordered_phases.begin(), iterator));
 }
 
-foundation::Result EngineFrameOrchestrator::synchronize_phase_registry() {
+foundation::Result EngineFrameOrchestrator::Impl::synchronize_phase_registry() {
     const foundation::ResultValue<pipeline::PhaseRegistrySnapshot> phase_snapshot =
-        registry_.phase_registry().snapshot();
+        pipeline::detail::PhaseRegistryExecution::snapshot(pipeline_host_->registry().phase_registry());
     if (!phase_snapshot) {
         return phase_snapshot.result;
     }
@@ -386,15 +520,16 @@ foundation::Result EngineFrameOrchestrator::synchronize_phase_registry() {
 
         bool rebuild_required = registry_changed;
         {
-            const pipeline::PipelinePlanHandle plan = host->active_plan_snapshot();
+            const pipeline::PipelinePlanHandle plan =
+                pipeline::detail::PipelineScopeHostExecution::active_plan_snapshot(*host);
             rebuild_required = rebuild_required || plan == nullptr || plan->phase_revision != revision;
         }
         if (rebuild_required) {
-            if (const foundation::Result result = host->rebuild(registry_, available_capabilities_); !result) {
+            if (const foundation::Result result = host->rebuild(pipeline_host_->registry(), available_capabilities_); !result) {
                 return result;
             }
         }
-        if (host->has_pending_plan()) {
+        if (pipeline::detail::PipelineScopeHostExecution::has_pending_plan(*host)) {
             if (const foundation::Result result = host->apply_pending_plan(); !result) {
                 return result;
             }
@@ -404,14 +539,14 @@ foundation::Result EngineFrameOrchestrator::synchronize_phase_registry() {
         }
     }
 
-    if (registry_.phase_registry().revision() != revision) {
+    if (pipeline::detail::PhaseRegistryExecution::revision(pipeline_host_->registry().phase_registry()) != revision) {
         return invalid_state("pipeline phase registry changed during synchronization");
     }
     phase_revision_ = revision;
     return foundation::Result::success();
 }
 
-foundation::Result EngineFrameOrchestrator::activate_all() {
+foundation::Result EngineFrameOrchestrator::Impl::activate_all() {
     activated_pipelines_.clear();
 
     std::vector<pipeline::PipelineScopeHost*> ordered;
@@ -444,7 +579,7 @@ foundation::Result EngineFrameOrchestrator::activate_all() {
     return foundation::Result::success();
 }
 
-foundation::Result EngineFrameOrchestrator::deactivate_all() {
+foundation::Result EngineFrameOrchestrator::Impl::deactivate_all() {
     foundation::Result first_error = foundation::Result::success();
     for (auto iterator = activated_pipelines_.rbegin(); iterator != activated_pipelines_.rend(); ++iterator) {
         pipeline::PipelineScopeHost* host = *iterator;
@@ -460,7 +595,7 @@ foundation::Result EngineFrameOrchestrator::deactivate_all() {
     return first_error;
 }
 
-foundation::Result EngineFrameOrchestrator::initialize() {
+foundation::Result EngineFrameOrchestrator::Impl::initialize() {
     if (initialized_) {
         return invalid_state("engine frame orchestrator is already initialized");
     }
@@ -477,7 +612,7 @@ foundation::Result EngineFrameOrchestrator::initialize() {
 
     initialized_ = true;
     const foundation::ResultValue<pipeline::PhaseRegistrySnapshot> phase_snapshot =
-        registry_.phase_registry().snapshot();
+        pipeline::detail::PhaseRegistryExecution::snapshot(pipeline_host_->registry().phase_registry());
     if (!phase_snapshot) {
         (void)deactivate_all();
         initialized_ = false;
@@ -505,7 +640,7 @@ foundation::Result EngineFrameOrchestrator::initialize() {
     return foundation::Result::success();
 }
 
-foundation::Result EngineFrameOrchestrator::begin_frame(const EngineFrameDesc& desc) {
+foundation::Result EngineFrameOrchestrator::Impl::begin_frame(const EngineFrameDesc& desc) {
     if (!initialized_) {
         return invalid_state("engine frame orchestrator is not initialized");
     }
@@ -520,18 +655,14 @@ foundation::Result EngineFrameOrchestrator::begin_frame(const EngineFrameDesc& d
     }
 
     try {
-        feature_buffers_.assign(desc.render_feature_buffers.begin(), desc.render_feature_buffers.end());
         feature_textures_.assign(desc.render_feature_textures.begin(), desc.render_feature_textures.end());
         execution_leases_.assign(desc.render_graph_execution_leases.begin(), desc.render_graph_execution_leases.end());
         render_views_.assign(desc.render_views.begin(), desc.render_views.end());
         render_scene_snapshots_.clear();
-        render_feature_contexts_.clear();
     } catch (const std::bad_alloc&) {
         return out_of_memory("frame descriptor copy allocation failed");
     }
     frame_desc_ = desc;
-    frame_desc_.render_feature_buffers = std::span<const render_graph::RenderGraphFeatureBufferBinding>(
-        feature_buffers_.data(), feature_buffers_.size());
     frame_desc_.render_feature_textures = std::span<const render_graph::RenderGraphFeatureTextureBinding>(
         feature_textures_.data(), feature_textures_.size());
     frame_desc_.render_graph_execution_leases =
@@ -545,7 +676,7 @@ foundation::Result EngineFrameOrchestrator::begin_frame(const EngineFrameDesc& d
     }
     frame_active_ = true;
     render_feature_prepared_ = false;
-    render_features_built_ = false;
+    render_feature_post_built_ = false;
     render_graph_executed_ = false;
     frame_presented_ = false;
     worlds_committed_ = false;
@@ -612,7 +743,7 @@ foundation::Result EngineFrameOrchestrator::begin_frame(const EngineFrameDesc& d
             frame_desc_.swapchain_image_desc = swapchain_desc;
 
             if (!desc.reset_render_graph && swapchain_resource_.is_valid() &&
-                render_graph_.contains_texture(swapchain_resource_)) {
+                render_graph::detail::RenderGraphResourceAccess::contains_texture(render_graph_, swapchain_resource_)) {
                 if (const foundation::Result result = render_graph_.update_imported_texture(
                         swapchain_resource_, acquired.image.texture, acquired.image.view,
                         frame_desc_.swapchain_image_desc, frame_desc_.swapchain_image_initial_state);
@@ -652,7 +783,8 @@ foundation::Result EngineFrameOrchestrator::begin_frame(const EngineFrameDesc& d
             if (host == nullptr || !host->is_active()) {
                 return fail_frame(invalid_state("all registered pipeline hosts must be active"));
             }
-            pipeline::PipelinePlanHandle plan = host->active_plan_snapshot();
+            pipeline::PipelinePlanHandle plan =
+                pipeline::detail::PipelineScopeHostExecution::active_plan_snapshot(*host);
             if (plan == nullptr || plan->phase_revision != phase_revision_) {
                 return fail_frame(invalid_state("pipeline plan is missing or uses a stale phase registry"));
             }
@@ -668,35 +800,64 @@ foundation::Result EngineFrameOrchestrator::begin_frame(const EngineFrameDesc& d
     return foundation::Result::success();
 }
 
-foundation::Result EngineFrameOrchestrator::execute_pipeline_phase(const PinnedPipeline& pinned_pipeline,
+foundation::Result EngineFrameOrchestrator::Impl::execute_pipeline_phase(const PinnedPipeline& pinned_pipeline,
                                                                    pipeline::PhaseId phase) {
     if (pinned_pipeline.host == nullptr || pinned_pipeline.plan == nullptr) {
         return invalid_state("pinned pipeline is incomplete");
     }
-    void* user_data = frame_desc_.user_data;
-    void* scope_data = nullptr;
-    if (world::WorldScope* world_scope = find_world_for_host(*pinned_pipeline.host); world_scope != nullptr) {
-        scope_data = world_scope;
-    } else if (world::WorldFrameScope* frame_scope = find_frame_scope_for_host(*pinned_pipeline.host);
-               frame_scope != nullptr) {
-        scope_data = frame_scope;
-    }
-    pipeline::PipelineExecutionContext context(user_data, pinned_pipeline.host->scope(),
-                                               &pinned_pipeline.host->artifacts(), nullptr, scope_data);
-    return pinned_pipeline.host->execute_phase(scheduler_, context, phase, pinned_pipeline.plan);
-}
-
-world::WorldScope* EngineFrameOrchestrator::find_world_for_host(
-    const pipeline::PipelineScopeHost& host) const noexcept {
-    for (const WorldRegistration& registration : worlds_) {
-        if (registration.world != nullptr && &registration.world->pipeline_host() == &host) {
-            return registration.world;
+    pipeline::PipelineExecutionContext context(pinned_pipeline.host->scope(), &pinned_pipeline.host->artifacts());
+    if (const auto result = pinned_pipeline.host->execute_phase(pipeline_host_->scheduler(), context, phase,
+                                                               pinned_pipeline.plan); !result) return result;
+    if (!inspection_enabled_) return foundation::Result::success();
+    try {
+        std::vector<detail::EngineFrameStageObservation> observations;
+        observations.reserve(context.visited_nodes().size());
+        for (const uint32_t index : context.visited_nodes()) {
+            if (index >= pinned_pipeline.plan->nodes.size()) return invalid_state("Stage inspection has an invalid visit");
+            const auto& node = pinned_pipeline.plan->nodes[index];
+            detail::EngineFrameStageObservation observation{};
+            observation.instance = pinned_pipeline.host->instance_id();
+            observation.stage = node.stage;
+            observation.phase = node.phase_id;
+            observation.scope = pinned_pipeline.host->scope();
+            observation.frame_number = frame_context_.frame_number();
+            observation.fixed_tick = frame_desc_.fixed_tick;
+            observation.user_data_identity = reinterpret_cast<uintptr_t>(frame_desc_.user_data);
+            if (auto* scope = find_frame_scope_for_host(*pinned_pipeline.host); scope != nullptr) {
+                observation.scope_identity = reinterpret_cast<uintptr_t>(scope);
+                observation.world_frame = scope->key();
+                const bool reads_snapshot = std::any_of(node.artifact_bindings.begin(), node.artifact_bindings.end(),
+                    [](const pipeline::ArtifactBinding& binding) {
+                        return binding.artifact == world::detail::kWorldSnapshotArtifactId &&
+                               binding.access == pipeline::ArtifactAccess::kRead;
+                    });
+                if (reads_snapshot) {
+                    const auto typed = scope->read_snapshot();
+                    if (!typed) return typed.result;
+                    const auto* bridge = pipeline::detail::PipelineScopeHostExecution::scope_bridge(*pinned_pipeline.host);
+                    if (bridge == nullptr) return invalid_state("Stage inspection lost the current host bridge");
+                    const auto bridged = bridge->read(world::detail::kWorldSnapshotArtifactId,
+                        world::detail::kWorldSnapshotArtifactTypeId, world::detail::kWorldSnapshotArtifactVersion);
+                    if (!bridged) return bridged.result;
+                    const auto* value = bridged.value.as<ecs::WorldSnapshot>(world::detail::kWorldSnapshotArtifactTypeId);
+                    if (value == nullptr || bridged.value.owner_scope() != pipeline::PipelineScope::kWorld ||
+                        value->world() != typed.value.world() || value->revision() != typed.value.revision() ||
+                        value->frame_number() != typed.value.frame_number() || value->fixed_tick() != typed.value.fixed_tick())
+                        return invalid_state("Stage inspection disagrees with the captured World bridge");
+                    observation.world_snapshot = typed.value;
+                    observation.bridged_snapshot = bridged.value;
+                }
+            }
+            observations.push_back(std::move(observation));
         }
+        inspection_trace_.stages.insert(inspection_trace_.stages.end(), observations.begin(), observations.end());
+    } catch (const std::bad_alloc&) {
+        return out_of_memory("Stage inspection allocation failed");
     }
-    return nullptr;
+    return foundation::Result::success();
 }
 
-world::WorldFrameScope* EngineFrameOrchestrator::find_frame_scope_for_host(
+world::WorldFrameScope* EngineFrameOrchestrator::Impl::find_frame_scope_for_host(
     const pipeline::PipelineScopeHost& host) const noexcept {
     for (const ActiveWorldFrame& active : active_world_frames_) {
         if (active.binding.frame_host == &host && active.scope != nullptr) {
@@ -706,29 +867,18 @@ world::WorldFrameScope* EngineFrameOrchestrator::find_frame_scope_for_host(
     return nullptr;
 }
 
-const renderer::RenderSceneSnapshot* EngineFrameOrchestrator::find_render_scene_snapshot(
-    const renderer::RenderView& view) const noexcept {
-    for (std::size_t index = 0; index < render_views_.size() && index < render_scene_snapshots_.size(); ++index) {
-        const renderer::RenderView& candidate = render_views_[index];
-        if (candidate.id == view.id || (candidate.world == view.world && candidate.view_id == view.view_id)) {
-            return render_scene_snapshots_[index].get();
-        }
-    }
-    return nullptr;
-}
-
-foundation::Result EngineFrameOrchestrator::prepare_world_frames() {
+foundation::Result EngineFrameOrchestrator::Impl::prepare_world_frames() {
     clear_world_frames();
     try {
         active_world_frames_.reserve(world_frames_.size());
         for (const WorldFrameBinding& binding : world_frames_) {
-            if (binding.world == nullptr || binding.frame_host == nullptr) {
+            if (binding.world == nullptr) {
                 return invalid_state("World view registration contains a null owner");
             }
             if (!binding.world->is_initialized()) {
                 return invalid_state("all registered World Scopes must be initialized");
             }
-            if (binding.frame_host->scope() != pipeline::PipelineScope::kFrame) {
+            if (binding.frame_host && binding.frame_host->scope() != pipeline::PipelineScope::kFrame) {
                 return invalid_state("World view is bound to a non-Frame pipeline host");
             }
             foundation::ResultValue<world::WorldFrameScope> scope_result =
@@ -741,8 +891,11 @@ foundation::Result EngineFrameOrchestrator::prepare_world_frames() {
             active.scope = std::make_unique<world::WorldFrameScope>(std::move(scope_result.value));
             active_world_frames_.push_back(std::move(active));
             ActiveWorldFrame& stored = active_world_frames_.back();
-            stored.previous_bridge = binding.frame_host->scope_bridge();
-            binding.frame_host->set_scope_bridge(stored.scope->bridge());
+            if (binding.frame_host) {
+                stored.previous_bridge = pipeline::detail::PipelineScopeHostExecution::scope_bridge(*binding.frame_host);
+                pipeline::detail::PipelineScopeHostExecution::set_scope_bridge(
+                    *binding.frame_host, world::detail::WorldSnapshotExecution::bridge(*stored.scope));
+            }
         }
     } catch (const std::bad_alloc&) {
         clear_world_frames();
@@ -751,7 +904,7 @@ foundation::Result EngineFrameOrchestrator::prepare_world_frames() {
     return foundation::Result::success();
 }
 
-foundation::Result EngineFrameOrchestrator::apply_world_commands() {
+foundation::Result EngineFrameOrchestrator::Impl::apply_world_commands() {
     for (const WorldRegistration& registration : worlds_) {
         world::WorldScope* world_scope = registration.world;
         if (world_scope == nullptr) {
@@ -764,7 +917,7 @@ foundation::Result EngineFrameOrchestrator::apply_world_commands() {
     return foundation::Result::success();
 }
 
-foundation::Result EngineFrameOrchestrator::commit_worlds() {
+foundation::Result EngineFrameOrchestrator::Impl::commit_worlds() {
     if (worlds_committed_) {
         return foundation::Result::success();
     }
@@ -773,6 +926,9 @@ foundation::Result EngineFrameOrchestrator::commit_worlds() {
             world::WorldScope* world_scope = registration.world;
             if (world_scope == nullptr) {
                 return invalid_state("orchestrator contains a null World Scope");
+            }
+            if (world_commands_) {
+                if (const auto result = world_commands_->consume(*world_scope); !result) return result;
             }
             const foundation::ResultValue<std::shared_ptr<const ecs::WorldSnapshot>> snapshot =
                 world_scope->commit(frame_context_.frame_number(), frame_desc_.fixed_tick);
@@ -795,7 +951,7 @@ foundation::Result EngineFrameOrchestrator::commit_worlds() {
     return foundation::Result::success();
 }
 
-foundation::Result EngineFrameOrchestrator::extract_render_scenes() {
+foundation::Result EngineFrameOrchestrator::Impl::extract_render_scenes() {
     if (frame_desc_.renderer == nullptr && !render_views_.empty()) {
         return invalid_argument("render views require a Renderer instance");
     }
@@ -824,13 +980,12 @@ foundation::Result EngineFrameOrchestrator::extract_render_scenes() {
                     if (!snapshot_artifact) {
                         return snapshot_artifact.result;
                     }
-                    const auto* snapshot =
-                        snapshot_artifact.value.as<ecs::WorldSnapshot>(world::kWorldSnapshotArtifactTypeId);
-                    if (snapshot == nullptr || snapshot->world() != active.binding.world->handle()) {
+                    const auto& snapshot = snapshot_artifact.value;
+                    if (!snapshot.is_valid() || snapshot.world() != active.binding.world->handle()) {
                         return invalid_state("render view resolver received an invalid World snapshot");
                     }
                     const auto resolved = frame_desc_.render_view_resolver(
-                        EngineFrameRenderViewContext{*snapshot, active.binding.view_id, output_extent});
+                        EngineFrameRenderViewContext{snapshot, active.binding.view_id, output_extent});
                     if (!resolved) {
                         return resolved.result;
                     }
@@ -852,8 +1007,8 @@ foundation::Result EngineFrameOrchestrator::extract_render_scenes() {
         }
 
         const bool single_swapchain_view = frame_desc_.acquire_swapchain_image && render_views_.size() == 1;
-        const pipeline::RenderResourceId default_color_target =
-            single_swapchain_view ? frame_desc_.swapchain_resource_id : pipeline::RenderResourceId{};
+        const feature::RenderResourceId default_color_target =
+            single_swapchain_view ? frame_desc_.swapchain_resource_id : feature::RenderResourceId{};
         render_scene_snapshots_.reserve(render_views_.size());
         for (std::size_t view_index = 0; view_index < render_views_.size(); ++view_index) {
             renderer::RenderView& view = render_views_[view_index];
@@ -885,8 +1040,7 @@ foundation::Result EngineFrameOrchestrator::extract_render_scenes() {
                     active_frame = &candidate;
                 }
             }
-            if (active_frame == nullptr || active_frame->binding.frame_host == nullptr ||
-                active_frame->scope == nullptr) {
+            if (active_frame == nullptr || active_frame->scope == nullptr) {
                 return not_found("RenderView has no registered World Frame scope");
             }
 
@@ -899,8 +1053,10 @@ foundation::Result EngineFrameOrchestrator::extract_render_scenes() {
             if (!snapshot) {
                 return snapshot.result;
             }
-            if (const foundation::Result result =
-                    frame_desc_.renderer->publish_frame_snapshot(*active_frame->binding.frame_host, snapshot.value);
+            if (active_frame->binding.frame_host)
+              if (const foundation::Result result =
+                    renderer::publish_frame_snapshot(*frame_desc_.renderer, *active_frame->binding.frame_host,
+                                                      snapshot.value);
                 !result) {
                 return result;
             }
@@ -918,7 +1074,7 @@ foundation::Result EngineFrameOrchestrator::extract_render_scenes() {
     return foundation::Result::success();
 }
 
-foundation::Result EngineFrameOrchestrator::release_frame_artifacts() {
+foundation::Result EngineFrameOrchestrator::Impl::release_frame_artifacts() {
     foundation::Result first_error = foundation::Result::success();
     for (pipeline::PipelineScopeHost* host : pipelines_) {
         if (host == nullptr) {
@@ -932,18 +1088,18 @@ foundation::Result EngineFrameOrchestrator::release_frame_artifacts() {
     return first_error;
 }
 
-foundation::Result EngineFrameOrchestrator::bind_feature_texture(pipeline::RenderResourceId id,
+foundation::Result EngineFrameOrchestrator::Impl::bind_feature_texture(feature::RenderResourceId id,
                                                                  render_graph::RenderGraphTexture texture) {
     if (!frame_active_ || !frame_context_.is_frame_active()) {
         return invalid_state("feature texture binding requires an active frame");
     }
-    if (render_feature_prepared_ || render_features_built_) {
-        return invalid_state("feature texture binding must finish before RenderFeature construction");
+    if (render_feature_prepared_) {
+        return invalid_state("feature texture binding must finish during frame preparation");
     }
     if (!id.is_valid() || !texture.is_valid()) {
         return invalid_argument("feature texture binding is invalid");
     }
-    if (!render_graph_.contains_texture(texture)) {
+    if (!render_graph::detail::RenderGraphResourceAccess::contains_texture(render_graph_, texture)) {
         return not_found("feature texture does not belong to the active RenderGraph");
     }
 
@@ -967,85 +1123,23 @@ foundation::Result EngineFrameOrchestrator::bind_feature_texture(pipeline::Rende
     return foundation::Result::success();
 }
 
-void EngineFrameOrchestrator::clear_world_frames() noexcept {
+void EngineFrameOrchestrator::Impl::clear_world_frames() noexcept {
     for (const ActiveWorldFrame& active : active_world_frames_) {
         if (active.binding.frame_host != nullptr) {
-            active.binding.frame_host->set_scope_bridge(active.previous_bridge);
+            pipeline::detail::PipelineScopeHostExecution::set_scope_bridge(*active.binding.frame_host,
+                                                                            active.previous_bridge);
         }
     }
     active_world_frames_.clear();
     worlds_committed_ = false;
 }
 
-foundation::Result EngineFrameOrchestrator::build_render_features() {
-    if (render_features_built_) {
-        return foundation::Result::success();
-    }
-    try {
-        render_feature_contexts_.clear();
-        render_feature_contexts_.reserve(pinned_pipelines_.size());
-        for (const PinnedPipeline& pinned_pipeline : pinned_pipelines_) {
-            const renderer::RenderFeatureContext* feature_context = nullptr;
-            if (frame_desc_.renderer != nullptr && pinned_pipeline.host != nullptr &&
-                pinned_pipeline.host->scope() == pipeline::PipelineScope::kFrame) {
-                for (const ActiveWorldFrame& active : active_world_frames_) {
-                    if (active.binding.frame_host != pinned_pipeline.host || active.scope == nullptr ||
-                        active.binding.world == nullptr) {
-                        continue;
-                    }
-                    renderer::RenderView view{};
-                    view.id = renderer::make_render_view_id(active.binding.world->handle(), active.binding.view_id);
-                    view.world = active.binding.world->handle();
-                    view.view_id = active.binding.view_id;
-                    const renderer::RenderSceneSnapshot* snapshot = find_render_scene_snapshot(view);
-                    if (snapshot == nullptr) {
-                        return not_found("Frame pipeline has no extracted RenderSceneSnapshot");
-                    }
-                    auto context = std::make_unique<renderer::RenderFeatureContext>(
-                        renderer::RenderFeatureContext{snapshot, frame_desc_.render_resource_resolver,
-                                                       frame_desc_.user_data, frame_desc_.render_passes});
-                    feature_context = context.get();
-                    render_feature_contexts_.push_back(
-                        RenderFeatureContextBinding{pinned_pipeline.host, std::move(context)});
-                    break;
-                }
-            }
-            const render_graph::RenderGraphFeatureRuntimeDesc desc{
-                std::span<const render_graph::RenderGraphFeatureBufferBinding>(feature_buffers_.data(),
-                                                                               feature_buffers_.size()),
-                std::span<const render_graph::RenderGraphFeatureTextureBinding>(feature_textures_.data(),
-                                                                                feature_textures_.size()),
-                frame_desc_.user_data,
-                feature_context,
-                frame_desc_.render_feature_state,
-                pinned_pipeline.host == nullptr ? std::shared_ptr<const pipeline::PipelineInstanceConfiguration>{}
-                                                : pinned_pipeline.host->configuration(),
-                frame_desc_.render_passes};
-            pipeline::PipelinePlanHandle plan = pinned_pipeline.plan;
-            if (const foundation::Result result =
-                    render_graph::build_render_graph_features(render_graph_, std::move(plan), registry_, desc);
-                !result) {
-                return result;
-            }
-        }
-    } catch (const std::bad_alloc&) {
-        return out_of_memory("render feature graph build allocation failed");
-    } catch (const std::exception& exception) {
-        return foundation::Result::failure(foundation::ResultCode::kUnknown, exception.what());
-    } catch (...) {
-        return foundation::Result::failure(foundation::ResultCode::kUnknown,
-                                           "render feature graph build threw an unknown exception");
-    }
-    render_features_built_ = true;
-    return foundation::Result::success();
-}
-
-foundation::Result EngineFrameOrchestrator::post_build_render_features() {
+foundation::Result EngineFrameOrchestrator::Impl::post_build_render_features() {
     if (render_feature_post_built_) {
         return foundation::Result::success();
     }
-    if (!render_features_built_) {
-        return invalid_state("RenderFeature post-build hook requires a built render graph");
+    if (!render_feature_prepared_) {
+        return invalid_state("frame post-build hook requires completed preparation");
     }
     if (frame_desc_.render_feature_post_build) {
         const EngineFramePostBuildContext post_build_context{
@@ -1053,6 +1147,9 @@ foundation::Result EngineFrameOrchestrator::post_build_render_features() {
             render_graph_,
             frame_context_.acquired_frame(),
             swapchain_resource_,
+            feature_textures_,
+            render_scene_snapshots_,
+            frame_desc_.render_resource_resolver,
         };
         try {
             if (const foundation::Result result = frame_desc_.render_feature_post_build(post_build_context); !result) {
@@ -1071,7 +1168,7 @@ foundation::Result EngineFrameOrchestrator::post_build_render_features() {
     return foundation::Result::success();
 }
 
-foundation::Result EngineFrameOrchestrator::execute_render_graph() {
+foundation::Result EngineFrameOrchestrator::Impl::execute_render_graph() {
     if (render_graph_executed_) {
         return foundation::Result::success();
     }
@@ -1089,7 +1186,7 @@ foundation::Result EngineFrameOrchestrator::execute_render_graph() {
     return foundation::Result::success();
 }
 
-foundation::Result EngineFrameOrchestrator::execute_registered_phase(pipeline::PhaseId phase, PhaseExecutionMode mode,
+foundation::Result EngineFrameOrchestrator::Impl::execute_registered_phase(pipeline::PhaseId phase, PhaseExecutionMode mode,
                                                                      bool finalize_frame) {
     if (!initialized_) {
         return invalid_state("engine frame orchestrator is not initialized");
@@ -1098,7 +1195,7 @@ foundation::Result EngineFrameOrchestrator::execute_registered_phase(pipeline::P
         return invalid_argument("phase id is invalid");
     }
     const foundation::ResultValue<pipeline::PhaseRegistrySnapshot> phase_snapshot =
-        registry_.phase_registry().snapshot();
+        pipeline::detail::PhaseRegistryExecution::snapshot(pipeline_host_->registry().phase_registry());
     if (!phase_snapshot) {
         return phase_snapshot.result;
     }
@@ -1225,7 +1322,8 @@ foundation::Result EngineFrameOrchestrator::execute_registered_phase(pipeline::P
             if (host == nullptr) {
                 return invalid_state("orchestrator contains a null pipeline host");
             }
-            const PinnedPipeline pinned_pipeline{host, host->active_plan_snapshot()};
+            const PinnedPipeline pinned_pipeline{
+                host, pipeline::detail::PipelineScopeHostExecution::active_plan_snapshot(*host)};
             if (const foundation::Result result = execute_pipeline_phase(pinned_pipeline, phase); !result) {
                 return result;
             }
@@ -1236,7 +1334,8 @@ foundation::Result EngineFrameOrchestrator::execute_registered_phase(pipeline::P
         !render_feature_prepared_) {
         if (frame_desc_.render_feature_preparation) {
             const EngineFramePreparationContext preparation_context{
-                frame_context_, render_graph_, frame_context_.acquired_frame(), swapchain_resource_, *this,
+                frame_context_, render_graph_, frame_context_.acquired_frame(), swapchain_resource_,
+                render_scene_snapshots_, owner_,
             };
             try {
                 if (const foundation::Result result = frame_desc_.render_feature_preparation(preparation_context);
@@ -1256,9 +1355,6 @@ foundation::Result EngineFrameOrchestrator::execute_registered_phase(pipeline::P
     }
 
     if (mode == PhaseExecutionMode::kFrame && is_builtin_phase(phase, pipeline::EnginePhase::kRenderBuild)) {
-        if (const foundation::Result result = build_render_features(); !result) {
-            return result;
-        }
         if (const foundation::Result result = post_build_render_features(); !result) {
             return result;
         }
@@ -1275,7 +1371,7 @@ foundation::Result EngineFrameOrchestrator::execute_registered_phase(pipeline::P
         frame_presented_ = true;
     }
 
-    if (registry_.phase_registry().revision() != phase_revision_) {
+    if (pipeline::detail::PhaseRegistryExecution::revision(pipeline_host_->registry().phase_registry()) != phase_revision_) {
         return invalid_state("phase registry changed during phase execution");
     }
 
@@ -1285,16 +1381,7 @@ foundation::Result EngineFrameOrchestrator::execute_registered_phase(pipeline::P
     return foundation::Result::success();
 }
 
-foundation::Result EngineFrameOrchestrator::execute_phase(pipeline::PhaseId phase) {
-    const bool finalize_frame = is_builtin_phase(phase, pipeline::EnginePhase::kFrameEnd);
-    const foundation::Result result = execute_registered_phase(phase, PhaseExecutionMode::kFrame, finalize_frame);
-    if (!result && frame_active_) {
-        return fail_frame(result);
-    }
-    return result;
-}
-
-foundation::Result EngineFrameOrchestrator::finish_frame(bool clear_state) {
+foundation::Result EngineFrameOrchestrator::Impl::finish_frame(bool clear_state) {
     if (!frame_active_) {
         return invalid_state("no orchestrator frame is active");
     }
@@ -1364,7 +1451,7 @@ foundation::Result EngineFrameOrchestrator::finish_frame(bool clear_state) {
     return presentation_status;
 }
 
-foundation::Result EngineFrameOrchestrator::fail_frame(foundation::Result result) {
+foundation::Result EngineFrameOrchestrator::Impl::fail_frame(foundation::Result result) {
     if (frame_active_ || frame_context_.is_frame_active()) {
         const foundation::Result abort_result = frame_context_.abort_frame();
         result = append_failure(std::move(result), abort_result);
@@ -1378,16 +1465,14 @@ foundation::Result EngineFrameOrchestrator::fail_frame(foundation::Result result
     return result;
 }
 
-foundation::Result EngineFrameOrchestrator::clear_frame_state() noexcept {
+foundation::Result EngineFrameOrchestrator::Impl::clear_frame_state() noexcept {
     const bool preserve_swapchain_resource = !frame_desc_.reset_render_graph;
     clear_world_frames();
     pinned_pipelines_.clear();
-    feature_buffers_.clear();
     feature_textures_.clear();
     execution_leases_.clear();
     render_views_.clear();
     render_scene_snapshots_.clear();
-    render_feature_contexts_.clear();
     if (!preserve_swapchain_resource) {
         swapchain_resource_ = {};
     }
@@ -1396,7 +1481,6 @@ foundation::Result EngineFrameOrchestrator::clear_frame_state() noexcept {
     has_last_phase_ = false;
     frame_active_ = false;
     render_feature_prepared_ = false;
-    render_features_built_ = false;
     render_feature_post_built_ = false;
     render_graph_executed_ = false;
     frame_presented_ = false;
@@ -1404,13 +1488,13 @@ foundation::Result EngineFrameOrchestrator::clear_frame_state() noexcept {
     return foundation::Result::success();
 }
 
-foundation::Result EngineFrameOrchestrator::run_frame(const EngineFrameDesc& desc) {
+foundation::Result EngineFrameOrchestrator::Impl::run_frame(const EngineFrameDesc& desc) {
     if (const foundation::Result result = begin_frame(desc); !result) {
         return result;
     }
 
     const foundation::ResultValue<pipeline::PhaseRegistrySnapshot> phase_snapshot =
-        registry_.phase_registry().snapshot();
+        pipeline::detail::PhaseRegistryExecution::snapshot(pipeline_host_->registry().phase_registry());
     if (!phase_snapshot) {
         return fail_frame(phase_snapshot.result);
     }
@@ -1498,7 +1582,7 @@ foundation::Result EngineFrameOrchestrator::run_frame(const EngineFrameDesc& des
     return foundation::Result::success();
 }
 
-foundation::Result EngineFrameOrchestrator::shutdown() {
+foundation::Result EngineFrameOrchestrator::Impl::shutdown() {
     if (!initialized_) {
         return invalid_state("engine frame orchestrator is not initialized");
     }
@@ -1529,7 +1613,7 @@ foundation::Result EngineFrameOrchestrator::shutdown() {
         }
     } else {
         const foundation::ResultValue<pipeline::PhaseRegistrySnapshot> phase_snapshot =
-            registry_.phase_registry().snapshot();
+        pipeline::detail::PhaseRegistryExecution::snapshot(pipeline_host_->registry().phase_registry());
         if (!phase_snapshot) {
             if (first_error) {
                 first_error = phase_snapshot.result;
@@ -1560,9 +1644,68 @@ foundation::Result EngineFrameOrchestrator::shutdown() {
     if (!deactivate_result && first_error) {
         first_error = deactivate_result;
     }
+    // RenderGraph imports are frame-owned references. Release them at the
+    // orchestration boundary so host-owned textures and views can be retired
+    // immediately after shutdown.
+    render_graph_.reset();
+    swapchain_resource_ = {};
     initialized_ = false;
     phase_revision_ = 0;
     (void)clear_frame_state();
     return first_error;
+}
+EngineFrameOrchestrator::EngineFrameOrchestrator(const EngineFramePipelineHost& pipeline_host,
+    render_graph::FrameContext& frame_context, render_graph::RenderGraph& render_graph,
+    uint64_t available_capabilities)
+    : impl_(std::make_unique<Impl>(*this, pipeline_host, frame_context, render_graph, available_capabilities)) {}
+EngineFrameOrchestrator::~EngineFrameOrchestrator() = default;
+foundation::Result EngineFrameOrchestrator::register_pipeline(const EngineFramePipelineRegistration& registration) {
+    return impl_->register_pipeline(registration);
+}
+foundation::Result EngineFrameOrchestrator::register_world(world::WorldScope& world_scope) {
+    return impl_->register_world(world_scope);
+}
+foundation::Result EngineFrameOrchestrator::register_world_frame(world::WorldScope& world_scope, uint32_t view_id) {
+    return impl_->register_world_frame(world_scope, view_id);
+}
+foundation::Result EngineFrameOrchestrator::register_world_frame(world::WorldScope& world_scope,
+    const EngineFramePipelineRegistration& registration, uint32_t view_id) {
+    return impl_->register_world_frame(world_scope, registration, view_id);
+}
+foundation::Result EngineFrameOrchestrator::unregister_world_frame(ecs::WorldHandle world, uint32_t view_id) {
+    return impl_->unregister_world_frame(world, view_id);
+}
+foundation::Result EngineFrameOrchestrator::unregister_world(ecs::WorldHandle world) {
+    return impl_->unregister_world(world);
+}
+foundation::Result EngineFrameOrchestrator::initialize() { return impl_->initialize(); }
+foundation::Result EngineFrameOrchestrator::begin_frame(const EngineFrameDesc& desc) { return impl_->begin_frame(desc); }
+foundation::Result EngineFrameOrchestrator::run_frame(const EngineFrameDesc& desc) { return impl_->run_frame(desc); }
+foundation::Result EngineFrameOrchestrator::shutdown() { return impl_->shutdown(); }
+bool EngineFrameOrchestrator::is_initialized() const noexcept { return impl_->initialized_; }
+bool EngineFrameOrchestrator::is_frame_active() const noexcept { return impl_->frame_active_; }
+std::size_t EngineFrameOrchestrator::world_count() const noexcept { return impl_->worlds_.size(); }
+std::size_t EngineFrameOrchestrator::world_frame_count() const noexcept { return impl_->world_frames_.size(); }
+uint32_t EngineFrameOrchestrator::draw_call_count() const noexcept { return impl_->draw_call_count_; }
+foundation::Result EngineFrameOrchestrator::bind_feature_texture(feature::RenderResourceId id,
+    render_graph::RenderGraphTexture texture) { return impl_->bind_feature_texture(id, texture); }
+foundation::Result detail::EngineFrameInspection::enable(EngineFrameOrchestrator& owner, bool enabled) {
+    if (owner.impl_->frame_active_ || owner.impl_->frame_context_.is_frame_active())
+        return invalid_state("cannot change Stage inspection during an active frame");
+    owner.impl_->inspection_trace_.stages.clear();
+    owner.impl_->inspection_enabled_ = enabled;
+    return foundation::Result::success();
+}
+foundation::Result detail::EngineFrameWorldCommands::attach(EngineFrameOrchestrator& owner,
+    FeatureWorldCommandConsumer& consumer) {
+    if (owner.impl_->frame_active_ || owner.impl_->frame_context_.is_frame_active())
+        return invalid_state("cannot attach World command consumption during an active frame");
+    owner.impl_->world_commands_ = &consumer;
+    return foundation::Result::success();
+}
+foundation::ResultValue<detail::EngineFrameInspectionTrace> detail::EngineFrameInspection::capture(
+    const EngineFrameOrchestrator& owner) {
+    try { return {foundation::Result::success(), owner.impl_->inspection_trace_}; }
+    catch (const std::bad_alloc&) { return {out_of_memory("Stage inspection copy allocation failed"), {}}; }
 }
 }  // namespace aeg::engine

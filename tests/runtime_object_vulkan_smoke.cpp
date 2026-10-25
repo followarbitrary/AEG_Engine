@@ -8,6 +8,7 @@
 #include "renderer.hpp"
 #include "rhi.hpp"
 #include "runtime_asset_resolver.hpp"
+#include "runtime_asset_upload_host.hpp"
 
 namespace {
 using namespace aeg;
@@ -51,8 +52,9 @@ int main() {
 
     render_graph::FrameContext frame(*device, {.frames_in_flight = 2});
     application::runtime::RuntimeAssetResolver resolver;
-    resolver.set_upload_context(
-        {.device = device.get(), .frame_context = &frame, .object_binding_layout = layout.value});
+    application::runtime::RuntimeAssetResolver::UploadContext upload_context{
+        .device = device.get(), .frame_context = &frame, .object_binding_layout = layout.value};
+    resolver.set_upload_context(upload_context);
 
     renderer::RenderInstance instance{};
     instance.object = renderer::RenderObjectId{7};

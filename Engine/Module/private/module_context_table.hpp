@@ -13,11 +13,11 @@ namespace aeg::module {
 /** @brief Kinds accepted by the checked module context table. */
 enum class ModuleContextKind : uint32_t {
     kModule = 1,
-    kPipeline = 2,
-    kFeature = 3,
-    kTask = 4,
+    kFeatureDefinition = 2,
+    kFeatureInstance = 3,
+    kProcess = 4,
     kRenderGraph = 5,
-    kRenderPass = 6,
+    kRenderWorkItem = 6,
     kReflection = 7,
 };
 

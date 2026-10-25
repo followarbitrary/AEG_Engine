@@ -2,11 +2,14 @@
  * @file concurrency_smoke.cpp
  * @brief Exercises completion, cancellation, executor, and task-group contracts.
  */
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <concurrency.hpp>
+#include <iostream>
 #include <memory>
-#include <thread>
+#include <vector>
 
 namespace {
 using aeg::foundation::Result;
@@ -22,7 +25,7 @@ using aeg::foundation::ResultCode;
         if (std::chrono::steady_clock::now() >= deadline) {
             return false;
         }
-        std::this_thread::yield();
+        aeg::concurrency::yield_current_thread();
     }
     return true;
 }
@@ -42,9 +45,118 @@ aeg::concurrency::CoroutineTask record_coroutine_start(std::atomic<uint32_t>& st
     start_count.fetch_add(1, std::memory_order_relaxed);
     co_return Result::success();
 }
+
+bool test_identity_issuer_is_unique_across_workers_and_preserves_thread_identity() {
+    using namespace aeg::concurrency;
+    const auto owner = current_thread_id();
+    std::array<std::array<uint64_t, 128>, 16> issued{};
+    std::array<CompletionSource, 4> started{};
+    CompletionSource release;
+    WorkerExecutor executor({ExecutorDomain::kCpuWorker, 4, false});
+    TaskGroup group;
+    for (std::size_t batch = 0; batch < issued.size(); ++batch) {
+        TaskDesc task{};
+        task.execute = [&, batch](const TaskContext&) {
+            const auto worker = current_thread_id();
+            if (batch < started.size()) {
+                static_cast<void>(started[batch].complete());
+                if (!release.completion().wait(5'000'000'000ull)) return failure_result();
+            }
+            for (auto& id : issued[batch]) {
+                id = allocate_unique_identity();
+                if (id == 0 || id == owner.value || id == worker.value || current_thread_id() != worker)
+                    return failure_result();
+            }
+            return Result::success();
+        };
+        if (!group.submit(executor, std::move(task))) return false;
+    }
+    for (const auto& worker : started)
+        if (!worker.completion().wait(5'000'000'000ull)) return false;
+    static_cast<void>(release.complete());
+    if (!group.wait(5'000'000'000ull) || !executor.wait_idle(5'000'000'000ull) || current_thread_id() != owner)
+        return false;
+    std::vector<uint64_t> identities;
+    for (const auto& batch : issued) identities.insert(identities.end(), batch.begin(), batch.end());
+    std::sort(identities.begin(), identities.end());
+    return identities.front() != 0 && std::adjacent_find(identities.begin(), identities.end()) == identities.end();
+}
+
+bool test_executor_lanes_cancellation_and_inline_replacement() {
+    using namespace aeg::concurrency;
+    const auto owner = current_thread_id();
+    // These are existing Concurrency lanes. kGpu selects its technical executor,
+    // and does not introduce another Feature domain or claim a GPU shader ran.
+    constexpr std::array domains{ExecutorDomain::kCpuWorker, ExecutorDomain::kIoWorker,
+                                 ExecutorDomain::kRenderThread, ExecutorDomain::kGpu};
+    struct LaneState final {
+        std::atomic<uint32_t> count{0};
+        ThreadId thread{};
+    };
+    std::array<LaneState, domains.size()> states{};
+    std::array<std::shared_ptr<WorkerExecutor>, domains.size()> executors{};
+    ThreadId main_execution{};
+    ExecutorRegistry registry;
+    const auto main = registry.find_executor(ExecutorDomain::kMainThread);
+    if (!main || main.value->domain() != ExecutorDomain::kMainThread || main.value->worker_count() != 0) return false;
+    TaskDesc main_task;
+    main_task.execute = [&](const TaskContext&) {
+        main_execution = current_thread_id();
+        return Result::success();
+    };
+    const auto main_submission = registry.submit(ExecutorDomain::kMainThread, std::move(main_task));
+    if (!main_submission || !main_submission.value.wait(5'000'000'000ull) || main_execution != owner) return false;
+
+    const auto make_task = [&](std::size_t index) {
+        TaskDesc task;
+        task.domain = domains[index];
+        task.user_data = &states[index];
+        task.execute = [&, index](const TaskContext& context) {
+            if (context.user_data != &states[index]) return failure_result();
+            states[index].thread = current_thread_id();
+            states[index].count.fetch_add(1, std::memory_order_relaxed);
+            return Result::success();
+        };
+        return task;
+    };
+    for (std::size_t index = 0; index < domains.size(); ++index) {
+        executors[index] = std::make_shared<WorkerExecutor>(WorkerExecutorDesc{domains[index], 1, true});
+        if (!registry.register_executor(executors[index])) return false;
+        const auto executor = registry.find_executor(domains[index]);
+        const auto submitted = registry.submit(domains[index], make_task(index));
+        if (!executor || executor.value != executors[index] || executor.value->domain() != domains[index] ||
+            executor.value->worker_count() != 1 || !submitted || !submitted.value.wait(5'000'000'000ull) ||
+            states[index].count.load() != 1 || !states[index].thread.is_valid() || states[index].thread == owner) {
+            std::cerr << "Direct Concurrency lane execution failed: " << index << '\n';
+            return false;
+        }
+        for (std::size_t previous = 0; previous < index; ++previous)
+            if (states[previous].thread == states[index].thread) return false;
+    }
+    CancellationSource cancellation;
+    static_cast<void>(cancellation.cancel());
+    auto cancelled_task = make_task(1);
+    cancelled_task.cancellation = cancellation.token();
+    const auto cancelled = registry.submit(ExecutorDomain::kIoWorker, std::move(cancelled_task));
+    if (!cancelled || cancelled.value.wait(5'000'000'000ull).code != ResultCode::kCancelled ||
+        states[1].count.load() != 1) return false;
+
+    auto inline_io = std::make_shared<InlineExecutor>(ExecutorDomain::kIoWorker);
+    if (registry.register_executor(inline_io).code != ResultCode::kInvalidState ||
+        registry.find_executor(ExecutorDomain::kIoWorker).value != executors[1] ||
+        !registry.wait_idle(5'000'000'000ull) || !registry.register_executor(inline_io, true)) return false;
+    const auto replacement = registry.find_executor(ExecutorDomain::kIoWorker);
+    const auto inline_submission = registry.submit(ExecutorDomain::kIoWorker, make_task(1));
+    if (!replacement || replacement.value != inline_io || replacement.value->worker_count() != 0 ||
+        !inline_submission || !inline_submission.value.wait(5'000'000'000ull) || states[1].count.load() != 2 ||
+        states[1].thread != owner || !registry.wait_idle(5'000'000'000ull)) return false;
+    return current_thread_id() == owner;
+}
 }  // namespace
 
 int main() {
+    if (!test_identity_issuer_is_unique_across_workers_and_preserves_thread_identity()) return 32;
+    if (!test_executor_lanes_cancellation_and_inline_replacement()) return 33;
     using aeg::concurrency::CompletionSource;
     using aeg::concurrency::ExecutorDomain;
     using aeg::concurrency::ExecutorRegistry;
@@ -55,6 +167,40 @@ int main() {
     using aeg::concurrency::TaskPriority;
     using aeg::concurrency::WorkerExecutor;
     using aeg::concurrency::WorkerExecutorDesc;
+
+    const auto owner_id = aeg::concurrency::current_thread_id();
+    if (!owner_id.is_valid() || owner_id != aeg::concurrency::current_thread_id()) {
+        return 28;
+    }
+    aeg::concurrency::CancellationSource delay_cancellation;
+    CompletionSource delay_started;
+    WorkerExecutor delay_executor({ExecutorDomain::kIoWorker, 1, true});
+    aeg::concurrency::ThreadId delay_thread{};
+    TaskDesc delay_task{};
+    delay_task.execute = [&](const aeg::concurrency::TaskContext&) {
+        delay_thread = aeg::concurrency::current_thread_id();
+        if (delay_thread == owner_id || delay_thread != aeg::concurrency::current_thread_id()) {
+            return failure_result();
+        }
+        static_cast<void>(delay_started.complete());
+        return aeg::concurrency::sleep_for(5'000'000'000ull, delay_cancellation.token());
+    };
+    const auto delay = delay_executor.submit(std::move(delay_task));
+    if (!delay || !delay_started.completion().wait(5'000'000'000ull) ||
+        delay.value.wait(10'000'000ull).code != ResultCode::kTimeout) {
+        return 29;
+    }
+    static_cast<void>(delay_cancellation.cancel());
+    if (delay.value.wait(500'000'000ull).code != ResultCode::kCancelled ||
+        aeg::concurrency::sleep_for(0, delay_cancellation.token()).code != ResultCode::kCancelled ||
+        !aeg::concurrency::sleep_for(0)) {
+        return 30;
+    }
+    const auto delay_start = std::chrono::steady_clock::now();
+    if (!aeg::concurrency::sleep_for(1'000'000ull) ||
+        std::chrono::steady_clock::now() - delay_start < std::chrono::milliseconds(1)) {
+        return 31;
+    }
 
     CompletionSource completion_source;
     const aeg::concurrency::Completion completion = completion_source.completion();
@@ -74,7 +220,7 @@ int main() {
         return 4;
     }
 
-    const std::thread::id main_thread = std::this_thread::get_id();
+    const aeg::concurrency::ThreadId main_thread = aeg::concurrency::current_thread_id();
     std::atomic<uint32_t> completed_tasks{0};
     std::atomic<uint32_t> worker_tasks{0};
     TaskGroup successful_group;
@@ -82,7 +228,7 @@ int main() {
         TaskDesc task{};
         task.execute = [&](const aeg::concurrency::TaskContext&) {
             completed_tasks.fetch_add(1, std::memory_order_relaxed);
-            if (std::this_thread::get_id() != main_thread) {
+            if (aeg::concurrency::current_thread_id() != main_thread) {
                 worker_tasks.fetch_add(1, std::memory_order_relaxed);
             }
             return Result::success();
@@ -153,7 +299,7 @@ int main() {
         stopped_task.execute = [&](const aeg::concurrency::TaskContext& context) {
             stopped_worker_state.store(1, std::memory_order_release);
             while (!context.is_stop_requested()) {
-                std::this_thread::yield();
+                aeg::concurrency::yield_current_thread();
             }
             stopped_worker_state.store(2, std::memory_order_release);
             return Result::success();
@@ -207,7 +353,7 @@ int main() {
     TaskDesc failing_task{};
     failing_task.execute = [&](const aeg::concurrency::TaskContext&) {
         while (!allow_failure.load(std::memory_order_acquire)) {
-            std::this_thread::yield();
+            aeg::concurrency::yield_current_thread();
         }
         return failure_result();
     };

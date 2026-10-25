@@ -1,135 +1,39 @@
-#include <algorithm>
+#include "editor_feature_definition_fixture.hpp"
 #include <iostream>
-
-#include "editor_composition_document.hpp"
-#include "editor_node_definition.hpp"
-#include "editor_composition_test_support.hpp"
-
-namespace {
-int failures = 0;
-
-void check(bool condition, const char* message) {
-    if (!condition) {
-        std::cerr << message << '\n';
-        ++failures;
-    }
-}
-
-aeg::pipeline::TypeCatalogEntry editable_feature() {
-    using namespace aeg::pipeline;
-    TypeCatalogEntry entry{};
-    entry.key = {AuthoringTypeKind::kFeature, FeatureId("Editor.DefinitionFeature").value()};
-    entry.version = {1, 0, 0};
-    entry.owner_module = ModuleId("Game.Editor");
-    entry.name = "Editor.DefinitionFeature";
-    entry.display_name = "Definition Feature";
-    entry.domains = to_mask(FeatureDomain::kRender);
-    entry.scopes = to_mask(PipelineScope::kFrame);
-    auto input = PortDescriptor{.id = 11,
-                                .name = "SceneColor",
-                                .direction = PortDirection::kInput,
-                                .value_kind = PortValueKind::kTexture,
-                                .schema_id = 1,
-                                .required = false,
-                                .min_connections = 0,
-                                .max_connections = 1,
-                                .binding_id = 11,
-                                .resource_constraints = {.resource_class = ResourceClass::kTexture}};
-    input.input = InputPortContract{.allowed_sources = input_source_mask(InputSourceKind::kEdge) |
-                                                       input_source_mask(InputSourceKind::kAsset),
-                                    .presence = InputPresenceRequirement::kOptional,
-                                    .min_edges = 0,
-                                    .max_edges = 1};
-    entry.ports.push_back(input);
-    entry.ports.push_back({.id = 12,
-                           .name = "Result",
-                           .direction = PortDirection::kOutput,
-                           .value_kind = PortValueKind::kTexture,
-                           .schema_id = 1,
-                           .max_connections = 2,
-                           .binding_id = 12,
-                           .resource_constraints = {.resource_class = ResourceClass::kTexture}});
-    entry.parameters.push_back({.id = 21,
-                                .name = "Intensity",
-                                .display_name = "Intensity",
-                                .kind = ParameterKind::kFloat64,
-                                .default_value = 1.0,
-                                .minimum = 0.0,
-                                .maximum = 2.0,
-                                .affects_topology = false});
-    entry.declaration = FeatureAuthoringDeclaration{.parts = {{0, FeatureDomain::kRender, "render"}},
-                                                     .allowed_pass_types = {RenderPassTypeId("Game.Pass")},
-                                                     .allow_add_passes = true};
-    return entry;
-}
-
-}  // namespace
-
 int main() {
     using namespace aeg;
-    auto entry = editable_feature();
-    application::NodeDefinitionDraft draft{};
-    draft.entry = entry;
-    draft.source = application::NodeContractSource::kEditorDraft;
-    draft.generated = true;
-
-    check(static_cast<bool>(application::validate_node_definition(draft)), "valid node definition accepted");
-
-    auto renamed = draft;
-    renamed.entry.ports[0].name = "InputColor";
-    const auto rename_diff = application::diff_node_definition(
-        entry, renamed, std::vector<application::NodeContractUsage>{{"Graph.aegpipe", "node", {}, {}}});
-    check(!rename_diff.requires_confirmation, "port rename does not require disconnect confirmation");
-    check(rename_diff.renamed_ports.size() == 1 && rename_diff.renamed_ports.front() == 11,
-          "port rename preserves stable PortId");
-
-    auto reordered = draft;
-    std::swap(reordered.entry.ports[0], reordered.entry.ports[1]);
-    const auto reorder_diff = application::diff_node_definition(
-        entry, reordered, std::vector<application::NodeContractUsage>{{"Graph.aegpipe", "node", {}, {}}});
-    check(reorder_diff.changed_ports.empty(), "port reorder is not a contract change");
-
-    auto removed = draft;
-    removed.entry.ports.erase(removed.entry.ports.begin());
-    const auto removal_diff = application::diff_node_definition(
-        entry, removed,
-        std::vector<application::NodeContractUsage>{{"Graph.aegpipe", "node", {"edge-scene-color"}, {11}}});
-    check(removal_diff.requires_confirmation, "connected port removal requires confirmation");
-    check(removal_diff.removed_ports.size() == 1 && removal_diff.affected_edge_ids.size() == 1 &&
-              removal_diff.affected_binding_ids.size() == 1,
-          "port removal reports exact affected identities");
-
-    auto invalid = draft;
-    invalid.entry.ports[0].id = invalid.entry.ports[1].id;
-    check(!application::validate_node_definition(invalid), "duplicate port id rejected");
+    auto draft = tests::feature_definition_draft();
+    if (const auto valid = application::validate_node_definition(draft); !valid) { std::cerr << valid.message << "\n"; return 1; }
+    auto renamed = draft; renamed.port_labels[0].name = "Renamed";
+    auto diff = application::diff_node_definition(draft, renamed, {});
+    if (diff.requires_confirmation || diff.renamed_ports != std::vector<uint64_t>{11}) return 2;
+    auto reordered = draft; std::swap(reordered.entry.contract.ports[0], reordered.entry.contract.ports[1]);
+    if (!application::diff_node_definition(draft, reordered, {}).changed_ports.empty()) return 3;
+    auto removed = draft; removed.entry.contract.ports.erase(removed.entry.contract.ports.begin()); removed.port_labels.erase(removed.port_labels.begin());
+    application::NodeContractUsage usage{}; usage.node_id = feature::FeatureNodeId{102}; usage.edges.push_back({"edge",11,0});
+    diff = application::diff_node_definition(draft, removed, std::span(&usage,1));
+    if (!diff.requires_confirmation || diff.removed_ports != std::vector<uint64_t>{11} || diff.affected_edge_ids != std::vector<std::string>{"edge"}) return 4;
+    auto invalid = draft; invalid.entry.contract.ports[0].id = invalid.entry.contract.ports[1].id;
+    if (application::validate_node_definition(invalid)) return 5;
+    invalid = draft; invalid.entry.contract.parameters[0].metadata->default_value = 3.0;
+    if (application::validate_node_definition(invalid)) return 6;
+    auto partial = draft; partial.entry.contract.structure = feature::FeatureStructure::kComposite; partial.entry.contract.clock.work_budget_ns = 0;
+    if (!application::validate_node_definition(partial)) {
+        std::cerr << "incomplete Composite cannot be saved as an editor draft\n"; return 40;
+    }
     invalid = draft;
-    invalid.entry.parameters[0].default_value = 3.0;
-    check(!application::validate_node_definition(invalid), "parameter default outside bounds rejected");
-
-    pipeline::TypeCatalog catalog;
-    check(static_cast<bool>(catalog.add(entry)), "catalog fixture added");
-    auto document = tests::EditorCompositionFixture{}.document;
-    application::EditorCompositionDocument editor{std::move(document), std::move(catalog)};
-    auto replacement = draft.entry;
-    replacement.display_name = "Updated Definition Feature";
-    pipeline::TypeCatalog next_catalog;
-    check(static_cast<bool>(next_catalog.add(replacement)), "replacement catalog prepared");
-    check(static_cast<bool>(editor.apply_contract_transaction(
-              "Update node definition", std::move(next_catalog), [](pipeline::PipelineDocument& next) {
-                  next.edges.clear();
-                  return foundation::Result::success();
-              })),
-          "contract transaction committed");
-    check(editor.catalog().find(replacement.key)->display_name == "Updated Definition Feature" &&
-              editor.snapshot()->edges.empty(),
-          "contract and document changed together");
-    check(static_cast<bool>(editor.undo()), "contract transaction undo succeeds");
-    check(editor.catalog().find(replacement.key)->display_name == entry.display_name &&
-              !editor.snapshot()->edges.empty(),
-          "undo restores contract and edges together");
-
-    if (failures)
-        return 1;
-    std::cout << "Editor node definition model smoke passed\n";
-    return 0;
+    invalid.entry.contract.clock = {draft.entry.contract.clock.id, 60, 8, feature::LateDataPolicy::kQueue};
+    if (application::validate_node_definition(invalid)) return 41;
+    for (unsigned field = 0; field != 4; ++field) {
+        auto changed = draft;
+        auto& clock = changed.entry.contract.clock;
+        if (field == 0) clock.capability_version.minor = 1;
+        if (field == 1) clock.timing->phase_ns = 11;
+        if (field == 2) clock.timing->deadline_policy = feature::DeadlinePolicy::kRejectCommit;
+        if (field == 3) ++clock.work_budget_ns;
+        const auto change = application::diff_node_definition(draft, changed, std::span(&usage, 1));
+        if (change.version_level != application::NodeContractVersionLevel::kMajor || !change.requires_confirmation ||
+            change.affected_edge_ids != std::vector<std::string>{"edge"}) return 42;
+    }
+    std::cout << "Feature definition model passed\n";
 }

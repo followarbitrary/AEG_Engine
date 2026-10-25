@@ -16,7 +16,8 @@
 
 #include "../Application/Editor/private/editor_ui_interaction.hpp"
 #include "../Application/Editor/private/hierarchy_ui_layout.hpp"
-#include "../Application/Editor/private/pipeline_overview_layout.hpp"
+#include "../Application/Editor/private/composition/editor_feature_graph_document.hpp"
+#include "feature_definition_fixture.hpp"
 #include "editor_imgui.hpp"
 #include "editor_toolbar.hpp"
 #include "editor_workspace.hpp"
@@ -113,9 +114,6 @@ int main() {
     assert(hierarchy_layout.frame_padding.y <= 2.0f);
     assert(hierarchy_layout.drop_zone_height <= 1.0f);
     assert(hierarchy_layout.footer_gap <= 4.0f);
-    // Overview must not split a phase into one card per contributing feature.
-    assert(aeg::application::pipeline_overview_key(8) == aeg::application::pipeline_overview_key(8));
-    assert(aeg::application::pipeline_overview_key(8) != aeg::application::pipeline_overview_key(10));
     assert(workspace.layout() != nullptr);
     uint32_t hierarchy_build_count = 0;
     assert(workspace.register_panel(
@@ -385,60 +383,40 @@ int main() {
     assert(aeg::application::remove_graph_edge(draft_edges, 0, 1));
     assert((draft_edges.size() == 1 && draft_edges.front() == std::pair{1, 2}));
     assert(!aeg::application::remove_graph_edge(draft_edges, 0, 1));
-    aeg::application::PipelineOrderingDraftQueue pipeline_drafts;
-    pipeline_drafts.stage_add("Game / Renderer", 3, 5);
-    assert(pipeline_drafts.dirty() && pipeline_drafts.changes().size() == 1 && pipeline_drafts.changes().front().add);
-    pipeline_drafts.stage_remove("Game / Renderer", 3, 5);
-    assert(!pipeline_drafts.dirty());
-    pipeline_drafts.stage_remove("Game / Renderer", 3, 5);
-    assert(pipeline_drafts.dirty() && !pipeline_drafts.changes().front().add);
-    aeg::application::PipelineOrderingSaveState persisted_orderings;
-    persisted_orderings.stage({"Game / Renderer", {11, 101}, {12, 102}, true});
-    persisted_orderings.stage({"Game / Renderer", {11, 101}, {12, 102}, false});
-    assert(persisted_orderings.changes().size() == 1 && !persisted_orderings.changes().front().add);
-    persisted_orderings.stage({"Game / Renderer", {11, 101}, {12, 102}, true});
-    assert(persisted_orderings.changes().size() == 1 && persisted_orderings.changes().front().add);
-    aeg::application::PipelineLayoutSaveState persisted_layout;
-    persisted_layout.stage({"Game / Renderer", {11, 101}, 240.0f, 96.0f});
-    persisted_layout.stage({"Game / Renderer", {11, 101}, 320.0f, 144.0f});
-    const auto restored_layout = persisted_layout.find("Game / Renderer", {11, 101});
-    assert(restored_layout && restored_layout->x == 320.0f && restored_layout->y == 144.0f);
-    assert(!persisted_layout.find("Game / Renderer", {12, 102}));
-    aeg::application::PipelineBlendSaveState persisted_blends;
-    persisted_blends.stage({"Game / Renderer", {11, 101}, 1});
-    persisted_blends.stage({"Game / Renderer", {11, 101}, 2});
-    assert(persisted_blends.blends().size() == 1 && persisted_blends.blends().front().blend_mode == 2);
+    // Workspace graph edits use the same immutable FeatureGraph transaction
+    // model as Main. A failed draft must preserve the published source owner.
+    const auto definition = aeg::tests::feature_definition();
+    const auto catalog = aeg::tests::feature_catalog(definition);
+    aeg::application::EditorFeatureGraphDocument graph_document{aeg::tests::feature_graph(definition), catalog};
+    const auto original_graph = graph_document.snapshot_owner();
+    assert(!graph_document.dirty() && !graph_document.can_undo());
+    assert(graph_document.erase_edge(aeg::feature::FeatureNodeId{101}, aeg::feature::PortId{12},
+                                     aeg::feature::FeatureNodeId{102}, aeg::feature::PortId{11}));
+    assert(graph_document.dirty() && graph_document.snapshot().edges.empty());
+    assert(original_graph->edges.size() == 1 && graph_document.snapshot_owner() != original_graph);
+    assert(graph_document.undo());
+    assert(graph_document.snapshot_owner() == original_graph && !graph_document.dirty());
+    assert(graph_document.redo() && graph_document.snapshot().edges.empty());
+    const auto valid_edge = original_graph->edges.front();
+    assert(graph_document.add_edge(valid_edge, catalog));
+    assert(graph_document.snapshot().edges.size() == 1);
+    graph_document.mark_saved();
+    const auto saved_graph = graph_document.snapshot_owner();
+    const auto saved_revision = graph_document.revision();
+    auto invalid_edge = valid_edge;
+    invalid_edge.target_port = aeg::feature::PortId{999};
+    assert(!graph_document.add_edge(invalid_edge, catalog));
+    assert(graph_document.snapshot_owner() == saved_graph && graph_document.revision() == saved_revision);
+    assert(!graph_document.dirty());
+    assert(!graph_document.execute("Failed draft", [](auto& graph) {
+        graph.nodes.clear();
+        return aeg::foundation::invalid_argument("Rejected author mutation");
+    }));
+    assert(graph_document.snapshot_owner() == saved_graph && graph_document.snapshot().nodes.size() == 2);
+    assert(original_graph->edges.size() == 1 && original_graph->nodes.size() == 2);
     assert(aeg::application::graph_link_hit({0, 0}, {100, 0}, {50, 0}, 1.0f));
     assert(aeg::application::graph_link_hit({0, 0}, {100, 0}, {50, 9}, 1.0f));
     assert(!aeg::application::graph_link_hit({0, 0}, {100, 0}, {50, 20}, 1.0f));
-    // A read-only RenderFeature with an existing state input must be able to
-    // forward that state to Present.  Its input count is still zero until the
-    // missing outgoing link is created, so reachability cannot gate its port.
-    assert(aeg::application::can_start_render_state_link(false, true));
-    assert(aeg::application::can_start_render_state_link(true, false));
-    assert(!aeg::application::can_start_render_state_link(false, false));
-    const auto card_layout = aeg::application::PipelineNodeCardLayout::for_font_size(17.0f);
-    assert(card_layout.title_y < card_layout.subtitle_y);
-    assert(card_layout.subtitle_y < card_layout.detail_y);
-    assert(card_layout.detail_y < card_layout.divider_y);
-    assert(card_layout.divider_y < card_layout.footer_y);
-    assert(card_layout.footer_y + 17.0f <= card_layout.height);
-    assert(aeg::application::PipelineNodeCardLayout::text_size(17.0f, 0.65f) >= 13.0f);
-    assert(aeg::application::pipeline_node_copy_text("Custom Outline Feature", "Feature", "Authored Pipeline node") ==
-           "Custom Outline Feature\nFeature\nAuthored Pipeline node");
-    const auto present_consumer = aeg::application::required_pipeline_present_consumer();
-    assert(present_consumer.node_id == "__aeg_present_consumer");
-    assert(present_consumer.title == "Present");
-    assert(present_consumer.subtitle == "Display consumer");
-    assert(present_consumer.detail == "No state link connected");
-    assert(!aeg::application::builtin_pipeline_debug_enabled());
-    const auto state_overlay = aeg::application::pipeline_graph_state_overlay(
-        5, std::vector<std::pair<int, int>>{{0, 1}, {1, 3}, {2, 3}, {3, 4}}, std::vector<int>{4});
-    assert(state_overlay.size() == 5);
-    assert(state_overlay[0].reaches_output && state_overlay[0].input_count == 0 && state_overlay[0].layer_count == 1);
-    assert(state_overlay[2].reaches_output && state_overlay[2].input_count == 0 && state_overlay[2].layer_count == 1);
-    assert(state_overlay[3].reaches_output && state_overlay[3].input_count == 2 && state_overlay[3].layer_count == 2);
-    assert(state_overlay[4].reaches_output && state_overlay[4].input_count == 1 && state_overlay[4].layer_count == 2);
     assert(aeg::application::asset_edit_block_reason(false, false, true) != nullptr);
     assert(aeg::application::asset_edit_block_reason(false, true, true) != nullptr);
     assert(aeg::application::asset_edit_block_reason(true, false, true) != nullptr);

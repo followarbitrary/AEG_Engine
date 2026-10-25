@@ -24,13 +24,15 @@ struct RuntimeRenderViewDesc final {
     /** @brief Per-view mask used by Renderer visibility filtering. */
     uint32_t visibility_mask{0xffffffffu};
     /** @brief Optional logical color output identity for RenderGraph integration. */
-    pipeline::RenderResourceId color_target{};
+    feature::RenderResourceId color_target{};
     /** @brief Optional logical depth output identity for RenderGraph integration. */
-    pipeline::RenderResourceId depth_target{};
+    feature::RenderResourceId depth_target{};
     /** @brief Enables conservative bounds-based frustum filtering during extraction. */
     bool frustum_culling{false};
     /** @brief Projection convention used when constructing the camera matrix. */
     math::ClipSpaceConvention clip_space_convention{};
+    /** @brief Optional independent directional ShadowDepth extent; zero falls back to output_extent. */
+    renderer::RenderExtent shadow_extent{0, 0};
 };
 
 /** @brief Resolves Transform and Camera components from an immutable snapshot into one RenderView. */
@@ -61,7 +63,7 @@ struct RuntimeRenderViewDesc final {
 /** @brief Shared data validation for extraction and transactional Editor updates. */
 [[nodiscard]] foundation::Result validate_point_light(const PointLight& light);
 [[nodiscard]] foundation::Result validate_spot_light(const SpotLight& light);
-[[nodiscard]] foundation::ResultValue<renderer::RenderPostProcessSettings> make_post_process_settings(
+[[nodiscard]] foundation::ResultValue<feature::RenderPostProcessSettings> make_post_process_settings(
     const SceneEnvironment& environment);
 /** @brief Extracts enabled point/spot components with Transform positions and rotations. */
 [[nodiscard]] foundation::Result extract_local_lights(const renderer::RenderExtractContext& context);

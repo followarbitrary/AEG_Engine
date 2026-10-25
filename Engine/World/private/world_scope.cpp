@@ -1,13 +1,13 @@
 /**
  * @file world_scope.cpp
- * @brief Implements World Scope ownership and snapshot bridge creation.
+ * @brief Implements aggregate World ownership and immutable snapshot capture.
  */
 #include "../public/world_scope.hpp"
+#include "world_snapshot_execution.hpp"
 
 #include <exception>
 #include <mutex>
 #include <new>
-#include <string>
 #include <utility>
 
 namespace aeg::world {
@@ -17,173 +17,102 @@ using foundation::invalid_state;
 using foundation::not_ready;
 using foundation::out_of_memory;
 
-[[nodiscard]] pipeline::PipelineInstanceId make_world_pipeline_instance_id(WorldHandle handle) noexcept {
-    uint64_t value = 14695981039346656037ull;
-    value ^= handle.index;
-    value *= 1099511628211ull;
-    value ^= handle.generation;
-    value *= 1099511628211ull;
-    return pipeline::PipelineInstanceId(value == 0 ? 1 : value);
-}
+// Frame scopes pin the registry storage without retaining the mutable ECS World.
+struct WorldSnapshotSource final {
+    pipeline::ArtifactRegistry artifacts{pipeline::PipelineScope::kWorld};
+};
+} // namespace
 
-}  // namespace
+struct WorldScope::Impl final {
+    std::shared_ptr<WorldSnapshotSource> source{};
+};
 
-WorldFrameScope::WorldFrameScope(WorldFrameKey key, pipeline::ArtifactId snapshot_artifact,
-                                 pipeline::ArtifactTypeId snapshot_type, uint32_t snapshot_version,
-                                 std::unique_ptr<pipeline::ArtifactScopeBridge> bridge,
-                                 std::weak_ptr<std::atomic_bool> source_active) noexcept
-    : key_(key),
-      snapshot_artifact_(snapshot_artifact),
-      snapshot_type_(snapshot_type),
-      snapshot_version_(snapshot_version),
-      bridge_(std::move(bridge)),
-      source_active_(std::move(source_active)) {}
+struct WorldFrameScope::Impl final {
+    std::shared_ptr<WorldSnapshotSource> source_owner{};
+    std::unique_ptr<pipeline::ArtifactScopeBridge> bridge{};
+    std::weak_ptr<std::atomic_bool> source_active{};
+};
 
+WorldFrameScope::WorldFrameScope() noexcept = default;
+WorldFrameScope::WorldFrameScope(WorldFrameKey key, std::unique_ptr<Impl> impl) noexcept
+    : key_(key), impl_(std::move(impl)) {}
 WorldFrameScope::~WorldFrameScope() = default;
 
 WorldFrameScope::WorldFrameScope(WorldFrameScope&& other) noexcept
-    : key_(other.key_),
-      snapshot_artifact_(other.snapshot_artifact_),
-      snapshot_type_(other.snapshot_type_),
-      snapshot_version_(other.snapshot_version_),
-      bridge_(std::move(other.bridge_)),
-      source_active_(std::move(other.source_active_)) {
+    : key_(other.key_), impl_(std::move(other.impl_)) {
     other.key_ = {};
-    other.snapshot_artifact_ = {};
-    other.snapshot_type_ = {};
-    other.snapshot_version_ = 0;
-    other.source_active_.reset();
 }
 
 WorldFrameScope& WorldFrameScope::operator=(WorldFrameScope&& other) noexcept {
     if (this != &other) {
         key_ = other.key_;
-        snapshot_artifact_ = other.snapshot_artifact_;
-        snapshot_type_ = other.snapshot_type_;
-        snapshot_version_ = other.snapshot_version_;
-        bridge_ = std::move(other.bridge_);
-        source_active_ = std::move(other.source_active_);
+        impl_ = std::move(other.impl_);
         other.key_ = {};
-        other.snapshot_artifact_ = {};
-        other.snapshot_type_ = {};
-        other.snapshot_version_ = 0;
-        other.source_active_.reset();
     }
     return *this;
 }
 
 bool WorldFrameScope::is_valid() const noexcept {
-    return key_.is_valid() && bridge_ != nullptr;
+    return key_.is_valid() && impl_ != nullptr && impl_->bridge != nullptr;
 }
 
 foundation::Result WorldFrameScope::capture() {
-    if (!is_valid()) {
-        return invalid_state("World frame scope is not initialized");
-    }
-    const std::shared_ptr<std::atomic_bool> source_active = source_active_.lock();
-    if (source_active == nullptr || !source_active->load(std::memory_order_acquire)) {
+    if (!is_valid()) return invalid_state("World frame scope is not initialized");
+    const auto source_active = impl_->source_active.lock();
+    if (source_active == nullptr || !source_active->load(std::memory_order_acquire))
         return invalid_state("World Scope is no longer active");
-    }
-    return bridge_->capture();
+    return impl_->bridge->capture();
 }
 
-foundation::ResultValue<pipeline::ArtifactView> WorldFrameScope::read_snapshot() const {
-    if (!is_valid()) {
-        return {invalid_state("World frame scope is not initialized"), {}};
-    }
-    return bridge_->read(snapshot_artifact_, snapshot_type_, snapshot_version_);
+foundation::ResultValue<ecs::WorldSnapshot> WorldFrameScope::read_snapshot() const {
+    if (!is_valid()) return {invalid_state("World frame scope is not initialized"), {}};
+    const auto view = impl_->bridge->read(detail::kWorldSnapshotArtifactId, detail::kWorldSnapshotArtifactTypeId,
+                                         detail::kWorldSnapshotArtifactVersion);
+    if (!view) return {view.result, {}};
+    const auto* snapshot = view.value.as<ecs::WorldSnapshot>(detail::kWorldSnapshotArtifactTypeId);
+    if (snapshot == nullptr) return {invalid_state("World frame scope does not contain a WorldSnapshot"), {}};
+    // WorldSnapshot copies its shared immutable SnapshotData; no allocation or borrowed payload escapes.
+    return {foundation::Result::success(), *snapshot};
 }
 
-WorldScope::WorldScope(std::shared_ptr<ecs::World> state, pipeline::PipelineRegistry& registry,
-                       const WorldScopeDesc& desc)
-    : state_(std::move(state)),
-      pipeline_host_(pipeline::PipelineScope::kWorld,
-                     desc.pipeline_instance.is_valid()
-                         ? desc.pipeline_instance
-                         : make_world_pipeline_instance_id(state_ == nullptr ? WorldHandle{} : state_->handle()),
-                     state_.get()),
-      registry_(&registry),
-      pipeline_id_(desc.pipeline),
-      snapshot_artifact_(desc.snapshot_artifact),
-      snapshot_type_(desc.snapshot_type),
-      snapshot_version_(desc.snapshot_version) {}
+WorldScope::WorldScope(std::shared_ptr<ecs::World> state)
+    : state_(std::move(state)), impl_(std::make_unique<Impl>()) {}
 
 WorldScope::~WorldScope() {
     if (active_token_ != nullptr) {
         active_token_->store(false, std::memory_order_release);
         active_token_.reset();
     }
-    if (pipeline_host_.is_active()) {
-        static_cast<void>(pipeline_host_.deactivate({}));
-    }
 }
 
-foundation::Result WorldScope::initialize(pipeline::CapabilityMask available_capabilities) {
-    if (initialized_) {
-        return invalid_state("World Scope is already initialized");
-    }
-    if (!handle().is_valid()) {
-        return invalid_argument("World Scope requires a valid WorldManager-owned World");
-    }
-    if (registry_ == nullptr) {
-        return invalid_state("World Scope has no pipeline registry");
-    }
-    if (!snapshot_artifact_.is_valid() || !snapshot_type_.is_valid() || snapshot_version_ == 0) {
-        return invalid_argument("World snapshot artifact contract is invalid");
-    }
-
+foundation::Result WorldScope::initialize() {
+    if (initialized_) return invalid_state("World Scope is already initialized");
+    if (!handle().is_valid()) return invalid_argument("World Scope requires a valid WorldManager-owned World");
+    std::shared_ptr<WorldSnapshotSource> source;
+    std::shared_ptr<std::atomic_bool> token;
     try {
-        active_token_ = std::make_shared<std::atomic_bool>(false);
+        source = std::make_shared<WorldSnapshotSource>();
+        token = std::make_shared<std::atomic_bool>(false);
     } catch (const std::bad_alloc&) {
-        return out_of_memory("World Scope activity token allocation failed");
+        return out_of_memory("World Scope snapshot storage allocation failed");
     }
-
     const pipeline::ArtifactDescriptor snapshot_descriptor{
-        snapshot_artifact_,
-        snapshot_type_,
+        detail::kWorldSnapshotArtifactId,
+        detail::kWorldSnapshotArtifactTypeId,
         pipeline::PipelineScope::kWorld,
         pipeline::ArtifactStorage::kImmutableSnapshot,
         pipeline::ArtifactLifetime::kWorld,
         pipeline::OwnershipPolicy::kSharedImmutable,
-        snapshot_version_,
+        detail::kWorldSnapshotArtifactVersion,
         0,
         false,
     };
-    if (const foundation::Result result = pipeline_host_.artifacts().install_contract(snapshot_descriptor); !result) {
-        return result;
-    }
-
-    if (pipeline_id_.is_valid()) {
-        if (const foundation::Result result = pipeline_host_.bind_pipeline(pipeline_id_); !result) {
-            return result;
-        }
-        if (const foundation::Result result = pipeline_host_.rebuild(*registry_, available_capabilities); !result) {
-            return result;
-        }
-    }
+    if (const auto result = source->artifacts.install_contract(snapshot_descriptor); !result) return result;
+    impl_->source = std::move(source);
+    active_token_ = std::move(token);
     initialized_ = true;
     active_token_->store(true, std::memory_order_release);
     return foundation::Result::success();
-}
-
-foundation::Result WorldScope::activate() {
-    if (!initialized_) {
-        return invalid_state("World Scope is not initialized");
-    }
-    if (pipeline_host_.active_plan_snapshot() == nullptr) {
-        return foundation::Result::success();
-    }
-    if (pipeline_host_.is_active()) {
-        return foundation::Result::success();
-    }
-    return pipeline_host_.activate({});
-}
-
-foundation::Result WorldScope::deactivate() {
-    if (!pipeline_host_.is_active()) {
-        return foundation::Result::success();
-    }
-    return pipeline_host_.deactivate({});
 }
 
 foundation::Result WorldScope::shutdown() {
@@ -191,56 +120,16 @@ foundation::Result WorldScope::shutdown() {
         active_token_->store(false, std::memory_order_release);
         active_token_.reset();
     }
-    foundation::Result first_error = foundation::Result::success();
-    if (const foundation::Result result = deactivate(); !result) {
-        first_error = result;
-    }
-    const foundation::Result release_result =
-        pipeline_host_.artifacts().release_lifetime(pipeline::ArtifactLifetime::kWorld);
-    if (!release_result && first_error) {
-        first_error = release_result;
-    }
+    const auto released = impl_->source != nullptr
+        ? impl_->source->artifacts.release_lifetime(pipeline::ArtifactLifetime::kWorld)
+        : foundation::Result::success();
     {
         std::unique_lock lock(snapshot_mutex_);
         latest_snapshot_.reset();
     }
     command_buffer_.clear();
     initialized_ = false;
-    return first_error;
-}
-
-foundation::Result WorldScope::bind_pipeline(pipeline::PipelineId pipeline) {
-    if (!initialized_) {
-        return invalid_state("World Scope is not initialized");
-    }
-    if (!pipeline.is_valid()) {
-        return invalid_argument("World pipeline id is invalid");
-    }
-    if (const foundation::Result result = pipeline_host_.bind_pipeline(pipeline); !result) {
-        return result;
-    }
-    pipeline_id_ = pipeline;
-    return foundation::Result::success();
-}
-
-foundation::Result WorldScope::rebuild(pipeline::CapabilityMask available_capabilities) {
-    if (!initialized_) {
-        return invalid_state("World Scope is not initialized");
-    }
-    if (registry_ == nullptr) {
-        return invalid_state("World Scope has no pipeline registry");
-    }
-    if (!pipeline_id_.is_valid()) {
-        return invalid_state("World Scope has no bound pipeline");
-    }
-    return pipeline_host_.rebuild(*registry_, available_capabilities);
-}
-
-foundation::Result WorldScope::apply_pending_plan() {
-    if (!initialized_) {
-        return invalid_state("World Scope is not initialized");
-    }
-    return pipeline_host_.apply_pending_plan();
+    return released;
 }
 
 foundation::Result WorldScope::apply_commands(ecs::WorldCommandBuffer& commands, uint32_t max_commands) {
@@ -309,8 +198,9 @@ foundation::Result WorldScope::publish_snapshot_value(std::shared_ptr<const ecs:
     }
 
     std::shared_ptr<const ecs::WorldSnapshot> artifact_snapshot = snapshot;
-    if (const foundation::Result result = pipeline_host_.artifacts().publish(
-            snapshot_artifact_, pipeline::ArtifactPayload::owned(snapshot_type_, std::move(artifact_snapshot), false));
+    if (const foundation::Result result = impl_->source->artifacts.publish(
+            detail::kWorldSnapshotArtifactId,
+            pipeline::ArtifactPayload::owned(detail::kWorldSnapshotArtifactTypeId, std::move(artifact_snapshot), false));
         !result) {
         return result;
     }
@@ -326,43 +216,46 @@ foundation::ResultValue<std::shared_ptr<const ecs::WorldSnapshot>> WorldScope::l
     return {foundation::Result::success(), latest_snapshot_};
 }
 
-foundation::ResultValue<std::unique_ptr<pipeline::ArtifactScopeBridge>> WorldScope::create_frame_bridge() const {
-    if (!initialized_) {
-        return {invalid_state("World Scope is not initialized"), {}};
+foundation::ResultValue<WorldFrameScope> WorldScope::create_frame_scope(uint64_t frame_number, uint32_t view_id) const {
+    if (!initialized_) return {invalid_state("World Scope is not initialized"), {}};
+    auto bridge = detail::WorldSnapshotExecution::create_frame_bridge(*this);
+    if (!bridge) return {bridge.result, {}};
+    try {
+        auto frame = std::make_unique<WorldFrameScope::Impl>();
+        frame->source_owner = impl_->source;
+        frame->bridge = std::move(bridge.value);
+        frame->source_active = active_token_;
+        return {foundation::Result::success(),
+                WorldFrameScope(WorldFrameKey{frame_number, handle(), view_id}, std::move(frame))};
+    } catch (const std::bad_alloc&) {
+        return {out_of_memory("World frame scope allocation failed"), {}};
     }
+}
+
+const pipeline::ArtifactScopeBridge* detail::WorldSnapshotExecution::bridge(const WorldFrameScope& frame) noexcept {
+    return frame.impl_ != nullptr ? frame.impl_->bridge.get() : nullptr;
+}
+
+foundation::ResultValue<std::unique_ptr<pipeline::ArtifactScopeBridge>>
+    detail::WorldSnapshotExecution::create_frame_bridge(const WorldScope& scope) {
+    if (!scope.initialized_ || scope.impl_->source == nullptr)
+        return {invalid_state("World Scope is not initialized"), {}};
     try {
         auto bridge = std::make_unique<pipeline::ArtifactScopeBridge>(
-            pipeline::PipelineScope::kWorld, pipeline::PipelineScope::kFrame, pipeline_host_.artifacts());
-        if (const foundation::Result result = bridge->expose(snapshot_artifact_); !result) {
-            return {result, {}};
-        }
+            pipeline::PipelineScope::kWorld, pipeline::PipelineScope::kFrame, scope.impl_->source->artifacts);
+        if (const auto result = bridge->expose(kWorldSnapshotArtifactId); !result) return {result, {}};
         return {foundation::Result::success(), std::move(bridge)};
     } catch (const std::bad_alloc&) {
         return {out_of_memory("World-to-Frame bridge allocation failed"), {}};
     }
 }
 
-foundation::Result WorldScope::capture_frame_bridge(pipeline::ArtifactScopeBridge& bridge) const {
-    if (!initialized_) {
-        return invalid_state("World Scope is not initialized");
-    }
+foundation::Result detail::WorldSnapshotExecution::capture_frame_bridge(const WorldScope& scope,
+                                                                        pipeline::ArtifactScopeBridge& bridge) {
+    if (!scope.initialized_ || scope.impl_->source == nullptr) return invalid_state("World Scope is not initialized");
     if (bridge.source_scope() != pipeline::PipelineScope::kWorld ||
-        bridge.target_scope() != pipeline::PipelineScope::kFrame || !bridge.is_bound_to(pipeline_host_.artifacts())) {
+        bridge.target_scope() != pipeline::PipelineScope::kFrame || !bridge.is_bound_to(scope.impl_->source->artifacts))
         return invalid_argument("World frame bridge has an invalid direction");
-    }
     return bridge.capture();
 }
-
-foundation::ResultValue<WorldFrameScope> WorldScope::create_frame_scope(uint64_t frame_number, uint32_t view_id) const {
-    if (!initialized_) {
-        return {invalid_state("World Scope is not initialized"), {}};
-    }
-    foundation::ResultValue<std::unique_ptr<pipeline::ArtifactScopeBridge>> bridge = create_frame_bridge();
-    if (!bridge) {
-        return {bridge.result, {}};
-    }
-    return {foundation::Result::success(),
-            WorldFrameScope(WorldFrameKey{frame_number, handle(), view_id}, snapshot_artifact_, snapshot_type_,
-                            snapshot_version_, std::move(bridge.value), active_token_)};
-}
-}  // namespace aeg::world
+} // namespace aeg::world

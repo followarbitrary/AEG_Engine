@@ -29,5 +29,12 @@ Material、Offscreen Render Target、Buffer/Texture 上传以及延迟销毁。
 
 ## 依赖边界
 
+上传结果携带引擎内部 Pass 提交回执：录入 RenderGraph 不等于 GPU 已提交，更不代表
+GPU 已完成。未提交的 Pass 被回滚、reset 或 clear_passes 移除时，其录制寿命结束。
+ResourceUploader/TextureUploader 可用匹配的原生目的分配重新录制同一上传路径；
+重录使用当前帧的新暂存，失败清理只销毁本次新建的分配，不销毁调用方借用的资源。
+这允许解析器保留纹理视图及材质描述符，同时避免读取未上传的缓存。回执只由 Graph
+所属线程访问，GPU 完成和销毁仍由 FrameContext/RHI 的完成点及租约管理。
+
 Resource 可以依赖 RHI 和 RenderGraph，但不应依赖具体后端实现。资源对象的所有权、
 上传完成条件和销毁时机必须显式表达，不能通过全局缓存或隐式设备同步掩盖生命周期。

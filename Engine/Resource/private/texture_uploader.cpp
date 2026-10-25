@@ -3,6 +3,8 @@
  * @brief Implements format-aware frame-local texture uploads.
  */
 #include "../public/texture_uploader.hpp"
+#include "../../RenderGraph/private/render_graph_execution.hpp"
+#include "render_graph_upload_access.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -247,8 +249,8 @@ namespace aeg::resource {
             return desc;
         }
 
-        [[nodiscard]] foundation::Result add_texture_copy_pass(
-                render_graph::RenderGraph& graph, std::string_view name,
+        [[nodiscard]] foundation::ResultValue<std::shared_ptr<const void>> add_texture_copy_pass(
+                render_graph::RenderGraph& graph, uint64_t frame_index, std::string_view name,
                 render_graph::RenderGraphBuffer source, render_graph::RenderGraphTexture target,
                 uint64_t source_offset, uint64_t transfer_size, uint32_t mip_levels, uint32_t array_layers,
                 std::vector<TextureCopyOperation> operations) {
@@ -287,15 +289,18 @@ namespace aeg::resource {
                         }
                         return foundation::Result::success();
                     });
-            return pass_result.result;
+            if (!pass_result) return {pass_result.result, {}};
+            return render_graph::detail::RenderGraphUploadAccess::track_pass_submission(
+                graph, pass_result.value, frame_index);
         }
     } // namespace
 
     foundation::ResultValue<TextureUpload> TextureUploader::upload_texture(
             render_graph::FrameContext& frame_context, render_graph::RenderGraph& graph,
-            const TextureData& texture, std::string_view name) {
+            const TextureData& texture, std::string_view name, const GpuTexture* reuse_destination) {
         try {
-            if (&frame_context.device() != &device_ || &graph.device() != &device_) {
+            if (&frame_context.device() != &device_ ||
+                &render_graph::detail::RenderGraphExecution::device(graph) != &device_) {
                 return {foundation::Result::failure(
                                 foundation::ResultCode::kInvalidArgument,
                                 "Texture upload objects must use the same RHI device"), {}};
@@ -324,6 +329,17 @@ namespace aeg::resource {
                                                            : name;
             destination_desc.name = rhi::DebugName{resource_name};
 
+            if (reuse_destination && (!reuse_destination->is_valid() ||
+                reuse_destination->format != destination_desc.format ||
+                reuse_destination->extent.width != destination_desc.extent.width ||
+                reuse_destination->extent.height != destination_desc.extent.height ||
+                reuse_destination->extent.depth != destination_desc.extent.depth ||
+                reuse_destination->mip_levels != destination_desc.mip_levels ||
+                reuse_destination->array_layers != destination_desc.array_layers ||
+                (rhi::has_flag(destination_desc.capabilities, rhi::TextureCapability::kSampled) &&
+                    !reuse_destination->sampled_view.is_valid())))
+                return {foundation::invalid_argument("Texture replay destination metadata does not match its payload"), {}};
+
             auto allocation_result = frame_context.allocate_upload(prepared.transfer_size, kBufferCopyAlignment);
             if (!allocation_result) {
                 return {allocation_result.result, {}};
@@ -340,7 +356,9 @@ namespace aeg::resource {
                 }
             }
 
-            auto texture_result = device_.create_texture(destination_desc);
+            auto texture_result = reuse_destination
+                ? foundation::ResultValue<rhi::TextureHandle>{foundation::Result::success(), reuse_destination->texture}
+                : device_.create_texture(destination_desc);
             if (!texture_result) {
                 return {texture_result.result, {}};
             }
@@ -350,8 +368,10 @@ namespace aeg::resource {
             gpu_texture.extent = destination_desc.extent;
             gpu_texture.mip_levels = destination_desc.mip_levels;
             gpu_texture.array_layers = destination_desc.array_layers;
+            if (reuse_destination) gpu_texture.sampled_view = reuse_destination->sampled_view;
 
-            const auto cleanup_texture = [this, &gpu_texture]() {
+            const auto cleanup_texture = [this, &gpu_texture, reuse_destination]() {
+                if (reuse_destination) return;
                 if (gpu_texture.sampled_view.is_valid()) {
                     (void) device_.destroy_texture_view(gpu_texture.sampled_view);
                     gpu_texture.sampled_view = {};
@@ -362,7 +382,7 @@ namespace aeg::resource {
                 }
             };
 
-            if (rhi::has_flag(destination_desc.capabilities, rhi::TextureCapability::kSampled)) {
+            if (!reuse_destination && rhi::has_flag(destination_desc.capabilities, rhi::TextureCapability::kSampled)) {
                 rhi::TextureViewDesc view_desc{};
                 view_desc.texture = gpu_texture.texture;
                 view_desc.kind = rhi::TextureViewKind::kSampled;
@@ -413,13 +433,13 @@ namespace aeg::resource {
                                     "Texture staging source offset overflows"), {}};
                 }
             }
-            const foundation::Result pass_result = add_texture_copy_pass(
-                    graph, resource_name, source_result.value, target_result.value, allocation.offset,
+            const auto pass_result = add_texture_copy_pass(
+                    graph, frame_context.frame_number(), resource_name, source_result.value, target_result.value, allocation.offset,
                     prepared.transfer_size, destination_desc.mip_levels, destination_desc.array_layers,
                     prepared.operations);
             if (!pass_result) {
                 cleanup_texture();
-                return {pass_result, {}};
+                return {pass_result.result, {}};
             }
 
             return {foundation::Result::success(),
@@ -429,7 +449,8 @@ namespace aeg::resource {
                         source_result.value,
                         target_result.value,
                         prepared.transfer_size,
-                        static_cast<uint32_t>(prepared.operations.size())
+                        static_cast<uint32_t>(prepared.operations.size()),
+                        pass_result.value
                     }};
         } catch (const std::bad_alloc&) {
             return {foundation::Result::failure(foundation::ResultCode::kOutOfMemory,

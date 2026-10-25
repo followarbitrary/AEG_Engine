@@ -14,10 +14,10 @@
 namespace aeg::asset {
 /** @brief Runtime-owned cooked payload and its UUID dependencies. */
 struct CookedAsset final {
-    AssetId id{};
-    AssetKind kind{AssetKind::kMesh};
+    foundation::AssetId id{};
+    foundation::AssetKind kind{foundation::AssetKind::kMesh};
     uint32_t schema_version{};
-    std::vector<AssetId> runtime_dependencies{};
+    std::vector<foundation::AssetId> runtime_dependencies{};
     std::vector<std::byte> payload{};
 };
 

@@ -2898,6 +2898,7 @@ Result VulkanDevice::select_physical_device(const DeviceCreateDesc& desc, QueueS
     }
     capabilities_.supports_swapchain = selected->features.swapchain;
     capabilities_.max_uniform_buffer_bytes = physical_properties_.limits.maxUniformBufferRange;
+    capabilities_.max_storage_buffer_bytes = physical_properties_.limits.maxStorageBufferRange;
     capabilities_.max_inline_constant_bytes = physical_properties_.limits.maxPushConstantsSize;
 
 #if AEG_VULKAN_ENABLE_VALIDATION || AEG_VULKAN_ENABLE_DEBUG_UTILS
@@ -3255,10 +3256,13 @@ Result VulkanDevice::submit_ownership_releases(std::span<const CommandListHandle
             const VulkanResourceState source = transfer->discard_contents
                                                    ? to_vk_discard_source_state(transfer->before, false)
                                                    : to_vk_resource_state(transfer->before, false);
+            // Queue submission makes flushed host writes available to the device.
+            // Ownership release orders prior GPU work; HOST cannot be a transfer stage.
+            const bool host_source = (source.stages2 & VK_PIPELINE_STAGE_2_HOST_BIT) != 0;
             VkBufferMemoryBarrier2 barrier{};
             barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
-            barrier.srcStageMask = source.stages2;
-            barrier.srcAccessMask = source.access2;
+            barrier.srcStageMask = host_source ? VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT : source.stages2;
+            barrier.srcAccessMask = host_source ? VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT : source.access2;
             barrier.dstStageMask = VK_PIPELINE_STAGE_2_NONE;
             barrier.dstAccessMask = 0;
             barrier.srcQueueFamilyIndex = transfer->source_family;
@@ -3270,7 +3274,7 @@ Result VulkanDevice::submit_ownership_releases(std::span<const CommandListHandle
 
             VkBufferMemoryBarrier legacy{};
             legacy.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-            legacy.srcAccessMask = source.access;
+            legacy.srcAccessMask = host_source ? VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT : source.access;
             legacy.dstAccessMask = 0;
             legacy.srcQueueFamilyIndex = transfer->source_family;
             legacy.dstQueueFamilyIndex = transfer->destination_family;
@@ -3278,7 +3282,7 @@ Result VulkanDevice::submit_ownership_releases(std::span<const CommandListHandle
             legacy.offset = transfer->offset;
             legacy.size = transfer->size;
             buffer_barriers.push_back(legacy);
-            legacy_source_stages |= source.stages;
+            legacy_source_stages |= host_source ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT : source.stages;
         }
 
         for (const TextureOwnershipTransfer* transfer : batch.textures) {
@@ -4678,7 +4682,13 @@ Result VulkanDevice::validate_buffer_usage(CommandListResource& command, BufferH
         }
         if (!resource_usage_matches(segment.state, expected)) {
             return Result::failure(ResultCode::kInvalidState,
-                                   "Explicit command list buffer state does not match the declared usage");
+                                   "Explicit command list buffer state does not match the declared usage: buffer=" +
+                                       std::to_string(buffer.value) + " range=" + std::to_string(offset) + "+" + std::to_string(size) +
+                                       " segment=" + std::to_string(segment.offset) + "+" + std::to_string(segment.size) +
+                                       " actual usage/queue=" + std::to_string(static_cast<unsigned>(segment.state.usage)) + "/" +
+                                       std::to_string(static_cast<unsigned>(segment.state.queue)) + " expected=" +
+                                       std::to_string(static_cast<unsigned>(expected.usage)) + "/" +
+                                       std::to_string(static_cast<unsigned>(expected.queue)));
         }
     }
     return Result::success();
@@ -4823,6 +4833,7 @@ Result VulkanDevice::record_barriers(CommandListResource& command, std::span<con
         ResourceState after{};
         bool discard_contents{false};
         bool requires_memory_dependency{false};
+        bool has_gpu_owner{true};
     };
     struct ResolvedTextureBarrier {
         TextureHandle handle{};
@@ -4987,7 +4998,10 @@ Result VulkanDevice::record_barriers(CommandListResource& command, std::span<con
                 }
                 resolved_buffers.push_back(ResolvedBufferBarrier{barrier.buffer, segment.offset, segment.size,
                                                                  segment.state, after, discard_contents,
-                                                                 barrier.requires_memory_dependency});
+                                                                 barrier.requires_memory_dependency,
+                    (segment.state.usage != ResourceUsage::kHostWrite && segment.state.usage != ResourceUsage::kHostRead) ||
+                    std::any_of(resource->last_use.begin(), resource->last_use.end(), [](uint64_t value) { return value != 0; }) ||
+                    buffer_has_unsubmitted_command_reference(barrier.buffer)});
                 if (segment.state != after) {
                     staged_buffer_changes.push_back(
                         BufferStateChange{barrier.buffer, segment.offset, segment.size, segment.state, after});
@@ -5061,7 +5075,7 @@ Result VulkanDevice::record_barriers(CommandListResource& command, std::span<con
         for (const ResolvedBufferBarrier& resolved : resolved_buffers) {
             uint32_t source_family = VK_QUEUE_FAMILY_IGNORED;
             uint32_t destination_family = VK_QUEUE_FAMILY_IGNORED;
-            if (is_cross_family_transfer(resolved.before, resolved.after, source_family, destination_family) &&
+            if (resolved.has_gpu_owner && is_cross_family_transfer(resolved.before, resolved.after, source_family, destination_family) &&
                 resolved.after.queue != command.queue) {
                 return Result::failure(ResultCode::kInvalidArgument,
                                        "Cross-queue buffer barriers must be recorded on the destination queue");
@@ -5103,7 +5117,7 @@ Result VulkanDevice::record_barriers(CommandListResource& command, std::span<con
             uint32_t source_family = VK_QUEUE_FAMILY_IGNORED;
             uint32_t destination_family = VK_QUEUE_FAMILY_IGNORED;
             const bool cross_family =
-                is_cross_family_transfer(resolved.before, resolved.after, source_family, destination_family);
+                resolved.has_gpu_owner && is_cross_family_transfer(resolved.before, resolved.after, source_family, destination_family);
             VkBufferMemoryBarrier2 barrier{};
             barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
             barrier.srcStageMask = cross_family ? VK_PIPELINE_STAGE_2_NONE : source.stages2;

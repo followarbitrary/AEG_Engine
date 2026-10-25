@@ -12,6 +12,7 @@
 #include <string_view>
 #include <vector>
 
+#include "asset_identity.hpp"
 #include "ecs.hpp"
 #include "reflection.hpp"
 #include "result.hpp"
@@ -29,6 +30,28 @@ public:
     [[nodiscard]] constexpr bool is_valid() const noexcept { return high_ != 0 || low_ != 0; }
     [[nodiscard]] constexpr uint64_t high() const noexcept { return high_; }
     [[nodiscard]] constexpr uint64_t low() const noexcept { return low_; }
+
+    /** @brief Returns canonical UUID bytes with each high/low word in big-endian order. */
+    [[nodiscard]] constexpr foundation::Uuid uuid() const noexcept {
+        foundation::Uuid result{};
+        for (std::size_t index = 0; index != 8; ++index) {
+            const auto shift = static_cast<unsigned>((7 - index) * 8);
+            result.bytes[index] = static_cast<uint8_t>(high_ >> shift);
+            result.bytes[index + 8] = static_cast<uint8_t>(low_ >> shift);
+        }
+        return result;
+    }
+
+    /** @brief Restores the high/low words from canonical UUID bytes without changing the identity domain. */
+    [[nodiscard]] static constexpr Guid128 from_uuid(const foundation::Uuid& uuid) noexcept {
+        uint64_t high = 0;
+        uint64_t low = 0;
+        for (std::size_t index = 0; index != 8; ++index) {
+            high = (high << 8u) | uuid.bytes[index];
+            low = (low << 8u) | uuid.bytes[index + 8];
+        }
+        return Guid128{high, low};
+    }
 
     friend constexpr bool operator==(Guid128, Guid128) = default;
     friend constexpr auto operator<=>(Guid128, Guid128) = default;

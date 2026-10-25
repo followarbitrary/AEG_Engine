@@ -15,17 +15,19 @@
 #include "asset_identity.hpp"
 
 namespace aeg::asset {
+inline constexpr uint32_t kScenePayloadSchemaVersion = 1;
+
 struct SceneAssetReference final {
     std::array<uint8_t, 16> scene_entity_uuid{};
     std::string component_type{};
     uint32_t component_version{};
     uint64_t field_id{};
-    AssetId asset{};
-    AssetKind kind{AssetKind::kMesh};
+    foundation::AssetId asset{};
+    foundation::AssetKind kind{foundation::AssetKind::kMesh};
 };
 
 struct ScenePayload final {
-    uint32_t schema_version{1};
+    uint32_t schema_version{kScenePayloadSchemaVersion};
     std::vector<std::byte> serialized_scene{};
     std::vector<SceneAssetReference> references{};
 };
@@ -34,7 +36,7 @@ struct ScenePayload final {
 [[nodiscard]] bool has_scene_payload_header(std::span<const std::byte> bytes) noexcept;
 
 /** @brief Resolve stable field ids into runtime AssetIds in an already encoded payload. */
-using SceneAssetResolver = std::function<foundation::ResultValue<AssetId>(uint64_t stable_id)>;
+using SceneAssetResolver = std::function<foundation::ResultValue<foundation::AssetId>(uint64_t stable_id)>;
 [[nodiscard]] foundation::Result relocate_scene_assets(ScenePayload& payload, std::span<const uint64_t> stable_ids,
                                                        const SceneAssetResolver& resolve);
 

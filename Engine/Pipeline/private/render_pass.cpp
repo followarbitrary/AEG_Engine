@@ -1,9 +1,28 @@
-#include "render_pass.hpp"
+#include "render_pass_execution.hpp"
+#include "render_pass_registry_execution.hpp"
+
+#include <limits>
 
 namespace aeg::pipeline {
-RenderPassRegistry& global_render_pass_registry() noexcept {
-    static RenderPassRegistry registry;
-    return registry;
+namespace {
+void advance_execution_epoch(uint64_t& epoch) noexcept {
+    epoch = epoch == std::numeric_limits<uint64_t>::max() ? 1 : epoch + 1;
+}
+}  // namespace
+
+uint64_t detail::RenderPassRegistryExecution::execution_epoch(const RenderPassRegistry& registry) noexcept {
+    return registry.execution_epoch_;
+}
+
+foundation::ResultValue<std::shared_ptr<const RenderPass>> detail::RenderPassRegistryExecution::find_pass(
+    const RenderPassRegistry& registry, RenderPassTypeId type) {
+    const auto it = registry.factories_.find(type);
+    if (it == registry.factories_.end())
+        return {foundation::not_found("render pass type is not registered"), {}};
+    auto pass = it->second();
+    if (!pass)
+        return {foundation::invalid_argument("render pass factory returned null"), {}};
+    return {foundation::Result::success(), std::shared_ptr<const RenderPass>(std::move(pass))};
 }
 
 foundation::Result RenderPassRegistry::register_pass(RenderPassFactory factory) {
@@ -21,33 +40,25 @@ foundation::Result RenderPassRegistry::register_pass(RenderPassFactory factory) 
     if (factories_.contains(d.type))
         return foundation::invalid_argument("render pass type is already registered");
     factories_.emplace(d.type, std::move(factory));
+    advance_execution_epoch(execution_epoch_);
     return foundation::Result::success();
 }
 
 foundation::Result RenderPassRegistry::unregister_pass(RenderPassTypeId type) {
     if (!factories_.erase(type))
         return foundation::not_found("render pass type is not registered");
+    advance_execution_epoch(execution_epoch_);
     return foundation::Result::success();
-}
-
-foundation::ResultValue<std::shared_ptr<const RenderPass>> RenderPassRegistry::find_pass(RenderPassTypeId type) const {
-    const auto it = factories_.find(type);
-    if (it == factories_.end())
-        return {foundation::not_found("render pass type is not registered"), {}};
-    auto pass = it->second();
-    if (!pass)
-        return {foundation::invalid_argument("render pass factory returned null"), {}};
-    return {foundation::Result::success(), std::shared_ptr<const RenderPass>(std::move(pass))};
 }
 
 foundation::ResultValue<RenderGraphPass> add_registered_render_pass(
     RenderGraphBuilder& builder, const RenderPassRegistry& registry,
     std::shared_ptr<const RenderPassConfiguration> configuration) {
-    if (!configuration || !configuration->type.is_valid())
+    if (!configuration || !configuration->type.is_valid() || configuration->queue > rhi::QueueClass::kCopy)
         return {foundation::invalid_argument("render pass configuration is invalid"), {}};
     if (!configuration->enabled)
         return {foundation::invalid_argument("render pass configuration is disabled"), {}};
-    auto found = registry.find_pass(configuration->type);
+    auto found = detail::RenderPassRegistryExecution::find_pass(registry, configuration->type);
     if (!found)
         return {found.result, {}};
     const auto owner = found.value;
@@ -56,12 +67,16 @@ foundation::ResultValue<RenderGraphPass> add_registered_render_pass(
     if (!(descriptor.allowed_queue_mask & queue_bit) ||
         (descriptor.graph_type == RenderGraphPassType::kGraphics && configuration->queue == rhi::QueueClass::kCompute))
         return {foundation::invalid_argument("render pass queue is not allowed"), {}};
-    return builder.add_pass(
+    const auto added = builder.add_pass(
         descriptor.name, descriptor.graph_type, configuration->queue,
         [owner, configuration](RenderPassBuilder& setup) { return owner->setup(setup, *configuration); },
         [owner, configuration](RenderPassExecutionContext& execute) {
             return owner->execute(execute, *configuration);
         });
+    if (!added) return added;
+    if (const auto retained = builder.retain_execution_owner(owner); !retained) return {retained, {}};
+    if (const auto retained = builder.retain_execution_owner(configuration); !retained) return {retained, {}};
+    return added;
 }
 
 }  // namespace aeg::pipeline

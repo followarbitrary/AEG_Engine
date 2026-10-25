@@ -5,9 +5,10 @@
 #include <windows.h>
 
 #include <chrono>
+#include <cstdio>
+#include <concurrency.hpp>
 #include <filesystem>
 #include <string>
-#include <thread>
 
 #ifndef AEG_EDITOR_APPLICATION_PATH
 #error "AEG_EDITOR_APPLICATION_PATH must name the built editor executable"
@@ -23,7 +24,8 @@ BOOL CALLBACK find_editor_window(HWND window, LPARAM parameter) {
     auto& search = *reinterpret_cast<WindowSearch*>(parameter);
     DWORD process_id = 0;
     GetWindowThreadProcessId(window, &process_id);
-    if (process_id != search.process_id) {
+    if (process_id != search.process_id || IsWindowVisible(window) == FALSE ||
+        (GetWindowLongPtrW(window, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) != 0) {
         return TRUE;
     }
     wchar_t title[256]{};
@@ -34,9 +36,46 @@ BOOL CALLBACK find_editor_window(HWND window, LPARAM parameter) {
     }
     return TRUE;
 }
+bool verify_main_window_matching() {
+    struct WindowCase final {
+        DWORD extended_style;
+        bool visible;
+        bool expected_match;
+    };
+    // A startup splash and a hidden main window can share the shipped title.
+    // Only a visible application window establishes the identity being tested.
+    constexpr WindowCase cases[]{{0, false, false},
+                                 {WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, true, false},
+                                 {0, true, true}};
+    for (const auto& test_case : cases) {
+        HWND window = CreateWindowExW(test_case.extended_style, L"STATIC", L"Aether Engine",
+                                      WS_OVERLAPPEDWINDOW, 0, 0, 1, 1, nullptr, nullptr,
+                                      GetModuleHandleW(nullptr), nullptr);
+        if (window == nullptr) {
+            std::fprintf(stderr, "Identity fixture window creation failed: %lu\n", GetLastError());
+            return false;
+        }
+        if (test_case.visible) {
+            ShowWindow(window, SW_SHOWNOACTIVATE);
+        }
+        WindowSearch search{GetCurrentProcessId(), nullptr};
+        EnumWindows(&find_editor_window, reinterpret_cast<LPARAM>(&search));
+        const bool matched = search.matching_window == window;
+        DestroyWindow(window);
+        if (matched != test_case.expected_match) {
+            std::fprintf(stderr, "Identity matched=%d for visible=%d, extended_style=%lu\n",
+                         matched, test_case.visible, test_case.extended_style);
+            return false;
+        }
+    }
+    return true;
+}
 }  // namespace
 
 int main() {
+    if (!verify_main_window_matching()) {
+        return 5;
+    }
     const std::filesystem::path editor_path{AEG_EDITOR_APPLICATION_PATH};
     if (editor_path.filename() != L"AetherEngine.exe") {
         return 1;
@@ -62,15 +101,18 @@ int main() {
         if (WaitForSingleObject(process.hProcess, 0) == WAIT_OBJECT_0) {
             break;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds{25});
+        static_cast<void>(aeg::concurrency::sleep_for(25'000'000ull));
     }
 
     if (search.matching_window != nullptr) {
         if (GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, process.dwProcessId) == FALSE) {
+            std::fprintf(stderr, "Identity could not signal editor exit: %lu\n", GetLastError());
             TerminateProcess(process.hProcess, 4);
         }
     }
     if (WaitForSingleObject(process.hProcess, 5000) == WAIT_TIMEOUT) {
+        std::fprintf(stderr, "Identity editor did not exit within 5 seconds; visible main window=%d\n",
+                     search.matching_window != nullptr);
         TerminateProcess(process.hProcess, 3);
         WaitForSingleObject(process.hProcess, 5000);
     }
@@ -78,7 +120,12 @@ int main() {
     GetExitCodeProcess(process.hProcess, &exit_code);
     CloseHandle(process.hProcess);
     if (search.matching_window == nullptr) {
+        std::fprintf(stderr, "Identity did not find a visible main window; editor exit code=%lu\n", exit_code);
         return 3;
     }
-    return exit_code == 0 ? 0 : 4;
+    if (exit_code != 0) {
+        std::fprintf(stderr, "Identity editor exit code=%lu\n", exit_code);
+        return 4;
+    }
+    return 0;
 }

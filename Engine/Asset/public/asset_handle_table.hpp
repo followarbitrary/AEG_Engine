@@ -13,14 +13,14 @@ namespace aeg::asset {
 /** @brief Monotonic, non-serializable runtime handles keyed by UUID and kind. */
 class AssetHandleTable final {
 public:
-    [[nodiscard]] foundation::ResultValue<uint64_t> intern(AssetId id, AssetKind kind);
-    [[nodiscard]] foundation::ResultValue<AssetId> resolve(uint64_t handle, AssetKind expected) const;
-    [[nodiscard]] foundation::ResultValue<uint64_t> find(AssetId id, AssetKind expected) const;
+    [[nodiscard]] foundation::ResultValue<uint64_t> intern(foundation::AssetId id, foundation::AssetKind kind);
+    [[nodiscard]] foundation::ResultValue<foundation::AssetId> resolve(uint64_t handle, foundation::AssetKind expected) const;
+    [[nodiscard]] foundation::ResultValue<uint64_t> find(foundation::AssetId id, foundation::AssetKind expected) const;
 
 private:
     struct Key final {
-        AssetId id{};
-        AssetKind kind{AssetKind::kMesh};
+        foundation::AssetId id{};
+        foundation::AssetKind kind{foundation::AssetKind::kMesh};
         auto operator<=>(const Key&) const = default;
     };
     struct Entry final {

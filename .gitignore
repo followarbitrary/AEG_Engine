@@ -1,7 +1,9 @@
 # Build directories
 /cmake-build-*/
 /build/
+/build-*/
 /out/
+/DemoProject/Binaries/
 
 # CMake generated files
 /shaders/public/generated/
@@ -38,6 +40,9 @@ Testing/
 *.so
 *.gch
 *.pch
+
+# Wavefront meshes in asset directories are source assets, not compiler objects.
+!**/Assets/**/*.obj
 
 # Logs and runtime output
 *.log

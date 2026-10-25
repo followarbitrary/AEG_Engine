@@ -19,11 +19,10 @@ struct LocalLight { float4 position_range; float4 color_intensity; float4 direct
 StructuredBuffer<LocalLight> lights : register(t2, space3);
 ByteAddressBuffer clusters : register(t3, space3);
 
-float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0, float3 normal : NORMAL) : SV_Target0 {
+float4 shade_clustered(float4 position, float2 uv, float3 normal, float visibility) {
     const float3 n=normalize(normal);
     float4 albedo=material_color.Sample(material_sampler,uv)*material_tint;
     float directional=max(dot(n,normalize(-directional_direction_intensity.xyz)),0.0f);
-    float visibility=viewport.z!=0 ? directional_shadow(shadow_map,position,clip_to_shadow,shadow_parameters):1.0f;
     float3 lighting=ambient_color.rgb+directional_color.rgb*directional_direction_intensity.w*directional*visibility;
     float4 view_h=mul(inverse_projection,float4(position.xy/float2(viewport.xy)*2.0f-1.0f,position.z,1));
     float3 surface=view_h.xyz/view_h.w;
@@ -47,4 +46,13 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0, float3 normal 
         lighting+=light.color_intensity.rgb*light.color_intensity.w*attenuation*max(dot(n,toward_light),0.0f);
     }
     return float4(albedo.rgb*lighting,albedo.a);
+}
+
+float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0, float3 normal : NORMAL) : SV_Target0 {
+    const float visibility=directional_shadow(shadow_map,position,clip_to_shadow,shadow_parameters);
+    return shade_clustered(position,uv,normal,visibility);
+}
+
+float4 main_unshadowed(float4 position : SV_Position, float2 uv : TEXCOORD0, float3 normal : NORMAL) : SV_Target0 {
+    return shade_clustered(position,uv,normal,1.0f);
 }

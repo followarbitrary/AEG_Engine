@@ -1,10 +1,13 @@
 #include "project_cooker.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <charconv>
+#include <chrono>
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <iterator>
 #include <map>
 #include <span>
 #include <system_error>
@@ -14,36 +17,150 @@
 #include "asset_cooker.hpp"
 #include "asset_dependency_packer.hpp"
 #include "asset_metadata.hpp"
+#include "asset_package_reader.hpp"
 #include "cooked_artifact_store.hpp"
 #include "cooked_asset.hpp"
 #include "game_build_manifest.hpp"
 #include "module_bundle.hpp"
-#include "pipeline_asset_importer.hpp"
+#include "feature_graph_asset.hpp"
+#include "feature_graph_asset_importer.hpp"
+#include "feature_registry.hpp"
+#include "feature_world_transform.hpp"
 #include "project_context.hpp"
+#include "project_module_agreement.hpp"
 #include "scene_asset.hpp"
 #include "scene_payload.hpp"
 #include "serialization.hpp"
+#include "world_command_routes.hpp"
 
 namespace aeg::tooling {
 namespace {
-pipeline::DocumentDiagnostic diagnostic(std::string code, std::string message) {
+ProjectDiagnostic diagnostic(std::string code, std::string message) {
     return {std::move(code), std::move(message), {}, {}, 0, 0};
 }
 
-asset::AssetId runtime_id(const AssetId& source) {
-    asset::AssetId result{};
+std::atomic_uint64_t publication_sequence{0};
+
+std::string next_publication_name() {
+    const auto timestamp =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch())
+            .count();
+    return std::to_string(timestamp) + "_" + std::to_string(publication_sequence.fetch_add(1));
+}
+
+foundation::AssetId runtime_id(const AssetId& source) {
+    foundation::AssetId result{};
     result.value.bytes = source.value.bytes;
     return result;
 }
 
 scene::SceneAssetId scene_id(const AssetId& source) {
-    uint64_t high = 0;
-    uint64_t low = 0;
-    for (std::size_t index = 0; index < 8; ++index)
-        high = (high << 8u) | source.value.bytes[index];
-    for (std::size_t index = 8; index < 16; ++index)
-        low = (low << 8u) | source.value.bytes[index];
-    return scene::SceneAssetId{high, low};
+    return scene::SceneAssetId::from_uuid(source.value);
+}
+
+foundation::ResultValue<scene::SceneAsset> decode_scene_archive(std::span<const std::byte> bytes) {
+    serialization::BinaryReader reader({reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size()});
+    auto scene = scene::SceneSerializer::deserialize(reader);
+    if (!scene) return scene;
+    if (reader.remaining() != 0)
+        return {foundation::invalid_argument("Startup Scene archive has trailing bytes"), {}};
+    return scene;
+}
+
+foundation::ResultValue<std::vector<asset::WorldCommandRoute>> load_world_command_routes(
+    const std::filesystem::path& scene_path, AssetId product) {
+    const auto sidecar = asset::world_command_routes_sidecar_path(scene_path);
+    std::error_code error;
+    const bool exists = std::filesystem::exists(sidecar, error);
+    if (error)
+        return {foundation::not_found("Cannot inspect startup Scene World route sidecar"), {}};
+    if (!exists) return {foundation::Result::success(), {}};
+    const auto size = std::filesystem::file_size(sidecar, error);
+    if (error || size > asset::kMaxWorldCommandRoutesBytes)
+        return {foundation::invalid_argument("Startup Scene World route sidecar exceeds its byte budget or is unreadable"), {}};
+    std::ifstream input(sidecar, std::ios::binary);
+    if (!input) return {foundation::not_found("Cannot read startup Scene World route sidecar"), {}};
+    std::vector<std::byte> bytes(static_cast<std::size_t>(size));
+    input.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    if (!input || input.peek() != std::char_traits<char>::eof())
+        return {foundation::invalid_argument("Startup Scene World route sidecar changed while reading"), {}};
+    auto routes = asset::decode_world_command_routes(bytes);
+    if (!routes || routes.value.empty()) return routes;
+
+    // Read the author document even on a warm cache. Its Scene identity is the
+    // sidecar's scope; only the packaged route uses the .meta product identity.
+    std::ifstream source(scene_path, std::ios::binary);
+    if (!source) return {foundation::not_found("Cannot read World route author Scene"), {}};
+    const std::string source_bytes((std::istreambuf_iterator<char>(source)), {});
+    const auto raw = std::span<const std::byte>(reinterpret_cast<const std::byte*>(source_bytes.data()), source_bytes.size());
+    const auto payload = asset::decode_scene_payload(raw);
+    if (!payload && asset::has_scene_payload_header(raw)) return {payload.result, {}};
+    const auto authored = decode_scene_archive(payload ? std::span<const std::byte>(payload.value.serialized_scene) : raw);
+    if (!authored) return {authored.result, {}};
+    const foundation::AssetId author_id{authored.value.id().uuid()};
+    for (auto& route : routes.value) {
+        if (route.scene_asset != author_id)
+            return {foundation::invalid_argument("World route Scene identity does not match its author Scene"), {}};
+        route.scene_asset = runtime_id(product);
+    }
+    return routes;
+}
+
+foundation::Result validate_packaged_world_command_routes(std::span<const asset::WorldCommandRoute> routes,
+    const std::filesystem::path& package_path, std::span<const AssetId> roots,
+    const feature::FeatureRegistry& features) {
+    if (routes.empty()) return foundation::Result::success();
+    const auto package = asset::AssetPackageReader::open(package_path);
+    if (!package) return package.result;
+    const auto scene = package.value.read_cooked(runtime_id(roots.front()));
+    if (!scene) return scene.result;
+    if (scene.value.kind != AssetKind::kScene)
+        return foundation::invalid_argument("World route startup product is not a Scene");
+    const auto payload = asset::decode_scene_payload(scene.value.payload);
+    if (!payload) return payload.result;
+    if (payload.value.schema_version != asset::kScenePayloadSchemaVersion)
+        return foundation::unsupported("World route packaged Scene payload schema version is unsupported");
+    const auto document = decode_scene_archive(payload.value.serialized_scene);
+    if (!document) return document.result;
+    if (document.value.id() != scene_id(roots.front()))
+        return foundation::invalid_argument("World route packaged Scene identity does not match its product UUID");
+    std::vector<feature::FeatureGraphDocument> graphs;
+    graphs.reserve(roots.size() - 1);
+    for (std::size_t index = 1; index < roots.size(); ++index) {
+        const auto cooked = package.value.read_cooked(runtime_id(roots[index]));
+        if (!cooked) return cooked.result;
+        if (cooked.value.kind != AssetKind::kFeatureGraph)
+            return foundation::invalid_argument("World route startup graph product is not a FeatureGraph");
+        auto graph = asset::decode_feature_graph_asset(cooked.value.payload);
+        if (!graph) return graph.result;
+        const auto identity = AssetId::parse(graph.value.asset_uuid);
+        if (!identity || identity.value != roots[index] || graph.value.schema_version != cooked.value.schema_version)
+            return foundation::invalid_argument("World route packaged graph identity or schema does not match its envelope");
+        if (const auto compiled = feature::FeatureGraphCompiler{}.compile(graph.value, features); !compiled)
+            return compiled.result;
+        graphs.push_back(std::move(graph.value));
+    }
+    const auto transform = ecs::ComponentTypeId(feature::kWorldTransformComponentName);
+    const auto transform_schema = reflection::TypeId(feature::kWorldTransformComponentName);
+    for (const auto& route : routes) {
+        if (route.scene_asset != runtime_id(roots.front()))
+            return foundation::invalid_argument("World route targets a different packaged startup Scene");
+        if (const auto valid = asset::validate_world_command_route_source(route, graphs, features); !valid)
+            return valid;
+        const auto entity = scene::SceneEntityId::from_uuid(route.scene_entity);
+        if (std::none_of(document.value.entities().begin(), document.value.entities().end(),
+                         [&](const auto& record) { return record.id == entity; }))
+            return foundation::invalid_argument("World route target entity is absent from the packaged Scene");
+        const auto component = std::find_if(document.value.components().begin(), document.value.components().end(),
+            [&](const auto& record) {
+                return record.entity == entity && record.component_type == transform && record.schema_type == transform_schema;
+            });
+        if (component == document.value.components().end())
+            return foundation::invalid_argument("World route packaged target entity has no Transform component");
+        if (const auto valid = feature::validate_world_transform_component(component->payload, component->schema_version); !valid)
+            return valid;
+    }
+    return foundation::Result::success();
 }
 
 foundation::ResultValue<AssetId> source_product(const std::filesystem::path& file, AssetKind expected) {
@@ -66,6 +183,113 @@ foundation::ResultValue<std::string> digest_file(const std::filesystem::path& fi
     return module::module_content_sha256(bytes);
 }
 
+struct StartupSourceFingerprint final {
+    std::filesystem::path stamp;
+    SourceId source;
+    std::string bytes;
+};
+
+foundation::ResultValue<StartupSourceFingerprint> startup_source_fingerprint(
+    const std::filesystem::path& source, const AssetId& expected, const std::filesystem::path& cache_root) {
+    const auto meta_path = std::filesystem::path{source.string() + ".meta"};
+    const auto metadata = AssetMetaCodec{}.load(meta_path);
+    if (!metadata) return {metadata.result, {}};
+    if (metadata.value.products.size() != 1 || metadata.value.products.front().id != expected)
+        return {foundation::invalid_argument("Startup source metadata changed during Cook"), {}};
+    const auto source_digest = digest_file(source);
+    if (!source_digest) return {source_digest.result, {}};
+    const auto meta_digest = digest_file(meta_path);
+    if (!meta_digest) return {meta_digest.result, {}};
+    // This is private Cooker provenance, separate from the immutable artifact
+    // manifest and Runtime schemas. Legacy bundles have no stamp and reimport.
+    return {foundation::Result::success(), {cache_root / ".project-cook-sources" /
+        (metadata.value.source.to_string() + "_" + expected.to_string() + ".sha256"),
+        metadata.value.source,
+        source_digest.value + '\n' + meta_digest.value + '\n'}};
+}
+
+foundation::Result write_startup_source_fingerprint(const StartupSourceFingerprint& fingerprint) {
+    std::error_code error;
+    std::filesystem::create_directories(fingerprint.stamp.parent_path(), error);
+    if (error) return foundation::Result::failure(foundation::ResultCode::kBackendError,
+                                                 "Cannot create startup source fingerprint directory");
+    auto temporary = fingerprint.stamp;
+    temporary += "." + next_publication_name() + ".tmp";
+    {
+        std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+        output << fingerprint.bytes;
+        output.close();
+        if (!output) {
+            std::filesystem::remove(temporary, error);
+            return foundation::Result::failure(foundation::ResultCode::kBackendError,
+                                                "Cannot write startup source fingerprint");
+        }
+    }
+    const auto published = replace_file_atomically(temporary, fingerprint.stamp);
+    if (!published) std::filesystem::remove(temporary, error);
+    return published;
+}
+
+template <typename Import>
+foundation::Result refresh_startup_source(const std::filesystem::path& source, const AssetId& expected,
+                                           const std::filesystem::path& cache_root,
+                                           const CookedArtifactIndex& index, Import&& import) {
+    const auto before = startup_source_fingerprint(source, expected, cache_root);
+    if (!before) return before.result;
+    bool readable_stamp = false;
+    std::string previous;
+    {
+        std::ifstream stamp(before.value.stamp, std::ios::binary);
+        if (stamp) {
+            previous.assign(std::istreambuf_iterator<char>(stamp), {});
+            readable_stamp = !stamp.bad();
+        }
+    }
+    if (readable_stamp && previous == before.value.bytes && index.read(expected))
+        return foundation::Result::success();
+    struct CacheSelection { bool known; std::filesystem::path manifest; };
+    const auto selection = [&]() -> CacheSelection {
+        const auto selected = CookedArtifactStore(cache_root).load_current(before.value.source);
+        if (selected) return {true, selected.value.manifest};
+        std::error_code error;
+        const bool exists = std::filesystem::exists(
+            cache_root / before.value.source.to_string() / "current.toml", error);
+        return {!exists && !error, {}};
+    };
+    const auto selected_before = selection();
+    std::error_code stamp_error;
+    const bool absent_stamp = !std::filesystem::exists(before.value.stamp, stamp_error) && !stamp_error;
+    // Invalidate before the importer can advance its current bundle. A crash,
+    // failed readback or concurrent source edit must never leave stamp A
+    // claiming that a newly published bundle B still came from source A.
+    auto pending = before.value;
+    pending.bytes = "import pending; source verification required\n";
+    if (const auto invalidated = write_startup_source_fingerprint(pending); !invalidated) return invalidated;
+    if (const auto imported = import(); !imported) {
+        // A parser failure preserves the previous cache/stamp exactly. An
+        // importer that failed after publication keeps the invalid marker.
+        const auto selected_after = selection();
+        if (selected_before.known && selected_after.known && selected_before.manifest == selected_after.manifest) {
+            if (readable_stamp) {
+                auto restored = before.value;
+                restored.bytes = previous;
+                if (const auto restore = write_startup_source_fingerprint(restored); !restore) return restore;
+            } else if (absent_stamp) {
+                std::error_code error;
+                std::filesystem::remove(before.value.stamp, error);
+                if (error) return foundation::Result::failure(foundation::ResultCode::kBackendError,
+                                                              "Cannot restore startup source fingerprint absence");
+            }
+        }
+        return imported;
+    }
+    const auto after = startup_source_fingerprint(source, expected, cache_root);
+    if (!after) return after.result;
+    if (before.value.stamp != after.value.stamp || before.value.bytes != after.value.bytes)
+        return foundation::invalid_state("Startup source changed while Cook imported it; retry with a stable saved source");
+    return write_startup_source_fingerprint(after.value);
+}
+
 foundation::Result validate_scene_reference_archive(const asset::ScenePayload& payload) {
     const auto archive = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(payload.serialized_scene.data()),
                                                   payload.serialized_scene.size());
@@ -80,7 +304,6 @@ foundation::Result validate_scene_reference_archive(const asset::ScenePayload& p
     for (const auto& component : decoded.value.components()) {
         if (component.schema_type != mesh_schema)
             continue;
-        uint64_t entity_high = component.entity.high(), entity_low = component.entity.low();
         std::vector<std::pair<uint64_t, uint64_t>> fields;
         if (component.payload.size() < 16)
             return foundation::invalid_argument("Scene component reflection payload is truncated");
@@ -111,12 +334,8 @@ foundation::Result validate_scene_reference_archive(const asset::ScenePayload& p
             std::size_t matches = 0;
             for (std::size_t index = 0; index < payload.references.size(); ++index) {
                 const auto& reference = payload.references[index];
-                uint64_t high = 0, low = 0;
-                for (int byte = 0; byte != 8; ++byte)
-                    high = (high << 8u) | reference.scene_entity_uuid[static_cast<std::size_t>(byte)];
-                for (int byte = 0; byte != 8; ++byte)
-                    low = (low << 8u) | reference.scene_entity_uuid[static_cast<std::size_t>(8 + byte)];
-                if (high == entity_high && low == entity_low && reference.component_type == "MeshRenderer" &&
+                const auto entity = scene::SceneEntityId::from_uuid(foundation::Uuid{reference.scene_entity_uuid});
+                if (entity == component.entity && reference.component_type == "MeshRenderer" &&
                     reference.field_id == id) {
                     if ((id == mesh_field && reference.kind != AssetKind::kMesh) ||
                         (id == material_field && reference.kind != AssetKind::kMaterial))
@@ -161,26 +380,10 @@ foundation::Result ensure_scene_cooked(const std::filesystem::path& source, cons
     } else {
         payload.serialized_scene.assign(reinterpret_cast<const std::byte*>(bytes.data()),
                                         reinterpret_cast<const std::byte*>(bytes.data() + bytes.size()));
-        // Project scaffolds and older editor exports may contain a raw
-        // SceneSerializer archive whose stable identity predates the .meta
-        // product UUID. Relocate that identity during Cook so the runtime
-        // package has one authoritative Scene UUID.
         const auto archive_bytes =
             std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size());
         serialization::BinaryReader reader(archive_bytes);
         const auto archive = scene::SceneSerializer::deserialize(reader);
-        if (archive && archive.value.id() != scene_id(expected)) {
-            auto relocated = std::move(archive.value);
-            if (const auto identity =
-                    relocated.set_identity(scene_id(expected), std::string(relocated.name()), relocated.version());
-                !identity)
-                return identity;
-            serialization::BinaryWriter writer;
-            if (const auto serialized = scene::SceneSerializer::serialize(relocated, writer); !serialized)
-                return serialized;
-            payload.serialized_scene.assign(reinterpret_cast<const std::byte*>(writer.data().data()),
-                                            reinterpret_cast<const std::byte*>(writer.data().data() + writer.size()));
-        }
         if (archive) {
             // Build relocation records directly from the reflected wire payload.
             // The tooling target intentionally does not depend on Runtime; the
@@ -231,12 +434,7 @@ foundation::Result ensure_scene_cooked(const std::filesystem::path& source, cons
                     if (stable == 0)
                         continue;
                     asset::SceneAssetReference reference{};
-                    for (int n = 0; n != 8; ++n)
-                        reference.scene_entity_uuid[static_cast<size_t>(n)] =
-                            static_cast<uint8_t>(component.entity.high() >> (56 - n * 8));
-                    for (int n = 0; n != 8; ++n)
-                        reference.scene_entity_uuid[static_cast<size_t>(8 + n)] =
-                            static_cast<uint8_t>(component.entity.low() >> (56 - n * 8));
+                    reference.scene_entity_uuid = component.entity.uuid().bytes;
                     reference.component_type = type == mesh_type ? "MeshRenderer" : "TextRenderer";
                     reference.component_version = component.schema_version;
                     reference.field_id = field_id.value;
@@ -361,6 +559,20 @@ foundation::Result ensure_scene_cooked(const std::filesystem::path& source, cons
         if (const auto relocated = asset::relocate_scene_assets(payload, stable_ids, resolve); !relocated)
             return relocated;
     }
+    // Both raw Editor archives and ScenePayload sources share the same product
+    // relocation. Stable entity UUIDs and relocation references stay unchanged.
+    auto archive = decode_scene_archive(payload.serialized_scene);
+    if (!archive) return archive.result;
+    if (archive.value.id() != scene_id(expected)) {
+        if (const auto identity = archive.value.set_identity(
+                scene_id(expected), std::string(archive.value.name()), archive.value.version()); !identity)
+            return identity;
+        serialization::BinaryWriter writer;
+        if (const auto serialized = scene::SceneSerializer::serialize(archive.value, writer); !serialized)
+            return serialized;
+        payload.serialized_scene.assign(reinterpret_cast<const std::byte*>(writer.data().data()),
+                                        reinterpret_cast<const std::byte*>(writer.data().data() + writer.size()));
+    }
     if (const auto validated = validate_scene_reference_archive(payload); !validated)
         return validated;
     const auto encoded = asset::encode_scene_payload(payload);
@@ -380,22 +592,20 @@ foundation::Result ensure_scene_cooked(const std::filesystem::path& source, cons
     return published ? foundation::Result::success() : published.result;
 }
 
-foundation::Result ensure_pipeline_cooked(const std::filesystem::path& source, const AssetId& expected,
-                                          const pipeline::TypeCatalog& catalog,
-                                          const std::filesystem::path& cache_root) {
+foundation::Result ensure_feature_graph_cooked(const std::filesystem::path& source, const AssetId& expected,
+                                               const std::filesystem::path& cache_root) {
     const auto metadata = AssetMetaCodec{}.load(source.string() + ".meta");
     if (!metadata)
         return metadata.result;
-    auto catalog_copy = std::make_shared<pipeline::TypeCatalog>(catalog);
-    PipelineAssetImporter importer(std::move(catalog_copy));
+    FeatureGraphAssetImporter importer;
     const auto cooked = importer.cook(source, metadata.value);
     if (!cooked)
         return cooked.result;
     std::vector<CookedArtifact> artifacts;
     artifacts.reserve(cooked.value.size());
     for (const auto& asset : cooked.value) {
-        if (asset.id != expected || asset.kind != AssetKind::kPipeline)
-            return foundation::invalid_argument("Startup pipeline metadata does not match the project manifest");
+        if (asset.id != expected || asset.kind != AssetKind::kFeatureGraph)
+            return foundation::invalid_argument("Startup FeatureGraph metadata does not match the project manifest");
         const auto envelope = CookedAssetCodec{}.encode(asset);
         if (!envelope)
             return envelope.result;
@@ -403,6 +613,59 @@ foundation::Result ensure_pipeline_cooked(const std::filesystem::path& source, c
     }
     const auto published = CookedArtifactStore(cache_root).publish(metadata.value.source, artifacts);
     return published ? foundation::Result::success() : published.result;
+}
+
+foundation::Result append_feature_parameter_dependencies(CookedAsset& cooked,
+                                                          const feature::FeatureRegistry& registry,
+                                                          const feature::AssetKindResolver& resolve_kind) {
+    const auto graph = asset::decode_feature_graph_asset(cooked.payload);
+    if (!graph) return graph.result;
+    const auto identity = AssetId::parse(graph.value.asset_uuid);
+    if (!identity || identity.value != cooked.id || graph.value.schema_version != cooked.schema_version)
+        return foundation::invalid_argument("FeatureGraph payload identity or schema does not match its cooked envelope");
+    if (!graph.value.nodes.empty() && graph.value.contract_digest == 0)
+        return foundation::invalid_argument("FeatureGraph contract digest is required for Cook");
+    if (const auto compiled = feature::FeatureGraphCompiler{}.compile(graph.value, registry); !compiled)
+        return compiled.result;
+
+    // Only authored roots have parameter overrides. Expanded children receive
+    // their own typed defaults, matching Runtime's separately owned instances.
+    const auto append = [&](auto&& self, const feature::ExpandedFeature& expanded,
+                            std::span<const uint8_t> blob) -> foundation::Result {
+        const auto& schema = expanded.contract.parameters;
+        const auto records = feature::decode_feature_parameters(blob, schema);
+        if (!records) return records.result;
+        for (const auto& record : records.value) {
+            const auto parameter = std::find_if(schema.begin(), schema.end(), [&](const auto& item) {
+                return item.id == record.id;
+            });
+            if (!parameter->metadata || parameter->metadata->type != feature::ParameterType::kAssetReference)
+                continue;
+            const auto value = feature::deserialize_parameter_value(record.payload, parameter->metadata->type);
+            if (!value) return value.result;
+            if (const auto valid = feature::validate_parameter_value(value.value, *parameter->metadata, resolve_kind);
+                !valid) return valid;
+            const auto& reference = std::get<foundation::AssetReference>(value.value);
+            if (reference.uuid.empty()) continue;
+            const auto dependency = AssetId::parse(reference.uuid);
+            if (!dependency) return dependency.result;
+            if (dependency.value != AssetId{}) cooked.runtime_dependencies.push_back(dependency.value);
+        }
+        for (const auto& child : expanded.children)
+            if (const auto result = self(self, child, {}); !result)
+                return foundation::Result::failure(result.code,
+                    "Child Feature " + std::to_string(child.definition_id.value()) + ": " + result.message);
+        return foundation::Result::success();
+    };
+    for (const auto& node : graph.value.nodes) {
+        const auto expanded = registry.expand(node.definition_id, node.owner_path);
+        if (!expanded) return expanded.result;
+        if (const auto result = append(append, expanded.value, node.parameter_blob); !result)
+            return foundation::Result::failure(result.code,
+                "FeatureGraph " + graph.value.asset_uuid + " node " + std::to_string(node.node_id.value()) +
+                ": " + result.message);
+    }
+    return foundation::Result::success();
 }
 }  // namespace
 
@@ -428,6 +691,12 @@ foundation::ResultValue<ProjectCookResult> cook_project(const ProjectCookRequest
     if (!paths)
         return {paths.result, std::move(result)};
 
+    if (const auto agreement = detail::validate_project_module_agreement(project.value.config, module.value.metadata,
+                                                                        request.configuration); !agreement) {
+        result.diagnostics.push_back(diagnostic("cook.module_project", agreement.message));
+        return {agreement, std::move(result)};
+    }
+
     std::vector<AssetId> roots;
     const auto scene_path =
         paths.value.directory(application::project::ProjectDirectory::kRoot) / project.value.config.startup_scene;
@@ -437,14 +706,21 @@ foundation::ResultValue<ProjectCookResult> cook_project(const ProjectCookRequest
         return {scene.result, std::move(result)};
     }
     roots.push_back(scene.value);
-    for (const auto& pipeline_path : project.value.config.startup_pipelines) {
-        const auto path = paths.value.directory(application::project::ProjectDirectory::kRoot) / pipeline_path;
-        const auto pipeline = source_product(path, AssetKind::kPipeline);
-        if (!pipeline) {
-            result.diagnostics.push_back(diagnostic("cook.startup_pipeline", pipeline.result.message));
-            return {pipeline.result, std::move(result)};
+    for (const auto& feature_graph_path : project.value.config.startup_feature_graphs) {
+        const auto path = paths.value.directory(application::project::ProjectDirectory::kRoot) / feature_graph_path;
+        const auto feature_graph = source_product(path, AssetKind::kFeatureGraph);
+        if (!feature_graph) {
+            result.diagnostics.push_back(diagnostic("cook.startup_feature_graph", feature_graph.result.message));
+            return {feature_graph.result, std::move(result)};
         }
-        roots.push_back(pipeline.value);
+        roots.push_back(feature_graph.value);
+    }
+
+    // Sidecars are author inputs, independent of immutable cooked cache hits.
+    auto world_routes = load_world_command_routes(scene_path, scene.value);
+    if (!world_routes) {
+        result.diagnostics.push_back(diagnostic("cook.world_routes", world_routes.result.message));
+        return {world_routes.result, std::move(result)};
     }
 
     std::error_code error;
@@ -453,49 +729,138 @@ foundation::ResultValue<ProjectCookResult> cook_project(const ProjectCookRequest
         return {
             foundation::Result::failure(foundation::ResultCode::kBackendError, "Cannot create cook output directory"),
             std::move(result)};
+    const auto publication_name = next_publication_name();
+    const auto publication_directory = request.output_directory / "versions" / publication_name;
+    std::filesystem::create_directories(publication_directory, error);
+    if (error)
+        return {
+            foundation::Result::failure(foundation::ResultCode::kBackendError,
+                                        "Cannot create versioned cook output directory"),
+            std::move(result)};
     const auto cache_root = paths.value.directory(application::project::ProjectDirectory::kCache);
     CookedArtifactIndex index(cache_root);
     if (const auto refresh = index.refresh(); !refresh) {
         result.diagnostics.push_back(diagnostic("cook.cache", refresh.message));
         return {refresh, std::move(result)};
     }
-    // A clean external project has no Editor-derived cache yet.  Cook the
-    // startup closure here using the same metadata/catalog validation as the
-    // Editor asset pipeline, then refresh the immutable index before packing.
-    if (!index.read(scene.value)) {
-        if (const auto cook = ensure_scene_cooked(scene_path, scene.value, cache_root,
-                                                  paths.value.directory(application::project::ProjectDirectory::kRoot));
-            !cook) {
-            result.diagnostics.push_back(diagnostic("cook.startup_scene", cook.message));
-            return {cook, std::move(result)};
-        }
+    // A saved startup asset can change without changing AssetId. Reuse an
+    // immutable bundle only when its source and .meta fingerprint still match.
+    // Unchanged sources retain their exact cache; final-package validation
+    // below still checks cached payloads rather than trusting these stamps.
+    if (const auto cook = refresh_startup_source(scene_path, scene.value, cache_root, index, [&] {
+            return ensure_scene_cooked(scene_path, scene.value, cache_root,
+                paths.value.directory(application::project::ProjectDirectory::kRoot));
+        }); !cook) {
+        result.diagnostics.push_back(diagnostic("cook.startup_scene", cook.message));
+        return {cook, std::move(result)};
     }
-    const auto package = request.output_directory / "game.aegbin";
-    for (const auto& pipeline_path : project.value.config.startup_pipelines) {
-        const auto source = paths.value.directory(application::project::ProjectDirectory::kRoot) / pipeline_path;
-        const auto product = source_product(source, AssetKind::kPipeline);
+    const auto package = publication_directory / "game.aegbin";
+    for (const auto& feature_graph_path : project.value.config.startup_feature_graphs) {
+        const auto source = paths.value.directory(application::project::ProjectDirectory::kRoot) / feature_graph_path;
+        const auto product = source_product(source, AssetKind::kFeatureGraph);
         if (!product)
             return {product.result, std::move(result)};
-        if (!index.read(product.value)) {
-            if (const auto cook =
-                    ensure_pipeline_cooked(source, product.value, module.value.metadata.catalog, cache_root);
-                !cook) {
-                result.diagnostics.push_back(diagnostic("cook.startup_pipeline", cook.message));
-                return {cook, std::move(result)};
-            }
+        if (const auto cook = refresh_startup_source(source, product.value, cache_root, index, [&] {
+                return ensure_feature_graph_cooked(source, product.value, cache_root);
+            }); !cook) {
+            result.diagnostics.push_back(diagnostic("cook.startup_feature_graph", cook.message));
+            return {cook, std::move(result)};
         }
     }
     if (const auto refresh = index.refresh(); !refresh) {
         result.diagnostics.push_back(diagnostic("cook.cache", refresh.message));
         return {refresh, std::move(result)};
     }
+
+    // Rebuild the immutable semantic registry from the validated module catalog.
+    // No executable callback is needed for graph compilation or expansion.
+    auto catalog_registry = feature::FeatureRegistry::from_catalog(module.value.metadata.feature_catalog);
+    if (!catalog_registry) {
+        result.diagnostics.push_back(diagnostic("cook.feature_catalog", catalog_registry.result.message));
+        return {catalog_registry.result, std::move(result)};
+    }
+    const auto& features = catalog_registry.value;
+    const feature::AssetKindResolver resolve_kind = [&index](AssetId id)
+        -> foundation::ResultValue<AssetKind> {
+        const auto bytes = index.read(id);
+        if (!bytes) return {bytes.result, {}};
+        const auto decoded = asset::decode_cooked_asset(bytes.value);
+        if (!decoded) return {decoded.result, {}};
+        if (decoded.value.id != id)
+            return {foundation::invalid_argument("Cooked asset resolver returned the wrong UUID"), {}};
+        return {foundation::Result::success(), decoded.value.kind};
+    };
+    const auto resolve_for_package = [&](AssetId id) -> foundation::ResultValue<std::vector<std::byte>> {
+        auto bytes = index.read(id);
+        if (!bytes) return bytes;
+        auto cooked = asset::decode_cooked_asset(bytes.value);
+        if (!cooked) return {cooked.result, {}};
+        if (cooked.value.id != id)
+            return {foundation::invalid_argument("Cooked asset resolver returned the wrong UUID"), {}};
+        if (cooked.value.kind != AssetKind::kFeatureGraph) return bytes;
+        if (const auto valid = append_feature_parameter_dependencies(cooked.value, features, resolve_kind); !valid)
+            return {valid, {}};
+        // Cache bundles remain immutable. The package receives a validated
+        // envelope whose dependencies include all effective asset parameters.
+        return asset::encode_cooked_asset(cooked.value);
+    };
     if (const auto packed =
-            AssetDependencyPacker{}.write(package, roots, [&index](AssetId id) { return index.read(id); });
+            AssetDependencyPacker{}.write(package, roots, resolve_for_package);
         !packed) {
         result.diagnostics.push_back(diagnostic("cook.dependencies", packed.message));
         return {packed, std::move(result)};
     }
 
+    if (const auto validated = validate_packaged_world_command_routes(world_routes.value, package, roots, features);
+        !validated) {
+        result.diagnostics.push_back(diagnostic("cook.world_routes", validated.message));
+        return {validated, std::move(result)};
+    }
+
+    // Deliver the exact validated module bundle beside the cooked package. Keep the
+    // manifest's internal relative metadata/binary paths unchanged inside a private
+    // module directory, then pin that manifest by its original bytes.
+    const auto delivery_module_root = publication_directory / "module";
+    std::filesystem::create_directories(delivery_module_root, error);
+    if (error) {
+        result.diagnostics.push_back(diagnostic("cook.module_delivery", "Cannot create module delivery directory"));
+        return {foundation::Result::failure(foundation::ResultCode::kBackendError, "Cannot create module delivery directory"), std::move(result)};
+    }
+    const auto module_manifest_relative = module.value.manifest_path.lexically_relative(module.value.directory);
+    const auto module_metadata_relative = module.value.metadata_path.lexically_relative(module.value.directory);
+    const auto module_binary_relative = module.value.binary_path.lexically_relative(module.value.directory);
+    if (module_manifest_relative.empty() || module_manifest_relative.is_absolute() ||
+        module_metadata_relative.empty() || module_metadata_relative.is_absolute() ||
+        module_binary_relative.empty() || module_binary_relative.is_absolute()) {
+        result.diagnostics.push_back(diagnostic("cook.module_delivery", "Validated module bundle paths are not relative"));
+        return {foundation::invalid_argument("Validated module bundle paths are not relative"), std::move(result)};
+    }
+    const auto copy_bundle_file = [&](const std::filesystem::path& relative, const std::filesystem::path& source) -> foundation::Result {
+        const auto destination = delivery_module_root / relative;
+        std::filesystem::create_directories(destination.parent_path(), error);
+        if (error || !std::filesystem::copy_file(source, destination, std::filesystem::copy_options::overwrite_existing, error) || error)
+            return foundation::Result::failure(foundation::ResultCode::kBackendError, "Cannot copy module bundle into delivery");
+        return foundation::Result::success();
+    };
+    for (const auto& item : {std::pair{module_manifest_relative, module.value.manifest_path},
+                             std::pair{module_metadata_relative, module.value.metadata_path},
+                             std::pair{module_binary_relative, module.value.binary_path}}) {
+        if (const auto copied = copy_bundle_file(item.first, item.second); !copied) {
+            result.diagnostics.push_back(diagnostic("cook.module_delivery", copied.message));
+            return {copied, std::move(result)};
+        }
+    }
+    const auto delivered_manifest_path = delivery_module_root / module_manifest_relative;
+    const auto delivered_bundle = module::validate_module_bundle(delivered_manifest_path);
+    if (!delivered_bundle) {
+        result.diagnostics.push_back(diagnostic("cook.module_delivery", delivered_bundle.result.message));
+        return {delivered_bundle.result, std::move(result)};
+    }
+    const auto delivered_manifest_digest = digest_file(delivered_manifest_path);
+    if (!delivered_manifest_digest) {
+        result.diagnostics.push_back(diagnostic("cook.module_delivery", delivered_manifest_digest.result.message));
+        return {delivered_manifest_digest.result, std::move(result)};
+    }
     asset::GameBuildManifest manifest{};
     manifest.project_uuid = project.value.config.project_uuid;
     manifest.module_id = project.value.config.module.id;
@@ -508,15 +873,18 @@ foundation::ResultValue<ProjectCookResult> cook_project(const ProjectCookRequest
     }
     manifest.package_digest = package_digest.value;
     manifest.startup_scene = runtime_id(roots.front());
+    manifest.world_command_routes = std::move(world_routes.value);
     for (std::size_t i = 1; i < roots.size(); ++i)
-        manifest.startup_pipelines.push_back(runtime_id(roots[i]));
+        manifest.startup_feature_graphs.push_back(runtime_id(roots[i]));
     manifest.target = project.value.config.target;
     manifest.configuration = request.configuration;
     manifest.package_name = package.filename().string();
+    manifest.module_manifest_name = (std::filesystem::path("module") / module_manifest_relative).generic_string();
+    manifest.module_manifest_sha256 = delivered_manifest_digest.value;
     const auto encoded_manifest = asset::encode_game_build_manifest(manifest);
     if (!encoded_manifest)
         return {encoded_manifest.result, std::move(result)};
-    result.game_manifest = request.output_directory / "game.manifest.bin";
+    result.game_manifest = publication_directory / "game.manifest.bin";
     std::ofstream binary(result.game_manifest, std::ios::binary | std::ios::trunc);
     binary.write(reinterpret_cast<const char*>(encoded_manifest.value.data()),
                  static_cast<std::streamsize>(encoded_manifest.value.size()));
@@ -526,7 +894,7 @@ foundation::ResultValue<ProjectCookResult> cook_project(const ProjectCookRequest
 
     // A small text sidecar is retained for the bootstrap command-line reader;
     // the binary manifest above remains the portable contract.
-    std::ofstream sidecar(request.output_directory / "game.manifest", std::ios::trunc);
+    std::ofstream sidecar(publication_directory / "game.manifest", std::ios::trunc);
     sidecar << "package = \"" << package.filename().string() << "\"\n"
             << "build_id = \"" << manifest.build_id << "\"\n"
             << "target = \"" << manifest.target << "\"\n"
@@ -535,6 +903,20 @@ foundation::ResultValue<ProjectCookResult> cook_project(const ProjectCookRequest
         return {
             foundation::Result::failure(foundation::ResultCode::kBackendError, "Cannot write game manifest sidecar"),
             std::move(result)};
+    const auto selector_temporary = request.output_directory / ("current_" + publication_name + ".tmp");
+    {
+        std::ofstream selector(selector_temporary, std::ios::binary | std::ios::trunc);
+        selector << "manifest = \"versions/" << publication_name << "/game.manifest.bin\"\n";
+        if (!selector)
+            return {foundation::Result::failure(foundation::ResultCode::kBackendError,
+                                                 "Cannot write cook output selector"),
+                    std::move(result)};
+    }
+    if (const auto published = replace_file_atomically(selector_temporary, request.output_directory / "current.toml");
+        !published) {
+        std::filesystem::remove(selector_temporary, error);
+        return {published, std::move(result)};
+    }
     result.package = package;
     return {foundation::Result::success(), std::move(result)};
 }

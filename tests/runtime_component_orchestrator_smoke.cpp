@@ -11,8 +11,12 @@
 #include "Components/component_bundle.hpp"
 #include "Components/component_render_extraction.hpp"
 #include "engine_frame_orchestrator.hpp"
+#include "engine_frame_pipeline_host.hpp"
+#include "engine_frame_pipeline_registration.hpp"
 #include "pipeline.hpp"
 #include "renderer.hpp"
+#include "renderer_frame_contract.hpp"
+#include "renderer_variants_internal.hpp"
 #include "rhi.hpp"
 #include "world_scope.hpp"
 
@@ -31,62 +35,17 @@ struct RenderViewResolverState final {
     aeg::ecs::EntityId camera_entity{};
     uint32_t call_count{0};
     bool snapshot_contains_camera{false};
+    uint64_t frame_number{0};
+    uint64_t fixed_tick{0};
+    uint64_t world_revision{0};
     aeg::renderer::RenderView resolved_view{};
 };
 
-/** @brief Captures the RenderSceneSnapshot made visible to the test RenderFeature. */
-struct RenderFeatureState final {
-    bool context_seen{false};
-    uint32_t instance_count{0};
-    aeg::renderer::RenderView view{};
-};
-
-/** @brief Reads the extracted Runtime scene through the standard RenderPipeline feature context. */
-class RuntimeComponentRenderFeature final : public aeg::pipeline::RenderFeature {
-public:
-    explicit RuntimeComponentRenderFeature(RenderFeatureState& state) : state_(&state) {}
-
-    [[nodiscard]] const aeg::pipeline::FeatureDescriptor& descriptor() const noexcept override {
-        static const aeg::pipeline::FeatureDescriptor kDescriptor{
-            .id = aeg::pipeline::FeatureId("RuntimeComponentOrchestratorFeature"),
-            .name = "RuntimeComponentOrchestratorFeature",
-            .domain = aeg::pipeline::FeatureDomain::kRender,
-            .domain_mask = aeg::pipeline::to_mask(aeg::pipeline::FeatureDomain::kRender),
-            .supported_scopes = aeg::pipeline::to_mask(aeg::pipeline::PipelineScope::kFrame),
-            .version = {1, 0, 0},
-        };
-        return kDescriptor;
-    }
-
-    [[nodiscard]] aeg::foundation::Result build_render_graph(
-        aeg::pipeline::RenderGraphBuilder& builder) const override {
-        const aeg::renderer::RenderFeatureContext* context = aeg::renderer::render_feature_context(builder);
-        if (context == nullptr || !context->is_valid()) {
-            return aeg::foundation::Result::failure(aeg::foundation::ResultCode::kInvalidState,
-                                                    "Runtime component feature did not receive a render context");
-        }
-        state_->context_seen = true;
-        state_->instance_count = static_cast<uint32_t>(context->scene_snapshot->instances.size());
-        state_->view = context->scene_snapshot->view;
-        return aeg::foundation::Result::success();
-    }
-
-protected:
-    [[nodiscard]] aeg::foundation::Result setup(aeg::pipeline::RenderGraphBuilder& builder) const override {
-        const aeg::pipeline::PipelineStageHandle stage = builder.add_stage({
-            .id = aeg::pipeline::StageId("RuntimeComponentOrchestratorFeature.Stage"),
-            .phase = aeg::pipeline::EnginePhase::kRenderBuild,
-            .execution_domain = aeg::pipeline::ExecutionDomain::kRenderThread,
-            .time_policy = aeg::pipeline::TimePolicy::kFrame,
-            .parallelizable = true,
-        });
-        return stage ? aeg::foundation::Result::success()
-                     : aeg::foundation::Result::failure(aeg::foundation::ResultCode::kInvalidState,
-                                                        "Runtime component feature declaration failed");
-    }
-
-private:
-    RenderFeatureState* state_{nullptr};
+/** @brief Retains the extracted scene independently of the frame artifact lifetime. */
+struct RenderSceneObservation final {
+    uint32_t post_build_count{0};
+    std::shared_ptr<const aeg::renderer::RenderSceneSnapshot> snapshot{};
+    const aeg::renderer::RenderResourceResolver* resolver{nullptr};
 };
 }  // namespace
 
@@ -97,21 +56,7 @@ int main() {
 
     constexpr uint32_t kViewId = 7;
     aeg::pipeline::PipelineRegistry registry;
-    RenderFeatureState render_feature_state{};
-    if (!require(aeg::renderer::register_render_pipeline(registry), "RenderPipeline registration failed") ||
-        !require(registry.register_feature([&render_feature_state] {
-            return std::make_unique<RuntimeComponentRenderFeature>(render_feature_state);
-        }),
-                 "Runtime component render feature registration failed") ||
-        !require(registry.bind_feature({
-                     .feature = aeg::pipeline::FeatureId("RuntimeComponentOrchestratorFeature"),
-                     .pipeline = aeg::pipeline::PipelineId("RenderPipeline"),
-                     .scope = aeg::pipeline::PipelineScope::kFrame,
-                     .point = aeg::pipeline::FeaturePointId("RenderPipeline.Opaque"),
-                     .priority = 0,
-                     .enabled = true,
-                 }),
-                 "Runtime component render feature binding failed")) {
+    if (!require(aeg::renderer::register_render_pipeline(registry), "RenderPipeline registration failed")) {
         return 1;
     }
 
@@ -157,7 +102,7 @@ int main() {
         return 5;
     }
 
-    aeg::world::WorldScope world_scope(world_result.value, registry, {});
+    aeg::world::WorldScope world_scope(world_result.value);
     if (!require(world_scope.initialize(), "Runtime component WorldScope initialization failed")) {
         return 6;
     }
@@ -179,11 +124,13 @@ int main() {
         return 9;
     }
     std::unique_ptr<aeg::rhi::Device> device = std::move(device_result.value);
-    aeg::pipeline::PipelineScheduler scheduler({1, 1, 1, 1});
+    aeg::pipeline::PipelineScheduler scheduler;
     aeg::render_graph::FrameContext frame_context(*device);
     aeg::render_graph::RenderGraph render_graph(*device);
-    aeg::engine::EngineFrameOrchestrator orchestrator(registry, scheduler, frame_context, render_graph);
-    if (!require(orchestrator.register_world_frame(world_scope, frame_host, kViewId),
+    aeg::engine::EngineFramePipelineHost pipeline_host(registry, scheduler);
+    aeg::engine::EngineFrameOrchestrator orchestrator(pipeline_host, frame_context, render_graph);
+    if (!require(orchestrator.register_world_frame(
+                     world_scope, aeg::engine::EngineFramePipelineRegistration{frame_host}, kViewId),
                  "Runtime component World view registration failed") ||
         !require(orchestrator.initialize(), "Runtime component orchestrator initialization failed")) {
         return 10;
@@ -191,6 +138,7 @@ int main() {
 
     RenderViewResolverState resolver_state{};
     resolver_state.camera_entity = camera_entity.value;
+    RenderSceneObservation scene_observation{};
     aeg::engine::EngineFrameDesc frame_desc{};
     frame_desc.fixed_tick = 42;
     frame_desc.renderer = &renderer;
@@ -200,6 +148,9 @@ int main() {
             context.world_snapshot.is_valid() &&
             context.world_snapshot.get<Transform>(resolver_state.camera_entity) != nullptr &&
             context.world_snapshot.get<Camera>(resolver_state.camera_entity) != nullptr;
+        resolver_state.frame_number = context.world_snapshot.frame_number();
+        resolver_state.fixed_tick = context.world_snapshot.fixed_tick();
+        resolver_state.world_revision = context.world_snapshot.revision();
 
         aeg::engine::components::RuntimeRenderViewDesc view_desc{};
         view_desc.camera_entity = resolver_state.camera_entity;
@@ -213,11 +164,40 @@ int main() {
         }
         return view;
     };
+    frame_desc.render_feature_post_build = [&scene_observation, &frame_host, &world_scope](
+                                              const aeg::engine::EngineFramePostBuildContext& context) {
+        if (context.render_scenes.size() != 1 || context.render_scenes.front() == nullptr ||
+            context.render_resource_resolver != nullptr) {
+            return aeg::foundation::invalid_state("Runtime post-build scene or resolver identity is incorrect");
+        }
+        scene_observation.snapshot = context.render_scenes.front();
+        scene_observation.resolver = context.render_resource_resolver;
+        const auto& scene = *scene_observation.snapshot;
+        const auto published = frame_host.artifacts().read(aeg::renderer::kRenderSceneSnapshotArtifactId,
+                                                          aeg::renderer::kRenderSceneSnapshotArtifactTypeId,
+                                                          aeg::renderer::kRenderSceneSnapshotArtifactVersion);
+        const auto committed = world_scope.latest_snapshot();
+        if (!published || !committed || !scene.is_valid() ||
+            published.value.owner_scope() != aeg::pipeline::PipelineScope::kFrame ||
+            published.value.storage() != aeg::pipeline::ArtifactStorage::kImmutableSnapshot ||
+            published.value.version() != aeg::renderer::kRenderSceneSnapshotArtifactVersion ||
+            published.value.as<aeg::renderer::RenderSceneSnapshot>(
+                aeg::renderer::kRenderSceneSnapshotArtifactTypeId) != scene_observation.snapshot.get() ||
+            scene.world != world_scope.handle() || scene.view.world != world_scope.handle() ||
+            scene.frame_number != 1 || context.frame_context.frame_number() != 1 ||
+            committed.value->frame_number() != 1 || committed.value->fixed_tick() != 42 ||
+            scene.world_revision != committed.value->revision()) {
+            return aeg::foundation::invalid_state("Runtime scene publication lost its owning snapshot");
+        }
+        ++scene_observation.post_build_count;
+        return aeg::foundation::Result::success();
+    };
     if (!require(orchestrator.run_frame(frame_desc), "Runtime component orchestrated frame failed")) {
         return 11;
     }
     if (!require(
             resolver_state.call_count == 1 && resolver_state.snapshot_contains_camera &&
+                resolver_state.frame_number == 1 && resolver_state.fixed_tick == 42 &&
                 resolver_state.resolved_view.id == aeg::renderer::make_render_view_id(world_handle.value, kViewId) &&
                 resolver_state.resolved_view.world == world_handle.value &&
                 resolver_state.resolved_view.view_id == kViewId &&
@@ -225,12 +205,19 @@ int main() {
                 resolver_state.resolved_view.frustum_culling &&
                 aeg::math::nearly_equal(resolver_state.resolved_view.camera.position, camera_transform.translation),
             "Runtime render-view resolver did not receive the committed World contract") ||
-        !require(render_feature_state.context_seen && render_feature_state.instance_count == 1 &&
-                     render_feature_state.view.id == resolver_state.resolved_view.id &&
-                     render_feature_state.view.world == world_handle.value &&
-                     render_feature_state.view.view_id == kViewId &&
-                     aeg::math::nearly_equal(render_feature_state.view.camera.position, camera_transform.translation),
-                 "Runtime RenderFeature did not receive the resolver-generated scene snapshot")) {
+        !require(scene_observation.post_build_count == 1 && scene_observation.snapshot != nullptr &&
+                     scene_observation.resolver == nullptr && scene_observation.snapshot->instances.size() == 1 &&
+                     scene_observation.snapshot->world_revision == resolver_state.world_revision &&
+                     scene_observation.snapshot->view.id == resolver_state.resolved_view.id &&
+                     scene_observation.snapshot->view.world == world_handle.value &&
+                     scene_observation.snapshot->view.view_id == kViewId &&
+                     aeg::math::nearly_equal(scene_observation.snapshot->view.camera.position,
+                                             camera_transform.translation),
+                 "Runtime post-build did not receive the resolver-generated scene snapshot") ||
+        !require(!frame_host.artifacts().read(aeg::renderer::kRenderSceneSnapshotArtifactId,
+                                             aeg::renderer::kRenderSceneSnapshotArtifactTypeId,
+                                             aeg::renderer::kRenderSceneSnapshotArtifactVersion),
+                 "Runtime frame retained its scene artifact after run_frame")) {
         return 12;
     }
 
@@ -282,6 +269,19 @@ int main() {
         !require(world_scope.shutdown(), "Runtime component WorldScope shutdown failed") ||
         !require(renderer.unregister_extractor(extractor.value), "Runtime mesh extractor unregistration failed")) {
         return 16;
+    }
+    if (!require(scene_observation.post_build_count == 1 && scene_observation.snapshot->is_valid() &&
+                     scene_observation.snapshot->world == world_handle.value &&
+                     scene_observation.snapshot->frame_number == 1 &&
+                     scene_observation.snapshot->world_revision == resolver_state.world_revision &&
+                     scene_observation.snapshot->instances.size() == 1 &&
+                     scene_observation.snapshot->view.id == resolver_state.resolved_view.id &&
+                     scene_observation.snapshot->view.world == world_handle.value &&
+                     scene_observation.snapshot->view.view_id == kViewId &&
+                     aeg::math::nearly_equal(scene_observation.snapshot->view.camera.position,
+                                             camera_transform.translation),
+                 "Runtime owning scene snapshot did not survive shutdown")) {
+        return 17;
     }
     return 0;
 }

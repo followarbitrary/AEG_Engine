@@ -8,13 +8,14 @@
 #include "asset_package.hpp"
 #include "cooked_asset.hpp"
 #include "runtime_asset_resolver.hpp"
+#include "runtime_asset_upload_host.hpp"
 #include "runtime_scene_loader.hpp"
 #include "scene_payload.hpp"
 
 int main() {
     namespace fs = std::filesystem;
     using namespace aeg;
-    const auto scene_id = asset::AssetId::parse("00000000-0000-4000-8000-0000000000a1");
+    const auto scene_id = foundation::AssetId::parse("00000000-0000-4000-8000-0000000000a1");
     if (!scene_id)
         return 1;
 
@@ -47,7 +48,7 @@ int main() {
 
     asset::CookedAsset cooked{};
     cooked.id = scene_id.value;
-    cooked.kind = asset::AssetKind::kScene;
+    cooked.kind = foundation::AssetKind::kScene;
     cooked.schema_version = 1;
     cooked.payload = encoded_payload.value;
     const auto envelope = tooling::CookedAssetCodec{}.encode(cooked);
@@ -64,10 +65,9 @@ int main() {
     if (!package)
         return 7;
 
-    pipeline::PipelineRegistry pipelines;
     reflection::TypeRegistry reflection;
     const auto loaded = application::runtime::RuntimeSceneLoader::load_startup_scene(package.value, scene_id.value,
-                                                                                     pipelines, reflection);
+                                                                                     reflection);
     if (!loaded || !loaded.value.world || !loaded.value.scope || loaded.value.instance.entity_count() != 1 ||
         loaded.value.world->entity_count() != 1 || !loaded.value.startup_camera.is_valid())
         return 8;
@@ -78,8 +78,8 @@ int main() {
 
     // A cooked MeshRenderer carries UUID references; runtime loading must bind
     // those UUIDs to session renderer identities before instantiating the World.
-    const auto mesh_asset = asset::AssetId::parse("10000000-0000-4000-8000-000000000001");
-    const auto material_asset = asset::AssetId::parse("10000000-0000-4000-8000-000000000002");
+    const auto mesh_asset = foundation::AssetId::parse("10000000-0000-4000-8000-000000000001");
+    const auto material_asset = foundation::AssetId::parse("10000000-0000-4000-8000-000000000002");
     if (!mesh_asset || !material_asset)
         return 16;
     reflection::TypeRegistry bound_reflection;
@@ -114,37 +114,36 @@ int main() {
     mesh_ref.component_version = 1;
     mesh_ref.field_id = reflection::FieldId("mesh_asset_id").value();
     mesh_ref.asset = mesh_asset.value;
-    mesh_ref.kind = asset::AssetKind::kMesh;
+    mesh_ref.kind = foundation::AssetKind::kMesh;
     auto material_ref = mesh_ref;
     material_ref.field_id = reflection::FieldId("material_asset_id").value();
     material_ref.asset = material_asset.value;
-    material_ref.kind = asset::AssetKind::kMaterial;
+    material_ref.kind = foundation::AssetKind::kMaterial;
     render_payload.references = {mesh_ref, material_ref};
     const auto render_encoded = asset::encode_scene_payload(render_payload);
     if (!render_encoded)
         return 21;
     asset::CookedAsset render_cooked{
-        scene_id.value, asset::AssetKind::kScene, 1, {mesh_asset.value, material_asset.value}, render_encoded.value};
-    auto encode_entry = [](asset::AssetId id, asset::AssetKind kind) {
+        scene_id.value, foundation::AssetKind::kScene, 1, {mesh_asset.value, material_asset.value}, render_encoded.value};
+    auto encode_entry = [](foundation::AssetId id, foundation::AssetKind kind) {
         return asset::encode_cooked_asset({id, kind, 1, {}, {std::byte{1}}});
     };
-    const auto mesh_entry = encode_entry(mesh_asset.value, asset::AssetKind::kMesh);
-    const auto material_entry = encode_entry(material_asset.value, asset::AssetKind::kMaterial);
+    const auto mesh_entry = encode_entry(mesh_asset.value, foundation::AssetKind::kMesh);
+    const auto material_entry = encode_entry(material_asset.value, foundation::AssetKind::kMaterial);
     const auto render_envelope = tooling::CookedAssetCodec{}.encode(render_cooked);
     if (!mesh_entry || !material_entry || !render_envelope ||
         !tooling::AssetPackageWriter{}.write(
             root / "render_scene.aegbin",
             {{render_cooked.id, render_cooked.kind, 1, render_envelope.value},
-             {mesh_asset.value, asset::AssetKind::kMesh, 1, mesh_entry.value},
-             {material_asset.value, asset::AssetKind::kMaterial, 1, material_entry.value}}))
+             {mesh_asset.value, foundation::AssetKind::kMesh, 1, mesh_entry.value},
+             {material_asset.value, foundation::AssetKind::kMaterial, 1, material_entry.value}}))
         return 22;
     const auto render_package = asset::AssetPackageReader::open(root / "render_scene.aegbin");
     if (!render_package)
         return 23;
     application::runtime::RuntimeAssetResolver resolver{render_package.value};
-    pipeline::PipelineRegistry render_pipelines;
     const auto bound_scene = application::runtime::RuntimeSceneLoader::load_startup_scene(
-        render_package.value, scene_id.value, render_pipelines, bound_reflection, {}, &resolver);
+        render_package.value, scene_id.value, bound_reflection, &resolver);
     if (!bound_scene)
         return 24;
     const auto bound_entity = bound_scene.value.instance.runtime_entity(render_entity);
@@ -168,17 +167,16 @@ int main() {
         !tooling::AssetPackageWriter{}.write(
             root / "render_scene_empty_refs.aegbin",
             {{render_cooked.id, render_cooked.kind, 1, empty_reference_envelope.value},
-             {mesh_asset.value, asset::AssetKind::kMesh, 1, mesh_entry.value},
-             {material_asset.value, asset::AssetKind::kMaterial, 1, material_entry.value}}))
+             {mesh_asset.value, foundation::AssetKind::kMesh, 1, mesh_entry.value},
+             {material_asset.value, foundation::AssetKind::kMaterial, 1, material_entry.value}}))
         return 28;
     const auto empty_reference_package = asset::AssetPackageReader::open(root / "render_scene_empty_refs.aegbin");
     if (!empty_reference_package)
         return 29;
     application::runtime::RuntimeAssetResolver empty_reference_resolver{empty_reference_package.value};
-    pipeline::PipelineRegistry empty_reference_pipelines;
     reflection::TypeRegistry empty_reference_reflection;
     if (application::runtime::RuntimeSceneLoader::load_startup_scene(
-            empty_reference_package.value, scene_id.value, empty_reference_pipelines, empty_reference_reflection, {},
+            empty_reference_package.value, scene_id.value, empty_reference_reflection,
             &empty_reference_resolver))
         return 30;
 
@@ -204,7 +202,7 @@ int main() {
         return 12;
     const auto wrong_package = asset::AssetPackageReader::open(root / "wrong_identity.aegbin");
     if (!wrong_package || application::runtime::RuntimeSceneLoader::load_startup_scene(
-                              wrong_package.value, scene_id.value, pipelines, reflection))
+                              wrong_package.value, scene_id.value, reflection))
         return 13;
 
     asset::CookedAsset malformed = cooked;
@@ -216,7 +214,7 @@ int main() {
         return 14;
     const auto malformed_package = asset::AssetPackageReader::open(root / "malformed.aegbin");
     if (!malformed_package || application::runtime::RuntimeSceneLoader::load_startup_scene(
-                                  malformed_package.value, scene_id.value, pipelines, reflection))
+                                  malformed_package.value, scene_id.value, reflection))
         return 15;
     fs::remove_all(root, ec);
     std::cout << "runtime Scene package creates an isolated World and rejects malformed payloads\n";

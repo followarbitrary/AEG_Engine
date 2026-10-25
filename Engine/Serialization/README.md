@@ -8,7 +8,8 @@
 ## 当前状态
 
 当前提供 `serialization.hpp` 中的 `BinaryWriter`、`BinaryReader`、
-`serialize_object()` 和 `deserialize_object()`。该实现使用小端、自描述字段记录：对象
+`serialize_object()` 和 `deserialize_object()`。二进制读写器支持 16/32/64 位无符号小端
+标量和字节序列。反射对象使用自描述字段记录：对象
 携带 `TypeId` 和 Schema 版本，每个字段携带稳定 `FieldId` 与字节长度，因此读取旧版本
 数据时可以跳过未知字段，读取高于当前 Schema 的数据时会明确返回不支持。
 
@@ -26,3 +27,8 @@ callback，因此场景资产层仍需定义显式的迁移策略。
 
 Serialization 可以使用 Foundation 和 Reflection，不应直接管理 RHI 资源或执行
 渲染命令。资源引用应通过稳定资产 ID 或明确的资源句柄协议表达。
+
+
+`private/json_value_codec.hpp` 只承载通用 JSON 字段、稳定 ID、版本和 Foundation ParameterValue
+的编码。Feature 契约语义留在 Engine/Feature，Module 描述符和发布容器留在 Engine/Module；
+这些内部 helper 不进入游戏 SDK，也不引入新的公开 JSON 依赖。
